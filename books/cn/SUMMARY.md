@@ -35,7 +35,7 @@
 
 ## 第 VII 部 自举与 no-libpython
 
-- [第 14 章 no-libpython:把运行时收缩成内核](ch14-no-libpython.md)
+- [第 14 章 no-libpython 与 zero-libc:让运行时成为 pcc-Python](ch14-no-libpython.md)
 - [第 15 章 自举:pcc1→pcc2→pcc3 不动点](ch15-bootstrap-fixed-point.md)
 
 ## 第 VIII 部 值模型与生态
@@ -50,6 +50,10 @@
 ## 第 X 部 加速器
 
 - [第 19 章 GPU 内核 IR、Metal 与加速器执行](ch19-gpu-kernel-ir.md)
+
+## 第 XI 部 应用执行
+
+- [第 20 章 声明式 GUI:组件、调度与无 WebView 应用边界](ch20-declarative-gui.md)
 
 ## 附录
 

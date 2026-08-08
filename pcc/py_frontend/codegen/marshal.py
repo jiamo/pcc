@@ -30,7 +30,6 @@ from typing import Mapping
 
 from pcc.llvm_capi.compat import ir
 
-from .core_helpers import _instruction_opname_text
 from ..py_ast import (
     BoolType,
     ByteArrayType,
@@ -376,6 +375,14 @@ def marshal_to_object(
             return builder.call(
                 runtime["py_float_from_f64"], [value], name="m.dyn.flt_box"
             )
+        if _ir_type_text(value_ty) == "void":
+            # A ``-> None``/unannotated callee lowers to ``ret void``. When
+            # inference typed the call expression as dyn, the Python-level
+            # value is None — materialize the singleton instead of trying to
+            # marshal a nonexistent SSA value (cross-module return-ABI fix;
+            # docs/investigations/libpy-runtime-pcc-archive-pure-c-chain-crashes.md).
+            gv = declare_runtime_global(module, "py_None")
+            return builder.load(gv, name="m.dyn.none")
         raise NotImplementedError(
             "marshal_to_object: DynType with IR "
             + _ir_type_text(value_ty)
@@ -426,11 +433,24 @@ def marshal_from_object(
             if pyobj.type.width < 64:
                 return builder.sext(pyobj, _I64, name="m.int_widen")
             return builder.trunc(pyobj, _I64, name="m.int_narrow")
-        # Allocate an overflow flag slot; caller can ignore.
+        folded = _boxed_i64_constant(pyobj)
+        if folded is not None:
+            # `py_int_from_i64(C)` immediately unboxed back to i64.  Every
+            # `load_i64(obj, SOME_OFFSET)` in the runtime ports hits this: the
+            # module-level offset is a Python int constant, so it is boxed to
+            # satisfy the object-typed name and unboxed again to satisfy the
+            # i64 parameter — two runtime calls to pass a literal.  Those two
+            # calls per constant use were the bulk of the int box/unbox
+            # traffic in a self-hosted pcc1 compile.
+            return folded
+        # The overflow slot is written but not branched on.  Record the source
+        # object so an immediate re-box can hand it back instead of a truncated
+        # i64: above 2**63-1 `py_int_to_i64` yields 0.
         ov_slot = _stash_overflow_slot(builder)
-        return builder.call(
+        unboxed = builder.call(
             runtime["py_int_to_i64"], [pyobj, ov_slot], name="m.int_unbox"
         )
+        return unboxed
     if isinstance(target_ty, FloatType) or target_name == "float":
         if isinstance(pyobj.type, ir.DoubleType):
             return pyobj
@@ -498,6 +518,50 @@ def marshal_from_object(
     raise NotImplementedError("marshal_from_object: unsupported target type descriptor")
 
 
+# Boxed integer constants, by identity of the emitted value.  The IR builder
+# returns opaque handles with no operand access, so a value cannot be asked
+# what it boxes after the fact; the producer records it here instead.  The
+# value itself is kept in the entry so its ``id`` cannot be recycled onto a
+# different object while the mapping is live.
+_BOXED_I64_CONSTANTS: dict[int, tuple] = {}
+
+
+# NOTE on `py_int_from_i64(py_int_to_i64(x))`: it is NOT an identity -- above
+# 2**63-1 `py_int_to_i64` yields 0 and the re-box gives 0.  Recovering the source
+# object here was implemented and MEASURED UNSOUND: retaining it leaks one
+# reference per call whenever the source is an OWNED temp the ownership lowering
+# already releases (26 MB at 20k iterations, 98 MB at 200k, against a flat 1 MB),
+# and not retaining frees it early.  Attribute reads mix both kinds -- the
+# `py_instance_get_field` result is borrowed while `py_obj_getattr` returns a new
+# reference -- so an opt-in flag per call site is not enough either.
+#
+# The shape that IS fixed is `int(<str>)`, via an object-returning variant
+# (`emit_int_builtin_as_object`) that never unboxes at all.  Doing the same for
+# the remaining sites needs the recovered value REGISTERED with the ownership
+# lowering as that call's owned result.  Tracked as M5-SELFHOST-BIG-INT-LITERAL.
+
+
+def note_boxed_i64_constant(value: ir.Value, constant: int) -> None:
+    """Record that *value* is ``py_int_from_i64`` of the literal *constant*."""
+    _BOXED_I64_CONSTANTS[id(value)] = (value, int(constant))
+
+
+def reset_boxed_i64_constants() -> None:
+    """Drop the mapping between modules."""
+    _BOXED_I64_CONSTANTS.clear()
+
+
+def _boxed_i64_constant(pyobj: ir.Value) -> ir.Value | None:
+    """Return the literal *pyobj* boxes, when it was recorded as boxing one."""
+    entry = _BOXED_I64_CONSTANTS.get(id(pyobj))
+    if entry is None:
+        return None
+    held, constant = entry
+    if held is not pyobj:
+        return None
+    return ir.Constant(_I64, constant)
+
+
 def _stash_overflow_slot(builder: ir.IRBuilder) -> ir.Value:
     """Allocate an int32 stack slot to receive an overflow flag.
 
@@ -515,12 +579,13 @@ def _stash_overflow_slot(builder: ir.IRBuilder) -> ir.Value:
     """
     fn = builder._block.function
     entry = fn.blocks[0]
-    insert_before = None
-    for instr in entry._instrs:
-        if _instruction_opname_text(instr) != "alloca":
-            insert_before = instr
-            break
-
+    # Insert at the very start of the entry block instead of scanning for
+    # the first non-alloca instruction: the scan walked the entry's alloca
+    # prefix on every call (O(prefix) opname reads), and since
+    # core_helpers._alloca_in_entry now parks one alloca per rooted call
+    # site in that prefix, int-heavy functions turned the scan quadratic
+    # under the self-hosted compiler. Ordering among entry allocas is
+    # irrelevant — each executes once.
     saved_block = builder._block
     # Read _pos directly rather than via getattr-with-default: the
     # pcc-py self-host runtime can return the default for instance
@@ -531,12 +596,8 @@ def _stash_overflow_slot(builder: ir.IRBuilder) -> ir.Value:
     # the alloca insertion point ends up restored as the primary
     # cursor and later emissions land before their operands.
     saved_pos = builder._pos
-    saved_anchor = None
 
-    if insert_before is not None:
-        builder.position_before(insert_before)
-    else:
-        builder.position_at_end(entry)
+    builder.position_at_start(entry)
     slot = builder.alloca(_I32, name="ov.flag")
 
     if saved_block is not None:
@@ -546,23 +607,12 @@ def _stash_overflow_slot(builder: ir.IRBuilder) -> ir.Value:
         # ``property`` descriptors, so depending on IRBuilder._anchor
         # can restore the cursor to the alloca insertion point and
         # emit later instructions before their operands.
-        if saved_pos is not None:
-            end_marker = getattr(builder, "_END", None)
-            if (
-                saved_block is entry
-                and insert_before is not None
-                and saved_pos != end_marker
-            ):
-                builder._pos = saved_pos + 1
-            else:
-                builder._pos = saved_pos
-        elif saved_block is entry and insert_before is not None:
-            # If we inserted into the same block, the new alloca shifted
-            # subsequent indices by 1 — account for that so future inserts
-            # land where the caller expected.
-            builder._anchor = saved_anchor + 1
+        end_marker = getattr(builder, "_END", None)
+        if saved_block is entry and saved_pos != end_marker:
+            # The front insert shifted every index in the entry block.
+            builder._pos = saved_pos + 1
         else:
-            builder._anchor = saved_anchor
+            builder._pos = saved_pos
     return slot
 
 

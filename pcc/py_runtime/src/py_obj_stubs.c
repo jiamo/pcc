@@ -392,6 +392,15 @@ PyObject *py_obj_str(PyObject *o) {
         tag == PY_TYPE_BYTES) {
         return py_format_obj_to_str(o, 0);
     }
+    /* A C-extension object (numpy scalar / ndarray) has no Python __str__;
+     * its text comes from its own tp_repr slot. The print formatter already
+     * had this fallback, so print(x) worked while str(x) returned NULL and
+     * "..." + str(x) rendered "<null>". Dispatch here so every consumer of
+     * str() — concatenation, f-strings, print — sees the same text. */
+    if (pcc_capi_is_cext_type_tag(tag)) {
+        PyObject *cext = pcc_capi_cext_object_repr(o);
+        if (cext != NULL) return cext;
+    }
     PyObject *dunder = py_user_str_dispatch(o);
     if (dunder != NULL) return dunder;
     if (py_err_occurred()) return NULL;

@@ -35,7 +35,7 @@
 
 ## Part VII: Self-Hosting
 
-- [Chapter 14: No-libpython — Shrinking the Runtime to a Kernel](ch14-no-libpython.md)
+- [Chapter 14: No-libpython and Zero-libc — Making the Runtime pcc-Python](ch14-no-libpython.md)
 - [Chapter 15: Bootstrap — the pcc1→pcc2→pcc3 Fixed Point](ch15-bootstrap-fixed-point.md)
 
 ## Part VIII: The Value Model and the Ecosystem
@@ -50,6 +50,10 @@
 ## Part X: Accelerators
 
 - [Chapter 19: GPU Kernel IR, Metal, and Accelerator Execution](ch19-gpu-kernel-ir.md)
+
+## Part XI: Application Execution
+
+- [Chapter 20: Declarative GUI — Components, Scheduling, and a Webview-Free Application Boundary](ch20-declarative-gui.md)
 
 ## Appendices
 

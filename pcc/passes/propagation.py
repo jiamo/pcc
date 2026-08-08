@@ -489,6 +489,13 @@ class _LocalValueNumbering(ASTTransformer):
         target_type = self._type_name(target_var)
         if not cached_type or not target_type:
             return False
+        # An array initializer is not an ordinary C value expression.  In
+        # particular, replacing a repeated string-literal initializer with an
+        # ID changes ``char b[] = "x"`` into aggregate initialization from a
+        # different array, which codegen cannot (and C does not) treat as a
+        # scalar copy.  Keep aggregate initialization out of source-level LVN.
+        if "[]" in cached_type or "[]" in target_type:
+            return False
         return cached_type == target_type
 
     @staticmethod

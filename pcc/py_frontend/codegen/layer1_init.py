@@ -23,6 +23,7 @@ class Layer1InitMixin:
         self.ast_module = module
         self._ast_body = module.body
         self._try_err_block = None
+        self._cpy_operand_cleanup_block = None
         self._finally_stack = []
         # Bare re-raise lowering consults this compiler-state stack after a
         # handler clears the runtime TLS exception.  Host Python can create
@@ -33,6 +34,11 @@ class Layer1InitMixin:
         self._emitting_finally = False
         self._prefer_native_callable_values = False
         self._cpy_values = set()
+        # `_cpy_values` is a domain tag only: it also contains borrowed
+        # loads from CPython-backed locals and module globals.  Keep the
+        # unconsumed new-reference subset separate so call boundaries can
+        # release fresh values without touching borrowed owners.
+        self._owned_cpy_values = set()
         self.emit_cpy_main_exitcode = emit_cpy_main_exitcode
         self._strict_no_libpython = False
         if ir_scaffold_mode not in ("off", "on"):
@@ -59,6 +65,13 @@ class Layer1InitMixin:
         )
         self._printf = self._declare_printf()
         self.functions: dict[str, ir.Function] = {}
+        # A Python name may be rebound by a later ``def``.  Keep the final
+        # name lookup in ``functions`` while retaining the distinct native
+        # body belonging to every executable FuncDef statement.
+        self._funcdef_functions: dict[int, ir.Function] = {}
+        self._native_symbol_funcdefs: dict[str, FuncDef] = {}
+        self._function_definition_ordinals: dict[str, int] = {}
+        self._duplicate_module_function_names: set[str] = set()
         self._c_abi_export_symbols: set[str] = set()
         self._module_has_c_abi_export = False
         self._fn_err_exit_blocks: dict[str, ir.Block] = {}
@@ -70,24 +83,41 @@ class Layer1InitMixin:
         # timing differs between host and self-hosted stages).
         self._fn_gc_root_slot_registry: dict[str, list] = {}
         self._fn_err_exit_gc_root_slots: dict[str, list] = {}
+        self._fn_err_exit_for_target_slots: dict[str, list] = {}
         self._fn_valueclass_payload_root_slots: dict[str, list] = {}
         # Function-exit blocks whose cleanup already emitted root leaves;
         # a slot registered later retro-patches its leave into each site
         # (entry enters always run, so every exit must leave every slot).
         self._fn_gc_root_exit_sites: dict[str, list] = {}
-        self._post_call_frame_blocks: dict[
-            tuple[str, str, str, str, int],
-            ir.Block,
-        ] = {}
+        # id(fn) -> err-target name -> line -> block.
+        # Nested plain keys, not one tuple key: see
+        # ExceptionLoweringMixin._ensure_post_call_frame_block.
+        self._post_call_frame_blocks: dict[int, dict] = {}
+        # Source text for traceback frames, read once per file: see
+        # ExceptionLoweringMixin._emit_exception_frame.
+        self._source_file_lines_cache: dict[str, list] = {}
+        # Values produced by `py_obj_call` on the generic dynamic-dispatch
+        # path.  Always a new reference; not inferable from the AST shape.
+        self._owned_dynamic_call_values: set = set()
         self._funcdef_yield_sentinel_cache: dict[int, bool] = {}
+        self._vthread_binding_cache: dict = {}
         self._generator_ctx_stack: list = []
         self._generator_func_names: set[str] = set()
+        # Closed-world virtual-thread effect analysis fills these before
+        # function declaration.  Keep exact FuncDef identities separate from
+        # direct-call names so a pcc1 build never has to infer the effect from
+        # a host-only Python generator transform.
+        self._vthread_may_park_func_ids: set[int] = set()
+        self._vthread_may_park_func_names: set[str] = set()
+        self._vthread_may_park_method_ids: set[int] = set()
+        self._vthread_may_park_method_keys: set[str] = set()
+        self._vthread_rejected_park_boundaries: dict[str, str] = {}
         self.builder: Optional[ir.IRBuilder] = None
         self.current_function: Optional[ir.Function] = None
         self.current_func_def: Optional[FuncDef] = None
         self._current_entry_block = None
         self._entry_alloca_insert_before_function = None
-        self._entry_alloca_insert_before_instr = None
+        self._entry_alloca_insert_index = -1
         self.current_class = None
         self.current_method_kind = None
         self._async_body_depth = 0
@@ -96,6 +126,14 @@ class Layer1InitMixin:
         self.env: dict[str, tuple[ir.AllocaInstr, ir.Type, Type]] = {}
         self._module_globals: dict[str, tuple[ir.GlobalVariable, Type]] = {}
         self._module_global_init_flags: dict[str, ir.GlobalVariable] = {}
+        # The pipeline fills this with the parser input path.  Keep it explicit
+        # constructor state because an empty package has no statement span from
+        # which module/resource ``__file__`` could otherwise be recovered.
+        self._module_source_path: str = ""
+        # Set by the pipeline before lowering.  Target-sensitive unsafe
+        # intrinsics must not consult the host platform during cross-target
+        # codegen; the IR triple is only serialized after generation.
+        self._target_triple: str = ""
         self._cpy_module_flags: dict[str, bool] = {}
         self.env_class_hint: dict[str, str] = {}
         self.env_class_object_hint: dict[str, str] = {}
@@ -119,6 +157,11 @@ class Layer1InitMixin:
         self._module_uses_raw_int_scaffold = False
         self._box_int_locals = False
         self._exact_int_env_flags: dict[str, bool] = {}
+        # Immutable per-function representation plan.  `_exact_int_env_flags`
+        # tracks the semantic type of the current binding and can be cleared
+        # by an intervening object assignment; this set keeps a later int
+        # rebind on the entry-planned object slot.
+        self._planned_exact_int_local_names: set[str] = set()
         self.loop_stack: list[tuple[ir.Block, ir.Block]] = []
         self._fmt_int: Optional[ir.GlobalVariable] = None
         self._fmt_float: Optional[ir.GlobalVariable] = None
@@ -140,6 +183,8 @@ class Layer1InitMixin:
         self._class_type_export_cache: dict[tuple[str, str], Optional[str]] = {}
         self._tmp_counter = 0
         self._skip_program_main: bool = False
+        self._python_library: bool = False
+        self._freestanding_module: bool = False
         self._sibling_module_inits: tuple[str, ...] = ()
         self._native_module_exports: Optional[dict] = _default_native_module_exports(
             module.name
@@ -169,8 +214,9 @@ class Layer1InitMixin:
         self._native_fileinput_env_flags: dict[str, bool] = {}
         self._threading_env_flags: dict[str, str] = {}
         self._threading_list_elem_flags: dict[str, str] = {}
-        self._thread_safepoints_enabled = bool(
-            str(os.environ.get("PCC_WITH_THREADS", "")).strip()
+        self._thread_safepoints_enabled = (
+            str(os.environ.get("PCC_WITH_THREADS", "")).strip().lower()
+            in ("1", "true", "yes", "on")
         )
         self._runtime_threads_enabled = (
             self._thread_safepoints_enabled or self._module_imports_threading(module)
@@ -182,10 +228,12 @@ class Layer1InitMixin:
         self._cross_module_identity_decorators: dict[str, bool] = {}
         self._cross_module_semantic_functions: dict[str, tuple[str, str]] = {}
         self._module_block_func_defs: dict[str, FuncDef] = {}
+        self._module_block_funcdef_ids: set[int] = set()
         self._owned_local_names: set[str] = set()
         self._owned_local_has_value: set[str] = set()
         self._owned_local_flag_slots: dict[str, ir.Value] = {}
         self._owned_local_flag_allocas: dict[str, ir.Value] = {}
+        self._for_target_owned_names: set[str] = set()
         self._gc_rooted_local_names: set[str] = set()
         self._gc_rooted_local_order: list[str] = []
         self._borrowed_gc_rooted_local_names: set[str] = set()
@@ -203,6 +251,7 @@ class Layer1InitMixin:
         self._current_param_names: set[str] = set()
         self._unboxed_typed_int_abi_cache: dict[str, bool] = {}
         self._typed_int_abi_call_arg_safety: list[tuple[str, list[bool]]] = []
+        self._bounded_int_abi_function_names: list[str] = []
         self._hoisted_capture_params = {}
         self._hoisted_class_capture_params = {}
         self._hoisted_enclosing_class = {}

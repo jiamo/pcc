@@ -2,7 +2,12 @@ from __future__ import annotations
 
 """Target-neutral value/liveness analysis helpers for the self backend."""
 
-from .self_backend_ir import ParsedFunction, ParsedInstr
+from .self_backend_ir import (
+    ParsedFunction,
+    ParsedInstr,
+    _dot_numeric_text_key_id,
+    text_key_names_equal,
+)
 from .self_backend_parse import (
     const_int_from_value,
     is_aggregate_literal_value,
@@ -11,7 +16,36 @@ from .self_backend_parse import (
 )
 
 
+# Classification is a pure function of the operand spelling, and a module's
+# operands repeat heavily: planning one oversized shard called the classifier
+# 346732 times over roughly 35000 distinct strings.  Answering from a memo
+# turns ten predicate checks plus three literal parsers into one lookup.  The
+# key space is bounded by the operand names actually present in the compiled
+# input, and every entry stays valid for the whole process because the answer
+# depends on nothing but the string.
+_LOCAL_VALUE_REF_CACHE: dict[str, bool] = {}
+
+# Bounded on purpose.  The memo lives for the process and an emit worker handles
+# several shards in a row, so an unbounded dict would pin every operand string
+# of every module it ever saw -- in a worker that already runs at ~10 GB that is
+# not an acceptable risk for a pure-function cache.  One module's distinct
+# operand set is well under this cap; crossing it means the working set changed
+# shape, and starting over costs only recomputation.
+_LOCAL_VALUE_REF_CACHE_CAP = 1 << 17
+
+
 def is_local_value_ref(value: str) -> bool:
+    cached = _LOCAL_VALUE_REF_CACHE.get(value)
+    if cached is not None:
+        return cached
+    computed = _is_local_value_ref_uncached(value)
+    if len(_LOCAL_VALUE_REF_CACHE) >= _LOCAL_VALUE_REF_CACHE_CAP:
+        _LOCAL_VALUE_REF_CACHE.clear()
+    _LOCAL_VALUE_REF_CACHE[value] = computed
+    return computed
+
+
+def _is_local_value_ref_uncached(value: str) -> bool:
     # llvmlite names unnamed SSA results ``%.6``, decoded here as ``.6``.
     # That spelling also matches our permissive float-literal regex, but LLVM
     # canonical floating constants include a leading digit.  Classify the
@@ -21,9 +55,21 @@ def is_local_value_ref(value: str) -> bool:
     return not (
         value == "null"
         or value == "poison"
+        or value == "undef"
         or value == "zeroinitializer"
         or is_aggregate_literal_value(value)
         or value.startswith("@")
+        or value.startswith(
+            (
+                "gep0:",
+                "gepconst:",
+                "cexpr:",
+                "negconst:",
+                "addconst:",
+                "ptrtointconst:",
+                "inttoptrconst:",
+            )
+        )
         or const_int_from_value(value) is not None
         or is_hex_literal(value)
         or is_float_literal(value)
@@ -31,15 +77,20 @@ def is_local_value_ref(value: str) -> bool:
 
 
 def instruction_defined_value(instr: ParsedInstr) -> str | None:
+    if instr.kind in {"binop", "fbinop", "icmp", "fcmp", "cast"}:
+        # These instruction tuples start with an opcode/predicate; their SSA
+        # destination is the second field.  Treating the opcode as the
+        # definition silently disables block-local liveness and every target
+        # combine that depends on it.
+        return instr.data[1]
     if instr.kind in {
         "alloca",
         "load",
-        "binop",
-        "fbinop",
+        "load_atomic",
+        "atomicrmw",
+        "cmpxchg",
+        "syscall6",
         "fneg",
-        "icmp",
-        "fcmp",
-        "cast",
         "select",
         "freeze",
         "insertelement",
@@ -66,6 +117,31 @@ def instruction_used_values(instr: ParsedInstr) -> list[str]:
     elif kind == "load":
         _dest, _value_type, _ptr_type, ptr_name = data
         values = [ptr_name]
+    elif kind == "load_atomic":
+        _dest, _value_type, _ptr_type, ptr_name, _ordering = data
+        values = [ptr_name]
+    elif kind == "store_atomic":
+        _value_type, value, _ptr_type, ptr_name, _ordering = data
+        values = [value, ptr_name]
+    elif kind == "atomicrmw":
+        _dest, _op, _ptr_type, ptr_name, _value_type, value, _ordering = data
+        values = [ptr_name, value]
+    elif kind == "cmpxchg":
+        (
+            _dest,
+            _pair_type,
+            _ptr_type,
+            ptr_name,
+            _value_type,
+            expected,
+            desired,
+            _success,
+            _failure,
+        ) = data
+        values = [ptr_name, expected, desired]
+    elif kind == "syscall6":
+        _dest, arg_values = data
+        values = list(arg_values)
     elif kind == "va_arg":
         _dest, _ap_type, ptr_name, _value_type = data
         values = [ptr_name]
@@ -111,7 +187,16 @@ def instruction_used_values(instr: ParsedInstr) -> list[str]:
         _dest, _base_type, _ptr_type, ptr_value, indices = data
         values = [ptr_value, *[index_value for _index_type, index_value in indices]]
     elif kind == "call":
-        _dest, _ret_type, callee, is_indirect, args, _fixed_arg_count, _is_vararg = data
+        (
+            _dest,
+            _ret_type,
+            callee,
+            is_indirect,
+            args,
+            _fixed_arg_count,
+            _is_vararg,
+            _arg_alignments,
+        ) = data
         if is_indirect:
             values.append(callee)
         values.extend(arg_value for _arg_type, arg_value in args)
@@ -132,46 +217,183 @@ def terminator_used_values(term: ParsedInstr) -> list[str]:
     return [value for value in values if is_local_value_ref(value)]
 
 
+def _stable_text_bucket_key(text: str) -> int:
+    numeric_id = _dot_numeric_text_key_id(text)
+    if numeric_id >= 0:
+        # Negative keys reserve a collision-free lane for the canonical
+        # ``.N``/``%.N`` aliases while ordinary polynomial keys stay >= 0.
+        return -numeric_id - 1
+    modulus = 1099511627776
+    value = 0
+    index = 0
+    while index < len(text):
+        value = (value * 131 + ord(text[index])) % modulus
+        index += 1
+    return value
+
+
+def _record_definition(
+    buckets: dict[int, list[tuple[str, str]]],
+    value_name: str,
+    block_name: str,
+) -> None:
+    bucket = buckets.setdefault(_stable_text_bucket_key(value_name), [])
+    for index, (existing_name, _existing_block) in enumerate(bucket):
+        if text_key_names_equal(existing_name, value_name):
+            bucket[index] = (existing_name, block_name)
+            return
+    bucket.append((value_name, block_name))
+
+
+def _record_block_length(
+    buckets: dict[int, list[tuple[str, int]]],
+    block_name: str,
+    length: int,
+) -> None:
+    bucket = buckets.setdefault(_stable_text_bucket_key(block_name), [])
+    for index, (existing_name, _existing_length) in enumerate(bucket):
+        if text_key_names_equal(existing_name, block_name):
+            bucket[index] = (existing_name, length)
+            return
+    bucket.append((block_name, length))
+
+
+def _block_length_get(
+    buckets: dict[int, list[tuple[str, int]]],
+    block_name: str,
+) -> int | None:
+    for existing_name, length in buckets.get(
+        _stable_text_bucket_key(block_name), []
+    ):
+        if text_key_names_equal(existing_name, block_name):
+            return length
+    return None
+
+
+def _record_use_position(
+    buckets: dict[
+        int,
+        list[tuple[str, list[tuple[str, int]]]],
+    ],
+    value_name: str,
+    block_name: str,
+    position: int,
+) -> None:
+    bucket = buckets.setdefault(_stable_text_bucket_key(value_name), [])
+    use_sites = None
+    for existing_name, existing_sites in bucket:
+        if text_key_names_equal(existing_name, value_name):
+            use_sites = existing_sites
+            break
+    if use_sites is None:
+        use_sites = []
+        bucket.append((value_name, use_sites))
+    for index, (existing_block, existing_position) in enumerate(use_sites):
+        if text_key_names_equal(existing_block, block_name):
+            if position > existing_position:
+                use_sites[index] = (existing_block, position)
+            return
+    use_sites.append((block_name, position))
+
+
+def _use_sites_get(
+    buckets: dict[
+        int,
+        list[tuple[str, list[tuple[str, int]]]],
+    ],
+    value_name: str,
+) -> list[tuple[str, int]] | None:
+    for existing_name, use_sites in buckets.get(
+        _stable_text_bucket_key(value_name), []
+    ):
+        if text_key_names_equal(existing_name, value_name):
+            return use_sites
+    return None
+
+
 def collect_block_local_last_uses(func: ParsedFunction) -> dict[str, dict[str, int]]:
-    def_blocks: dict[str, str] = {}
-    block_lengths = {block.name: len(block.instructions) for block in func.blocks}
+    """Return last-use positions only for values confined to one block.
+
+    Native bootstrap can produce equal text names with inconsistent hashes.
+    Stable integer buckets plus equality checks keep a hidden cross-block use
+    from being mistaken for a local interval, which would otherwise let an
+    AArch64 caller-saved register escape its proven block/call boundary.
+    """
+
+    def_buckets: dict[int, list[tuple[str, str]]] = {}
+    block_length_buckets: dict[int, list[tuple[str, int]]] = {}
     for block in func.blocks:
+        _record_block_length(
+            block_length_buckets, block.name, len(block.instructions)
+        )
         for phi in block.phis:
-            def_blocks[phi.dest] = block.name
+            _record_definition(def_buckets, phi.dest, block.name)
         for instr in block.instructions:
             dest = instruction_defined_value(instr)
             if dest is not None:
-                def_blocks[dest] = block.name
+                _record_definition(def_buckets, dest, block.name)
 
-    use_blocks: dict[str, set[str]] = {}
-    last_uses: dict[tuple[str, str], int] = {}
+    use_buckets: dict[
+        int,
+        list[tuple[str, list[tuple[str, int]]]],
+    ] = {}
     for block in func.blocks:
         term_pos = len(block.instructions)
         for phi in block.phis:
             for incoming in phi.incoming:
                 if not is_local_value_ref(incoming.value):
                     continue
-                use_blocks.setdefault(incoming.value, set()).add(incoming.label)
-                key = (incoming.label, incoming.value)
-                last_uses[key] = max(
-                    last_uses.get(key, -1), block_lengths[incoming.label]
+                incoming_position = _block_length_get(
+                    block_length_buckets, incoming.label
+                )
+                assert incoming_position is not None
+                _record_use_position(
+                    use_buckets,
+                    incoming.value,
+                    incoming.label,
+                    incoming_position,
                 )
         for index, instr in enumerate(block.instructions):
             for value in instruction_used_values(instr):
-                use_blocks.setdefault(value, set()).add(block.name)
-                key = (block.name, value)
-                last_uses[key] = max(last_uses.get(key, -1), index)
+                _record_use_position(use_buckets, value, block.name, index)
         for value in terminator_used_values(block.terminator):
-            use_blocks.setdefault(value, set()).add(block.name)
-            key = (block.name, value)
-            last_uses[key] = max(last_uses.get(key, -1), term_pos)
+            _record_use_position(use_buckets, value, block.name, term_pos)
 
     block_local_last_uses: dict[str, dict[str, int]] = {}
-    for value, block_name in def_blocks.items():
-        if use_blocks.get(value) == {block_name}:
-            block_local_last_uses.setdefault(block_name, {})[value] = last_uses[
-                (block_name, value)
-            ]
+    # Resolve the per-block dict through a stable int bucket, NOT by looking up
+    # `block_local_last_uses` itself.  That dict grows inside this very loop, so
+    # a text-keyed lookup on it re-entered the false-hash-miss fallback, whose
+    # incremental index materialised `list(mapping)` on every growth: one
+    # 28 MB shard turned into O(definitions x blocks) pointer copies plus a
+    # fresh multi-hundred-KB list per definition -- measured at 57+ minutes of
+    # 100% CPU and a 54.4 GB physical footprint for a single emit worker, with
+    # `collect_block_local_last_uses` -> `text_key_mapping_get` holding
+    # 6545 of 6573 samples.  Bucketing is the same technique the rest of this
+    # function already uses, and equality is still checked explicitly, so
+    # inconsistent native str hashing remains handled.
+    mapping_buckets: dict[int, list[tuple[str, dict[str, int]]]] = {}
+    for definition_bucket in def_buckets.values():
+        for value, block_name in definition_bucket:
+            use_sites = _use_sites_get(use_buckets, value)
+            if (
+                use_sites is None
+                or len(use_sites) != 1
+                or not text_key_names_equal(use_sites[0][0], block_name)
+            ):
+                continue
+            bucket = mapping_buckets.setdefault(
+                _stable_text_bucket_key(block_name), []
+            )
+            block_mapping = None
+            for existing_name, candidate in bucket:
+                if text_key_names_equal(existing_name, block_name):
+                    block_mapping = candidate
+                    break
+            if block_mapping is None:
+                block_mapping = {}
+                bucket.append((block_name, block_mapping))
+                block_local_last_uses[block_name] = block_mapping
+            block_mapping[value] = use_sites[0][1]
     return block_local_last_uses
 
 

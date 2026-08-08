@@ -5,30 +5,35 @@ i64 slots that are either PY_DICT_EMPTY (-1), PY_DICT_TOMBSTONE (-2),
 or an index into entries[]. entries[] is insertion-ordered for
 deterministic iteration.
 
-PyDictObject layout (from py_internal.h):
-    offset  0   PyObjectHeader   (16 bytes)
-    offset 16   size             (i64)
-    offset 24   capacity         (i64)
-    offset 32   indices          (i64* — pointer to indices array)
-    offset 40   entries          (DictEntry* — pointer to entries array)
-    offset 48   entries_used     (i64)
-    total: 56 bytes (PyDictObject is sizeof = 56)
+The concrete PyDictObject and DictEntry layouts are consumed exclusively via
+the generated C-header-derived ``py_abi_constants`` module below.  Numeric
+layout copies do not belong in this docstring because the generator cannot
+update prose.
 
-DictEntry layout:
-    offset  0   hash             (i64)
-    offset  8   key              (PyObject*)
-    offset 16   value            (PyObject*)
-    total: 24 bytes
-
-PY_TYPE_DICT     = 6
 PY_DICT_EMPTY    = -1
 PY_DICT_TOMBSTONE= -2
-INITIAL_CAPACITY = 8 (must be power of 2; inlined per the
-                     module-init gotcha — see feedback memory).
+INITIAL_CAPACITY = 8 (must be power of 2). Public object layout and type tags
+come from the generated C-header-derived py_abi_constants module.
 """
 
 from pcc.extern import extern, c_abi_export, c_ptr, c_int32, c_int64, c_void
+from pcc.py_runtime.py.py_abi_constants import (
+    DICTENTRY_HASH_OFFSET,
+    DICTENTRY_KEY_OFFSET,
+    DICTENTRY_SIZE,
+    DICTENTRY_VALUE_OFFSET,
+    PYDICTOBJECT_CAPACITY_OFFSET,
+    PYDICTOBJECT_ENTRIES_OFFSET,
+    PYDICTOBJECT_ENTRIES_USED_OFFSET,
+    PYDICTOBJECT_INDICES_OFFSET,
+    PYDICTOBJECT_ITEM_COUNT_OFFSET,
+    PYDICTOBJECT_SIZE,
+    PYOBJECTHEADER_TYPE_TAG_OFFSET,
+    PY_TYPE_DICT,
+    PY_TYPE_STR,
+)
 from pcc.unsafe import (
+    cstr,
     free,
     global_addr,
     is_tagged_int,
@@ -40,6 +45,7 @@ from pcc.unsafe import (
     null,
     ptr_eq,
     ptr_is_null,
+    ptr_to_int,
     store_i32,
     store_i64,
     store_ptr,
@@ -79,27 +85,24 @@ py_current_exception = extern("py_current_exception", (), c_ptr)
 py_exc_builtin_class = extern("py_exc_builtin_class", (c_int64,), c_ptr)
 py_exc_matches = extern("py_exc_matches", (c_ptr, c_ptr), c_int64)
 py_clear_exception = extern("py_clear_exception", (), c_void)
+py_runtime_error_if_unset = extern(
+    "py_runtime_error_if_unset", (c_ptr, c_ptr), c_ptr
+)
+
+
+pcc_gc_pointer_is_managed = extern(
+    "pcc_gc_pointer_is_managed", (c_ptr,), c_int64
+)
 
 
 def _ptr_can_have_header(o) -> bool:
-    if ptr_is_null(o) != 0:
-        return False
-    if is_tagged_int(o) != 0:
-        return False
-    bits: int = untag_int(o)
-    if bits < 2048:
-        return False
-    if (bits & 3) != 0:
-        return False
-    if bits >= 140737488355328:
-        return False
-    return True
+    return pcc_gc_pointer_is_managed(o) != 0
 
 
 def _ptr_is_dict(o) -> bool:
     if not _ptr_can_have_header(o):
         return False
-    return load_i32(o, 8) == 6
+    return load_i32(o, PYOBJECTHEADER_TYPE_TAG_OFFSET) == PY_TYPE_DICT
 
 
 def _keys_equal(entry_key, key) -> int:
@@ -108,7 +111,7 @@ def _keys_equal(entry_key, key) -> int:
     if is_tagged_int(entry_key) != 0 and is_tagged_int(key) != 0:
         return 0
     if is_tagged_int(entry_key) == 0 and is_tagged_int(key) == 0:
-        if load_i32(entry_key, 8) == 4 and load_i32(key, 8) == 4:
+        if load_i32(entry_key, PYOBJECTHEADER_TYPE_TAG_OFFSET) == PY_TYPE_STR and load_i32(key, PYOBJECTHEADER_TYPE_TAG_OFFSET) == PY_TYPE_STR:
             if py_str_eq(entry_key, key) != 0:
                 return 1
             return 0
@@ -122,7 +125,7 @@ def _alloc_tables(d, capacity: int) -> int:
     indices = malloc(capacity * 8)
     if ptr_is_null(indices) != 0:
         return -1
-    entries = malloc(capacity * 24)
+    entries = malloc(capacity * DICTENTRY_SIZE)
     if ptr_is_null(entries) != 0:
         free(indices)
         return -1
@@ -132,12 +135,12 @@ def _alloc_tables(d, capacity: int) -> int:
         store_i64(indices, i * 8, -1)
         i = i + 1
     # entries[] is only read for 0..entries_used, so no init.
-    store_ptr(d, 32, indices)
-    store_ptr(d, 40, entries)
-    store_i64(d, 24, capacity)
-    store_i64(d, 16, 0)  # size
-    store_i64(d, 48, 0)  # entries_used
-    pcc_gc_backend4_zpage_register_owner_payload_span(d, entries, capacity * 24)
+    store_ptr(d, PYDICTOBJECT_INDICES_OFFSET, indices)
+    store_ptr(d, PYDICTOBJECT_ENTRIES_OFFSET, entries)
+    store_i64(d, PYDICTOBJECT_CAPACITY_OFFSET, capacity)
+    store_i64(d, PYDICTOBJECT_ITEM_COUNT_OFFSET, 0)  # item count
+    store_i64(d, PYDICTOBJECT_ENTRIES_USED_OFFSET, 0)  # entries_used
+    pcc_gc_backend4_zpage_register_owner_payload_span(d, entries, capacity * DICTENTRY_SIZE)
     return 0
 
 
@@ -155,9 +158,9 @@ def _lookup(d, hash_val: int, key) -> int:
     # Pack two int64 results into i64 return: high 32 = slot, low 32 =
     # entry_idx. Both fit because capacity is bounded. We return i64 here
     # as (slot << 32) | (entry_idx_or_minus1 & 0xFFFFFFFF).
-    capacity: int = load_i64(d, 24)
-    indices = load_ptr(d, 32)
-    entries = load_ptr(d, 40)
+    capacity: int = load_i64(d, PYDICTOBJECT_CAPACITY_OFFSET)
+    indices = load_ptr(d, PYDICTOBJECT_INDICES_OFFSET)
+    entries = load_ptr(d, PYDICTOBJECT_ENTRIES_OFFSET)
     if capacity <= 0:
         return 0xFFFFFFFF
     if ptr_is_null(indices) != 0:
@@ -183,13 +186,13 @@ def _lookup(d, hash_val: int, key) -> int:
             if first_tombstone < 0:
                 first_tombstone = j
         else:
-            entry_off: int = ix * 24
-            key_slot = ptr_add(entries, entry_off + 8)
+            entry_off: int = ix * DICTENTRY_SIZE
+            key_slot = ptr_add(entries, entry_off + DICTENTRY_KEY_OFFSET)
             ek = load_ptr(key_slot, 0)
             if read_barrier_enabled != 0:
                 ek = pcc_gc_load_ptr(d, key_slot)
             if ptr_is_null(ek) == 0:
-                eh: int = load_i64(entries, entry_off)
+                eh: int = load_i64(entries, entry_off + DICTENTRY_HASH_OFFSET)
                 if eh == hash_val:
                     if _keys_equal(ek, key) != 0:
                         return (j << 32) | (ix & 0xFFFFFFFF)
@@ -216,7 +219,7 @@ def _entry_idx_of(packed: int) -> int:
 
 
 def _entry_key(d, entries, entry_off: int):
-    slot = ptr_add(entries, entry_off + 8)
+    slot = ptr_add(entries, entry_off + DICTENTRY_KEY_OFFSET)
     k = load_ptr(slot, 0)
     if ptr_is_null(k) != 0:
         return k
@@ -226,7 +229,7 @@ def _entry_key(d, entries, entry_off: int):
 
 
 def _entry_value(d, entries, entry_off: int):
-    slot = ptr_add(entries, entry_off + 16)
+    slot = ptr_add(entries, entry_off + DICTENTRY_VALUE_OFFSET)
     v = load_ptr(slot, 0)
     if ptr_is_null(v) != 0:
         return v
@@ -239,30 +242,30 @@ def _insert_fresh(d, hash_val: int, key, value) -> None:
     # Inlined lookup + entry move. INCREFs key and value.
     packed: int = _lookup(d, hash_val, key)
     slot: int = _slot_of(packed)
-    indices = load_ptr(d, 32)
-    entries = load_ptr(d, 40)
-    ei: int = load_i64(d, 48)  # entries_used
-    store_i64(d, 48, ei + 1)
-    entry_off: int = ei * 24
-    store_i64(entries, entry_off, hash_val)
-    store_ptr(entries, entry_off + 8, null())
-    store_ptr(entries, entry_off + 16, null())
-    pcc_gc_store_ptr(d, ptr_add(entries, entry_off + 8), key)
-    pcc_gc_store_ptr(d, ptr_add(entries, entry_off + 16), value)
+    indices = load_ptr(d, PYDICTOBJECT_INDICES_OFFSET)
+    entries = load_ptr(d, PYDICTOBJECT_ENTRIES_OFFSET)
+    ei: int = load_i64(d, PYDICTOBJECT_ENTRIES_USED_OFFSET)  # entries_used
+    store_i64(d, PYDICTOBJECT_ENTRIES_USED_OFFSET, ei + 1)
+    entry_off: int = ei * DICTENTRY_SIZE
+    store_i64(entries, entry_off + DICTENTRY_HASH_OFFSET, hash_val)
+    store_ptr(entries, entry_off + DICTENTRY_KEY_OFFSET, null())
+    store_ptr(entries, entry_off + DICTENTRY_VALUE_OFFSET, null())
+    pcc_gc_store_ptr(d, ptr_add(entries, entry_off + DICTENTRY_KEY_OFFSET), key)
+    pcc_gc_store_ptr(d, ptr_add(entries, entry_off + DICTENTRY_VALUE_OFFSET), value)
     store_i64(indices, slot * 8, ei)
-    sz: int = load_i64(d, 16)
-    store_i64(d, 16, sz + 1)
+    sz: int = load_i64(d, PYDICTOBJECT_ITEM_COUNT_OFFSET)
+    store_i64(d, PYDICTOBJECT_ITEM_COUNT_OFFSET, sz + 1)
 
 
 def _rehash(d, new_capacity: int) -> int:
-    old_entries = load_ptr(d, 40)
-    old_indices = load_ptr(d, 32)
-    old_entries_used: int = load_i64(d, 48)
+    old_entries = load_ptr(d, PYDICTOBJECT_ENTRIES_OFFSET)
+    old_indices = load_ptr(d, PYDICTOBJECT_INDICES_OFFSET)
+    old_entries_used: int = load_i64(d, PYDICTOBJECT_ENTRIES_USED_OFFSET)
 
     new_indices = malloc(new_capacity * 8)
     if ptr_is_null(new_indices) != 0:
         return -1
-    new_entries = malloc(new_capacity * 24)
+    new_entries = malloc(new_capacity * DICTENTRY_SIZE)
     if ptr_is_null(new_entries) != 0:
         free(new_indices)
         return -1
@@ -271,48 +274,48 @@ def _rehash(d, new_capacity: int) -> int:
         store_i64(new_indices, i * 8, -1)
         i = i + 1
 
-    store_ptr(d, 32, new_indices)
-    store_ptr(d, 40, new_entries)
-    store_i64(d, 24, new_capacity)
-    store_i64(d, 16, 0)
-    store_i64(d, 48, 0)
-    pcc_gc_backend4_zpage_register_owner_payload_span(d, new_entries, new_capacity * 24)
+    store_ptr(d, PYDICTOBJECT_INDICES_OFFSET, new_indices)
+    store_ptr(d, PYDICTOBJECT_ENTRIES_OFFSET, new_entries)
+    store_i64(d, PYDICTOBJECT_CAPACITY_OFFSET, new_capacity)
+    store_i64(d, PYDICTOBJECT_ITEM_COUNT_OFFSET, 0)
+    store_i64(d, PYDICTOBJECT_ENTRIES_USED_OFFSET, 0)
+    pcc_gc_backend4_zpage_register_owner_payload_span(d, new_entries, new_capacity * DICTENTRY_SIZE)
     free(old_indices)
 
     # Walk old entries in insertion order, copying live ones over.
     j: int = 0
     while j < old_entries_used:
-        old_off: int = j * 24
+        old_off: int = j * DICTENTRY_SIZE
         k = _entry_key(d, old_entries, old_off)
         if ptr_is_null(k) == 0:
-            h: int = load_i64(old_entries, old_off)
+            h: int = load_i64(old_entries, old_off + DICTENTRY_HASH_OFFSET)
             v = _entry_value(d, old_entries, old_off)
             packed: int = _lookup(d, h, k)
             slot: int = _slot_of(packed)
-            ei: int = load_i64(d, 48)
-            store_i64(d, 48, ei + 1)
-            new_off: int = ei * 24
-            store_i64(new_entries, new_off, h)
-            store_ptr(new_entries, new_off + 8, k)
-            store_ptr(new_entries, new_off + 16, v)
-            pcc_gc_note_slot_write_barrier(d, ptr_add(new_entries, new_off + 8), k)
-            pcc_gc_note_slot_write_barrier(d, ptr_add(new_entries, new_off + 16), v)
+            ei: int = load_i64(d, PYDICTOBJECT_ENTRIES_USED_OFFSET)
+            store_i64(d, PYDICTOBJECT_ENTRIES_USED_OFFSET, ei + 1)
+            new_off: int = ei * DICTENTRY_SIZE
+            store_i64(new_entries, new_off + DICTENTRY_HASH_OFFSET, h)
+            store_ptr(new_entries, new_off + DICTENTRY_KEY_OFFSET, k)
+            store_ptr(new_entries, new_off + DICTENTRY_VALUE_OFFSET, v)
+            pcc_gc_note_slot_write_barrier(d, ptr_add(new_entries, new_off + DICTENTRY_KEY_OFFSET), k)
+            pcc_gc_note_slot_write_barrier(d, ptr_add(new_entries, new_off + DICTENTRY_VALUE_OFFSET), v)
             store_i64(new_indices, slot * 8, ei)
-            sz: int = load_i64(d, 16)
-            store_i64(d, 16, sz + 1)
+            sz: int = load_i64(d, PYDICTOBJECT_ITEM_COUNT_OFFSET)
+            store_i64(d, PYDICTOBJECT_ITEM_COUNT_OFFSET, sz + 1)
         j = j + 1
     free(old_entries)
     return 0
 
 
 def _maybe_grow(d) -> int:
-    capacity: int = load_i64(d, 24)
-    entries_used: int = load_i64(d, 48)
+    capacity: int = load_i64(d, PYDICTOBJECT_CAPACITY_OFFSET)
+    entries_used: int = load_i64(d, PYDICTOBJECT_ENTRIES_USED_OFFSET)
     threshold: int = (capacity * 2) // 3
     if entries_used <= threshold:
         return 0
     new_cap: int = capacity
-    size: int = load_i64(d, 16)
+    size: int = load_i64(d, PYDICTOBJECT_ITEM_COUNT_OFFSET)
     if size > threshold // 2:
         new_cap = capacity * 2
     return _rehash(d, new_cap)
@@ -320,14 +323,14 @@ def _maybe_grow(d) -> int:
 
 @c_abi_export("py_dict_new")
 def py_dict_new():
-    d = pcc_gc_alloc(56, 6, 0)
+    d = pcc_gc_alloc(PYDICTOBJECT_SIZE, PY_TYPE_DICT, 0)
     if ptr_is_null(d) != 0:
         return null()
-    store_i64(d, 16, 0)  # size
-    store_i64(d, 24, 0)  # capacity
-    store_ptr(d, 32, null())  # indices
-    store_ptr(d, 40, null())  # entries
-    store_i64(d, 48, 0)  # entries_used
+    store_i64(d, PYDICTOBJECT_ITEM_COUNT_OFFSET, 0)  # item count
+    store_i64(d, PYDICTOBJECT_CAPACITY_OFFSET, 0)  # capacity
+    store_ptr(d, PYDICTOBJECT_INDICES_OFFSET, null())  # indices
+    store_ptr(d, PYDICTOBJECT_ENTRIES_OFFSET, null())  # entries
+    store_i64(d, PYDICTOBJECT_ENTRIES_USED_OFFSET, 0)  # entries_used
     if _alloc_tables(d, 8) != 0:
         py_decref(d)
         return null()
@@ -342,13 +345,15 @@ def py_dict_set(d, key, value) -> None:
     if ptr_is_null(key) != 0:
         return
     h: int = py_obj_hash(key)
+    if py_err_occurred() != 0:
+        return
     packed: int = _lookup(d, h, key)
     ix: int = _entry_idx_of(packed)
     if ix >= 0:
         # Update existing — replace value, keep key.
-        entries = load_ptr(d, 40)
-        entry_off: int = ix * 24
-        pcc_gc_store_ptr(d, ptr_add(entries, entry_off + 16), value)
+        entries = load_ptr(d, PYDICTOBJECT_ENTRIES_OFFSET)
+        entry_off: int = ix * DICTENTRY_SIZE
+        pcc_gc_store_ptr(d, ptr_add(entries, entry_off + DICTENTRY_VALUE_OFFSET), value)
         return
     _insert_fresh(d, h, key, value)
     _maybe_grow(d)
@@ -361,12 +366,14 @@ def py_dict_get(d, key):
     if ptr_is_null(key) != 0:
         return null()
     h: int = py_obj_hash(key)
+    if py_err_occurred() != 0:
+        return null()
     packed: int = _lookup(d, h, key)
     ix: int = _entry_idx_of(packed)
     if ix < 0:
         return null()
-    entries = load_ptr(d, 40)
-    v = pcc_gc_load_ptr(d, ptr_add(entries, ix * 24 + 16))
+    entries = load_ptr(d, PYDICTOBJECT_ENTRIES_OFFSET)
+    v = pcc_gc_load_ptr(d, ptr_add(entries, ix * DICTENTRY_SIZE + 16))
     if ptr_is_null(v) != 0:
         return null()
     py_incref(v)
@@ -378,6 +385,8 @@ def py_dict_get_default(d, key, default_value):
     v = py_dict_get(d, key)
     if ptr_is_null(v) == 0:
         return v
+    if py_err_occurred() != 0:
+        return null()
     py_incref(default_value)
     return default_value
 
@@ -390,6 +399,8 @@ def py_dict_getitem(d, key):
     v = py_dict_get(d, key)
     if ptr_is_null(v) == 0:
         return v
+    if py_err_occurred() != 0:
+        return null()
     exc = py_exc_new_with_value(4, key)  # PY_EXC_KEYERROR
     py_raise(exc)
     return null()
@@ -405,21 +416,46 @@ def py_dict_fromkeys(iterable, value):
     if ptr_is_null(d) != 0:
         return null()
     it = py_obj_iter(iterable)
-    if ptr_is_null(it) == 0:
-        done: int = 0
-        while done == 0:
-            k = py_obj_next(it)
-            if ptr_is_null(k) != 0:
-                if py_err_occurred() != 0:
-                    cur = py_current_exception()
-                    stop = py_exc_builtin_class(8)  # PY_EXC_STOPITERATION
-                    if py_exc_matches(cur, stop) != 0:
-                        py_clear_exception()
-                done = 1
+    if ptr_is_null(it) != 0:
+        py_runtime_error_if_unset(
+            cstr("py_obj_iter"),
+            cstr("dict.fromkeys could not create an iterator"),
+        )
+        py_decref(d)
+        return null()
+    done: int = 0
+    while done == 0:
+        k = py_obj_next(it)
+        if ptr_is_null(k) != 0:
+            if py_err_occurred() != 0:
+                cur = py_current_exception()
+                stop = py_exc_builtin_class(8)  # PY_EXC_STOPITERATION
+                if py_exc_matches(cur, stop) != 0:
+                    py_clear_exception()
+                    done = 1
+                else:
+                    py_decref(it)
+                    py_decref(d)
+                    return null()
             else:
-                py_dict_set(d, k, value)
+                py_runtime_error_if_unset(
+                    cstr("py_obj_next"),
+                    cstr(
+                        "dict.fromkeys iterator returned NULL without an exception"
+                    ),
+                )
+                py_decref(it)
+                py_decref(d)
+                return null()
+        else:
+            py_dict_set(d, k, value)
+            if py_err_occurred() != 0:
                 py_decref(k)
-        py_decref(it)
+                py_decref(it)
+                py_decref(d)
+                return null()
+            py_decref(k)
+    py_decref(it)
     return d
 
 
@@ -429,6 +465,8 @@ def py_dict_pop(d, key):
     if ptr_is_null(v) == 0:
         py_dict_del(d, key)
         return v
+    if py_err_occurred() != 0:
+        return null()
     exc = py_exc_new_with_value(4, key)  # PY_EXC_KEYERROR
     py_raise(exc)
     return null()
@@ -440,13 +478,13 @@ def py_dict_popitem(d):
     # insertion-ordered); KeyError if empty. py_tuple_set_item increfs, so
     # py_dict_del's decref leaves key/value owned by the tuple. No `break`
     # (pcc-Python lacks it): a `found` flag in the loop condition exits.
-    entries = load_ptr(d, 40)
-    ei: int = load_i64(d, 48)  # entries_used
+    entries = load_ptr(d, PYDICTOBJECT_ENTRIES_OFFSET)
+    ei: int = load_i64(d, PYDICTOBJECT_ENTRIES_USED_OFFSET)  # entries_used
     i: int = ei - 1
     found: int = 0
     result = null()
     while i >= 0 and found == 0:
-        entry_off: int = i * 24
+        entry_off: int = i * DICTENTRY_SIZE
         key = _entry_key(d, entries, entry_off)
         if ptr_is_null(key) == 0:
             val = _entry_value(d, entries, entry_off)
@@ -471,6 +509,8 @@ def py_dict_contains(d, key) -> int:
     if ptr_is_null(key) != 0:
         return 0
     h: int = py_obj_hash(key)
+    if py_err_occurred() != 0:
+        return 0
     packed: int = _lookup(d, h, key)
     ix: int = _entry_idx_of(packed)
     if ix >= 0:
@@ -485,23 +525,25 @@ def py_dict_del(d, key) -> int:
     if ptr_is_null(key) != 0:
         return -1
     h: int = py_obj_hash(key)
+    if py_err_occurred() != 0:
+        return -1
     packed: int = _lookup(d, h, key)
     ix: int = _entry_idx_of(packed)
     if ix < 0:
         return -1
     slot: int = _slot_of(packed)
-    entries = load_ptr(d, 40)
-    indices = load_ptr(d, 32)
-    entry_off: int = ix * 24
+    entries = load_ptr(d, PYDICTOBJECT_ENTRIES_OFFSET)
+    indices = load_ptr(d, PYDICTOBJECT_INDICES_OFFSET)
+    entry_off: int = ix * DICTENTRY_SIZE
     ek = _entry_key(d, entries, entry_off)
     ev = _entry_value(d, entries, entry_off)
     py_decref(ek)
     py_decref(ev)
-    store_ptr(entries, entry_off + 8, null())
-    store_ptr(entries, entry_off + 16, null())
+    store_ptr(entries, entry_off + DICTENTRY_KEY_OFFSET, null())
+    store_ptr(entries, entry_off + DICTENTRY_VALUE_OFFSET, null())
     store_i64(indices, slot * 8, -2)  # PY_DICT_TOMBSTONE
-    sz: int = load_i64(d, 16)
-    store_i64(d, 16, sz - 1)
+    sz: int = load_i64(d, PYDICTOBJECT_ITEM_COUNT_OFFSET)
+    store_i64(d, PYDICTOBJECT_ITEM_COUNT_OFFSET, sz - 1)
     return 0
 
 
@@ -509,42 +551,42 @@ def py_dict_del(d, key) -> int:
 def py_dict_clear(d) -> None:
     if not _ptr_is_dict(d):
         return
-    entries = load_ptr(d, 40)
-    entries_used: int = load_i64(d, 48)
+    entries = load_ptr(d, PYDICTOBJECT_ENTRIES_OFFSET)
+    entries_used: int = load_i64(d, PYDICTOBJECT_ENTRIES_USED_OFFSET)
     i: int = 0
     while i < entries_used:
-        off: int = i * 24
+        off: int = i * DICTENTRY_SIZE
         k = _entry_key(d, entries, off)
         if ptr_is_null(k) == 0:
             v = _entry_value(d, entries, off)
             py_decref(k)
             py_decref(v)
-            store_i64(entries, off, 0)
-            store_ptr(entries, off + 8, null())
-            store_ptr(entries, off + 16, null())
+            store_i64(entries, off + DICTENTRY_HASH_OFFSET, 0)
+            store_ptr(entries, off + DICTENTRY_KEY_OFFSET, null())
+            store_ptr(entries, off + DICTENTRY_VALUE_OFFSET, null())
         i = i + 1
-    indices = load_ptr(d, 32)
-    capacity: int = load_i64(d, 24)
+    indices = load_ptr(d, PYDICTOBJECT_INDICES_OFFSET)
+    capacity: int = load_i64(d, PYDICTOBJECT_CAPACITY_OFFSET)
     j: int = 0
     while j < capacity:
         store_i64(indices, j * 8, -1)
         j = j + 1
-    store_i64(d, 16, 0)
-    store_i64(d, 48, 0)
+    store_i64(d, PYDICTOBJECT_ITEM_COUNT_OFFSET, 0)
+    store_i64(d, PYDICTOBJECT_ENTRIES_USED_OFFSET, 0)
 
 
 @c_abi_export("py_dict_len")
 def py_dict_len(d) -> int:
     if not _ptr_is_dict(d):
         return 0
-    return load_i64(d, 16)
+    return load_i64(d, PYDICTOBJECT_ITEM_COUNT_OFFSET)
 
 
 @c_abi_export("py_dict_entries_used")
 def py_dict_entries_used(d) -> int:
     if not _ptr_is_dict(d):
         return 0
-    return load_i64(d, 48)
+    return load_i64(d, PYDICTOBJECT_ENTRIES_USED_OFFSET)
 
 
 @c_abi_export("py_dict_entry_key_at")
@@ -553,11 +595,11 @@ def py_dict_entry_key_at(d, i: int):
         return null()
     if i < 0:
         return null()
-    entries_used: int = load_i64(d, 48)
+    entries_used: int = load_i64(d, PYDICTOBJECT_ENTRIES_USED_OFFSET)
     if i >= entries_used:
         return null()
-    entries = load_ptr(d, 40)
-    k = _entry_key(d, entries, i * 24)
+    entries = load_ptr(d, PYDICTOBJECT_ENTRIES_OFFSET)
+    k = _entry_key(d, entries, i * DICTENTRY_SIZE)
     if ptr_is_null(k) == 0:
         py_incref(k)
     return k
@@ -569,11 +611,11 @@ def py_dict_entry_value_at(d, i: int):
         return null()
     if i < 0:
         return null()
-    entries_used: int = load_i64(d, 48)
+    entries_used: int = load_i64(d, PYDICTOBJECT_ENTRIES_USED_OFFSET)
     if i >= entries_used:
         return null()
-    entries = load_ptr(d, 40)
-    off: int = i * 24
+    entries = load_ptr(d, PYDICTOBJECT_ENTRIES_OFFSET)
+    off: int = i * DICTENTRY_SIZE
     k = _entry_key(d, entries, off)
     if ptr_is_null(k) != 0:
         return null()
@@ -587,18 +629,18 @@ def py_dict_entry_value_at(d, i: int):
 def py_dict_keys(d):
     if not _ptr_is_dict(d):
         return null()
-    size: int = load_i64(d, 16)
+    size: int = load_i64(d, PYDICTOBJECT_ITEM_COUNT_OFFSET)
     cap_hint: int = size
     if cap_hint <= 0:
         cap_hint = 4
     out = py_list_new(cap_hint)
     if ptr_is_null(out) != 0:
         return null()
-    entries = load_ptr(d, 40)
-    entries_used: int = load_i64(d, 48)
+    entries = load_ptr(d, PYDICTOBJECT_ENTRIES_OFFSET)
+    entries_used: int = load_i64(d, PYDICTOBJECT_ENTRIES_USED_OFFSET)
     i: int = 0
     while i < entries_used:
-        off: int = i * 24
+        off: int = i * DICTENTRY_SIZE
         k = _entry_key(d, entries, off)
         if ptr_is_null(k) == 0:
             py_list_append(out, k)
@@ -610,18 +652,18 @@ def py_dict_keys(d):
 def py_dict_values(d):
     if not _ptr_is_dict(d):
         return null()
-    size: int = load_i64(d, 16)
+    size: int = load_i64(d, PYDICTOBJECT_ITEM_COUNT_OFFSET)
     cap_hint: int = size
     if cap_hint <= 0:
         cap_hint = 4
     out = py_list_new(cap_hint)
     if ptr_is_null(out) != 0:
         return null()
-    entries = load_ptr(d, 40)
-    entries_used: int = load_i64(d, 48)
+    entries = load_ptr(d, PYDICTOBJECT_ENTRIES_OFFSET)
+    entries_used: int = load_i64(d, PYDICTOBJECT_ENTRIES_USED_OFFSET)
     i: int = 0
     while i < entries_used:
-        off: int = i * 24
+        off: int = i * DICTENTRY_SIZE
         k = _entry_key(d, entries, off)
         if ptr_is_null(k) == 0:
             v = _entry_value(d, entries, off)
@@ -634,18 +676,18 @@ def py_dict_values(d):
 def py_dict_items(d):
     if not _ptr_is_dict(d):
         return null()
-    size: int = load_i64(d, 16)
+    size: int = load_i64(d, PYDICTOBJECT_ITEM_COUNT_OFFSET)
     cap_hint: int = size
     if cap_hint <= 0:
         cap_hint = 4
     out = py_list_new(cap_hint)
     if ptr_is_null(out) != 0:
         return null()
-    entries = load_ptr(d, 40)
-    entries_used: int = load_i64(d, 48)
+    entries = load_ptr(d, PYDICTOBJECT_ENTRIES_OFFSET)
+    entries_used: int = load_i64(d, PYDICTOBJECT_ENTRIES_USED_OFFSET)
     i: int = 0
     while i < entries_used:
-        off: int = i * 24
+        off: int = i * DICTENTRY_SIZE
         k = _entry_key(d, entries, off)
         if ptr_is_null(k) == 0:
             v = _entry_value(d, entries, off)
@@ -667,11 +709,11 @@ def py_dict_update(dst, src) -> None:
         return
     if not _ptr_is_dict(src):
         return
-    entries = load_ptr(src, 40)
-    entries_used: int = load_i64(src, 48)
+    entries = load_ptr(src, PYDICTOBJECT_ENTRIES_OFFSET)
+    entries_used: int = load_i64(src, PYDICTOBJECT_ENTRIES_USED_OFFSET)
     i: int = 0
     while i < entries_used:
-        off: int = i * 24
+        off: int = i * DICTENTRY_SIZE
         k = _entry_key(src, entries, off)
         if ptr_is_null(k) == 0:
             v = _entry_value(src, entries, off)

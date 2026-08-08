@@ -13,8 +13,8 @@ code-point ordering. ``sort_keys=False`` (and the no-kwarg form) keep the
 insertion-order ``py_json_dumps`` path.
 
 Compiles + runs under ``--backend self --python-libpython=off`` in DEFAULT
-runtime mode (pcc-Python ports + the C-only ``py_json.c`` helper — the goal
-mode). Output is diffed against CPython.
+runtime mode, including the pcc-Python ``py_json_runtime.py`` production
+owner. Output is diffed against CPython.
 """
 from __future__ import annotations
 
@@ -73,3 +73,41 @@ def test_json_dumps_sort_keys_no_libpython(tmp_path):
         json.dumps({"b": 1, "a": 2}),
     ]
     assert out.split("\n")[: len(expected)] == expected, out
+
+
+def test_json_dumps_ensure_ascii_false_no_libpython(tmp_path):
+    out = _run_pcc_program(
+        tmp_path,
+        "import json\n"
+        "def main():\n"
+        "    print(json.dumps({'内容': '中文😀'}, ensure_ascii=False))\n"
+        "    print(json.dumps({'乙': 2, '甲': 1}, ensure_ascii=False, sort_keys=True))\n"
+        "main()\n",
+    )
+    expected = [
+        json.dumps({"内容": "中文😀"}, ensure_ascii=False),
+        json.dumps({"乙": 2, "甲": 1}, ensure_ascii=False, sort_keys=True),
+    ]
+    assert out.splitlines() == expected
+
+
+def test_json_pcc_python_owner_edge_semantics_no_libpython(tmp_path):
+    out = _run_pcc_program(
+        tmp_path,
+        "import json\n"
+        "def main():\n"
+        "    big = 1234567890123456789012345678901234567890\n"
+        "    text = '{\"big\": ' + str(big) + ', \"one\": 1.0, \"yes\": true, \"nothing\": null}'\n"
+        "    decoded = json.loads(text)\n"
+        "    print(decoded['big'] == big)\n"
+        "    print(json.dumps([decoded['big'], decoded['one'], decoded['yes'], decoded['nothing']]))\n"
+        "    print(json.loads('\"\\\\u00e9\"') == chr(233))\n"
+        "    print(json.loads('\"\\\\ud83d\\\\ude00\"') == chr(128512))\n"
+        "main()\n",
+    )
+    assert out.splitlines() == [
+        "True",
+        "[1234567890123456789012345678901234567890, 1.0, true, null]",
+        "True",
+        "True",
+    ]

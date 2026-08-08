@@ -22,6 +22,10 @@ Initial capacity: 8 (must be power of 2). Grow at 2/3 load factor.
 Probing: CPython-style perturbation (perturb = hash; j = hash & mask;
 next: perturb >>= 5; j = (j*5 + perturb + 1) & mask).
 """
+from pcc.py_runtime.py.py_abi_constants import (
+    PYOBJECTHEADER_TYPE_TAG_OFFSET,
+    PY_TYPE_SET,
+)
 from pcc.extern import extern, c_abi_export, c_ptr, c_int32, c_int64, c_void
 from pcc.unsafe import (
     cstr,
@@ -51,6 +55,7 @@ pcc_gc_backend4_zpage_register_owner_payload_span = extern(
 )
 py_obj_hash          = extern("py_obj_hash",          (c_ptr,),                     c_int64)
 py_obj_eq            = extern("py_obj_eq",            (c_ptr, c_ptr),               c_int32)
+py_err_occurred      = extern("py_err_occurred",      (),                           c_int64)
 py_exc_new           = extern("py_exc_new",           (c_int64, c_ptr),             c_ptr)
 py_raise             = extern("py_raise",             (c_ptr,),                     c_void)
 py_gc_track          = extern("py_gc_track",          (c_ptr,),                     c_void)
@@ -75,7 +80,7 @@ def _ptr_is_set(o) -> bool:
         return False
     if is_tagged_int(o) != 0:
         return False
-    return load_i32(o, 8) == 8
+    return load_i32(o, PYOBJECTHEADER_TYPE_TAG_OFFSET) == PY_TYPE_SET
 
 
 def _alloc_entries(capacity: int):
@@ -205,7 +210,7 @@ def _maybe_grow(s) -> int:
 
 @c_abi_export("py_set_new")
 def py_set_new():
-    s = pcc_gc_alloc(48, 8, 0)  # sizeof(PySetObject), PY_TYPE_SET
+    s = pcc_gc_alloc(48, PY_TYPE_SET, 0)  # sizeof(PySetObject), PY_TYPE_SET
     if ptr_is_null(s) != 0:
         return null()
     store_i64(s, 16, 0)    # size
@@ -233,6 +238,8 @@ def py_set_add(s, item) -> None:
     entries = load_ptr(s, 40)
     capacity: int = load_i64(s, 24)
     h: int = py_obj_hash(item)
+    if py_err_occurred() != 0:
+        return
     slot: int = _lookup_slot(s, entries, capacity, h, item)
     if slot >= 0:
         return                      # already present
@@ -263,7 +270,7 @@ def py_set_update(dst, src) -> None:
         return
     if is_tagged_int(src) != 0:
         return
-    if load_i32(src, 8) != 8:          # PY_TYPE_SET
+    if load_i32(src, PYOBJECTHEADER_TYPE_TAG_OFFSET) != PY_TYPE_SET:
         return
     entries = load_ptr(src, 40)
     capacity: int = load_i64(src, 24)
@@ -500,6 +507,8 @@ def py_set_contains(s, item) -> int:
     entries = load_ptr(s, 40)
     capacity: int = load_i64(s, 24)
     h: int = py_obj_hash(item)
+    if py_err_occurred() != 0:
+        return 0
     slot: int = _lookup_slot(s, entries, capacity, h, item)
     if slot >= 0:
         return 1
@@ -515,6 +524,8 @@ def py_set_remove(s, item) -> int:
     entries = load_ptr(s, 40)
     capacity: int = load_i64(s, 24)
     h: int = py_obj_hash(item)
+    if py_err_occurred() != 0:
+        return -1
     slot: int = _lookup_slot(s, entries, capacity, h, item)
     if slot < 0:
         return -1

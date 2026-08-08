@@ -8,10 +8,10 @@ The hook fires at wheel-build time (`python -m build`,
    ``libpy_runtime_pcc_py.a``.
 2. Run pcc again to self-compile ``pcc/__main__.py`` into a native
    ``pcc1`` executable, mirroring ``scripts/bootstrap.sh`` stage1.
-3. Bundle both artifacts into the wheel: the archive at
-   ``pcc/py_runtime/libpy_runtime_pcc_py.a`` (consumed by the lazy
-   first-run path), the binary at ``.data/scripts/pcc1`` as the explicit
-   native bootstrap helper.
+3. Bundle both native artifacts into the wheel: the archive plus its verified
+   provenance/C-API-inventory sidecars under ``pcc/py_runtime`` (consumed by
+   the lazy first-run path), and the binary at ``.data/scripts/pcc1`` as the
+   explicit native bootstrap helper.
 
 Prefer the ``self`` backend so the build doesn't shell out to clang.
 Fall back to ``--backend llvm`` (uses clang) if self fails.
@@ -33,12 +33,53 @@ still prove both native artifacts can be built.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import os
 import subprocess
 import sys
 from pathlib import Path
 
 from hatchling.builders.hooks.plugin.interface import BuildHookInterface
+
+
+def _load_runtime_archive_provenance():
+    """Load the verifier owned by this source artifact.
+
+    Hatch imports custom hooks in an isolated build environment before the
+    project is installed, so the checkout is not an import root.  Importing
+    ``pcc.tools`` here would either fail or, worse, select an unrelated already
+    installed ``pcc``.  The verifier is deliberately stdlib-only; load that
+    exact in-tree file without changing ``sys.path`` or relying on PYTHONPATH.
+    """
+
+    provenance_path = (
+        Path(__file__).resolve().parent
+        / "pcc"
+        / "tools"
+        / "runtime_archive_provenance.py"
+    )
+    if not provenance_path.is_file():
+        raise RuntimeError(
+            f"runtime archive provenance verifier is missing: {provenance_path}"
+        )
+    provenance_spec = importlib.util.spec_from_file_location(
+        "_pcc_build_runtime_archive_provenance",
+        provenance_path,
+    )
+    if provenance_spec is None or provenance_spec.loader is None:
+        raise RuntimeError(
+            f"cannot load runtime archive provenance verifier: {provenance_path}"
+        )
+    provenance = importlib.util.module_from_spec(provenance_spec)
+    provenance_spec.loader.exec_module(provenance)
+    return provenance
+
+
+_provenance = _load_runtime_archive_provenance()
+ProvenanceError = _provenance.ProvenanceError
+capi_inventory_path_for_archive = _provenance.capi_inventory_path_for_archive
+manifest_path_for_archive = _provenance.manifest_path_for_archive
+verify_runtime_archive_manifest = _provenance.verify_runtime_archive_manifest
 
 
 class CustomBuildHook(BuildHookInterface):
@@ -100,9 +141,17 @@ class CustomBuildHook(BuildHookInterface):
                 force=force_runtime_rebuild,
             )
         if ok and archive.is_file():
+            manifest = self._require_runtime_archive_manifest(archive)
+            capi_inventory = capi_inventory_path_for_archive(archive)
             self._write_archive_target_stamp(archive)
             rel = f"pcc/py_runtime/{target}"
             build_data.setdefault("force_include", {})[str(archive)] = rel
+            build_data.setdefault("force_include", {})[str(manifest)] = (
+                rel + ".provenance.json"
+            )
+            build_data.setdefault("force_include", {})[str(capi_inventory)] = (
+                rel + ".capi_syms"
+            )
             stamp = Path(str(archive) + ".target")
             if not stamp.is_file():
                 raise RuntimeError(
@@ -205,6 +254,8 @@ class CustomBuildHook(BuildHookInterface):
         mismatched = False
         for archive in runtime_dir.glob("libpy_runtime*.a"):
             stamp = Path(str(archive) + ".target")
+            manifest = manifest_path_for_archive(archive)
+            capi_inventory = capi_inventory_path_for_archive(archive)
             have = ""
             try:
                 have = stamp.read_text(encoding="utf-8").strip()
@@ -225,6 +276,14 @@ class CustomBuildHook(BuildHookInterface):
                 stamp.unlink()
             except OSError:
                 pass
+            try:
+                manifest.unlink()
+            except OSError:
+                pass
+            try:
+                capi_inventory.unlink()
+            except OSError:
+                pass
         if mismatched:
             # `make` would otherwise re-link the archive from the
             # wrong-arch .o files it sees as up to date (the lazy
@@ -241,13 +300,19 @@ class CustomBuildHook(BuildHookInterface):
             pass
 
     def _write_wheel_archive_stamp(self, archive: Path) -> Path:
-        digest = hashlib.sha256()
-        with archive.open("rb") as stream:
-            while True:
-                chunk = stream.read(1024 * 1024)
-                if not chunk:
-                    break
-                digest.update(chunk)
+        manifest = manifest_path_for_archive(archive)
+        capi_inventory = capi_inventory_path_for_archive(archive)
+
+        def file_sha256(path: Path) -> str:
+            digest = hashlib.sha256()
+            with path.open("rb") as stream:
+                while True:
+                    chunk = stream.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    digest.update(chunk)
+            return digest.hexdigest()
+
         # Never write into self.directory: that is the distribution output
         # directory (dist/), and every non-distribution entry left there makes
         # the PyPI upload fail with "InvalidDistribution: Unknown distribution
@@ -257,18 +322,53 @@ class CustomBuildHook(BuildHookInterface):
         marker_root.mkdir(parents=True, exist_ok=True)
         marker = marker_root / (archive.name + ".wheel")
         marker.write_text(
-            "pcc.runtime-wheel-artifact.v1\n"
+            "pcc.runtime-wheel-artifact.v2\n"
+            + "target="
             + self._archive_target_id()
-            + "\nsha256:"
-            + digest.hexdigest()
+            + "\narchive-sha256="
+            + file_sha256(archive)
+            + "\nmanifest-sha256="
+            + file_sha256(manifest)
+            + "\ncapi-inventory-sha256="
+            + file_sha256(capi_inventory)
             + "\n",
             encoding="utf-8",
         )
         return marker
 
+    def _runtime_archive_manifest_valid(self, archive: Path) -> bool:
+        try:
+            verify_runtime_archive_manifest(
+                archive,
+                runtime_root=archive.parent,
+            )
+        except (OSError, UnicodeError, subprocess.TimeoutExpired, ProvenanceError):
+            return False
+        return True
+
+    def _require_runtime_archive_manifest(self, archive: Path) -> Path:
+        manifest = manifest_path_for_archive(archive)
+        try:
+            verify_runtime_archive_manifest(
+                archive,
+                runtime_root=archive.parent,
+            )
+        except (
+            OSError,
+            UnicodeError,
+            subprocess.TimeoutExpired,
+            ProvenanceError,
+        ) as exc:
+            raise RuntimeError(
+                f"runtime archive provenance verification failed for {archive}: {exc}"
+            ) from exc
+        return manifest
+
     def _runtime_archive_inputs_newer(self, root: Path, archive: Path) -> bool:
         """Mirror the pipeline's pcc-emitted archive freshness contract."""
         if not archive.is_file():
+            return True
+        if not self._runtime_archive_manifest_valid(archive):
             return True
         archive_mtime = archive.stat().st_mtime
         pcc_root = root / "pcc"

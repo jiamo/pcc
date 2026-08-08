@@ -1,0 +1,908 @@
+{
+  "schema": "pcc.cpython-replacement.workloads.v1",
+  "python_baseline": {
+    "language": "3.13",
+    "oracle": "CPython 3.13.2"
+  },
+  "targets": [
+    {
+      "triple": "arm64-apple-darwin",
+      "runtime_boundary": "named-libSystem-abi",
+      "status": "unverified"
+    },
+    {
+      "triple": "x86_64-unknown-linux-gnu",
+      "runtime_boundary": "static-zero-libc-required",
+      "status": "unverified"
+    }
+  ],
+  "claim_contract": {
+    "required_mode": "pcc1/pcc-native/self/no-libpython",
+    "forbidden_evidence_modes": [
+      "host-python",
+      "host-pcc",
+      "cpython-compat",
+      "libpython",
+      "llvm-fallback"
+    ],
+    "gc_backends": [0, 1, 2, 3, 4],
+    "fixed_point": "current-pcc1-to-pcc2-to-pcc3",
+    "historical_evidence_satisfies_current_claim": false
+  },
+  "levels": [
+    {
+      "level": 1,
+      "name": "pcc-native pure-Python service replacement",
+      "cumulative_includes": [1],
+      "required_categories": [
+        "pure-python-service"
+      ],
+      "required_gates": [
+        "current-clean-pcc1-self-five-gc-fixed-point",
+        "host-python-and-host-pcc-disabled-for-install-build-run",
+        "tests/integration/test_pcc1_pure_python_service_replacement.py",
+        "thirty-minute-service-lifecycle-and-resource-report",
+        "process-tree-runtime-archive-and-linkage-audit"
+      ],
+      "performance_envelope": {
+        "duration_seconds": 1800,
+        "warmup_seconds": 60,
+        "sample_interval_seconds": 5,
+        "metrics": [
+          "throughput",
+          "latency_p50",
+          "latency_p95",
+          "latency_p99",
+          "rss_peak_bytes",
+          "rss_growth_bytes_per_hour",
+          "gc_pause_p95_seconds",
+          "error_count"
+        ],
+        "acceptance": {
+          "correctness": "zero unexplained CPython-oracle differential and zero pcc-path workload errors",
+          "resource_growth": "no statistically significant unbounded RSS, native-handle, or scheduler-root growth",
+          "comparison": "machine-labeled pcc1 and CPython oracle results; no universal speed claim",
+          "max_error_count": 0,
+          "rss_growth_estimator": "theil-sen-after-warmup",
+          "max_rss_growth_fraction_of_peak_per_hour": 0.05,
+          "max_gc_pause_p95_seconds": 1.0,
+          "throughput_policy": "report-machine-labeled-no-universal-floor",
+          "latency_policy": "report-machine-labeled-no-universal-ceiling"
+        }
+      },
+      "unsupported_policy": {
+        "behavior": "fail-closed-before-artifact-publication",
+        "diagnostic_prefix": "PCC-CPY-UNSUPPORTED-L1-",
+        "publication": "forbidden"
+      },
+      "claim_mode": "pcc1/pcc-native/self/no-libpython",
+      "status": "unverified",
+      "final_product_goal": false
+    },
+    {
+      "level": 2,
+      "name": "common scientific and build ecosystem replacement",
+      "cumulative_includes": [1, 2],
+      "required_categories": [
+        "pure-python-service",
+        "scientific-array",
+        "build-tool",
+        "compression-archive",
+        "native-extension-family"
+      ],
+      "required_gates": [
+        "all-level-1-gates-current-and-green",
+        "current-clean-pcc1-self-five-gc-fixed-point",
+        "host-python-and-host-pcc-disabled-for-acquire-install-build-run",
+        "tests/integration/test_pcc1_scientific_build_replacement.py",
+        "scientific-numerical-and-native-handle-lifetime-report",
+        "generic-mechanism-no-package-name-branch-audit"
+      ],
+      "performance_envelope": {
+        "duration_seconds": 1800,
+        "warmup_seconds": 60,
+        "sample_interval_seconds": 5,
+        "metrics": [
+          "throughput",
+          "latency_p50",
+          "latency_p95",
+          "latency_p99",
+          "rss_peak_bytes",
+          "rss_growth_bytes_per_hour",
+          "gc_pause_p95_seconds",
+          "error_count"
+        ],
+        "acceptance": {
+          "correctness": "zero unexplained behavioral or documented numerical-contract differential",
+          "resource_growth": "no statistically significant unbounded RSS, native-handle, archive-buffer, or GC-root growth",
+          "comparison": "machine-labeled package, target, GC, pcc1 and CPython oracle results; no universal speed claim",
+          "max_error_count": 0,
+          "rss_growth_estimator": "theil-sen-after-warmup",
+          "max_rss_growth_fraction_of_peak_per_hour": 0.05,
+          "max_gc_pause_p95_seconds": 1.0,
+          "throughput_policy": "report-machine-labeled-no-universal-floor",
+          "latency_policy": "report-machine-labeled-no-universal-ceiling"
+        }
+      },
+      "unsupported_policy": {
+        "behavior": "fail-closed-before-artifact-publication",
+        "diagnostic_prefix": "PCC-CPY-UNSUPPORTED-L2-",
+        "publication": "forbidden"
+      },
+      "claim_mode": "pcc1/pcc-native/self/no-libpython",
+      "status": "unverified",
+      "final_product_goal": false
+    },
+    {
+      "level": 3,
+      "name": "supported python3 drop-in replacement",
+      "cumulative_includes": [1, 2, 3],
+      "required_categories": [
+        "pure-python-service",
+        "scientific-array",
+        "build-tool",
+        "compression-archive",
+        "native-extension-family",
+        "language-compatibility",
+        "stdlib-compatibility",
+        "cli-import-tooling",
+        "package-extension-compatibility",
+        "operations-concurrency"
+      ],
+      "required_gates": [
+        "all-level-1-and-level-2-gates-current-and-green",
+        "current-clean-pcc1-self-five-gc-fixed-point",
+        "host-python-and-host-pcc-absent-from-python3-role-environment",
+        "tests/integration/test_pcc1_python3_dropin_replacement.py",
+        "complete-published-compatibility-matrix-with-zero-promised-unsupported-entry",
+        "signed-clean-release-provenance-bundle"
+      ],
+      "performance_envelope": {
+        "duration_seconds": 3600,
+        "warmup_seconds": 120,
+        "sample_interval_seconds": 5,
+        "metrics": [
+          "throughput",
+          "latency_p50",
+          "latency_p95",
+          "latency_p99",
+          "rss_peak_bytes",
+          "rss_growth_bytes_per_hour",
+          "gc_pause_p95_seconds",
+          "error_count"
+        ],
+        "acceptance": {
+          "correctness": "zero unsupported entry inside the published matrix and zero unexplained CPython-oracle differential",
+          "resource_growth": "no statistically significant unbounded RSS, native-handle, thread, continuation, subprocess, or GC-root growth",
+          "comparison": "machine-labeled full-matrix pcc1 and CPython oracle results; no universal speed claim",
+          "max_error_count": 0,
+          "rss_growth_estimator": "theil-sen-after-warmup",
+          "max_rss_growth_fraction_of_peak_per_hour": 0.05,
+          "max_gc_pause_p95_seconds": 1.0,
+          "throughput_policy": "report-machine-labeled-no-universal-floor",
+          "latency_policy": "report-machine-labeled-no-universal-ceiling"
+        }
+      },
+      "unsupported_policy": {
+        "behavior": "fail-closed-before-artifact-publication",
+        "diagnostic_prefix": "PCC-CPY-UNSUPPORTED-L3-",
+        "publication": "forbidden"
+      },
+      "claim_mode": "pcc1/pcc-native/self/no-libpython",
+      "status": "unverified",
+      "final_product_goal": true
+    }
+  ],
+  "workloads": [
+    {
+      "id": "cpy-l1-pproxy-service-1-9-5",
+      "minimum_level": 1,
+      "category": "pure-python-service",
+      "title": "Unmodified pproxy HTTP/SOCKS lifecycle and sustained tunnel load",
+      "source": {
+        "kind": "vendored-upstream-source",
+        "name": "pproxy",
+        "version": "1.9.5",
+        "digest_policy": "repository-tree-pinned-before-gate"
+      },
+      "targets": [
+        "arm64-apple-darwin",
+        "x86_64-unknown-linux-gnu"
+      ],
+      "lifecycle": [
+        "acquire",
+        "install",
+        "build",
+        "start",
+        "exercise",
+        "shutdown",
+        "cleanup"
+      ],
+      "oracle": {
+        "implementation": "CPython 3.13.2",
+        "role": "behavioral-reference-only",
+        "execution_is_separate": true
+      },
+      "required_gates": [
+        "locked-source-tree-sha256",
+        "unchanged-source-install-build-start",
+        "http-and-socks-connect-roundtrip",
+        "reload-drain-shutdown-cleanup",
+        "gc0-through-gc4-thirty-minute-load",
+        "process-tree-linkage-runtime-provenance"
+      ],
+      "performance_envelope": {
+        "duration_seconds": 1800,
+        "warmup_seconds": 60,
+        "sample_interval_seconds": 5,
+        "metrics": [
+          "throughput",
+          "latency_p50",
+          "latency_p95",
+          "latency_p99",
+          "rss_peak_bytes",
+          "rss_growth_bytes_per_hour",
+          "gc_pause_p95_seconds",
+          "error_count"
+        ],
+        "acceptance": {
+          "correctness": "request bytes, response bytes, half-close, error, reload, and shutdown behavior equal the CPython oracle",
+          "resource_growth": "no unbounded connection, waiter, timer, buffer, continuation, or RSS growth",
+          "comparison": "machine-labeled target and GC results compared with a separately executed CPython oracle",
+          "max_error_count": 0,
+          "rss_growth_estimator": "theil-sen-after-warmup",
+          "max_rss_growth_fraction_of_peak_per_hour": 0.05,
+          "max_gc_pause_p95_seconds": 1.0,
+          "throughput_policy": "report-machine-labeled-no-universal-floor",
+          "latency_policy": "report-machine-labeled-no-universal-ceiling"
+        }
+      },
+      "unsupported_policy": {
+        "behavior": "fail-closed-before-artifact-publication",
+        "diagnostic_prefix": "PCC-CPY-UNSUPPORTED-L1-PPROXY-",
+        "publication": "forbidden"
+      },
+      "claim_mode": "pcc1/pcc-native/self/no-libpython",
+      "status": "unverified"
+    },
+    {
+      "id": "cpy-l2-numpy-2-4-4",
+      "minimum_level": 2,
+      "category": "scientific-array",
+      "title": "NumPy import, array compute, serialization, and native cleanup",
+      "source": {
+        "kind": "vendored-upstream-source",
+        "name": "numpy",
+        "version": "2.4.4",
+        "digest_policy": "repository-tree-pinned-before-gate"
+      },
+      "targets": [
+        "arm64-apple-darwin",
+        "x86_64-unknown-linux-gnu"
+      ],
+      "lifecycle": [
+        "acquire",
+        "install",
+        "build",
+        "start",
+        "exercise",
+        "shutdown",
+        "cleanup"
+      ],
+      "oracle": {
+        "implementation": "CPython 3.13.2",
+        "role": "behavioral-reference-only",
+        "execution_is_separate": true
+      },
+      "required_gates": [
+        "projects/numpy-2.4.4-source-sha256",
+        "offline-hostless-source-build-and-pcc-native-install",
+        "import-numpy-and-native-core",
+        "array-index-broadcast-reduce-linear-algebra-and-serialization-corpus",
+        "documented-dtype-specific-numerical-tolerances",
+        "gc0-through-gc4-native-handle-and-buffer-cleanup"
+      ],
+      "performance_envelope": {
+        "duration_seconds": 1800,
+        "warmup_seconds": 60,
+        "sample_interval_seconds": 5,
+        "metrics": [
+          "throughput",
+          "latency_p50",
+          "latency_p95",
+          "latency_p99",
+          "rss_peak_bytes",
+          "rss_growth_bytes_per_hour",
+          "gc_pause_p95_seconds",
+          "error_count"
+        ],
+        "acceptance": {
+          "correctness": "shape, dtype, exception, serialization, and values meet the frozen numerical contract",
+          "resource_growth": "no unbounded ndarray, buffer, capsule, native-handle, or RSS growth",
+          "comparison": "machine-labeled target, dtype, BLAS provider, GC, pcc1 and CPython oracle results",
+          "max_error_count": 0,
+          "rss_growth_estimator": "theil-sen-after-warmup",
+          "max_rss_growth_fraction_of_peak_per_hour": 0.05,
+          "max_gc_pause_p95_seconds": 1.0,
+          "throughput_policy": "report-machine-labeled-no-universal-floor",
+          "latency_policy": "report-machine-labeled-no-universal-ceiling"
+        }
+      },
+      "unsupported_policy": {
+        "behavior": "fail-closed-before-artifact-publication",
+        "diagnostic_prefix": "PCC-CPY-UNSUPPORTED-L2-NUMPY-",
+        "publication": "forbidden"
+      },
+      "claim_mode": "pcc1/pcc-native/self/no-libpython",
+      "status": "unverified"
+    },
+    {
+      "id": "cpy-l2-build-tool-closure-v1",
+      "minimum_level": 2,
+      "category": "build-tool",
+      "title": "pcc-owned offline wheel, sdist, metadata, lock, and source-build closure",
+      "source": {
+        "kind": "repository-generated-corpus",
+        "name": "pcc-build-tool-closure",
+        "version": "v1",
+        "digest_policy": "generated-corpus-canonical-sha256"
+      },
+      "targets": [
+        "arm64-apple-darwin",
+        "x86_64-unknown-linux-gnu"
+      ],
+      "lifecycle": [
+        "acquire",
+        "install",
+        "build",
+        "start",
+        "exercise",
+        "shutdown",
+        "cleanup"
+      ],
+      "oracle": {
+        "implementation": "CPython 3.13.2",
+        "role": "behavioral-reference-only",
+        "execution_is_separate": true
+      },
+      "required_gates": [
+        "offline-lock-replay",
+        "pcc1-m-pip-command-surface",
+        "wheel-and-sdist-metadata-roundtrip",
+        "pure-python-and-pcc-native-source-build",
+        "build-isolation-has-no-host-python-process",
+        "partial-environment-is-never-published-on-failure"
+      ],
+      "performance_envelope": {
+        "duration_seconds": 900,
+        "warmup_seconds": 30,
+        "sample_interval_seconds": 5,
+        "metrics": [
+          "throughput",
+          "latency_p50",
+          "latency_p95",
+          "latency_p99",
+          "rss_peak_bytes",
+          "rss_growth_bytes_per_hour",
+          "gc_pause_p95_seconds",
+          "error_count"
+        ],
+        "acceptance": {
+          "correctness": "normalized metadata, dependency graph, files, modes, RECORD, and import outputs equal the oracle",
+          "resource_growth": "repeated isolated builds leave no growing subprocess, temporary tree, descriptor, or RSS set",
+          "comparison": "machine-labeled warm and cold pcc1 build results compared with a separate CPython build oracle",
+          "max_error_count": 0,
+          "rss_growth_estimator": "theil-sen-after-warmup",
+          "max_rss_growth_fraction_of_peak_per_hour": 0.05,
+          "max_gc_pause_p95_seconds": 1.0,
+          "throughput_policy": "report-machine-labeled-no-universal-floor",
+          "latency_policy": "report-machine-labeled-no-universal-ceiling"
+        }
+      },
+      "unsupported_policy": {
+        "behavior": "fail-closed-before-artifact-publication",
+        "diagnostic_prefix": "PCC-CPY-UNSUPPORTED-L2-BUILD-",
+        "publication": "forbidden"
+      },
+      "claim_mode": "pcc1/pcc-native/self/no-libpython",
+      "status": "unverified"
+    },
+    {
+      "id": "cpy-l2-compression-archive-corpus-v1",
+      "minimum_level": 2,
+      "category": "compression-archive",
+      "title": "Streaming zlib, gzip, zip, and tar interoperability corpus",
+      "source": {
+        "kind": "repository-generated-corpus",
+        "name": "pcc-compression-archive-corpus",
+        "version": "v1",
+        "digest_policy": "generated-corpus-canonical-sha256"
+      },
+      "targets": [
+        "arm64-apple-darwin",
+        "x86_64-unknown-linux-gnu"
+      ],
+      "lifecycle": [
+        "acquire",
+        "install",
+        "build",
+        "start",
+        "exercise",
+        "shutdown",
+        "cleanup"
+      ],
+      "oracle": {
+        "implementation": "CPython 3.13.2",
+        "role": "behavioral-reference-only",
+        "execution_is_separate": true
+      },
+      "required_gates": [
+        "zlib-and-gzip-streaming-roundtrip",
+        "zipfile-and-tarfile-cross-runtime-interoperability",
+        "large-file-bounded-buffering",
+        "crc-mtime-mode-path-and-error-parity",
+        "truncated-and-adversarial-input-stable-diagnostics",
+        "gc0-through-gc4-stream-and-native-resource-cleanup"
+      ],
+      "performance_envelope": {
+        "duration_seconds": 900,
+        "warmup_seconds": 30,
+        "sample_interval_seconds": 5,
+        "metrics": [
+          "throughput",
+          "latency_p50",
+          "latency_p95",
+          "latency_p99",
+          "rss_peak_bytes",
+          "rss_growth_bytes_per_hour",
+          "gc_pause_p95_seconds",
+          "error_count"
+        ],
+        "acceptance": {
+          "correctness": "bytes, headers, metadata, extraction results, and errors match the frozen interoperability oracle",
+          "resource_growth": "streaming remains within the declared bounded-buffer and descriptor envelope",
+          "comparison": "machine-labeled codec, input-size, target, GC, pcc1 and CPython oracle results",
+          "max_error_count": 0,
+          "rss_growth_estimator": "theil-sen-after-warmup",
+          "max_rss_growth_fraction_of_peak_per_hour": 0.05,
+          "max_gc_pause_p95_seconds": 1.0,
+          "throughput_policy": "report-machine-labeled-no-universal-floor",
+          "latency_policy": "report-machine-labeled-no-universal-ceiling"
+        }
+      },
+      "unsupported_policy": {
+        "behavior": "fail-closed-before-artifact-publication",
+        "diagnostic_prefix": "PCC-CPY-UNSUPPORTED-L2-ARCHIVE-",
+        "publication": "forbidden"
+      },
+      "claim_mode": "pcc1/pcc-native/self/no-libpython",
+      "status": "unverified"
+    },
+    {
+      "id": "cpy-l2-simplejson-4-1-1",
+      "minimum_level": 2,
+      "category": "native-extension-family",
+      "title": "Unmodified simplejson source extension install, import, behavior, and cleanup",
+      "source": {
+        "kind": "upstream-release-sdist",
+        "name": "simplejson",
+        "version": "4.1.1",
+        "digest_policy": "sha256-pinned-release-artifact"
+      },
+      "targets": [
+        "arm64-apple-darwin",
+        "x86_64-unknown-linux-gnu"
+      ],
+      "lifecycle": [
+        "acquire",
+        "install",
+        "build",
+        "start",
+        "exercise",
+        "shutdown",
+        "cleanup"
+      ],
+      "oracle": {
+        "implementation": "CPython 3.13.2",
+        "role": "behavioral-reference-only",
+        "execution_is_separate": true
+      },
+      "required_gates": [
+        "sdist-sha256-c08eb9f7a90f77ae470e19a07472e9a79ebc0d1c2315d86a72767665bd5ba79f",
+        "offline-hostless-pcc-native-source-build",
+        "native-speedups-import-and-active-provider",
+        "encode-decode-error-and-container-boundary-parity",
+        "gc0-through-gc4-module-object-and-native-handle-cleanup",
+        "no-simplejson-name-branch-in-compiler-runtime-loader-or-builder"
+      ],
+      "performance_envelope": {
+        "duration_seconds": 900,
+        "warmup_seconds": 30,
+        "sample_interval_seconds": 5,
+        "metrics": [
+          "throughput",
+          "latency_p50",
+          "latency_p95",
+          "latency_p99",
+          "rss_peak_bytes",
+          "rss_growth_bytes_per_hour",
+          "gc_pause_p95_seconds",
+          "error_count"
+        ],
+        "acceptance": {
+          "correctness": "encoded bytes, decoded objects, exceptions, and native-provider activation match the CPython oracle",
+          "resource_growth": "repeated encode, decode, import, unload, and cleanup have bounded native and managed memory",
+          "comparison": "machine-labeled payload, target, GC, pcc1 and CPython oracle results",
+          "max_error_count": 0,
+          "rss_growth_estimator": "theil-sen-after-warmup",
+          "max_rss_growth_fraction_of_peak_per_hour": 0.05,
+          "max_gc_pause_p95_seconds": 1.0,
+          "throughput_policy": "report-machine-labeled-no-universal-floor",
+          "latency_policy": "report-machine-labeled-no-universal-ceiling"
+        }
+      },
+      "unsupported_policy": {
+        "behavior": "fail-closed-before-artifact-publication",
+        "diagnostic_prefix": "PCC-CPY-UNSUPPORTED-L2-SIMPLEJSON-",
+        "publication": "forbidden"
+      },
+      "claim_mode": "pcc1/pcc-native/self/no-libpython",
+      "status": "unverified"
+    },
+    {
+      "id": "cpy-l3-language-3-13-v1",
+      "minimum_level": 3,
+      "category": "language-compatibility",
+      "title": "Frozen Python 3.13 syntax, object model, exception, generator, coroutine, and reflection differential corpus",
+      "source": {
+        "kind": "repository-generated-corpus",
+        "name": "pcc-python-3.13-language-corpus",
+        "version": "v1",
+        "digest_policy": "generated-corpus-canonical-sha256"
+      },
+      "targets": [
+        "arm64-apple-darwin",
+        "x86_64-unknown-linux-gnu"
+      ],
+      "lifecycle": [
+        "acquire",
+        "install",
+        "build",
+        "start",
+        "exercise",
+        "shutdown",
+        "cleanup"
+      ],
+      "oracle": {
+        "implementation": "CPython 3.13.2",
+        "role": "behavioral-reference-only",
+        "execution_is_separate": true
+      },
+      "required_gates": [
+        "tests/python/test_pcc1_cpython_language_matrix.py",
+        "arbitrary-precision-int-and-representation-join-parity",
+        "dunder-descriptor-class-and-reflection-parity",
+        "exception-finally-generator-coroutine-and-suspended-frame-parity",
+        "weakref-finalizer-resurrection-and-threaded-exception-parity",
+        "zero-fallback-and-stable-unsupported-diagnostic-report"
+      ],
+      "performance_envelope": {
+        "duration_seconds": 900,
+        "warmup_seconds": 30,
+        "sample_interval_seconds": 5,
+        "metrics": [
+          "throughput",
+          "latency_p50",
+          "latency_p95",
+          "latency_p99",
+          "rss_peak_bytes",
+          "rss_growth_bytes_per_hour",
+          "gc_pause_p95_seconds",
+          "error_count"
+        ],
+        "acceptance": {
+          "correctness": "values, types, identities, exceptions, output, finalization, and observable ordering match the oracle",
+          "resource_growth": "repeated dynamic, suspended-frame, weakref, and exception cases leave no unbounded roots or RSS growth",
+          "comparison": "machine-labeled semantic-case, target, GC, pcc1 and CPython oracle results",
+          "max_error_count": 0,
+          "rss_growth_estimator": "theil-sen-after-warmup",
+          "max_rss_growth_fraction_of_peak_per_hour": 0.05,
+          "max_gc_pause_p95_seconds": 1.0,
+          "throughput_policy": "report-machine-labeled-no-universal-floor",
+          "latency_policy": "report-machine-labeled-no-universal-ceiling"
+        }
+      },
+      "unsupported_policy": {
+        "behavior": "fail-closed-before-artifact-publication",
+        "diagnostic_prefix": "PCC-CPY-UNSUPPORTED-L3-LANGUAGE-",
+        "publication": "forbidden"
+      },
+      "claim_mode": "pcc1/pcc-native/self/no-libpython",
+      "status": "unverified"
+    },
+    {
+      "id": "cpy-l3-stdlib-3-13-v1",
+      "minimum_level": 3,
+      "category": "stdlib-compatibility",
+      "title": "Published supported Python 3.13 stdlib module and behavior matrix",
+      "source": {
+        "kind": "repository-generated-corpus",
+        "name": "pcc-python-3.13-stdlib-corpus",
+        "version": "v1",
+        "digest_policy": "generated-corpus-canonical-sha256"
+      },
+      "targets": [
+        "arm64-apple-darwin",
+        "x86_64-unknown-linux-gnu"
+      ],
+      "lifecycle": [
+        "acquire",
+        "install",
+        "build",
+        "start",
+        "exercise",
+        "shutdown",
+        "cleanup"
+      ],
+      "oracle": {
+        "implementation": "CPython 3.13.2",
+        "role": "behavioral-reference-only",
+        "execution_is_separate": true
+      },
+      "required_gates": [
+        "published-stdlib-module-symbol-and-platform-matrix",
+        "filesystem-network-process-time-random-and-serialization-parity",
+        "threading-asyncio-context-and-shutdown-parity",
+        "compression-archive-and-build-tool-closure",
+        "all-promised-entries-native-or-pcc-owned",
+        "every-outside-entry-has-stable-diagnostic"
+      ],
+      "performance_envelope": {
+        "duration_seconds": 1800,
+        "warmup_seconds": 60,
+        "sample_interval_seconds": 5,
+        "metrics": [
+          "throughput",
+          "latency_p50",
+          "latency_p95",
+          "latency_p99",
+          "rss_peak_bytes",
+          "rss_growth_bytes_per_hour",
+          "gc_pause_p95_seconds",
+          "error_count"
+        ],
+        "acceptance": {
+          "correctness": "all promised module, symbol, platform, side-effect, return, and exception cases match the oracle",
+          "resource_growth": "repeated stdlib resource lifecycles leave no unbounded file, socket, process, thread, timer, or RSS growth",
+          "comparison": "machine-labeled stdlib-entry, platform, target, GC, pcc1 and CPython oracle results",
+          "max_error_count": 0,
+          "rss_growth_estimator": "theil-sen-after-warmup",
+          "max_rss_growth_fraction_of_peak_per_hour": 0.05,
+          "max_gc_pause_p95_seconds": 1.0,
+          "throughput_policy": "report-machine-labeled-no-universal-floor",
+          "latency_policy": "report-machine-labeled-no-universal-ceiling"
+        }
+      },
+      "unsupported_policy": {
+        "behavior": "fail-closed-before-artifact-publication",
+        "diagnostic_prefix": "PCC-CPY-UNSUPPORTED-L3-STDLIB-",
+        "publication": "forbidden"
+      },
+      "claim_mode": "pcc1/pcc-native/self/no-libpython",
+      "status": "unverified"
+    },
+    {
+      "id": "cpy-l3-python3-cli-import-tooling-v1",
+      "minimum_level": 3,
+      "category": "cli-import-tooling",
+      "title": "python3 script, module, command, stdin, REPL, diagnostics, debugger, profiler, and coverage surface",
+      "source": {
+        "kind": "repository-generated-corpus",
+        "name": "pcc-python3-cli-import-tooling-corpus",
+        "version": "v1",
+        "digest_policy": "generated-corpus-canonical-sha256"
+      },
+      "targets": [
+        "arm64-apple-darwin",
+        "x86_64-unknown-linux-gnu"
+      ],
+      "lifecycle": [
+        "acquire",
+        "install",
+        "build",
+        "start",
+        "exercise",
+        "shutdown",
+        "cleanup"
+      ],
+      "oracle": {
+        "implementation": "CPython 3.13.2",
+        "role": "behavioral-reference-only",
+        "execution_is_separate": true
+      },
+      "required_gates": [
+        "tests/python/test_pcc1_python3_cli_matrix.py",
+        "script-module-command-stdin-and-interactive-repl-parity",
+        "sys-argv-path-prefix-exit-and-import-cache-parity",
+        "traceback-warning-source-map-and-optimized-frame-parity",
+        "debugger-profiler-and-coverage-observation-parity",
+        "installed-pcc1-occupies-python3-role-with-host-python-absent"
+      ],
+      "performance_envelope": {
+        "duration_seconds": 900,
+        "warmup_seconds": 30,
+        "sample_interval_seconds": 5,
+        "metrics": [
+          "throughput",
+          "latency_p50",
+          "latency_p95",
+          "latency_p99",
+          "rss_peak_bytes",
+          "rss_growth_bytes_per_hour",
+          "gc_pause_p95_seconds",
+          "error_count"
+        ],
+        "acceptance": {
+          "correctness": "CLI output, exit, import, traceback, warning, debug, profile, and coverage observations match the oracle",
+          "resource_growth": "repeated REPL, import, debug, profile, and coverage sessions leave no unbounded modules, hooks, frames, or RSS growth",
+          "comparison": "machine-labeled invocation-mode, optimization, target, GC, pcc1 and CPython oracle results",
+          "max_error_count": 0,
+          "rss_growth_estimator": "theil-sen-after-warmup",
+          "max_rss_growth_fraction_of_peak_per_hour": 0.05,
+          "max_gc_pause_p95_seconds": 1.0,
+          "throughput_policy": "report-machine-labeled-no-universal-floor",
+          "latency_policy": "report-machine-labeled-no-universal-ceiling"
+        }
+      },
+      "unsupported_policy": {
+        "behavior": "fail-closed-before-artifact-publication",
+        "diagnostic_prefix": "PCC-CPY-UNSUPPORTED-L3-TOOLING-",
+        "publication": "forbidden"
+      },
+      "claim_mode": "pcc1/pcc-native/self/no-libpython",
+      "status": "unverified"
+    },
+    {
+      "id": "cpy-l3-package-extension-matrix-v1",
+      "minimum_level": 3,
+      "category": "package-extension-compatibility",
+      "title": "Frozen pure-Python, pcc-native, source-rebuilt extension, and rejected CPython-ABI package matrix",
+      "source": {
+        "kind": "repository-generated-corpus",
+        "name": "pcc-package-extension-compatibility-corpus",
+        "version": "v1",
+        "digest_policy": "generated-corpus-canonical-sha256"
+      },
+      "targets": [
+        "arm64-apple-darwin",
+        "x86_64-unknown-linux-gnu"
+      ],
+      "lifecycle": [
+        "acquire",
+        "install",
+        "build",
+        "start",
+        "exercise",
+        "shutdown",
+        "cleanup"
+      ],
+      "oracle": {
+        "implementation": "CPython 3.13.2",
+        "role": "behavioral-reference-only",
+        "execution_is_separate": true
+      },
+      "required_gates": [
+        "offline-lock-acquisition-install-build-import-run-cleanup",
+        "pure-python-pcc-native-and-source-rebuilt-capability-profiles",
+        "slot-capsule-buffer-and-native-handle-five-gc-parity",
+        "cpython-abi-artifacts-rejected-not-relabelled",
+        "no-package-name-semantic-branch-audit",
+        "manifest-wheel-tag-linkage-and-runtime-provenance-parity"
+      ],
+      "performance_envelope": {
+        "duration_seconds": 1800,
+        "warmup_seconds": 60,
+        "sample_interval_seconds": 5,
+        "metrics": [
+          "throughput",
+          "latency_p50",
+          "latency_p95",
+          "latency_p99",
+          "rss_peak_bytes",
+          "rss_growth_bytes_per_hour",
+          "gc_pause_p95_seconds",
+          "error_count"
+        ],
+        "acceptance": {
+          "correctness": "package metadata, import objects, extension calls, buffers, capsules, errors, and cleanup match the oracle",
+          "resource_growth": "repeated install, import, extension use, unload, and cleanup leave no unbounded cache, native-handle, root, or RSS growth",
+          "comparison": "machine-labeled package identity, ABI mode, target, GC, pcc1 and CPython oracle results",
+          "max_error_count": 0,
+          "rss_growth_estimator": "theil-sen-after-warmup",
+          "max_rss_growth_fraction_of_peak_per_hour": 0.05,
+          "max_gc_pause_p95_seconds": 1.0,
+          "throughput_policy": "report-machine-labeled-no-universal-floor",
+          "latency_policy": "report-machine-labeled-no-universal-ceiling"
+        }
+      },
+      "unsupported_policy": {
+        "behavior": "fail-closed-before-artifact-publication",
+        "diagnostic_prefix": "PCC-CPY-UNSUPPORTED-L3-PACKAGE-",
+        "publication": "forbidden"
+      },
+      "claim_mode": "pcc1/pcc-native/self/no-libpython",
+      "status": "unverified"
+    },
+    {
+      "id": "cpy-l3-operations-concurrency-v1",
+      "minimum_level": 3,
+      "category": "operations-concurrency",
+      "title": "Long-running network, process, thread, virtual-thread, signal, reload, and shutdown application matrix",
+      "source": {
+        "kind": "repository-generated-corpus",
+        "name": "pcc-operations-concurrency-corpus",
+        "version": "v1",
+        "digest_policy": "generated-corpus-canonical-sha256"
+      },
+      "targets": [
+        "arm64-apple-darwin",
+        "x86_64-unknown-linux-gnu"
+      ],
+      "lifecycle": [
+        "acquire",
+        "install",
+        "build",
+        "start",
+        "exercise",
+        "shutdown",
+        "cleanup"
+      ],
+      "oracle": {
+        "implementation": "CPython 3.13.2",
+        "role": "behavioral-reference-only",
+        "execution_is_separate": true
+      },
+      "required_gates": [
+        "network-file-process-thread-and-virtual-thread-application-corpus",
+        "signal-cancellation-timeout-reload-drain-and-shutdown-parity",
+        "subprocess-tree-and-environment-provenance",
+        "gc0-through-gc4-scheduler-frame-and-native-root-parity",
+        "one-hour-rss-pause-throughput-latency-fragmentation-report",
+        "crash-exit-and-stable-diagnostic-parity"
+      ],
+      "performance_envelope": {
+        "duration_seconds": 3600,
+        "warmup_seconds": 120,
+        "sample_interval_seconds": 5,
+        "metrics": [
+          "throughput",
+          "latency_p50",
+          "latency_p95",
+          "latency_p99",
+          "rss_peak_bytes",
+          "rss_growth_bytes_per_hour",
+          "gc_pause_p95_seconds",
+          "error_count"
+        ],
+        "acceptance": {
+          "correctness": "network, process, scheduling, signal, timeout, cancellation, reload, error, and shutdown behavior match the oracle",
+          "resource_growth": "no unbounded thread, continuation, waiter, timer, descriptor, subprocess, native-handle, GC-root, fragmentation, or RSS growth",
+          "comparison": "machine-labeled workload, concurrency, target, GC, pcc1 and CPython oracle results",
+          "max_error_count": 0,
+          "rss_growth_estimator": "theil-sen-after-warmup",
+          "max_rss_growth_fraction_of_peak_per_hour": 0.05,
+          "max_gc_pause_p95_seconds": 1.0,
+          "throughput_policy": "report-machine-labeled-no-universal-floor",
+          "latency_policy": "report-machine-labeled-no-universal-ceiling"
+        }
+      },
+      "unsupported_policy": {
+        "behavior": "fail-closed-before-artifact-publication",
+        "diagnostic_prefix": "PCC-CPY-UNSUPPORTED-L3-OPERATIONS-",
+        "publication": "forbidden"
+      },
+      "claim_mode": "pcc1/pcc-native/self/no-libpython",
+      "status": "unverified"
+    }
+  ]
+}

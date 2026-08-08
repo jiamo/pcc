@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -12,12 +14,29 @@ from pathlib import Path
 import pytest
 
 from pcc.macho_normalize import normalize_macho_metadata
+from tests.host_pcc_pcc1_parity import (
+    ParityContractError,
+    load_applicability_manifest,
+    pcc1_receipt_path,
+    verify_pcc1_receipt,
+    write_parity_failure_report,
+    write_pcc1_receipt,
+)
+from tests.py_corpus_support import PYTHON_CORPUS_CASES, PythonCorpusCase
+from tests.python import test_intent_constraints as intent_constraints
 from tests.runtime_build_cache import (
     cached_self_host_oracle_dir,
     self_backend_object_cache_key,
     self_host_object_cache_dir,
     self_host_source_key,
 )
+
+# The pcc1/pcc2/pcc3 fixtures are session-scoped per xdist worker but publish
+# one source-addressed stage chain.  Keep every dependent oracle on the bounded
+# self-heavy lane so one worker owns the cold build; otherwise several workers
+# can retry the same failed 600-second stage and turn one warmup timeout into
+# hundreds of cached fixture errors.
+pytestmark = pytest.mark.xdist_group(name="pcc_heavy_self")
 
 REPO_ROOT = Path(__file__).absolute().parents[2]
 NO_HOST_PYTHON = shutil.which("false") or "/usr/bin/false"
@@ -4001,6 +4020,83 @@ CASES: tuple[tuple[str, str], ...] = (
     ),
 )
 
+PARITY_MANIFEST_PATH = REPO_ROOT / "tests" / "host_pcc_pcc1_parity_manifest.json"
+PARITY_APPLICABILITY = load_applicability_manifest(PARITY_MANIFEST_PATH, CASES)
+APPLICABLE_PARITY_CASES = PARITY_APPLICABILITY.applicable
+CORPUS_PARITY_MANIFEST_PATH = (
+    REPO_ROOT / "tests" / "host_pcc_pcc1_corpus_parity_manifest.json"
+)
+CORPUS_PARITY_INPUTS = tuple(
+    (case.name, case.source) for case in PYTHON_CORPUS_CASES
+)
+CORPUS_PARITY_APPLICABILITY = load_applicability_manifest(
+    CORPUS_PARITY_MANIFEST_PATH,
+    CORPUS_PARITY_INPUTS,
+    registry_id="tests.py_corpus_support.PYTHON_CORPUS_CASES",
+)
+APPLICABLE_CORPUS_PARITY_CASES = CORPUS_PARITY_APPLICABILITY.applicable
+CORPUS_CASE_BY_NAME = {case.name: case for case in PYTHON_CORPUS_CASES}
+
+
+def _intent_parity_inputs() -> tuple[tuple[str, str], ...]:
+    """Expose every source-program intent oracle to the pcc1 parity gate.
+
+    Prefixes preserve the originating contract, so equal short ids in two
+    registries cannot silently collapse.  GC programs run here in the default
+    backend; their five-backend equality remains a separate final gate.
+    """
+
+    inputs: list[tuple[str, str]] = []
+    groups = (
+        ("semantics", intent_constraints.SEMANTICS_CASES),
+        ("error", intent_constraints.ERROR_MODEL_CASES),
+        ("stdlib", intent_constraints.STDLIB_CASES),
+        ("identity", intent_constraints.IDENTITY_CASES),
+        ("bignum", intent_constraints.INT_BIGNUM_CASES),
+        ("gc_default", intent_constraints.GC_PROGRAMS),
+    )
+    for prefix, cases in groups:
+        for name, source in cases:
+            inputs.append((f"{prefix}__{name}", source))
+    for name, source, _expected in intent_constraints.VALUECLASS_CASES:
+        inputs.append((f"valueclass__{name}", source))
+    for seed in intent_constraints.METAMORPHIC_SEEDS:
+        inputs.append(
+            (f"metamorphic_int__{seed}", intent_constraints._gen_program(seed))
+        )
+    for seed in intent_constraints.STR_LIST_SEEDS:
+        inputs.append(
+            (
+                f"metamorphic_str_list__{seed}",
+                intent_constraints._gen_str_list_program(seed),
+            )
+        )
+    inputs.extend(
+        (
+            (
+                "valueclass__method_field_access",
+                intent_constraints.VALUECLASS_GAP_SRC,
+            ),
+            (
+                "valueclass__genexpr_field_access",
+                intent_constraints.VALUECLASS_GENEXPR_GAP_SRC,
+            ),
+        )
+    )
+    return tuple(inputs)
+
+
+INTENT_PARITY_MANIFEST_PATH = (
+    REPO_ROOT / "tests" / "host_pcc_pcc1_intent_parity_manifest.json"
+)
+INTENT_PARITY_INPUTS = _intent_parity_inputs()
+INTENT_PARITY_APPLICABILITY = load_applicability_manifest(
+    INTENT_PARITY_MANIFEST_PATH,
+    INTENT_PARITY_INPUTS,
+    registry_id="tests.python.test_intent_constraints.HOST_PCC_PROGRAMS",
+)
+APPLICABLE_INTENT_PARITY_CASES = INTENT_PARITY_APPLICABILITY.applicable
+
 FIXPOINT_SMOKE_CASES = frozenset(
     {
         "ternary_inline",
@@ -4203,6 +4299,14 @@ def _self_host_artifact_lock(path: Path):
         stream.close()
 
 
+def _selected_pcc1_receipt_path(pcc1: Path) -> Path:
+    if os.environ.get("PCC1_BINARY"):
+        return Path(
+            os.environ.get("PCC1_RECEIPT", str(pcc1_receipt_path(pcc1)))
+        ).resolve()
+    return pcc1_receipt_path(pcc1)
+
+
 @pytest.fixture(scope="session")
 def pcc1_self_host_binary(tmp_path_factory, worker_id):
     if not _supported_self_host():
@@ -4211,12 +4315,35 @@ def pcc1_self_host_binary(tmp_path_factory, worker_id):
     if explicit_pcc1:
         pcc1 = Path(explicit_pcc1).resolve()
         assert pcc1.is_file(), f"PCC1_BINARY does not exist: {pcc1}"
+        receipt = _selected_pcc1_receipt_path(pcc1)
+        try:
+            verify_pcc1_receipt(
+                pcc1,
+                receipt,
+                source_key=self_host_source_key(),
+                object_cache_identity=self_backend_object_cache_key(),
+            )
+        except ParityContractError as exc:
+            pytest.fail(f"PCC1_BINARY is not receipt-verified: {exc}")
         return pcc1
     out_dir = _shared_self_host_oracle_dir(tmp_path_factory, worker_id)
     pcc1 = out_dir / "pcc1"
+    receipt = pcc1_receipt_path(pcc1)
+    source_key = self_host_source_key()
+    object_cache_identity = self_backend_object_cache_key()
     with _self_host_artifact_lock(out_dir / "pcc1.lock"):
         if pcc1.is_file():
-            return pcc1
+            try:
+                verify_pcc1_receipt(
+                    pcc1,
+                    receipt,
+                    source_key=source_key,
+                    object_cache_identity=object_cache_identity,
+                )
+            except ParityContractError:
+                pass
+            else:
+                return pcc1
         temporary = out_dir / f".pcc1.{os.getpid()}.tmp"
         try:
             result = subprocess.run(
@@ -4228,6 +4355,8 @@ def pcc1_self_host_binary(tmp_path_factory, worker_id):
                     "off",
                     "--backend",
                     "self",
+                    "--ir-scaffold",
+                    "on",
                     "pcc/__main__.py",
                     "-o",
                     str(temporary),
@@ -4244,9 +4373,21 @@ def pcc1_self_host_binary(tmp_path_factory, worker_id):
                 f"stderr:\n{result.stderr}"
             )
             os.replace(temporary, pcc1)
+            write_pcc1_receipt(
+                pcc1,
+                receipt,
+                source_key=source_key,
+                object_cache_identity=object_cache_identity,
+            )
         finally:
             if temporary.exists():
                 temporary.unlink()
+    verify_pcc1_receipt(
+        pcc1,
+        receipt,
+        source_key=source_key,
+        object_cache_identity=object_cache_identity,
+    )
     return pcc1
 
 
@@ -4407,6 +4548,168 @@ def _compile_and_run(
     )
 
 
+def _subprocess_text(value: str | bytes | None) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
+def _parity_subprocess_record(
+    command: list[str],
+    *,
+    timeout: int,
+) -> dict[str, object]:
+    try:
+        result = subprocess.run(
+            command,
+            cwd=str(REPO_ROOT),
+            env=_child_env(),
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        return {
+            "command": command,
+            "returncode": None,
+            "stdout": _subprocess_text(exc.stdout),
+            "stderr": _subprocess_text(exc.stderr),
+            "timed_out": True,
+            "timeout_seconds": timeout,
+        }
+    return {
+        "command": command,
+        "returncode": result.returncode,
+        "stdout": result.stdout,
+        "stderr": result.stderr,
+        "timed_out": False,
+        "timeout_seconds": timeout,
+    }
+
+
+def _compile_and_run_parity_observation(
+    compiler: list[str],
+    src: Path,
+    out: Path,
+) -> dict[str, object]:
+    compile_command = compiler + [
+        "--python-libpython",
+        "off",
+        "--backend",
+        "self",
+        "--ir-scaffold",
+        "on",
+        str(src),
+        "-o",
+        str(out),
+    ]
+    compile_record = _parity_subprocess_record(compile_command, timeout=90)
+    observation: dict[str, object] = {
+        "compile": compile_record,
+        "run": None,
+    }
+    if compile_record["timed_out"] or compile_record["returncode"] != 0:
+        return observation
+    observation["run"] = _parity_subprocess_record([str(out)], timeout=20)
+    return observation
+
+
+def _parity_problem(
+    host: dict[str, object],
+    pcc1: dict[str, object] | None,
+) -> str | None:
+    host_compile = host["compile"]
+    assert isinstance(host_compile, dict)
+    if host_compile["timed_out"]:
+        return "host pcc compile timed out"
+    if host_compile["returncode"] != 0:
+        return "host pcc compile failed"
+    host_run = host["run"]
+    if not isinstance(host_run, dict):
+        return "host pcc compile succeeded without a runtime observation"
+    if host_run["timed_out"]:
+        return "host-pcc artifact timed out"
+    if pcc1 is None:
+        return "pcc1 observation was not produced after host pcc succeeded"
+    pcc1_compile = pcc1["compile"]
+    assert isinstance(pcc1_compile, dict)
+    if pcc1_compile["timed_out"]:
+        return "pcc1 compile timed out"
+    if pcc1_compile["returncode"] != 0:
+        return "pcc1 compile failed"
+    pcc1_run = pcc1["run"]
+    if not isinstance(pcc1_run, dict):
+        return "pcc1 compile succeeded without a runtime observation"
+    if pcc1_run["timed_out"]:
+        return "pcc1 artifact timed out"
+    for field in ("returncode", "stdout", "stderr"):
+        if pcc1_run[field] != host_run[field]:
+            return f"pcc1 runtime {field} differs from host pcc"
+    return None
+
+
+def _fail_host_pcc_pcc1_parity(
+    *,
+    request,
+    name: str,
+    src: Path,
+    pcc1_binary: Path,
+    host: dict[str, object],
+    pcc1: dict[str, object] | None,
+    problem: str,
+    manifest_path: Path,
+    candidate_names_digest: str,
+    oracle: dict[str, object] | None = None,
+) -> None:
+    source_key = self_host_source_key()
+    receipt = verify_pcc1_receipt(
+        pcc1_binary,
+        _selected_pcc1_receipt_path(pcc1_binary),
+        source_key=source_key,
+        object_cache_identity=self_backend_object_cache_key(),
+    )
+    report = write_parity_failure_report(
+        source_key=source_key,
+        case_name=name,
+        payload={
+            "problem": problem,
+            "pytest_nodeid": request.node.nodeid,
+            "stages": ["host-pcc-to-program", "pcc1-to-program"],
+            "mode": {
+                "backend": "self",
+                "ir_scaffold": "on",
+                "python_libpython": "off",
+            },
+            "manifest": str(manifest_path),
+            "candidate_names_sha256": candidate_names_digest,
+            "source_sha256": hashlib.sha256(src.read_bytes()).hexdigest(),
+            "pcc1_binary": str(pcc1_binary),
+            "pcc1_receipt": receipt,
+            "oracle": oracle,
+            "host_pcc": host,
+            "pcc1": pcc1,
+        },
+    )
+    pytest.fail(f"{problem}; durable failure report: {report}", pytrace=False)
+
+
+def _corpus_oracle_problem(
+    host: dict[str, object],
+    case: PythonCorpusCase,
+) -> str | None:
+    run = host["run"]
+    if not isinstance(run, dict):
+        return "host pcc produced no corpus runtime observation"
+    if run["returncode"] != case.expected_status:
+        return "host pcc runtime status differs from checked-in corpus oracle"
+    stdout = run["stdout"]
+    if not isinstance(stdout, str) or stdout.encode("utf-8") != case.expected_stdout:
+        return "host pcc stdout differs from checked-in corpus oracle"
+    return None
+
+
 def _run_python(src: Path) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         [sys.executable, str(src)],
@@ -4461,6 +4764,164 @@ def _compile_and_run_artifact_no_host(
         text=True,
         timeout=20,
     )
+
+
+def _duplicate_definition_symbols(ir_text: str) -> list[str]:
+    symbols: list[str] = []
+    for match in re.finditer(
+        r'^define\b[^\n]*@(?:"([^"]+)"|([^\s(]+))',
+        ir_text,
+        flags=re.MULTILINE,
+    ):
+        symbol = match.group(1) or match.group(2)
+        if re.search(r"_choose\.definition\.\d+$", symbol):
+            symbols.append(symbol)
+    return symbols
+
+
+_DUPLICATE_DEFINITION_SOURCE = """\
+def choose(value: int = 1) -> int:
+    return value
+
+saved = choose
+print(saved())
+
+def choose(value: int = 2) -> int:
+    return value + 10
+
+print(saved(), choose())
+"""
+
+
+def test_pcc1_duplicate_definition_ir_matches_host_shape(
+    pcc1_self_host_binary,
+    tmp_path,
+):
+    """Host/pcc1 keep two bodies and pcc1 executes both live bindings."""
+
+    from llvmlite import binding as llvm
+
+    src = tmp_path / "duplicate_definition_shape.py"
+    src.write_text(
+        _DUPLICATE_DEFINITION_SOURCE,
+        encoding="utf-8",
+    )
+    host_ir = tmp_path / "duplicate_definition.host.ll"
+    pcc1_ir = tmp_path / "duplicate_definition.pcc1.ll"
+    common = [
+        "--python-libpython",
+        "off",
+        "--backend",
+        "self",
+        "--emit-llvm",
+    ]
+    for compiler, output in (
+        ([sys.executable, "-m", "pcc"], host_ir),
+        ([str(pcc1_self_host_binary)], pcc1_ir),
+    ):
+        result = subprocess.run(
+            compiler + common + [str(output), str(src)],
+            cwd=str(REPO_ROOT),
+            env=_child_env(),
+            capture_output=True,
+            text=True,
+            timeout=90,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+
+    host_text = host_ir.read_text(encoding="utf-8")
+    pcc1_text = pcc1_ir.read_text(encoding="utf-8")
+    llvm.parse_assembly(host_text).verify()
+    llvm.parse_assembly(pcc1_text).verify()
+    expected = [
+        "user_duplicate_definition_shape_choose.definition.0",
+        "user_duplicate_definition_shape_choose.definition.1",
+    ]
+    assert _duplicate_definition_symbols(host_text) == expected
+    assert _duplicate_definition_symbols(pcc1_text) == expected
+
+    cpython = _run_python(src)
+    pcc1 = _compile_and_run_artifact_no_host(
+        [str(pcc1_self_host_binary)],
+        src,
+        tmp_path / "duplicate_definition.pcc1.out",
+    )
+    assert cpython.returncode == 0
+    assert pcc1.returncode == cpython.returncode
+    assert cpython.stdout == "1\n1 12\n"
+    assert pcc1.stdout == cpython.stdout
+    assert pcc1.stderr == cpython.stderr
+
+
+def test_pcc1_runtime_rebuild_uses_repo_python_and_surfaces_make_error(
+    pcc1_self_host_binary,
+    tmp_path,
+):
+    """A pcc1 app build never hides the causal runtime-build diagnostic.
+
+    The synthetic runtime target deliberately imports llvmlite and then fails
+    with a stable marker.  PATH begins with an executable python3 that cannot
+    do that import; reaching the stable marker therefore proves pcc1 passed the
+    repository .venv interpreter to Make.  The deliberate failure must stop at
+    the runtime boundary rather than continuing to an unrelated undefined-
+    symbol link error.
+    """
+
+    runtime_dir = tmp_path / "runtime"
+    runtime_dir.mkdir()
+    causal_marker = "PCC_BLESSED_HOST_RUNTIME_FAILURE"
+    (runtime_dir / "Makefile").write_text(
+        "libpy_runtime_pcc_py.a:\n"
+        "\t@$(PYTHON) -c \"import llvmlite; "
+        f"raise SystemExit('{causal_marker}')\"\n",
+        encoding="utf-8",
+    )
+    bad_bin = tmp_path / "unblessed-bin"
+    bad_bin.mkdir()
+    bad_python = bad_bin / "python3"
+    bad_python.write_text(
+        "#!/bin/sh\n"
+        "echo PCC_UNBLESSED_PATH_PYTHON_USED >&2\n"
+        "exit 97\n",
+        encoding="utf-8",
+    )
+    bad_python.chmod(0o755)
+    source = tmp_path / "app.py"
+    source.write_text("print(42)\n", encoding="utf-8")
+    output = tmp_path / "app"
+
+    run_env = _child_env()
+    run_env.pop("PCC_HOST_PYTHON", None)
+    run_env.pop("PCC_RUNTIME_ARCHIVE", None)
+    run_env["PATH"] = str(bad_bin) + os.pathsep + run_env.get("PATH", "")
+    run_env["PCC_SOURCE_ROOT"] = str(REPO_ROOT)
+    run_env["PCC_REPO_ROOT"] = str(REPO_ROOT)
+    run_env["PCC_RUNTIME_DIR"] = str(runtime_dir)
+    run_env["PCC_RUNTIME_CC"] = "pcc"
+    run_env["PCC_RUNTIME_HIGH"] = "py"
+    result = subprocess.run(
+        [
+            str(pcc1_self_host_binary),
+            "--python-libpython",
+            "off",
+            "--backend",
+            "self",
+            str(source),
+            "-o",
+            str(output),
+        ],
+        cwd=str(REPO_ROOT),
+        env=run_env,
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+    diagnostic = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert causal_marker in diagnostic
+    assert "PCC_UNBLESSED_PATH_PYTHON_USED" not in diagnostic
+    assert "failed to build required Python runtime archive" in diagnostic
+    assert "undefined symbol" not in diagnostic.lower()
 
 
 def test_pcc2_hoists_nested_closure_across_try_handler(
@@ -4547,30 +5008,165 @@ def test_pcc1_bare_reraise_preserves_active_exception(
     assert pcc1.stderr == cpython.stderr
 
 
-@pytest.mark.parametrize("name, source", CASES)
+@pytest.mark.parametrize(
+    "name, source",
+    APPLICABLE_PARITY_CASES,
+    ids=[name for name, _source in APPLICABLE_PARITY_CASES],
+)
 def test_pcc1_matches_stage0_for_python_idioms(
     pcc1_self_host_binary,
     tmp_path,
+    request,
     name,
     source,
 ):
     src = tmp_path / f"{name}.py"
     src.write_text(textwrap.dedent(source).lstrip(), encoding="utf-8")
 
-    stage0 = _compile_and_run(
+    stage0 = _compile_and_run_parity_observation(
         [sys.executable, "-m", "pcc"],
         src,
         tmp_path / f"{name}.stage0.out",
     )
-    pcc1 = _compile_and_run(
-        [str(pcc1_self_host_binary)],
-        src,
-        tmp_path / f"{name}.pcc1.out",
+    stage0_compile = stage0["compile"]
+    assert isinstance(stage0_compile, dict)
+    stage0_run = stage0["run"]
+    pcc1 = None
+    if (
+        not stage0_compile["timed_out"]
+        and stage0_compile["returncode"] == 0
+        and isinstance(stage0_run, dict)
+        and not stage0_run["timed_out"]
+    ):
+        pcc1 = _compile_and_run_parity_observation(
+            [str(pcc1_self_host_binary)],
+            src,
+            tmp_path / f"{name}.pcc1.out",
+        )
+    problem = _parity_problem(stage0, pcc1)
+    if problem is None:
+        return
+
+    _fail_host_pcc_pcc1_parity(
+        request=request,
+        name=name,
+        src=src,
+        pcc1_binary=pcc1_self_host_binary,
+        host=stage0,
+        pcc1=pcc1,
+        problem=problem,
+        manifest_path=PARITY_MANIFEST_PATH,
+        candidate_names_digest=PARITY_APPLICABILITY.candidate_names_sha256,
     )
 
-    assert pcc1.returncode == stage0.returncode
-    assert pcc1.stdout == stage0.stdout
-    assert pcc1.stderr == stage0.stderr
+
+@pytest.mark.parametrize(
+    "name, source",
+    APPLICABLE_CORPUS_PARITY_CASES,
+    ids=[name.replace("__", "/") for name, _source in APPLICABLE_CORPUS_PARITY_CASES],
+)
+def test_pcc1_matches_host_pcc_for_checked_python_corpus(
+    pcc1_self_host_binary,
+    tmp_path,
+    request,
+    name,
+    source,
+):
+    case = CORPUS_CASE_BY_NAME[name]
+    src = tmp_path / f"{name}.py"
+    src.write_text(source, encoding="utf-8")
+    host = _compile_and_run_parity_observation(
+        [sys.executable, "-m", "pcc"],
+        src,
+        tmp_path / f"{name}.host.out",
+    )
+    host_compile = host["compile"]
+    host_run = host["run"]
+    assert isinstance(host_compile, dict)
+    pcc1 = None
+    if (
+        not host_compile["timed_out"]
+        and host_compile["returncode"] == 0
+        and isinstance(host_run, dict)
+        and not host_run["timed_out"]
+    ):
+        pcc1 = _compile_and_run_parity_observation(
+            [str(pcc1_self_host_binary)],
+            src,
+            tmp_path / f"{name}.pcc1.out",
+        )
+    problem = _parity_problem(host, pcc1)
+    if problem is None:
+        problem = _corpus_oracle_problem(host, case)
+    if problem is None:
+        return
+    _fail_host_pcc_pcc1_parity(
+        request=request,
+        name=name,
+        src=src,
+        pcc1_binary=pcc1_self_host_binary,
+        host=host,
+        pcc1=pcc1,
+        problem=problem,
+        manifest_path=CORPUS_PARITY_MANIFEST_PATH,
+        candidate_names_digest=CORPUS_PARITY_APPLICABILITY.candidate_names_sha256,
+        oracle={
+            "expected_status": case.expected_status,
+            "expected_stdout_sha256": hashlib.sha256(
+                case.expected_stdout
+            ).hexdigest(),
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "name, source",
+    APPLICABLE_INTENT_PARITY_CASES,
+    ids=[name.replace("__", "/") for name, _source in APPLICABLE_INTENT_PARITY_CASES],
+)
+def test_pcc1_matches_host_pcc_for_intent_programs(
+    pcc1_self_host_binary,
+    tmp_path,
+    request,
+    name,
+    source,
+):
+    src = tmp_path / f"{name}.py"
+    src.write_text(source, encoding="utf-8")
+    host = _compile_and_run_parity_observation(
+        [sys.executable, "-m", "pcc"],
+        src,
+        tmp_path / f"{name}.host.out",
+    )
+    host_compile = host["compile"]
+    host_run = host["run"]
+    assert isinstance(host_compile, dict)
+    pcc1 = None
+    if (
+        not host_compile["timed_out"]
+        and host_compile["returncode"] == 0
+        and isinstance(host_run, dict)
+        and not host_run["timed_out"]
+    ):
+        pcc1 = _compile_and_run_parity_observation(
+            [str(pcc1_self_host_binary)],
+            src,
+            tmp_path / f"{name}.pcc1.out",
+        )
+    problem = _parity_problem(host, pcc1)
+    if problem is None:
+        return
+    _fail_host_pcc_pcc1_parity(
+        request=request,
+        name=name,
+        src=src,
+        pcc1_binary=pcc1_self_host_binary,
+        host=host,
+        pcc1=pcc1,
+        problem=problem,
+        manifest_path=INTENT_PARITY_MANIFEST_PATH,
+        candidate_names_digest=INTENT_PARITY_APPLICABILITY.candidate_names_sha256,
+    )
 
 
 @pytest.mark.parametrize(

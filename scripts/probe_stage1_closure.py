@@ -72,7 +72,13 @@ def _count_py_cpy_calls(ir_text: str) -> int:
 
 def _try_full_multi_compile(srcs: list[str], mods: list[str]) -> tuple[bool, str, str]:
     """Try the actual compile_python_multi over the closure with
-    libpython=auto. Return (ok, ir_text_or_empty, error)."""
+    strict no-libpython ownership. Return (ok, ir_text_or_empty, error).
+
+    The closure ratchet is the pcc1 ownership gate.  Running it in ``auto``
+    mode measures optional CPython callable wrappers rather than the shipped
+    self/no-libpython compiler and can report fallback growth even when the
+    strict production closure remains exactly zero.
+    """
     from pcc.py_frontend.pipeline import compile_python_multi
     out_path = "/tmp/stage1_closure_probe.ll"
     try:
@@ -83,7 +89,7 @@ def _try_full_multi_compile(srcs: list[str], mods: list[str]) -> tuple[bool, str
             emit_llvm_only=True,
             entry_module=mods[0],
             module_names=mods,
-            libpython_mode="auto",
+            libpython_mode="off",
             backend="llvm",
         )
         if os.path.exists(out_path):

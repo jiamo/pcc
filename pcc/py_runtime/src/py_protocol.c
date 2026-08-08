@@ -1,4 +1,6 @@
-/* User protocol dunder dispatch.
+/* Host-C oracle for py/py_protocol_runtime.py.
+ *
+ * User protocol dunder dispatch.
  *
  * This file centralizes dynamic data-model lookups for protocols that are
  * implemented by generic object operations:
@@ -16,15 +18,7 @@
 #include <string.h>
 
 static int ptr_can_have_header(void *ptr) {
-    uintptr_t bits = (uintptr_t)ptr;
-    if (ptr == NULL) return 0;
-    if ((bits & 1u) != 0u) return 0;
-    if (bits < 0x1000u) return 0;
-    if ((bits & 0x7u) != 0u) return 0;
-#if UINTPTR_MAX > 0xffffffffu
-    if ((bits >> 48) != 0u) return 0;
-#endif
-    return 1;
+    return pcc_gc_pointer_is_managed((PyObject *)ptr) != 0;
 }
 
 /* Forward declarations for the dict-subclass fallback (defined at the end of
@@ -37,7 +31,12 @@ PyObject *py_dict_subclass_getitem(PyObject *o, PyObject *key);
 static int is_user_instance(PyObject *o) {
     if (o == NULL || PY_IS_TAGGED_INT(o)) return 0;
     int32_t tag = py_type_of(o);
-    return tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER;
+    /* C-extension tags share the high numeric range with pcc user classes,
+     * but their instance layout is PyObject-compatible rather than
+     * PyInstanceObject-compatible.  Treating one as a user instance makes
+     * lookup_dunder read an arbitrary word as ``inst->cls``. */
+    if (pcc_capi_is_cext_type_tag((int64_t)tag) != 0) return 0;
+    return tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER_CLASS_START;
 }
 
 static PyObject *lookup_dunder(PyObject *o, const char *name) {
@@ -47,19 +46,47 @@ static PyObject *lookup_dunder(PyObject *o, const char *name) {
     return py_class_lookup(inst->cls, name);
 }
 
+static PyObject *protocol_require_result(
+    PyObject *result,
+    const char *helper_name,
+    const char *message
+) {
+    if (result == NULL) {
+        py_runtime_error_if_unset(helper_name, message);
+    }
+    return result;
+}
+
 static PyObject *call_unary(PyObject *method, PyObject *self) {
+    /* ``method == NULL`` is the lookup sentinel owned by the caller.  Every
+     * NULL after a method has been selected is an error result. */
     if (method == NULL) return NULL;
     if (ptr_can_have_header(method) && !PY_IS_TAGGED_INT(method)
         && py_type_of(method) == PY_TYPE_FUNC) {
         PyObject *args = py_tuple_new(1);
-        if (args == NULL) return NULL;
+        if (args == NULL) {
+            return protocol_require_result(
+                NULL,
+                "py_tuple_new",
+                "user protocol argument tuple allocation failed"
+            );
+        }
         py_tuple_set_item(args, 0, self);
         PyObject *out = py_func_call(method, args);
+        protocol_require_result(
+            out,
+            "user protocol call",
+            "user protocol callback returned NULL without an exception"
+        );
         py_decref(args);
         return out;
     }
     typedef PyObject *(*Unary)(PyObject *);
-    return ((Unary)(uintptr_t)method)(self);
+    return protocol_require_result(
+        ((Unary)(uintptr_t)method)(self),
+        "user protocol call",
+        "user protocol callback returned NULL without an exception"
+    );
 }
 
 static PyObject *call_binary(PyObject *method, PyObject *self, PyObject *arg) {
@@ -67,15 +94,30 @@ static PyObject *call_binary(PyObject *method, PyObject *self, PyObject *arg) {
     if (ptr_can_have_header(method) && !PY_IS_TAGGED_INT(method)
         && py_type_of(method) == PY_TYPE_FUNC) {
         PyObject *args = py_tuple_new(2);
-        if (args == NULL) return NULL;
+        if (args == NULL) {
+            return protocol_require_result(
+                NULL,
+                "py_tuple_new",
+                "user protocol argument tuple allocation failed"
+            );
+        }
         py_tuple_set_item(args, 0, self);
         py_tuple_set_item(args, 1, arg);
         PyObject *out = py_func_call(method, args);
+        protocol_require_result(
+            out,
+            "user protocol call",
+            "user protocol callback returned NULL without an exception"
+        );
         py_decref(args);
         return out;
     }
     typedef PyObject *(*Binary)(PyObject *, PyObject *);
-    return ((Binary)(uintptr_t)method)(self, arg);
+    return protocol_require_result(
+        ((Binary)(uintptr_t)method)(self, arg),
+        "user protocol call",
+        "user protocol callback returned NULL without an exception"
+    );
 }
 
 static PyObject *call_ternary(PyObject *method, PyObject *self,
@@ -84,16 +126,31 @@ static PyObject *call_ternary(PyObject *method, PyObject *self,
     if (ptr_can_have_header(method) && !PY_IS_TAGGED_INT(method)
         && py_type_of(method) == PY_TYPE_FUNC) {
         PyObject *args = py_tuple_new(3);
-        if (args == NULL) return NULL;
+        if (args == NULL) {
+            return protocol_require_result(
+                NULL,
+                "py_tuple_new",
+                "user protocol argument tuple allocation failed"
+            );
+        }
         py_tuple_set_item(args, 0, self);
         py_tuple_set_item(args, 1, a);
         py_tuple_set_item(args, 2, b);
         PyObject *out = py_func_call(method, args);
+        protocol_require_result(
+            out,
+            "user protocol call",
+            "user protocol callback returned NULL without an exception"
+        );
         py_decref(args);
         return out;
     }
     typedef PyObject *(*Ternary)(PyObject *, PyObject *, PyObject *);
-    return ((Ternary)(uintptr_t)method)(self, a, b);
+    return protocol_require_result(
+        ((Ternary)(uintptr_t)method)(self, a, b),
+        "user protocol call",
+        "user protocol callback returned NULL without an exception"
+    );
 }
 
 int64_t py_user_len_dispatch(PyObject *o, int64_t *handled) {
@@ -315,8 +372,8 @@ PyObject *py_obj_floordiv(PyObject *a, PyObject *b) {
         }
         return py_float_from_f64(floor(py_float_to_f64(a) / bd));
     }
-    if (at == PY_TYPE_INSTANCE || at >= PY_TYPE_USER
-        || bt == PY_TYPE_INSTANCE || bt >= PY_TYPE_USER) {
+    if (at == PY_TYPE_INSTANCE || at >= PY_TYPE_USER_CLASS_START
+        || bt == PY_TYPE_INSTANCE || bt >= PY_TYPE_USER_CLASS_START) {
         return py_user_binop_dispatch(
             a, b, "__floordiv__", "__rfloordiv__",
             "unsupported operand type(s) for //");
@@ -336,7 +393,12 @@ PyObject *py_obj_inplace_op(PyObject *a, PyObject *b, int64_t op_code) {
     };
     if (a != NULL && !PY_IS_TAGGED_INT(a) && op_code >= 0 && op_code < 6) {
         int32_t at = py_type_of(a);
-        if (at == PY_TYPE_INSTANCE || at >= PY_TYPE_USER) {
+        if (pcc_capi_is_cext_type_tag((int64_t)at) != 0) {
+            PyObject *result = pcc_capi_cext_inplace_number(a, b, op_code);
+            if (result == NULL) return NULL;
+            if (result != py_NotImplemented) return result;
+            py_decref(result);
+        } else if (is_user_instance(a)) {
             PyObject *method = lookup_dunder(a, inames[op_code]);
             if (method != NULL) {
                 PyObject *result = call_binary(method, a, b);

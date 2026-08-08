@@ -203,3 +203,21 @@ def test_simple_method_off_routes_dyn_dispatch(method, arg_count, _ret):
         "dynamically (either py_cpy_* fallback or py_obj_* "
         f"native dyn dispatch); got:\n" + body
     )
+
+
+def test_extract_value_boxes_native_integer_index_for_python_callee():
+    ir_text = _compile_to_ll(
+        "def extract_lane(builder, aggregate):\n"
+        "    return builder.extract_value(aggregate, 0)\n",
+        "sm_extract_value_native_index",
+        mode="on",
+    )
+    body = _function_body(ir_text, "extract_lane")
+
+    assert body is not None, ir_text
+    assert re.search(r"@py_int_from_i64\(i64 0\)", body), body
+    assert re.search(
+        r"@user_pcc_llvm_capi_ir_IRBuilder_extract_value\("
+        rf"{_PTR} [^,]+, {_PTR} [^,]+, {_PTR} [^,]+, {_PTR} [^)]+\)",
+        body,
+    ), body

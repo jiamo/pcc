@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import os
+
 from pcc.llvm_capi.compat import ir
 
-from ..py_ast import Stmt
+from ..py_ast import Call, ExprStmt, Name, Stmt
+from .runtime_abi import declare_runtime_global
 
 _I8 = ir.IntType(8)
 _I32 = ir.IntType(32)
@@ -14,7 +17,37 @@ _CSTR = _I8.as_pointer()
 
 class ModuleLifecycleLoweringMixin:
     def _emit_module_docstring_binding(self) -> None:
-        """Publish the module's implicit ``__doc__`` attribute."""
+        """Publish the module's finite import identity and ``__doc__``."""
+        source_filename = getattr(self, "_module_source_path", "") or ""
+        if source_filename:
+            source_filename = os.path.abspath(source_filename)
+        else:
+            for stmt in self.ast_module.body:
+                span = getattr(stmt, "span", None)
+                filename = getattr(span, "file", "")
+                if filename and not filename.startswith("<"):
+                    source_filename = os.path.abspath(filename)
+                    break
+        if source_filename == "":
+            source_filename = (self.ast_module.name or "pcc_py_module") + ".py"
+        storage_module_name = self.ast_module.name or "__main__"
+        module_name = storage_module_name if self._skip_program_main else "__main__"
+        if module_name == "__main__":
+            package_name = ""
+        elif os.path.basename(source_filename) == "__init__.py":
+            package_name = module_name
+        elif "." in module_name:
+            package_name = module_name.rsplit(".", 1)[0]
+        else:
+            package_name = ""
+        for attr_name, text in (
+            ("__name__", module_name),
+            ("__package__", package_name),
+            ("__file__", source_filename),
+        ):
+            value = self._emit_str_literal(text)
+            self._publish_module_scope_import_binding(attr_name, value)
+            self._gc_release(value)
         docstring = self.ast_module.docstring
         if docstring is None:
             value = self._emit_none_literal()
@@ -95,7 +128,7 @@ class ModuleLifecycleLoweringMixin:
                 gv,
                 name=self._fresh("mod.fini.value"),
             )
-            self.builder.call(self.runtime["pcc_gc_unpin"], [value])
+            self._gc_unpin(value)
             self.builder.call(
                 self.runtime["pcc_gc_store_root"],
                 [
@@ -110,7 +143,7 @@ class ModuleLifecycleLoweringMixin:
                 gv,
                 name=self._fresh("mod.attr.fini.value"),
             )
-            self.builder.call(self.runtime["pcc_gc_unpin"], [value])
+            self._gc_unpin(value)
             self.builder.call(
                 self.runtime["pcc_gc_store_root"],
                 [
@@ -203,6 +236,84 @@ class ModuleLifecycleLoweringMixin:
         setattr(self, "_exact_int_env_flags", saved_exact_int_flags)
         setattr(self, "loop_stack", saved_loops)
 
+
+    def _is_user_main_call_stmt(self, stmt) -> bool:
+        """Zero-arg module-level ``main()`` expression statement (the
+        user's own trailing call).  The self-backend entry skips it and
+        instead calls the function directly at the end so its return
+        value can become the process exit code."""
+        if not isinstance(stmt, ExprStmt):
+            return False
+        expr = getattr(stmt, "expr", None)
+        if expr is None:
+            expr = getattr(stmt, "value", None)
+        if not isinstance(expr, Call):
+            return False
+        if getattr(expr, "args", ()) or getattr(expr, "kwargs", ()):
+            return False
+        func = getattr(expr, "func", None)
+        return isinstance(func, Name) and getattr(func, "ident", None) == "main"
+
+    def _emit_trailing_main_exit_code(self, stmt) -> ir.Value:
+        """Invoke the user's trailing module-level ``main()`` and turn
+        its return value into the process exit code (self-backend pcc
+        convention): ``None`` -> 0, int -> the value. Falls back to
+        plain statement emission (exit 0) when a zero-arg direct call
+        cannot be formed."""
+        fn = self.functions.get("main")
+        if not isinstance(fn, ir.Function) or len(fn.args) != 0:
+            self._emit_stmts((stmt,))
+            return ir.Constant(_I32, 0)
+        ret_ty = fn.function_type.return_type
+        if isinstance(ret_ty, ir.VoidType):
+            self.builder.call(fn, [])
+            self._emit_post_call_err_check(stmt.span)
+            return ir.Constant(_I32, 0)
+        ret_val = self.builder.call(fn, [], name=self._fresh("user.main.ret"))
+        self._emit_post_call_err_check(stmt.span)
+        if isinstance(ret_ty, ir.IntType):
+            if ret_ty.width == 32:
+                return ret_val
+            if ret_ty.width > 32:
+                return self.builder.trunc(
+                    ret_val, _I32, name=self._fresh("user.main.exit")
+                )
+            return self.builder.zext(
+                ret_val, _I32, name=self._fresh("user.main.exit")
+            )
+        if not isinstance(ret_ty, ir.PointerType):
+            return ir.Constant(_I32, 0)
+        # Boxed object return: None -> 0, otherwise unbox as int.
+        none_gv = declare_runtime_global(self.module, "py_None")
+        none_val = self.builder.load(none_gv, name=self._fresh("user.main.none"))
+        is_none = self.builder.icmp_unsigned(
+            "==", ret_val, none_val, name=self._fresh("user.main.isnone")
+        )
+        code_slot = self.builder.alloca(_I32, name=self._fresh("user.main.code"))
+        self.builder.store(ir.Constant(_I32, 0), code_slot)
+        bb_unbox = self.current_function.append_basic_block("user.main.unbox")
+        bb_done = self.current_function.append_basic_block("user.main.done")
+        self.builder.cbranch(is_none, bb_done, bb_unbox)
+        self.builder.position_at_end(bb_unbox)
+        ov_slot = self.builder.alloca(_I32, name=self._fresh("user.main.ov"))
+        self.builder.store(ir.Constant(_I32, 0), ov_slot)
+        as_i64 = self.builder.call(
+            self.runtime["py_int_to_i64"],
+            [ret_val, ov_slot],
+            name=self._fresh("user.main.i64"),
+        )
+        self._emit_post_call_err_check(stmt.span)
+        as_i32 = self.builder.trunc(
+            as_i64, _I32, name=self._fresh("user.main.exit")
+        )
+        self.builder.store(as_i32, code_slot)
+        self.builder.branch(bb_done)
+        self.builder.position_at_end(bb_done)
+        self._gc_release(ret_val)
+        return self.builder.load(
+            code_slot, name=self._fresh("user.main.code.load")
+        )
+
     def _emit_program_main(self, body: list["Stmt"]) -> None:
         """Synthesize ``i32 @main(i32 argc, i8** argv)`` holding
         module-level statements.
@@ -216,7 +327,6 @@ class ModuleLifecycleLoweringMixin:
             # it alone. This is a pcc-py convention for hand-written
             # entry points.
             return
-
         fnty = ir.FunctionType(_I32, [_I32, _CSTR.as_pointer()])
         fn = ir.Function(self.module, fnty, name="main")
         entry = fn.append_basic_block("entry")
@@ -240,6 +350,12 @@ class ModuleLifecycleLoweringMixin:
             self.runtime["py_set_program_args"],
             [fn.args[0], fn.args[1]],
         )
+        if self.emit_cpy_main_exitcode:
+            # Establish CPython on the process main thread before any module
+            # statement can launch a worker whose first action enters the
+            # libpython bridge.  The per-function emission guard keeps later
+            # imports in this generated main from adding a duplicate call.
+            self._ensure_cpy_init()
 
         sibling_init_functions = []
         for sibling_mod in self._sibling_module_inits:
@@ -284,7 +400,15 @@ class ModuleLifecycleLoweringMixin:
         # state across cycles (parent setup; import child; child reads parent).
         self._emit_module_root_enters()
         self._emit_module_docstring_binding()
-        self._emit_stmts(tuple(body))
+        user_body = list(body)
+        trailing_main_stmt = None
+        if (
+            not self.emit_cpy_main_exitcode
+            and user_body
+            and self._is_user_main_call_stmt(user_body[-1])
+        ):
+            trailing_main_stmt = user_body.pop()
+        self._emit_stmts(tuple(user_body))
 
         if not self._builder_block_is_terminated():
             if self.emit_cpy_main_exitcode:
@@ -292,6 +416,10 @@ class ModuleLifecycleLoweringMixin:
                     self.runtime["py_cpy_main_exitcode"],
                     [],
                     name=self._fresh("cpy.exitcode"),
+                )
+            elif trailing_main_stmt is not None:
+                exit_code = self._emit_trailing_main_exit_code(
+                    trailing_main_stmt
                 )
             else:
                 exit_code = ir.Constant(_I32, 0)

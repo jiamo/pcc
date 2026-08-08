@@ -1,13 +1,15 @@
 """Real-transform tests for LoopSimplifyPass (subset)."""
 
-import shutil
+import pytest
 import unittest
 
 from pcc.ir_passes.loop_simplify import LoopSimplifyPass, loop_simplify_module
 from pcc.ir_passes.parity import assert_ir_parity
 
 
-_OPT = shutil.which("opt")
+from pcc.passes.llvm_text_pipeline import find_opt_binary
+
+_OPT = find_opt_binary()
 
 
 class LoopSimplifyTests(unittest.TestCase):
@@ -108,7 +110,7 @@ exit:
         self.assertIn("%i.ph = phi i32", out)
 
 
-@unittest.skipUnless(_OPT, "requires LLVM opt")
+@pytest.mark.pcc_gate(unavailable=None if _OPT else "matching LLVM opt not installed")
 class UpstreamParityTests(unittest.TestCase):
     def test_multiple_external_preds_matches_upstream(self):
         report = assert_ir_parity("""

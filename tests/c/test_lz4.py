@@ -11,7 +11,9 @@ from pcc.project import (
 from tests.parallel_jobs import translation_unit_jobs
 
 
-PROJECT_DIR = os.path.dirname(os.path.dirname(__file__))
+PROJECT_DIR = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
 PROJECTS_DIR = os.path.join(PROJECT_DIR, "projects")
 LZ4_LIB_DIR = os.path.join(PROJECTS_DIR, "lz4-1.10.0", "lib")
 LZ4_TEST_MAIN = os.path.join(PROJECTS_DIR, "test_lz4_main.c")

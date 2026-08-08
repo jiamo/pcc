@@ -110,10 +110,7 @@ class CpyImportStateMixin:
             [mod_val, attr_ptr],
             name=self._fresh(f"cpy.star.{name}"),
         )
-        if not hasattr(self, "_cpy_values"):
-            self._cpy_values = set()
-        self._cpy_values.add(val)
-        return val
+        return self._mark_owned_cpy_value(val)
 
     def _ensure_cpy_init(self) -> None:
         """Emit a one-time ``py_cpy_ensure_init()`` in the current

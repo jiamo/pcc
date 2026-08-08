@@ -146,6 +146,7 @@ class AnalysisManagerTests(unittest.TestCase):
 
 class _RecordingPass(ModulePass):
     name = "recording"
+    mutation_class = "none"
 
     def __init__(self, preserved: PreservedAnalyses) -> None:
         self.preserved = preserved
@@ -154,6 +155,26 @@ class _RecordingPass(ModulePass):
     def run(self, module, am):
         self.invocations += 1
         return self.preserved
+
+
+class _RequiredConstPass(ModulePass):
+    name = "required-const"
+    required_analyses = (_ConstResult.KEY,)
+    mutation_class = "none"
+
+    def __init__(self, preserved=None) -> None:
+        self.preserved = preserved or PreservedAnalyses.all()
+        self.values: list[int] = []
+
+    def run(self, module, am):
+        result = am.get(_ConstResult.KEY, module)
+        self.values.append(result.value)
+        return self.preserved
+
+
+class _UnknownRequiredConstPass(_RequiredConstPass):
+    name = "unknown-required-const"
+    mutation_class = "unknown"
 
 
 class IRPassManagerTests(unittest.TestCase):
@@ -209,6 +230,78 @@ class IRPassManagerTests(unittest.TestCase):
         am.get(_LoopyResult.KEY, module)
         self.assertEqual(counter["n"], 2)
 
+    def test_required_analysis_is_materialized_once_and_reported(self):
+        counter = {"n": 0}
+
+        def compute(_unit):
+            counter["n"] += 1
+            return _ConstResult(counter["n"])
+
+        am = AnalysisManager()
+        am.register(_ConstResult.KEY, compute)
+        first = _RequiredConstPass()
+        second = _RequiredConstPass()
+        IRPassManager().add(first).add(second).run(_parse(), am)
+        self.assertEqual(first.values, [1])
+        self.assertEqual(second.values, [1])
+        counters = am.telemetry()["module:const-analysis"]
+        self.assertEqual(counters["misses"], 1)
+        self.assertEqual(counters["recomputes"], 1)
+        self.assertGreaterEqual(counters["hits"], 3)
+
+    def test_explicit_invalidation_forces_recompute(self):
+        counter = {"n": 0}
+
+        def compute(_unit):
+            counter["n"] += 1
+            return _ConstResult(counter["n"])
+
+        am = AnalysisManager()
+        am.register(_ConstResult.KEY, compute)
+        invalidating = _RequiredConstPass(PreservedAnalyses.none())
+        invalidating.mutation_class = "instructions"
+        observer = _RequiredConstPass()
+        IRPassManager().add(invalidating).add(observer).run(_parse(), am)
+        self.assertEqual(invalidating.values, [1])
+        self.assertEqual(observer.values, [2])
+        self.assertEqual(
+            am.telemetry()["module:const-analysis"]["invalidations"],
+            1,
+        )
+
+    def test_unknown_mutation_invalidates_even_when_pass_reports_all(self):
+        counter = {"n": 0}
+
+        def compute(_unit):
+            counter["n"] += 1
+            return _ConstResult(counter["n"])
+
+        am = AnalysisManager()
+        am.register(_ConstResult.KEY, compute)
+        unknown = _UnknownRequiredConstPass()
+        observer = _RequiredConstPass()
+        IRPassManager().add(unknown).add(observer).run(_parse(), am)
+        self.assertEqual(unknown.values, [1])
+        self.assertEqual(observer.values, [2])
+
+    def test_deleted_unit_is_erased_before_identity_can_be_reused(self):
+        counter = {"n": 0}
+
+        def compute(_unit):
+            counter["n"] += 1
+            return _ConstResult(counter["n"])
+
+        am = AnalysisManager()
+        am.register(_ConstResult.KEY, compute)
+        module = _parse()
+        self.assertEqual(am.get(_ConstResult.KEY, module).value, 1)
+        am.erase_module_tree(module)
+        self.assertEqual(am.get(_ConstResult.KEY, module).value, 2)
+
+    def test_invalid_analysis_scope_is_rejected(self):
+        with self.assertRaises(ValueError):
+            AnalysisKey("bad", scope="backend-only")
+
 
 class _FnPass(FunctionPass):
     name = "fn-visitor"
@@ -218,6 +311,27 @@ class _FnPass(FunctionPass):
 
     def run(self, function, am):
         self.seen.append(function.name)
+        return PreservedAnalyses.all()
+
+
+class _FnResult(AnalysisResult):
+    KEY = AnalysisKey("function-probe", scope="function")
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+
+
+class _RequiredFnPass(FunctionPass):
+    name = "required-fn"
+    required_analyses = (_FnResult.KEY,)
+    mutation_class = "none"
+
+    def __init__(self) -> None:
+        self.seen: list[str] = []
+
+    def run(self, function, am):
+        result = am.get(_FnResult.KEY, function)
+        self.seen.append(result.name)
         return PreservedAnalyses.all()
 
 
@@ -233,6 +347,21 @@ class FunctionPassAdaptorTests(unittest.TestCase):
         pm = IRPassManager().add_function_pass(inner)
         pm.run(module)
         self.assertEqual(sorted(inner.seen), ["a", "b"])
+
+    def test_function_scoped_requirement_reuses_iterator_wrappers(self):
+        ir = """
+        define i32 @a(i32 %x) { ret i32 %x }
+        define i32 @b(i32 %x) { ret i32 %x }
+        """
+        am = AnalysisManager()
+        am.register(_FnResult.KEY, lambda fn: _FnResult(fn.name))
+        inner = _RequiredFnPass()
+        IRPassManager().add_function_pass(inner).run(_parse(ir), am)
+        self.assertEqual(sorted(inner.seen), ["a", "b"])
+        counters = am.telemetry()["function:function-probe"]
+        self.assertEqual(counters["misses"], 2)
+        self.assertEqual(counters["recomputes"], 2)
+        self.assertEqual(counters["hits"], 2)
 
 
 if __name__ == "__main__":  # pragma: no cover

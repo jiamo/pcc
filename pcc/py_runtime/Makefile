@@ -13,6 +13,8 @@
 #   make clean                    - remove all objects + archives
 #   make distclean                - clean + drop pcc-emitted trees too
 
+.DEFAULT_GOAL := all
+
 CC       ?= cc
 AR       ?= ar
 RANLIB   ?= ranlib
@@ -69,12 +71,16 @@ OBJDIR_LIBPY = build_libpython
 # Runtime modules that exist as Python ports under py/ and are used by
 # the libpy_runtime_pcc_py.a variant in place of the cc-built .o.
 # Keep in sync with the list of @c_abi_export-decorated modules in py/.
-PY_MODULES = py_tuple py_tuple_slice py_obj_stubs py_exc_tls py_exc_objects py_exc_match py_exc_table py_exc_traceback py_obj_gc py_gc_telemetry py_gc_backend py_set py_os_env py_os_path py_os_substrate py_process py_process_substrate py_print_sys py_print_fmt py_obj py_obj_dealloc py_dict py_list py_list_set_slice py_iter py_gen py_coroutine py_func py_re py_dunder py_weakref py_file py_threading py_class py_obj_ops_dispatch py_obj_ops_slice py_obj_ops_set_slice py_obj_ops_mod py_obj_ops_compare py_str py_str_accessors py_str_slice py_int_core py_int_decimal py_int_shift py_int_bitwise py_int_addsub py_int_mul py_int_bigint_pow py_int_ops py_int py_int_parse py_int_convert py_int_bigint_convert py_substrate
+PY_MODULES = py_tuple py_tuple_slice py_obj_stubs py_exc_tls py_exc_objects py_exc_match py_exc_table py_exc_traceback py_obj_gc py_gc_telemetry py_gc_backend py_set py_os_env py_os_system py_os_path py_os_substrate py_process py_process_substrate py_process_timeout py_print_sys py_print_fmt py_format_runtime py_obj py_obj_dealloc py_dict py_list py_list_set_slice py_iter py_gen py_coroutine py_context_runtime py_call_splat_runtime py_module_attrs_runtime py_compiled_module_runtime py_dlpack_runtime py_runtime_log py_json_runtime py_pickle_copy_runtime py_protocol_runtime py_extension_loader_runtime py_http_runtime py_asyncio_io_runtime py_re_engine_runtime freestanding_io_waitset py_func py_re py_dunder py_weakref py_file py_threading py_class py_obj_ops_dispatch py_obj_ops_slice py_obj_ops_set_slice py_obj_ops_mod py_obj_ops_compare py_str py_str_accessors py_str_slice py_int_core py_int_decimal py_int_shift py_int_bitwise py_int_addsub py_int_mul py_int_bigint_pow py_int_ops py_int py_int_parse py_int_convert py_int_bigint_convert py_substrate
+PY_MODULES += py_virtual_thread_runtime freestanding_runtime_debug py_capi_core_runtime py_capi_memory_runtime py_capi_stdio_runtime py_capi_numeric_runtime py_capi_collections_runtime py_capi_exc_runtime py_capi_dict_runtime py_capi_object_runtime py_capi_type_runtime py_capi_unicode_runtime py_capi_capsule_runtime py_capi_set_runtime py_capi_misc_runtime py_capi_cfunction_runtime py_capi_object_call_runtime py_capi_method_bridge_runtime py_capi_object_attr_runtime py_capi_number_runtime py_capi_sequence_runtime py_capi_mapping_runtime py_capi_import_runtime py_capi_unicode_search_runtime py_capi_unicode_writer_runtime py_capi_buffer_runtime py_capi_module_runtime py_capi_cext_runtime py_capi_module_state_runtime py_capi_private_runtime py_capi_slice_runtime py_capi_seqiter_runtime py_capi_contextvar_runtime py_capi_call_runtime py_capi_arg_runtime py_capi_str_conv_runtime py_capi_buildvalue_runtime py_capi_type_descriptor_runtime py_capi_visit_runtime
+ifeq ($(PCC_WITH_THREADS),1)
+PY_MODULES += freestanding_thread_kernel_pthread
+endif
 
 # C objects that are replaced indirectly by a Python port with a different
 # module name. py_obj_stubs.py owns the exported bytes helpers in the
 # pcc-Python runtime archive, so the C py_bytes.o must not remain there.
-PY_REPLACED_C_MODULES = $(PY_MODULES) py_bytes
+PY_REPLACED_C_MODULES = $(PY_MODULES) py_bytes py_call_splat py_compiled_module py_context py_module_attrs py_gc_index_table pcc_gc_external_resource py_os_native py_complex_pow py_float_fromhex py_json py_pickle_copy py_protocol py_extension_loader py_http py_asyncio_io py_io_waitset py_class_attrs py_format
 
 SRCS = \
 	$(SRCDIR)/py_obj.c \
@@ -124,7 +130,7 @@ SRCS = \
 		$(SRCDIR)/py_call_splat.c \
 		$(SRCDIR)/py_module_attrs.c \
 		$(SRCDIR)/py_compiled_module.c \
-		$(PY_CAPI_SHIM_SRC) \
+		$(PY_CAPI_ORACLE_SRC) \
 		$(SRCDIR)/py_extension_loader.c \
 		$(SRCDIR)/py_tuple.c \
 	$(SRCDIR)/py_dict.c \
@@ -166,65 +172,106 @@ LIBPYTHON_SRCS = py_libpython.c
 endif
 
 PY_CAPI_SHIM_SRC =
+PY_CAPI_ORACLE_SRC =
 ifneq ($(PCC_WITH_LIBPYTHON),1)
-PY_CAPI_SHIM_SRC = $(SRCDIR)/py_capi_shim.c
+PY_CAPI_ORACLE_SRC = $(SRCDIR)/py_capi_shim_oracle.c
 endif
 
 OBJS     = $(patsubst $(SRCDIR)/%.c,$(OBJDIR)/%.o,$(SRCS))
 OBJS_PCC = $(patsubst $(SRCDIR)/%.c,$(OBJDIR_PCC)/%.o,$(SRCS))
+
+# LIBC-P2-MEM-STR: vendored musl string/memory functions, compiled BY PCC
+# and archived so the static link resolves them here instead of importing
+# libSystem's (the libc import ratchet counts the drop). Upstream pins and
+# the single local patch live in vendor/musl-1.2.5/string/VENDOR.json. The
+# cc oracle archive (libpy_runtime.a) intentionally stays pure host libc so
+# differential tests keep a reference.
+# One vendor tree, several musl subdirectories (string, stdlib, ctype, ...).
+# vpath lets a single pattern rule cover all of them; basenames are unique.
+VENDOR_MUSL_DIRS = vendor/musl-1.2.5/string vendor/musl-1.2.5/stdlib vendor/musl-1.2.5/ctype vendor/musl-1.2.5/internal vendor/musl-1.2.5/math
+# musl's scan helpers include each other through internal headers.
+VENDOR_MUSL_INCLUDES = --cpp-arg=-I$(CURDIR)/vendor/musl-1.2.5/internal
+# Only the units that DEFINE a mem primitive need -O0: at higher levels LLVM
+# rewrites their bodies back into the very primitive being defined
+# (BUG-P1-SELF-MEM-INTRINSIC-LIBCALL-SELF-BRANCH). Everything else keeps the
+# default level — the scan helpers in particular MISCOMPILE at -O0 (a double
+# return value is lost, tracked as BUG-P1-CC-O0-DOUBLE-RETURN-LOST).
+# The mem primitives no longer need -O0: PCC_NO_BUILTIN stops pcc's own
+# libcall recognition, and with it in place LLVM no longer rewrites their
+# bodies into the primitive being defined at any level (verified: bzero at
+# -O2 emits a normal `U _memset` tail call, not a self-branch). The scan
+# helpers MUST NOT use -O0 anyway (a double return value is lost there).
+VENDOR_MUSL_O0_SRCS =
+VENDOR_STRING_SRCS = $(foreach d,$(VENDOR_MUSL_DIRS),$(wildcard $(d)/*.c))
+VENDOR_STRING_OBJS_PCC = $(patsubst %.c,$(OBJDIR_PCC)/vendor_%.o,$(notdir $(VENDOR_STRING_SRCS)))
+VENDOR_MEM_STR_SRCS = $(wildcard vendor/musl-1.2.5/string/*.c)
+VENDOR_MEM_STR_OBJS_PCC = $(patsubst %.c,$(OBJDIR_PCC)/vendor_%.o,$(notdir $(VENDOR_MEM_STR_SRCS)))
+VENDOR_NON_MEM_STR_OBJS_PCC = $(filter-out $(VENDOR_MEM_STR_OBJS_PCC),$(VENDOR_STRING_OBJS_PCC))
+vpath %.c $(VENDOR_MUSL_DIRS)
+
+# pcc-owned _FORTIFY_SOURCE wrappers (__memcpy_chk & friends). Compiled by
+# pcc from SRCS like every other runtime source; also archived into the
+# default port archive so the fortify symbols stop being libSystem imports.
+FORTIFY_OBJ_PCC = $(OBJDIR_PCC)/py_libc_fortify.o
+
+# Not part of SRCS: the cc oracle archive must stay pure host libc, so the
+# wrappers are compiled only for the pcc archives (they exist to remove
+# libSystem imports from pcc-produced artifacts).
+$(OBJDIR_PCC)/py_libc_fortify.o: $(SRCDIR)/py_libc_fortify.c $(RUNTIME_HEADERS) | $(OBJDIR_PCC)
+	$(PCC) --cpp-arg=-DPCC_USE_FREESTANDING_PLATFORM_PROCESS=1 --cpp-arg=-I$(CURDIR)/include --cpp-arg=-I$(CURDIR)/src --emit-obj $@ $<
+
+$(OBJDIR_PCC)/vendor_%.o: %.c | $(OBJDIR_PCC)
+	# PCC_NO_BUILTIN=1 is pcc's -fno-builtin: a unit that DEFINES a libc
+	# primitive must not have its body recognized back into that same
+	# primitive (llvm.memset(p,0,n) becomes a `bzero` call on Darwin, so
+	# libc's own bzero would recurse forever). -O0 additionally keeps the
+	# loop-idiom pass from re-synthesizing the intrinsics.
+	PCC_NO_BUILTIN=1 $(PCC) $(if $(filter $(notdir $<),$(VENDOR_MUSL_O0_SRCS)),-O0,) $(VENDOR_MUSL_INCLUDES) --emit-obj $@ $<
 OBJS_PY  = $(patsubst %,$(OBJDIR_PY)/%.o,$(PY_MODULES))
+# Raw C-ABI modules are authored in pcc-Python like the runtime-high ports,
+# but their strict freestanding contract forbids managed-runtime references.
+# Keep the list separate so PY_REPLACED_C_MODULES remains a semantic-runtime
+# mapping rather than accidentally treating retained oracle names as ports.
+FREESTANDING_PY_MODULES = freestanding_mem_str freestanding_lfq_spsc freestanding_iobuf_pool freestanding_uring pcc_gui_layout pcc_gui_cg pcc_gui_commands pcc_gui_binding pcc_gui_controls pcc_gui_elements pcc_gui_theme_anim pcc_gui_window pcc_gui_text pcc_gui_image pcc_gui_kit pcc_gui_components pcc_gui_scheduler pcc_gui_style pcc_gui_events freestanding_libc_numeric freestanding_strtoint freestanding_re_engine freestanding_allocator freestanding_timer_heap freestanding_runtime_high_substrate freestanding_gc_index_table freestanding_gc_external_resource freestanding_gc_state freestanding_gc_control freestanding_gc_tracking freestanding_gc_root_registry freestanding_gc_frame_registry freestanding_gc_root_operations freestanding_gc_mapped_roots freestanding_gc_object_root_seeding freestanding_gc_refcount_roots freestanding_gc_object_slots freestanding_gc_common_mark_cycle freestanding_gc_backend0_slots freestanding_gc_sweep_slots freestanding_gc_tracing_sweep_collector freestanding_gc_public_collection freestanding_gc_incremental_concurrent_scheduler freestanding_gc_forwarding_identity freestanding_gc_object_nodes freestanding_gc_generational_oldification freestanding_gc_generational_remembered_owners freestanding_gc_generational_promotion freestanding_gc_generational_scheduler freestanding_gc_relocation_remap freestanding_gc_relocation_payload freestanding_gc_relocation_copy freestanding_gc_relocation_selector freestanding_gc_relocation_drain freestanding_gc_zpage_mechanics freestanding_gc_zpage_lifecycle freestanding_gc_forwarding_retirement freestanding_gc_barrier_dispatcher freestanding_gc_zpage_allocation freestanding_gc_backend0_collector freestanding_gc_root_introspection freestanding_platform_io freestanding_platform_fs freestanding_platform_env freestanding_platform_system freestanding_platform_time freestanding_platform_process freestanding_platform_socket freestanding_platform_rss freestanding_errno freestanding_metal_runtime freestanding_stdio
+FREESTANDING_PY_MODULES += pcc_gui_app_lifecycle freestanding_gateway_control
+ifneq ($(PCC_WITH_THREADS),1)
+FREESTANDING_PY_MODULES += freestanding_thread_kernel
+endif
+FREESTANDING_OBJS_PY = $(patsubst %,$(OBJDIR_PY)/%.o,$(FREESTANDING_PY_MODULES))
+PCC_PY_OBJECTS = $(OBJS_PY) $(FREESTANDING_OBJS_PY)
+PCC_PY_RECEIPTS = $(addsuffix .provenance.json,$(PCC_PY_OBJECTS))
 
 LIB        = libpy_runtime.a
 LIB_PCC    = libpy_runtime_pcc.a
 LIB_PCC_PY = libpy_runtime_pcc_py.a
 LIB_PCC_PY_LIBPYTHON = libpy_runtime_pcc_py_libpython.a
-OBJ_PY_CC_HELPERS = $(OBJDIR_PY)/py_gc_index_table.o $(OBJDIR_PY)/py_os_native.o $(OBJDIR_PY)/pcc_threads.o $(OBJDIR_PY)/pcc_runtime_log.o $(OBJDIR_PY)/py_json.o $(OBJDIR_PY)/py_pickle_copy.o $(OBJDIR_PY)/py_runtime_high_substrate.o
-OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/pcc_metal_runtime.o
-OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/pcc_gc_external_resource.o
-OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/pcc_dlpack_runtime.o
-OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_context.o $(OBJDIR_PY)/py_format.o
-OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_process_timeout.o
-# float.fromhex hex-float parser (C-only, no port; see py_float_fromhex.c).
-# Linked into the default pcc-Python port archive so float.fromhex works
-# under --python-libpython=off.
-OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_float_fromhex.o
-# Complex ``**`` (C-only, no port; see py_complex_pow.c / .py). Linked into the
-# default pcc-Python port archive alongside the other complex helpers.
-OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_complex_pow.o
-OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_asyncio_io.o
-OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_protocol.o $(OBJDIR_PY)/py_class_attrs.o
-OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_call_splat.o $(OBJDIR_PY)/py_module_attrs.o
-OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_compiled_module.o
-OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_capi_shim.o $(OBJDIR_PY)/py_extension_loader.o
-OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_http.o
-OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_int_modexp.o
-OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_obj_min_max.o
-OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_tuple_methods.o
-OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_re_engine.o $(OBJDIR_PY)/py_re_engine_obj.o
-OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_cpy_handle.o
-OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_os_rss.o
-OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_os_heap.o
-OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_enumerate.o
-OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_int_bytes.o
-# Dependency-free timer min-heap. pcc_threads.o (a C-only helper above) now
-# calls pcc_timer_heap_* for the vthread sleep/poll-timers path, so the object
-# must be in the pcc-Python runtime archive too, not only the C-runtime one.
-OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_timer_heap.o
-# Dependency-free IO waitset (poll fallback + Darwin kqueue). py_asyncio_io.o
-# (a C-only helper above) now calls pcc_io_waitset_kqueue_available() to report
-# the platform readiness backend, so the object must be in the pcc-Python
-# runtime archive too, not only the C-runtime one.
-OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/py_io_waitset.o
+PCC_RUNTIME_ARCHIVE_LOCK_HELD ?= 0
+PCC_RUNTIME_ARCHIVE_LOCK_MAX_WAITS ?= 3000
+PCC_RUNTIME_ARCHIVE_LOCK_OWNER_GRACE_WAITS ?= 50
+PCC_RUNTIME_ARCHIVE_LOCK_SLEEP ?= 0.1
+PCC_RUNTIME_ARCHIVE_MAKEFILE := $(abspath $(firstword $(MAKEFILE_LIST)))
+# The default archive owns the single-thread kernel in freestanding
+# pcc-Python. Explicit PCC_WITH_THREADS=1 selects the pthread ABI owner module;
+# both modes share the pcc-Python virtual-thread scheduler and debug guards.
 
-.PHONY: all clean distclean
+.PHONY: all clean distclean _pcc_runtime_archive_lock_force
 
+# The C-API inventory is the completion marker consumed by pipeline.py.  Make
+# nm failure or an object-less archive fail before either payload is published,
+# rather than warning later after an unrelated undefined-symbol link failure.
 all: $(LIB)
 
 $(LIB): $(OBJS)
-	rm -f $@.tmp
-	$(AR) rcs $@.tmp $^
-	$(RANLIB) $@.tmp
-	mv -f $@.tmp $@
+	@set -eu; \
+	rm -f "$@.tmp" "$@.capi_syms.nm.tmp" "$@.capi_syms.tmp" "$@.capi_syms"; \
+	$(AR) rcs "$@.tmp" $^; \
+	$(RANLIB) "$@.tmp"; \
+	nm -g "$@.tmp" > "$@.capi_syms.nm.tmp" 2>/dev/null; \
+	awk '$$2!="U" && $$2 ~ /^[A-Z]$$/ && ($$3 ~ /^_?Py/ || $$3 ~ /^_?_Py/) {print $$3}' "$@.capi_syms.nm.tmp" | LC_ALL=C sort -u > "$@.capi_syms.tmp"; \
+	test -s "$@.capi_syms.tmp"; \
+	rm -f "$@.capi_syms.nm.tmp"; \
+	mv -f "$@.tmp" "$@"; \
+	mv -f "$@.capi_syms.tmp" "$@.capi_syms"
 
 $(OBJDIR)/%.o: $(SRCDIR)/%.c $(RUNTIME_HEADERS) | $(OBJDIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
@@ -236,11 +283,19 @@ $(OBJDIR):
 # distinct archive so the two builds never collide. The pcc invocation
 # uses --cpp-arg=-I for header lookup because pcc does not (yet)
 # consume -I directly; --emit-obj writes the object file in place.
-$(LIB_PCC): $(OBJS_PCC)
-	rm -f $@.tmp
-	$(AR) rcs $@.tmp $^
-	$(RANLIB) $@.tmp
-	mv -f $@.tmp $@
+# The pipeline treats this inventory as the completion signal for the
+# transitional pcc-C archive, matching the host-C oracle archive above.
+$(LIB_PCC): $(OBJS_PCC) $(VENDOR_STRING_OBJS_PCC)
+	@set -eu; \
+	rm -f "$@.tmp" "$@.capi_syms.nm.tmp" "$@.capi_syms.tmp" "$@.capi_syms"; \
+	$(AR) rcs "$@.tmp" $^; \
+	$(RANLIB) "$@.tmp"; \
+	nm -g "$@.tmp" > "$@.capi_syms.nm.tmp" 2>/dev/null; \
+	awk '$$2!="U" && $$2 ~ /^[A-Z]$$/ && ($$3 ~ /^_?Py/ || $$3 ~ /^_?_Py/) {print $$3}' "$@.capi_syms.nm.tmp" | LC_ALL=C sort -u > "$@.capi_syms.tmp"; \
+	test -s "$@.capi_syms.tmp"; \
+	rm -f "$@.capi_syms.nm.tmp"; \
+	mv -f "$@.tmp" "$@"; \
+	mv -f "$@.capi_syms.tmp" "$@.capi_syms"
 
 $(OBJDIR_PCC)/%.o: $(SRCDIR)/%.c $(RUNTIME_HEADERS) | $(OBJDIR_PCC)
 	$(PCC) --cpp-arg=-I$(CURDIR)/include --cpp-arg=-I$(CURDIR)/src --emit-obj $@ $<
@@ -260,18 +315,10 @@ $(OBJDIR_PCC)/py_re_engine.o: $(PCC_STDATOMIC_HEADER)
 # SAME archive (e.g. py_asyncio_io.o calls pcc_io_waitset_kqueue_available), and
 # that still links because the CC-built object is archived alongside them.
 # Explicit rules override the generic pcc pattern rule above.
-PCC_CC_ONLY_SRCS = py_os_rss py_os_heap py_io_waitset pcc_metal_runtime pcc_gc_external_resource pcc_dlpack_runtime
+PCC_CC_ONLY_SRCS = py_os_rss py_os_heap py_io_waitset pcc_metal_runtime
 $(OBJDIR_PCC)/pcc_metal_runtime.o: $(SRCDIR)/pcc_metal_runtime.c $(RUNTIME_HEADERS) | $(OBJDIR_PCC)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
-$(OBJDIR_PCC)/pcc_gc_external_resource.o: $(SRCDIR)/pcc_gc_external_resource.c $(RUNTIME_HEADERS) | $(OBJDIR_PCC)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
-$(OBJDIR_PCC)/pcc_dlpack_runtime.o: $(SRCDIR)/pcc_dlpack_runtime.c $(RUNTIME_HEADERS) | $(OBJDIR_PCC)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
-$(OBJDIR_PCC)/py_os_rss.o: $(SRCDIR)/py_os_rss.c $(RUNTIME_HEADERS) | $(OBJDIR_PCC)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
 $(OBJDIR_PCC)/py_io_waitset.o: $(SRCDIR)/py_io_waitset.c $(RUNTIME_HEADERS) | $(OBJDIR_PCC)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
-$(OBJDIR_PCC)/py_os_heap.o: $(SRCDIR)/py_os_heap.c $(RUNTIME_HEADERS) | $(OBJDIR_PCC)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 $(OBJDIR_PCC):
@@ -288,33 +335,115 @@ $(OBJDIR_PCC):
 # linker (e.g. another xdist worker's clang, which holds no build lock) then
 # fails with "no such file: libpy_runtime_pcc_py.a". `mv` is an atomic rename,
 # so a linker always opens the old-or-new complete archive, never a gap.
-$(LIB_PCC_PY): $(OBJS_PY) $(OBJ_PY_CC_HELPERS)
-	rm -f $@.tmp
-	$(AR) rcs $@.tmp $(OBJS_PY) $(OBJ_PY_CC_HELPERS)
-	$(RANLIB) $@.tmp
-	mv -f $@.tmp $@
+#
+# Direct Make and head-truth invocations do not pass through pipeline.py's
+# runtime-build lock.  The public target therefore acquires its own lock before
+# recursively entering the real object/receipt dependency graph.  Acquiring a
+# lock only in the archive recipe is too late: Make builds prerequisites first,
+# so two processes could still overwrite the same .ll/.o/receipt files.  Keep
+# this lock distinct from the pipeline lock: a pipeline-owned build nests this
+# target while already holding that lock.
+# The verified provenance manifest binds the exact C-API sidecar bytes and
+# remains the final publication/completion marker after both payload files.
+ifneq ($(PCC_RUNTIME_ARCHIVE_LOCK_HELD),1)
+$(LIB_PCC_PY): _pcc_runtime_archive_lock_force
+	+@set -eu; \
+	lock="$@.build.lock"; \
+	owner="$$lock/owner"; \
+	waited=0; \
+	ownerless_waited=0; \
+	while :; do \
+		if mkdir "$$lock" 2>/dev/null; then \
+			if ! printf '%s\n' "$$$$" > "$$owner"; then \
+				rm -f "$$owner"; \
+				rmdir "$$lock" 2>/dev/null || :; \
+				exit 1; \
+			fi; \
+			break; \
+		fi; \
+		owner_pid=; \
+		if [ -r "$$owner" ]; then \
+			IFS= read -r owner_pid < "$$owner" || owner_pid=; \
+		fi; \
+		owner_valid=0; \
+		owner_alive=0; \
+		case "$$owner_pid" in \
+			''|*[!0-9]*) ;; \
+			*) owner_valid=1; kill -0 "$$owner_pid" 2>/dev/null && owner_alive=1 || : ;; \
+		esac; \
+		if [ "$$owner_valid" -eq 1 ] && [ "$$owner_alive" -eq 0 ]; then \
+			rm -f "$$owner"; \
+			if rmdir "$$lock" 2>/dev/null; then \
+				ownerless_waited=0; \
+				continue; \
+			fi; \
+		elif [ "$$owner_valid" -eq 0 ]; then \
+			ownerless_waited=$$((ownerless_waited + 1)); \
+			if [ "$$ownerless_waited" -ge "$(PCC_RUNTIME_ARCHIVE_LOCK_OWNER_GRACE_WAITS)" ]; then \
+				rm -f "$$owner"; \
+				if rmdir "$$lock" 2>/dev/null; then \
+					ownerless_waited=0; \
+					continue; \
+				fi; \
+			fi; \
+		else \
+			ownerless_waited=0; \
+		fi; \
+		waited=$$((waited + 1)); \
+		if [ "$$waited" -ge "$(PCC_RUNTIME_ARCHIVE_LOCK_MAX_WAITS)" ]; then \
+			echo "timed out waiting for pcc runtime archive lock: $$lock (owner=$${owner_pid:-unknown})" >&2; \
+			exit 124; \
+		fi; \
+		sleep "$(PCC_RUNTIME_ARCHIVE_LOCK_SLEEP)"; \
+	done; \
+	cleanup_runtime_archive_lock() { \
+		rm -f "$$owner"; \
+		rmdir "$$lock" 2>/dev/null || :; \
+	}; \
+	trap cleanup_runtime_archive_lock 0; \
+	trap 'exit 129' 1; \
+	trap 'exit 130' 2; \
+	trap 'exit 143' 15; \
+	$(MAKE) --no-print-directory -f "$(PCC_RUNTIME_ARCHIVE_MAKEFILE)" PCC_RUNTIME_ARCHIVE_LOCK_HELD=1 "$@"
+else
+$(LIB_PCC_PY): $(PCC_PY_OBJECTS) $(PCC_PY_RECEIPTS)
+	@set -eu; \
+	rm -f "$@.tmp"; \
+	rm -f "$@.capi_syms.nm.tmp"; \
+	rm -f "$@.capi_syms.tmp"; \
+	rm -f "$@.provenance.json.tmp"; \
+	$(AR) rcs $@.tmp $(PCC_PY_OBJECTS); \
+	$(RANLIB) "$@.tmp"; \
+	nm -g "$@.tmp" > "$@.capi_syms.nm.tmp" 2>/dev/null; \
+	awk '$$2!="U" && $$2 ~ /^[A-Z]$$/ && ($$3 ~ /^_?Py/ || $$3 ~ /^_?_Py/) {print $$3}' "$@.capi_syms.nm.tmp" | LC_ALL=C sort -u > "$@.capi_syms.tmp"; \
+	rm -f "$@.capi_syms.nm.tmp"; \
+	PYTHONPATH=$(PCC_REPO_ROOT) $(PYTHON) -m pcc.tools.runtime_archive_provenance assemble --archive "$@.tmp" --runtime-root $(CURDIR) --output "$@.provenance.json.tmp" --capi-inventory "$@.capi_syms.tmp" --ar $(AR) $(PCC_PY_OBJECTS); \
+	mv -f "$@.tmp" "$@"; \
+	mv -f "$@.capi_syms.tmp" "$@.capi_syms"; \
+	mv -f "$@.provenance.json.tmp" "$@.provenance.json"
+endif
 
 # Compatibility fallback archive for bootstrap builds that still emit
 # py_cpy_* calls. It keeps the pcc-Python runtime replacement archive
 # as the base and adds only the CPython bridge object.
+# Preserve pcc-native C-API objects for internal object-model semantics.  The
+# final link makes their public Py*/_Py* symbols non-exported so a dlopen'd
+# CPython extension resolves those names from libpython instead.  The
+# pcc-native extension loader is a distinct ABI and is replaced by the
+# bridge's fail-closed entrypoints in this mixed-object-model archive.
 $(LIB_PCC_PY_LIBPYTHON): $(LIB_PCC_PY) $(OBJDIR_LIBPY)/py_libpython.o
-	cp $(LIB_PCC_PY) $@.tmp
-	-$(AR) d $@.tmp py_libpython.o
-	# In libpython mode the real libpython provides the CPython C-API. The
-	# no-libpython C-API shim (py_capi_shim.o: ~286 Py* symbols using pcc's
-	# object model with no libpython delegation) must NOT be in this variant:
-	# dlopen'd extensions are built -undefined dynamic_lookup, so their Py*
-	# calls resolve from the executable's globals; if the shim is present it
-	# SHADOWS libpython's real C-API and mishandles real CPython objects,
-	# breaking C-extension module init (e.g. import numpy / unicodedata ->
-	# "execution of module ... failed without setting an exception"). Drop it
-	# so libpython's C-API wins. The no-libpython archive (LIB_PCC_PY) keeps
-	# the shim and is unchanged, so self-host bootstrap is unaffected. See
-	# docs/investigations/python-cpython-compat-import-numpy-multiarray-init-fails.md
-	-$(AR) d $@.tmp py_capi_shim.o
-	$(AR) r $@.tmp $(OBJDIR_LIBPY)/py_libpython.o
-	$(RANLIB) $@.tmp
-	mv -f $@.tmp $@
+	@set -eu; \
+	rm -f "$@.tmp" "$@.capi_syms.nm.tmp" "$@.capi_syms.tmp" "$@.capi_syms"; \
+	cp $(LIB_PCC_PY) "$@.tmp"; \
+	$(AR) d "$@.tmp" py_extension_loader_runtime.o; \
+	$(AR) r "$@.tmp" $(OBJDIR_LIBPY)/py_libpython.o; \
+	$(RANLIB) "$@.tmp"; \
+	nm -g "$@.tmp" > "$@.capi_syms.nm.tmp" 2>/dev/null; \
+	awk '$$2!="U" && $$2 ~ /^[A-Z]$$/ && ($$3 ~ /^_?Py/ || $$3 ~ /^_?_Py/) {print $$3}' "$@.capi_syms.nm.tmp" | LC_ALL=C sort -u > "$@.capi_syms.tmp"; \
+	test -s "$@.capi_syms.tmp"; \
+	rm -f "$@.capi_syms.nm.tmp"; \
+	mv -f "$@.tmp" "$@"; \
+	mv -f "$@.capi_syms.tmp" "$@.capi_syms"
 
 $(OBJDIR_LIBPY)/py_libpython.o: $(SRCDIR)/py_libpython.c $(RUNTIME_HEADERS) | $(OBJDIR_LIBPY)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -DPCC_WITH_LIBPYTHON=1 $(shell python3-config --includes) $(INCLUDES) -c $< -o $@
@@ -323,31 +452,34 @@ $(OBJDIR_LIBPY):
 	mkdir -p $(OBJDIR_LIBPY)
 
 # Recompile a pcc-Python runtime module when that module changes. The archive
-# target already tracks additions/removals through OBJS_PY/OBJ_PY_CC_HELPERS;
+# target already tracks additions/removals through OBJS_PY/FREESTANDING_OBJS_PY;
 # making every object depend on the entire Makefile turned any helper-list edit
 # into a full runtime rebuild. Compiler/target/config invalidation is owned by
 # pipeline._ensure_runtime's explicit full-rebuild decision.
 $(OBJDIR_PY)/%.o: $(PYDIR)/%.py | $(OBJDIR_PY)
 	PYTHONPATH=$(PCC_REPO_ROOT) PCC_HOST_PYTHON=$(PYTHON) $(PCC) --python-library --emit-llvm=$(OBJDIR_PY)/$*.ll $<
-	PYTHONPATH=$(PCC_REPO_ROOT) $(PCC_IR_TO_OBJ) $(OBJDIR_PY)/$*.ll $@
+	PYTHONPATH=$(PCC_REPO_ROOT) $(PCC_IR_TO_OBJ) $(OBJDIR_PY)/$*.ll $@ --provenance $@.provenance.json --source $< --runtime-root $(CURDIR) --member $(@F)
+
+# The receipt is a completion sidecar emitted with the object.  Give it an
+# explicit dependency edge so deleting or losing a receipt cannot leave an
+# apparently up-to-date object eligible for the production archive.  The
+# recursive rebuild runs only for that recovery case; ordinary object builds
+# publish both files in one emitter process.
+$(OBJDIR_PY)/%.o.provenance.json: $(OBJDIR_PY)/%.o
+	test -f $@ || $(MAKE) -B $(@D)/$*.o
+	test -f $@
+
+# This module implements pcc_thread_safepoint itself. Compiling it with the
+# ordinary PCC_WITH_THREADS=1 frontend setting would inject a function-entry
+# call to pcc_thread_safepoint into pcc_thread_safepoint (and every helper),
+# causing immediate unbounded recursion. Its blocking loops already contain
+# the required explicit polls; disable automatic insertion for this one object.
+$(OBJDIR_PY)/freestanding_thread_kernel_pthread.o: $(PYDIR)/freestanding_thread_kernel_pthread.py | $(OBJDIR_PY)
+	PYTHONPATH=$(PCC_REPO_ROOT) PCC_HOST_PYTHON=$(PYTHON) PCC_WITH_THREADS=0 $(PCC) --python-library --emit-llvm=$(OBJDIR_PY)/freestanding_thread_kernel_pthread.ll $<
+	PYTHONPATH=$(PCC_REPO_ROOT) $(PCC_IR_TO_OBJ) $(OBJDIR_PY)/freestanding_thread_kernel_pthread.ll $@ --provenance $@.provenance.json --source $< --runtime-root $(CURDIR) --member $(@F)
 
 $(OBJDIR_PY):
 	mkdir -p $(OBJDIR_PY)
-
-$(OBJDIR_PY)/py_gc_index_table.o: $(SRCDIR)/py_gc_index_table.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
-
-$(OBJDIR_PY)/py_os_native.o: $(SRCDIR)/py_os_native.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
-
-$(OBJDIR_PY)/py_http.o: $(SRCDIR)/py_http.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
-
-$(OBJDIR_PY)/py_asyncio_io.o: $(SRCDIR)/py_asyncio_io.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
-
-$(OBJDIR_PY)/py_process_timeout.o: $(SRCDIR)/py_process_timeout.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 $(OBJDIR_PY)/py_io_waitset.o: $(SRCDIR)/py_io_waitset.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
@@ -361,16 +493,7 @@ $(OBJDIR_PY)/py_obj_min_max.o: $(SRCDIR)/py_obj_min_max.c $(RUNTIME_HEADERS) | $
 $(OBJDIR_PY)/py_tuple_methods.o: $(SRCDIR)/py_tuple_methods.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
-$(OBJDIR_PY)/py_re_engine.o: $(SRCDIR)/py_re_engine.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
-
-$(OBJDIR_PY)/py_re_engine_obj.o: $(SRCDIR)/py_re_engine_obj.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
-
 $(OBJDIR_PY)/py_cpy_handle.o: $(SRCDIR)/py_cpy_handle.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
-
-$(OBJDIR_PY)/py_os_rss.o: $(SRCDIR)/py_os_rss.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 $(OBJDIR_PY)/py_os_heap.o: $(SRCDIR)/py_os_heap.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
@@ -388,46 +511,21 @@ $(OBJDIR_PY)/py_timer_heap.o: $(SRCDIR)/py_timer_heap.c $(RUNTIME_HEADERS) | $(O
 $(OBJDIR_PY)/pcc_threads.o: $(SRCDIR)/pcc_threads.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
-$(OBJDIR_PY)/pcc_runtime_log.o: $(SRCDIR)/pcc_runtime_log.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
-
-$(OBJDIR_PY)/pcc_metal_runtime.o: $(SRCDIR)/pcc_metal_runtime.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
-
 $(OBJDIR_PY)/pcc_gc_external_resource.o: $(SRCDIR)/pcc_gc_external_resource.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
-
-$(OBJDIR_PY)/pcc_dlpack_runtime.o: $(SRCDIR)/pcc_dlpack_runtime.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
-
-$(OBJDIR_PY)/py_json.o: $(SRCDIR)/py_json.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
-
-$(OBJDIR_PY)/py_pickle_copy.o: $(SRCDIR)/py_pickle_copy.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
 $(OBJDIR_PY)/py_runtime_high_substrate.o: $(SRCDIR)/py_runtime_high_substrate.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
-$(OBJDIR_PY)/py_protocol.o: $(SRCDIR)/py_protocol.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
-
-$(OBJDIR_PY)/py_class_attrs.o: $(SRCDIR)/py_class_attrs.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
-
 $(OBJDIR_PY)/py_context.o: $(SRCDIR)/py_context.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
-$(OBJDIR_PY)/py_format.o: $(SRCDIR)/py_format.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
-
-# Explicit rule: build the port-archive py_float_fromhex.o from the C source
-# (a C-only OBJ_PY_CC_HELPERS helper).
+# Retained explicit C-oracle rule; this object is not in the production
+# pcc-Python archive inventory.
 $(OBJDIR_PY)/py_float_fromhex.o: $(SRCDIR)/py_float_fromhex.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
-# Explicit rule: build the port-archive py_complex_pow.o from the C source (a
-# C-only OBJ_PY_CC_HELPERS helper). This overrides the generic
+# Retained explicit C-oracle rule for py_complex_pow.o. This overrides the generic
 # $(OBJDIR_PY)/%.o: $(PYDIR)/%.py pattern rule so the co-located reference
 # py_complex_pow.py (which is NOT a linked port module) is never compiled.
 $(OBJDIR_PY)/py_complex_pow.o: $(SRCDIR)/py_complex_pow.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
@@ -442,15 +540,13 @@ $(OBJDIR_PY)/py_module_attrs.o: $(SRCDIR)/py_module_attrs.c $(RUNTIME_HEADERS) |
 $(OBJDIR_PY)/py_compiled_module.o: $(SRCDIR)/py_compiled_module.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
 
-$(OBJDIR_PY)/py_capi_shim.o: $(SRCDIR)/py_capi_shim.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
-
-$(OBJDIR_PY)/py_extension_loader.o: $(SRCDIR)/py_extension_loader.c $(RUNTIME_HEADERS) | $(OBJDIR_PY)
-	$(CC) $(CPPFLAGS) $(CFLAGS) $(INCLUDES) -c $< -o $@
-
 clean:
-	rm -rf $(OBJDIR) $(LIB)
+	rm -rf $(OBJDIR) $(LIB) $(LIB).capi_syms
 
 distclean: clean
-	rm -rf $(OBJDIR_PCC) $(LIB_PCC) $(OBJDIR_PY) $(LIB_PCC_PY) \
-		$(OBJDIR_LIBPY) $(LIB_PCC_PY_LIBPYTHON)
+	rm -rf $(OBJDIR_PCC) $(LIB_PCC) $(LIB_PCC).capi_syms \
+		$(OBJDIR_PY) $(LIB_PCC_PY) \
+		$(LIB_PCC_PY).capi_syms \
+		$(LIB_PCC_PY).provenance.json \
+		$(OBJDIR_LIBPY) $(LIB_PCC_PY_LIBPYTHON) \
+		$(LIB_PCC_PY_LIBPYTHON).capi_syms

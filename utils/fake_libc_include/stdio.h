@@ -27,5 +27,6 @@ int fseeko(FILE *stream, off_t offset, int whence);
 off_t ftello(FILE *stream);
 FILE *popen(const char *command, const char *mode);
 int pclose(FILE *stream);
+FILE *open_memstream(char **bufp, size_t *sizep);
 
 #endif

@@ -26,6 +26,16 @@ def test_context_enter_exit_runtime(tmp_path, c_runtime_archive):
                 return py_bool_from_bit(1);
             }
 
+            static PyObject *silent_enter(PyObject *self) {
+                (void)self;
+                return NULL;
+            }
+
+            static PyObject *silent_exit(PyObject *self, PyObject *exc_type, PyObject *exc, PyObject *tb) {
+                (void)self; (void)exc_type; (void)exc; (void)tb;
+                return NULL;
+            }
+
             int main(void) {
                 PyClassObject *cls = py_class_new("CM", NULL, 0, NULL, 0);
                 py_class_add_method(cls, "__enter__", (PyObject *)(uintptr_t)enter);
@@ -34,6 +44,16 @@ def test_context_enter_exit_runtime(tmp_path, c_runtime_archive):
                 PyObject *value = py_context_enter(obj);
                 if (strcmp(py_str_utf8(value), "entered") != 0) return 1;
                 if (py_context_exit(obj, py_None, py_None, py_None) != 1) return 2;
+
+                PyClassObject *bad_cls = py_class_new("BadCM", NULL, 0, NULL, 0);
+                py_class_add_method(bad_cls, "__enter__", (PyObject *)(uintptr_t)silent_enter);
+                py_class_add_method(bad_cls, "__exit__", (PyObject *)(uintptr_t)silent_exit);
+                PyObject *bad_obj = py_instance_new(bad_cls);
+                if (py_context_enter(bad_obj) != NULL || !py_err_occurred()) return 3;
+                py_clear_exception();
+                if (py_context_exit(bad_obj, py_None, py_None, py_None) != 0) return 4;
+                if (!py_err_occurred()) return 5;
+                py_clear_exception();
                 printf("context-ok\\n");
                 return 0;
             }
@@ -53,3 +73,48 @@ def test_context_enter_exit_runtime(tmp_path, c_runtime_archive):
     )
     proc = subprocess.run([str(exe)], check=True, text=True, capture_output=True)
     assert proc.stdout.strip() == "context-ok"
+
+
+def test_context_runtime_guards_silent_null_before_owned_method_cleanup():
+    c_source = open("pcc/py_runtime/src/py_context.c", encoding="utf-8").read()
+    py_source = open(
+        "pcc/py_runtime/py/py_context_runtime.py", encoding="utf-8"
+    ).read()
+
+    for source in (c_source, py_source):
+        assert "py_runtime_error_if_unset" in source
+        assert "context __enter__ returned NULL without setting an exception" in source
+        assert "context __exit__ returned NULL without setting an exception" in source
+        assert "py_context_enter received NULL manager" in source
+        assert "py_context_exit received NULL manager" in source
+
+    for source, call, guard, cleanup in (
+        (
+            c_source,
+            "PyObject *result = call_unary_method(method, manager);",
+            "py_context_enter returned NULL without setting an exception",
+            "py_decref(method);",
+        ),
+        (
+            py_source,
+            "result = _call_enter_method(method, manager)",
+            "py_context_enter returned NULL without setting an exception",
+            "py_decref(method)",
+        ),
+        (
+            c_source,
+            "PyObject *result = call_exit_method(method, manager, exc_type, exc, tb);",
+            "py_context_exit returned NULL without setting an exception",
+            "py_decref(method);",
+        ),
+        (
+            py_source,
+            "result = _call_exit_method(method, manager, exc_type, exc, traceback)",
+            "py_context_exit returned NULL without setting an exception",
+            "py_decref(method)",
+        ),
+    ):
+        call_pos = source.index(call)
+        guard_pos = source.index(guard, call_pos)
+        cleanup_pos = source.index(cleanup, call_pos)
+        assert call_pos < guard_pos < cleanup_pos

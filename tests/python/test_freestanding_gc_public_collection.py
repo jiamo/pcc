@@ -1,0 +1,399 @@
+from __future__ import annotations
+
+import ast
+import re
+import subprocess
+from pathlib import Path
+
+import pytest
+
+from pcc.py_frontend import pipeline
+from pcc.py_frontend.codegen.runtime_abi import FREESTANDING_GC_RUNTIME_GLOBALS
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+RUNTIME_DIR = REPO_ROOT / "pcc" / "py_runtime"
+STRICT_SOURCE = RUNTIME_DIR / "py" / "freestanding_gc_public_collection.py"
+MANAGED_SOURCE = RUNTIME_DIR / "py" / "py_gc_backend.py"
+C_ORACLE_SOURCE = RUNTIME_DIR / "src" / "py_gc_backend.c"
+MAKEFILE = RUNTIME_DIR / "Makefile"
+
+OWNED_SYMBOLS = {
+    "pcc_gc_begin_explicit_tracing_collect",
+    "pcc_gc_collect_tracing",
+    "pcc_gc_config_ensure",
+    "pcc_gc_config_parse_env_i32",
+    "pcc_gc_end_explicit_tracing_collect",
+    "pcc_gc_has_tracing_sweep",
+    "pcc_gc_maybe_start_cms_worker",
+    "pcc_gc_cms_worker_main_py",
+    "pcc_gc_config_abort_bad_backend",
+    "pcc_gc_config_parse_backend",
+}
+RAW_FUNCTION_IMPORTS = {
+    "pcc_gc_tracing_budget_from_debt",
+    "pcc_gc_tracing_has_sweep_candidate",
+    "pcc_gc_tracing_step_cycle",
+    "pcc_gc_tracing_sweep_unreachable",
+    "pcc_platform_getenv",
+    "pcc_platform_abort",
+    "pcc_platform_write",
+    "pcc_platform_sleep_ns",
+    "pcc_resume_world",
+    "pcc_stop_the_world",
+    "pcc_threads_enabled",
+    "pcc_thread_start",
+    "pcc_thread_safepoint",
+}
+RAW_GLOBAL_IMPORTS = {
+    "pcc_gc_backend_selected",
+    "pcc_gc_cms_worker_started",
+    "pcc_gc_cms_worker_starts",
+    "pcc_gc_cms_worker_handle",
+    "pcc_gc_cms_worker_stop_requested",
+    "pcc_gc_cms_queue_pushes",
+    "pcc_gc_cms_worker_drains",
+    "pcc_gc_cms_worker_stops",
+    "pcc_gc_cms_worker_traces",
+    "pcc_gc_config_initialized",
+    "pcc_gc_cycle_requested",
+    "pcc_gc_debt_threshold_override",
+    "pcc_gc_explicit_collect_active",
+    "pcc_gc_minor_alloc_max",
+    "pcc_gc_minor_heap_size",
+    "pcc_gc_pause",
+    "pcc_gc_read_barrier_enabled",
+    "pcc_gc_stepmul",
+}
+
+
+def _exported_symbols(source: str) -> set[str]:
+    return set(re.findall(r'@c_abi_export\("([^"]+)"\)', source))
+
+
+def _literal_global_imports() -> set[str]:
+    globals_: set[str] = set()
+    tree = ast.parse(STRICT_SOURCE.read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Name):
+            continue
+        if node.func.id != "global_addr" or not node.args:
+            continue
+        value = node.args[0]
+        if isinstance(value, ast.Constant) and isinstance(value.value, str):
+            globals_.add(value.value)
+    return globals_
+
+
+def _compile_object(tmp_path: Path, emitter: str) -> Path:
+    llvm_ir = tmp_path / ("freestanding_gc_public_collection_" + emitter + ".ll")
+    pipeline.compile_python(
+        str(STRICT_SOURCE),
+        str(llvm_ir),
+        emit_llvm_only=True,
+        libpython_mode="off",
+        python_library=True,
+    )
+    source = llvm_ir
+    if emitter == "self":
+        from pcc.backend.self_backend_dispatch import emit_self_asm
+
+        source = tmp_path / "freestanding_gc_public_collection.s"
+        source.write_text(
+            emit_self_asm(llvm_ir.read_text(encoding="utf-8")),
+            encoding="utf-8",
+        )
+    obj = tmp_path / ("freestanding_gc_public_collection_" + emitter + ".o")
+    result = subprocess.run(
+        ["clang", "-c", str(source), "-o", str(obj)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return obj
+
+
+def _compile_llvm_object(tmp_path: Path, source_path: Path, stem: str) -> Path:
+    llvm_ir = tmp_path / (stem + ".ll")
+    pipeline.compile_python(
+        str(source_path),
+        str(llvm_ir),
+        emit_llvm_only=True,
+        libpython_mode="off",
+        python_library=True,
+    )
+    obj = tmp_path / (stem + ".o")
+    result = subprocess.run(
+        ["clang", "-c", str(llvm_ir), "-o", str(obj)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return obj
+
+
+def test_public_collection_has_one_strict_source_owner():
+    strict = STRICT_SOURCE.read_text(encoding="utf-8")
+    managed = MANAGED_SOURCE.read_text(encoding="utf-8")
+    makefile = MAKEFILE.read_text(encoding="utf-8")
+
+    assert "__pcc_freestanding__ = True" in strict
+    assert _exported_symbols(strict) == OWNED_SYMBOLS
+    assert _exported_symbols(managed).isdisjoint(OWNED_SYMBOLS)
+    assert "freestanding_gc_public_collection" in makefile
+    assert '_init_config = extern("pcc_gc_config_ensure"' in managed
+    assert '_maybe_start_cms_worker = extern("pcc_gc_maybe_start_cms_worker"' in managed
+    for name in ("_parse_env_i32", "_init_config", "_maybe_start_cms_worker"):
+        assert f"def {name}(" not in managed
+
+
+def test_public_collection_preserves_config_and_collection_order():
+    strict = STRICT_SOURCE.read_text(encoding="utf-8")
+    worker = strict.split(
+        '@c_abi_export("pcc_gc_cms_worker_main_py")', 1
+    )[1].split("\n@c_abi_export", 1)[0]
+    worker_stw = worker.index("pcc_stop_the_world()")
+    worker_trace = worker.index("pcc_gc_tracing_step_cycle(")
+    worker_resume = worker.index("pcc_resume_world()")
+    assert worker_stw < worker_trace < worker_resume
+    assert "pcc_thread_safepoint()" in worker
+
+    start = strict.split(
+        '@c_abi_export("pcc_gc_maybe_start_cms_worker")', 1
+    )[1].split("\n@c_abi_export", 1)[0]
+    assert 'function_addr("pcc_gc_cms_worker_main_py")' in start
+    assert start.index("pcc_thread_start(") < start.index(
+        'global_addr("pcc_gc_cms_worker_starts")'
+    )
+
+    config = strict.split('@c_abi_export("pcc_gc_config_ensure")', 1)[1].split(
+        "\n@c_abi_export", 1
+    )[0]
+    for env_name in (
+        "PCC_GC_BACKEND",
+        "PCC_GC_PAUSE",
+        "PCC_GC_STEPMUL",
+        "PCC_GC_STEP_MUL",
+        "PCC_GC_DEBT_THRESHOLD",
+        "PCC_GC_MINOR_HEAP_SIZE",
+        "PCC_GC_MINOR_ALLOC_MAX",
+    ):
+        assert env_name in config
+    assert "33554432, 256, 1099511627776" in config
+    assert "16, 16, 1073741824" in config
+    assert config.index('store_i32(global_addr("pcc_gc_backend_selected")') < (
+        config.index("pcc_gc_maybe_start_cms_worker()")
+    )
+
+    collect = strict.split('@c_abi_export("pcc_gc_collect_tracing")', 1)[1].split(
+        "\n@c_abi_export", 1
+    )[0]
+    full_sweep = "pcc_gc_tracing_sweep_unreachable(9223372036854775807)"
+    assert collect.index("pcc_stop_the_world()") < collect.index(full_sweep)
+    assert collect.index(full_sweep) < collect.index("pcc_resume_world()")
+    assert "pcc_gc_tracing_sweep_unreachable(1024)" not in collect
+
+    c_oracle = C_ORACLE_SOURCE.read_text(encoding="utf-8")
+    c_collect = c_oracle.split("int64_t pcc_gc_collect_tracing(void)", 1)[1].split(
+        "\n}", 1
+    )[0]
+    assert "pcc_gc_sweep_unreachable(INT64_MAX)" in c_collect
+    assert "pcc_gc_sweep_unreachable(1024)" not in c_collect
+
+    begin = strict.split(
+        '@c_abi_export("pcc_gc_begin_explicit_tracing_collect")', 1
+    )[1].split("\n@c_abi_export", 1)[0]
+    assert begin.index('store_i32(global_addr("pcc_gc_explicit_collect_active")') < (
+        begin.index('store_i32(global_addr("pcc_gc_cycle_requested")')
+    )
+
+
+@pytest.mark.parametrize("emitter", ["llvm", "self"])
+def test_public_collection_object_has_exact_raw_closure(
+    tmp_path: Path, emitter: str
+):
+    obj = _compile_object(tmp_path, emitter)
+    assert _literal_global_imports() == RAW_GLOBAL_IMPORTS
+    assert RAW_GLOBAL_IMPORTS <= FREESTANDING_GC_RUNTIME_GLOBALS
+    undefined_result = subprocess.run(
+        ["nm", "-u", str(obj)], capture_output=True, text=True, timeout=30
+    )
+    assert undefined_result.returncode == 0, (
+        undefined_result.stdout + undefined_result.stderr
+    )
+    undefined = {
+        line.split()[-1].lstrip("_")
+        for line in undefined_result.stdout.splitlines()
+        if line.strip()
+    }
+    assert undefined == RAW_FUNCTION_IMPORTS | RAW_GLOBAL_IMPORTS
+
+    symbols_result = subprocess.run(
+        ["nm", "-g", str(obj)], capture_output=True, text=True, timeout=30
+    )
+    assert symbols_result.returncode == 0, symbols_result.stdout + symbols_result.stderr
+    defined = {
+        line.split()[-1].lstrip("_")
+        for line in symbols_result.stdout.splitlines()
+        if line.strip() and " U " not in line
+    }
+    assert defined == OWNED_SYMBOLS
+
+
+def test_pcc_python_cms_worker_starts_drains_and_joins(tmp_path: Path) -> None:
+    public_obj = _compile_object(tmp_path, "llvm")
+    scheduler_obj = _compile_llvm_object(
+        tmp_path,
+        RUNTIME_DIR / "py" / "freestanding_gc_incremental_concurrent_scheduler.py",
+        "freestanding_gc_incremental_concurrent_scheduler",
+    )
+    state_obj = _compile_llvm_object(
+        tmp_path,
+        RUNTIME_DIR / "py" / "freestanding_gc_state.py",
+        "freestanding_gc_state",
+    )
+    harness = tmp_path / "cms_worker.c"
+    harness.write_text(
+        r'''
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <time.h>
+
+typedef struct WorkerHandle { pthread_t thread; } WorkerHandle;
+
+extern void pcc_gc_maybe_start_cms_worker(void);
+extern void pcc_gc_cms_note_alloc(int64_t bytes);
+extern void pcc_gc_cms_stop_worker(void);
+extern int32_t pcc_gc_backend_selected;
+extern int32_t pcc_gc_config_initialized;
+extern int32_t pcc_gc_cycle_requested;
+extern int32_t pcc_gc_mark_active;
+extern int32_t pcc_gc_cms_worker_started;
+extern int32_t pcc_gc_cms_worker_starts;
+extern int32_t pcc_gc_cms_worker_stops;
+extern int32_t pcc_gc_cms_worker_drains;
+extern void *pcc_gc_cms_worker_handle;
+
+void *pcc_platform_getenv(void *name) { (void)name; return NULL; }
+int64_t pcc_threads_enabled(void) { return 1; }
+int64_t pcc_thread_start(void **out, void *entry, void *arg) {
+    WorkerHandle *handle = (WorkerHandle *)calloc(1, sizeof(*handle));
+    if (handle == NULL) return -1;
+    int rc = pthread_create(
+        &handle->thread, NULL, (void *(*)(void *))entry, arg
+    );
+    if (rc != 0) { free(handle); return -1; }
+    *out = handle;
+    return 0;
+}
+int64_t pcc_thread_join(void *raw, void *result_out) {
+    (void)result_out;
+    WorkerHandle *handle = (WorkerHandle *)raw;
+    if (handle == NULL) return -1;
+    int rc = pthread_join(handle->thread, NULL);
+    free(handle);
+    return rc;
+}
+void pcc_thread_safepoint(void) {}
+int64_t pcc_platform_sleep_ns(int64_t ns) {
+    struct timespec delay = { ns / 1000000000, ns % 1000000000 };
+    return nanosleep(&delay, NULL);
+}
+int64_t pcc_platform_monotonic_us(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
+    return (int64_t)now.tv_sec * 1000000 + now.tv_nsec / 1000;
+}
+int64_t pcc_stop_the_world(void) { return 0; }
+int64_t pcc_resume_world(void) { return 0; }
+int64_t pcc_gc_tracing_has_sweep_candidate(void) { return 0; }
+int64_t pcc_gc_tracing_sweep_unreachable(int64_t budget) {
+    (void)budget;
+    return 0;
+}
+void pcc_py_gc_minor_graph_lock(void) {}
+void pcc_py_gc_minor_graph_unlock(void) {}
+void pcc_gc_begin_mark_cycle(void) { pcc_gc_mark_active = 1; }
+int64_t pcc_gc_finish_tracing_cycle(void) { return 1; }
+void pcc_gc_trace_referents(void *obj) { (void)obj; }
+int64_t pcc_gc_gray_count_load_acquire(void) { return 0; }
+void pcc_gc_gray_count_decrement_acq_rel(void) {}
+void pcc_gc_gray_count_store_release(int64_t value) { (void)value; }
+
+int main(void) {
+    pcc_gc_backend_selected = 2;
+    pcc_gc_config_initialized = 1;
+    pcc_gc_cycle_requested = 1;
+    pcc_gc_maybe_start_cms_worker();
+    if (
+        pcc_gc_cms_worker_started != 1
+        || pcc_gc_cms_worker_starts != 1
+        || pcc_gc_cms_worker_handle == NULL
+    ) return 10;
+    pcc_gc_cms_note_alloc(64);
+    for (int i = 0; i < 1000 && pcc_gc_cms_worker_drains == 0; i++) {
+        pcc_platform_sleep_ns(1000000);
+    }
+    if (pcc_gc_cms_worker_drains == 0) return 11;
+    pcc_gc_cms_stop_worker();
+    if (
+        pcc_gc_cms_worker_started != 0
+        || pcc_gc_cms_worker_handle != NULL
+        || pcc_gc_cms_worker_stops != 1
+    ) return 12;
+    puts("cms-worker:ok");
+    return 0;
+}
+''',
+        encoding="utf-8",
+    )
+    executable = tmp_path / "cms_worker"
+    build = subprocess.run(
+        [
+            "clang",
+            "-std=c11",
+            "-pthread",
+            str(harness),
+            str(public_obj),
+            str(scheduler_obj),
+            str(state_obj),
+            "-o",
+            str(executable),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert build.returncode == 0, build.stdout + build.stderr
+    run = subprocess.run(
+        [str(executable)], capture_output=True, text=True, timeout=10
+    )
+    assert run.returncode == 0, run.stdout + run.stderr
+    assert run.stdout == "cms-worker:ok\n"
+
+
+def test_production_archive_has_one_public_collection_owner(
+    pcc_py_runtime_archive: Path,
+):
+    symbols_result = subprocess.run(
+        ["nm", "-A", "-g", str(pcc_py_runtime_archive)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert symbols_result.returncode == 0, symbols_result.stdout + symbols_result.stderr
+    for symbol in OWNED_SYMBOLS:
+        owners = [
+            line
+            for line in symbols_result.stdout.splitlines()
+            if line.strip()
+            and line.split()[-1].lstrip("_") == symbol
+            and " U " not in line
+        ]
+        assert len(owners) == 1, (symbol, owners)
+        assert ":freestanding_gc_public_collection.o:" in owners[0]
+        assert ":py_gc_backend.o:" not in owners[0]

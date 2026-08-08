@@ -54,6 +54,12 @@ from .instsimplify import simplify_module_text
 from .ir_mutator import BasicBlock, Instruction, MutableModule
 from .loop_info import compute_loop_info
 from .manager import AnalysisManager, ModulePass, PreservedAnalyses
+from .integer_fold_contract import (
+    FOLD_CONSTANT,
+    FOLD_POISON,
+    fold_llvm_integer_binary,
+    signed_value,
+)
 
 
 _PHI_RE = re.compile(
@@ -65,7 +71,8 @@ _ADD_INC_RE = re.compile(
 )
 _BINOP_RE = re.compile(
     r"^\s*%(?P<name>[\w\.]+)\s*=\s*(?P<op>add|sub|mul)\s+"
-    r"(?:(?:nsw|nuw)\s+)*(?P<ty>i\d+)\s+(?P<lhs>[^,]+)\s*,\s*(?P<rhs>.+?)\s*$"
+    r"(?P<flags>(?:(?:nsw|nuw)\s+)*)(?P<ty>i\d+)\s+"
+    r"(?P<lhs>[^,]+)\s*,\s*(?P<rhs>.+?)\s*$"
 )
 _ICMP_LIMIT_RE = re.compile(
     r"^\s*%(?P<name>[\w\.]+)\s*=\s*icmp\s+(?P<pred>slt|ult|sle|ule|eq|ne)\s+"
@@ -224,11 +231,17 @@ def _constant_trip_count(fn, loop, cfg: CFG) -> tuple[int, bool] | None:
                 lhs_const = _resolve_small_const(lhs, const_values)
                 rhs_const = _resolve_small_const(rhs, const_values)
                 value: int | None = None
-                if m.group("op") == "add":
-                    if lhs_const is not None and rhs_const is not None:
-                        value = lhs_const + rhs_const
-                elif lhs_const is not None and rhs_const is not None:
-                    value = lhs_const - rhs_const
+                if lhs_const is not None and rhs_const is not None:
+                    width = int(m.group("ty")[1:])
+                    status, raw_value = fold_llvm_integer_binary(
+                        m.group("op"),
+                        width,
+                        lhs_const,
+                        rhs_const,
+                        m.group("flags"),
+                    )
+                    if status == FOLD_CONSTANT:
+                        value = signed_value(raw_value, width)
                 if value is not None:
                     const_values[m.group("name")] = value
             m = _ICMP_LIMIT_RE.match(text)
@@ -1569,13 +1582,22 @@ def _try_fold_const_binop(text: str) -> str | None:
         rhs = int(match.group("rhs"))
     except ValueError:
         return None
-    op = match.group("op")
-    if op == "add":
-        return str(lhs + rhs)
-    if op == "sub":
-        return str(lhs - rhs)
-    if op == "mul":
-        return str(lhs * rhs)
+    ty = match.group("ty")
+    try:
+        width = int(ty[1:])
+    except ValueError:
+        return None
+    status, value = fold_llvm_integer_binary(
+        match.group("op"),
+        width,
+        lhs,
+        rhs,
+        match.group("flags"),
+    )
+    if status == FOLD_POISON:
+        return "poison"
+    if status == FOLD_CONSTANT:
+        return str(signed_value(value, width))
     return None
 
 

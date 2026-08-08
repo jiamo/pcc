@@ -21,6 +21,7 @@ from ..py_ast import (
     TupleType,
 )
 from . import marshal
+from .freestanding_abi_constants import PY_TYPE_SET
 
 
 _I1 = ir.IntType(1)
@@ -67,10 +68,16 @@ class SetLoweringMixin:
             name=self._fresh("set.binop.rhs.tag"),
         )
         lhs_is_set = self.builder.icmp_signed(
-            "==", lhs_tag, ir.Constant(_I64, 8), name=self._fresh("set.binop.lhs.ok")
+            "==",
+            lhs_tag,
+            ir.Constant(_I64, PY_TYPE_SET),
+            name=self._fresh("set.binop.lhs.ok"),
         )
         rhs_is_set = self.builder.icmp_signed(
-            "==", rhs_tag, ir.Constant(_I64, 8), name=self._fresh("set.binop.rhs.ok")
+            "==",
+            rhs_tag,
+            ir.Constant(_I64, PY_TYPE_SET),
+            name=self._fresh("set.binop.rhs.ok"),
         )
         valid = self.builder.and_(
             lhs_is_set,
@@ -143,6 +150,7 @@ class SetLoweringMixin:
         else:
             helper = "py_set_symmetric_difference_update"
         self.builder.call(self.runtime[helper], [lhs, rhs])
+        self._emit_post_call_err_check(span)
         return self._gc_retain(lhs, name=self._fresh("set.inplace.retain"))
 
     def _dict_keys_view_receiver(self, expr: Expr) -> Optional[Expr]:
@@ -210,6 +218,7 @@ class SetLoweringMixin:
             name=self._fresh("dict.keys.set.item"),
         )
         self.builder.call(self.runtime["py_set_add"], [out, item])
+        self._emit_post_call_err_check(getattr(receiver, "span", None))
         self._gc_release(item, self._release_context_label("dict.keys.set.item"))
         next_index = self.builder.add(
             current,
@@ -345,6 +354,7 @@ class SetLoweringMixin:
                 self.runtime[fn_name],
                 [recv, self._emit_as_object(expr.args[0])],
             )
+            self._emit_post_call_err_check(expr.span)
             return self._emit_none_literal()
         if name in ("issubset", "issuperset"):
             fn_name = (
@@ -380,11 +390,13 @@ class SetLoweringMixin:
                 self.runtime["py_set_new"], [], name=self._fresh(f"set.{name}.new"),
             )
             self.builder.call(self.runtime["py_set_update"], [new_set, recv])
+            self._emit_post_call_err_check(expr.span)
             if name == "union":
                 self.builder.call(
                     self.runtime["py_set_update"],
                     [new_set, self._emit_as_object(expr.args[0])],
                 )
+                self._emit_post_call_err_check(expr.span)
             return new_set
         if name == "pop":
             result = self.builder.call(
@@ -414,12 +426,19 @@ class SetLoweringMixin:
         item = self._emit_expr_as_pcc_object(expr.args[0])
         if name == "add":
             self.builder.call(self.runtime["py_set_add"], [recv, item])
+            # The void helper reports an unhashable item through the pending
+            # exception channel.  Do not let ``set.add`` appear successful.
+            self._emit_post_call_err_check(expr.span)
             return self._emit_none_literal()
         removed = self.builder.call(
             self.runtime["py_set_remove"],
             [recv, item],
             name=self._fresh("set.remove"),
         )
+        # ``-1`` means either an absent item or a hash failure.  Preserve a
+        # pending hash exception before discard ignores absence or remove
+        # synthesizes KeyError for the ordinary missing-item case.
+        self._emit_post_call_err_check(expr.span)
         if name == "discard":
             return self._emit_none_literal()
         missing = self.builder.icmp_signed(
@@ -495,6 +514,7 @@ class SetLoweringMixin:
                     self.runtime["py_set_add"],
                     [new_set, v_obj],
                 )
+                self._emit_post_call_err_check(getattr(el, "span", expr.span))
             return new_set
         arg_ty = arg.ty
         if isinstance(arg_ty, SetType):
@@ -503,6 +523,7 @@ class SetLoweringMixin:
                 self.runtime["py_set_update"],
                 [new_set, src_val],
             )
+            self._emit_post_call_err_check(expr.span)
             return new_set
         if isinstance(arg_ty, ClassType):
             # A user-class instance (custom __iter__/__next__, no __len__):
@@ -547,6 +568,7 @@ class SetLoweringMixin:
                 name=self._fresh("set.iter.elem"),
             )
             self.builder.call(self.runtime["py_set_add"], [new_set, elem])
+            self._emit_post_call_err_check(expr.span)
             self.builder.branch(step_bb)
             self.builder.position_at_end(step_bb)
             nxt = self.builder.add(
@@ -601,10 +623,12 @@ class SetLoweringMixin:
                 [src_obj, idx_box],
                 name=self._fresh("set.elem"),
             )
+            self._emit_post_call_err_check(expr.span)
             self.builder.call(
                 self.runtime["py_set_add"],
                 [new_set, elem],
             )
+            self._emit_post_call_err_check(expr.span)
             self.builder.branch(step_bb)
             self.builder.position_at_end(step_bb)
             nxt = self.builder.add(
@@ -628,7 +652,9 @@ class SetLoweringMixin:
             name=self._fresh("set.union"),
         )
         self.builder.call(self.runtime["py_set_update"], [new_set, lhs])
+        self._emit_post_call_err_check()
         self.builder.call(self.runtime["py_set_update"], [new_set, rhs])
+        self._emit_post_call_err_check()
         return new_set
     def _spread_into_set(self, dst_set: ir.Value, src_expr: "Expr") -> None:
         """Iterate ``src_expr`` and ``py_set_add`` each element to
@@ -637,6 +663,7 @@ class SetLoweringMixin:
         src_val = self._emit_expr(src_expr)
         if isinstance(src_expr.ty, SetType):
             self.builder.call(self.runtime["py_set_update"], [dst_set, src_val])
+            self._emit_post_call_err_check(getattr(src_expr, "span", None))
             return
         src_obj = marshal.marshal_to_object(
             self.builder,
@@ -678,10 +705,12 @@ class SetLoweringMixin:
             [src_obj, idx_box],
             name=self._fresh("set.spread.elem"),
         )
+        self._emit_post_call_err_check(getattr(src_expr, "span", None))
         self.builder.call(
             self.runtime["py_set_add"],
             [dst_set, elem],
         )
+        self._emit_post_call_err_check(getattr(src_expr, "span", None))
         self.builder.branch(step_bb)
         self.builder.position_at_end(step_bb)
         nxt = self.builder.add(

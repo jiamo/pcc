@@ -98,8 +98,8 @@ class AttrStoreLoweringMixin:
                     gv,
                     name=self._fresh(f"modattr.{target.name}.old"),
                 )
-                self.builder.call(self.runtime["pcc_gc_unpin"], [old_value])
-                self.builder.call(self.runtime["pcc_gc_pin"], [value_obj])
+                self._gc_unpin(old_value)
+                self._gc_pin(value_obj)
                 self.builder.call(
                     self.runtime["pcc_gc_store_root"],
                     [
@@ -129,8 +129,8 @@ class AttrStoreLoweringMixin:
                     gv,
                     name=self._fresh(f"modattr.{target.name}.old"),
                 )
-                self.builder.call(self.runtime["pcc_gc_unpin"], [old_value])
-                self.builder.call(self.runtime["pcc_gc_pin"], [value_obj])
+                self._gc_unpin(old_value)
+                self._gc_pin(value_obj)
                 self.builder.call(
                     self.runtime["pcc_gc_store_root"],
                     [

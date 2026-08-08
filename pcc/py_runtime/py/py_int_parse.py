@@ -4,7 +4,7 @@ String-to-int parsing for int(str) / int(str, base). The arithmetic core
 stays in py_int.c for now; this module only parses an int64 payload and
 delegates canonical tagged-vs-heap construction to py_int_from_i64.
 """
-from pcc.extern import extern, c_abi_export, c_ptr, c_int64, c_void
+from pcc.extern import extern, c_abi_export, c_ptr, c_int64, c_void, c_double
 from pcc.unsafe import cstr, load_i8, store_i8, malloc, free, strlen, null, ptr_is_null
 
 
@@ -12,6 +12,11 @@ py_int_from_i64 = extern("py_int_from_i64", (c_int64,),       c_ptr)
 py_int_mul      = extern("py_int_mul",      (c_ptr, c_ptr),   c_ptr)
 py_int_add      = extern("py_int_add",      (c_ptr, c_ptr),   c_ptr)
 py_decref       = extern("py_decref",       (c_ptr,),         c_void)
+py_obj_type_tag  = extern("py_obj_type_tag",  (c_ptr,),         c_int64)
+py_str_utf8      = extern("py_str_utf8",      (c_ptr,),         c_ptr)
+py_float_to_f64  = extern("py_float_to_f64",  (c_ptr,),         c_double)
+py_obj_truthy    = extern("py_obj_truthy",    (c_ptr,),         c_int64)
+py_incref        = extern("py_incref",        (c_ptr,),         c_void)
 py_raise        = extern("py_raise",        (c_ptr,),         c_void)
 py_exc_new      = extern("py_exc_new",      (c_int64, c_ptr), c_ptr)
 
@@ -359,3 +364,22 @@ def py_int_from_cstr_or_raise(s, base: int):
     else:
         py_raise(py_exc_new(2, cstr("invalid literal for int()")))
     return null()
+
+
+@c_abi_export("py_obj_as_int_object")
+def py_obj_as_int_object(obj, base: int):
+    # Mirror of py_obj_as_int_object in py_int_parse.c.  `int(o[, base])` with an
+    # OBJECT result: the frontend's i64-returning `int(<dyn>)` lowering phis four
+    # unboxed branches and truncates a bignum to 0, so callers that want the
+    # object projection emit ONE call here instead.  Returns a NEW reference.
+    if ptr_is_null(obj):
+        return null()
+    tag: int = py_obj_type_tag(obj)
+    if tag == 4:  # PY_TYPE_STR
+        return py_int_from_cstr_or_raise(py_str_utf8(obj), base)
+    if tag == 3:  # PY_TYPE_FLOAT
+        return py_int_from_i64(int(py_float_to_f64(obj)))
+    if tag == 1:  # PY_TYPE_BOOL
+        return py_int_from_i64(py_obj_truthy(obj))
+    py_incref(obj)
+    return obj

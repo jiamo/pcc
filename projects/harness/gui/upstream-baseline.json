@@ -1,0 +1,16 @@
+{
+  "upstream_commit": "47f943859bef60e4160492346772ded9b24f765a",
+  "viewport": {
+    "width": 1280,
+    "height": 800,
+    "theme": "light"
+  },
+  "source_anchors": [
+    "packages/client/ui-layout/src/client/AppFrame.module.css",
+    "packages/client/ui-sidebar/src/client/SidebarRoot.module.css",
+    "packages/client/ui-conversation/src/client/skeleton/HeroShell.module.css",
+    "packages/client/ui-conversation/src/client/skeleton/InputBar.module.css",
+    "packages/client/ui-theme/src/styles/design-platform.css"
+  ],
+  "current_parity": "first native shell; interaction and pixel convergence remain open"
+}

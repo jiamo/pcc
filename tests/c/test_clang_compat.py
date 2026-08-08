@@ -1499,12 +1499,124 @@ def test_gcc_atomic_fetch_and_lock_builtins_lower_to_llvm_atomics():
     ), f"atomic builtin compat failed:\n{result.stdout}\n{result.stderr}"
 
 
+def test_gcc_atomic_exchange_n_lowers_to_atomicrmw_without_helper_symbol():
+    source = r"""
+        int main(void) {
+            int value = 3;
+            int old = __atomic_exchange_n(
+                &value, 9, __ATOMIC_ACQ_REL
+            );
+            if (old != 3) return 1;
+            if (value != 9) return 2;
+
+            unsigned char lock = 0;
+            if (__atomic_exchange_n(
+                    &lock, 1, __ATOMIC_ACQUIRE) != 0) return 3;
+            return lock == 1 ? 0 : 4;
+        }
+    """
+
+    evaluator = CEvaluator()
+    unit = TranslationUnit("atomic_exchange.c", "/dev/null", source)
+    compiled = evaluator.compile_translation_units(
+        [unit], base_dir="/tmp", use_compile_cache=False
+    )
+    ir_text = compiled[0][1]
+
+    assert ir_text.count("atomicrmw xchg") == 2
+    assert "__atomic_exchange_n" not in ir_text
+
+    result = evaluator.run_compiled_translation_units_with_system_cc(
+        compiled, optimize=True
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_gcc_atomic_exchange_n_supports_pointer_scalars():
+    source = r"""
+        static int first = 3;
+        static int second = 9;
+
+        int main(void) {
+            int *slot = &first;
+            int *old = __atomic_exchange_n(
+                &slot, &second, __ATOMIC_ACQ_REL
+            );
+            if (old != &first) return 1;
+            if (slot != &second) return 2;
+            return *old + *slot == 12 ? 0 : 3;
+        }
+    """
+
+    evaluator = CEvaluator()
+    unit = TranslationUnit("atomic_exchange_pointer.c", "/dev/null", source)
+    compiled = evaluator.compile_translation_units(
+        [unit], base_dir="/tmp", use_compile_cache=False
+    )
+    ir_text = compiled[0][1]
+
+    assert ir_text.count("atomicrmw xchg") == 1
+    assert "__atomic_exchange_n" not in ir_text
+
+    result = evaluator.run_compiled_translation_units_with_system_cc(
+        compiled, optimize=True
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def test_gcc_atomic_memory_order_is_masked_and_dynamic_order_is_seq_cst():
+    source = r"""
+        static int exchange_dynamic(int *slot, int order) {
+            return __atomic_exchange_n(slot, 7, order);
+        }
+
+        static int exchange_masked(int *slot) {
+            return __atomic_exchange_n(
+                slot, 11, __ATOMIC_ACQ_REL | 0x10000
+            );
+        }
+
+        int main(void) {
+            int value = 3;
+            if (exchange_dynamic(&value, __ATOMIC_RELAXED) != 3) return 1;
+            if (exchange_masked(&value) != 7) return 2;
+            return value == 11 ? 0 : 3;
+        }
+    """
+
+    evaluator = CEvaluator()
+    unit = TranslationUnit("atomic_exchange_order.c", "/dev/null", source)
+    compiled = evaluator.compile_translation_units(
+        [unit], base_dir="/tmp", use_compile_cache=False
+    )
+    exchange_lines = [
+        line.strip()
+        for line in compiled[0][1].splitlines()
+        if "atomicrmw xchg" in line
+    ]
+
+    assert len(exchange_lines) == 2
+    assert " seq_cst" in exchange_lines[0]
+    assert " acq_rel" in exchange_lines[1]
+
+    result = evaluator.run_compiled_translation_units_with_system_cc(
+        compiled, optimize=True
+    )
+    assert result.returncode == 0, result.stderr
+
+
 def test_float16_keyword_parses_as_floating_scalar():
     source = r"""
+        _Static_assert(sizeof(_Float16) == 2, "_Float16 must use a 16-bit ABI");
+        _Static_assert(_Alignof(_Float16) == 2, "_Float16 alignment must be 2");
+
         int main(void) {
             _Float16 half = 1.5f;
             float value = half;
-            return value > 1.0f && value < 2.0f ? 0 : 1;
+            _Float16 rounded = 1.0f / 3.0f;
+            return value > 1.0f && value < 2.0f
+                && (float)rounded > 0.333f && (float)rounded < 0.334f
+                ? 0 : 1;
         }
     """
 

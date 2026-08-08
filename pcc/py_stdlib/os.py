@@ -110,9 +110,12 @@ class _path:
             i = i - 1
         if i < 0:
             return ""
-        if i == 0:
-            return "/"
-        return p[:i]
+        head = p[: i + 1]
+        # CPython strips trailing slashes unless the head is all slashes, so
+        # dirname("/a//b") is "/a" and dirname("//") stays "//".
+        if head != "/" * len(head):
+            head = head.rstrip("/")
+        return head
 
     @staticmethod
     def exists(p: str) -> bool:

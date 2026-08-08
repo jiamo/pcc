@@ -249,6 +249,11 @@ class ReturnLoweringMixin:
             self._return_log("exact int end")
             return
         self._return_log("value emit expr")
+        exact_i64_return = (
+            isinstance(ret_ty, ir.IntType)
+            and isinstance(self.current_func_def.return_ty, IntType)
+            and self._int_expr_needs_exact_object_boundary(stmt.value)
+        )
         valueclass_target_ty = self.current_func_def.return_ty
         if not self._is_valueclass_payload_type(
             valueclass_target_ty
@@ -259,7 +264,34 @@ class ReturnLoweringMixin:
             stmt.value,
         )
         valueclass_payload_fields_owned = False
-        if valueclass_payload is not None:
+        if exact_i64_return:
+            # Compute in Python's arbitrary-precision object projection first;
+            # only the explicit C-ABI boundary may project the final value back
+            # to i64.  Unboxing exact operands before evaluating the expression
+            # would silently turn a bignum add/shift into wrapping machine IR.
+            exact_object = self._emit_exact_int_operand_object(stmt.value)
+            exact_owned = self._pcc_pointer_source_is_owned(stmt.value)
+            exact_pinned = (
+                isinstance(exact_object.type, ir.PointerType)
+                and exact_object not in getattr(self, "_cpy_values", ())
+            )
+            if exact_pinned:
+                self._gc_pin(exact_object)
+            value = marshal.marshal_from_object(
+                self.builder,
+                self.module,
+                self.runtime,
+                exact_object,
+                self.current_func_def.return_ty,
+            )
+            if exact_pinned:
+                self._gc_unpin(exact_object)
+            if exact_owned:
+                self._gc_release(
+                    exact_object,
+                    self._release_context_label("exact-i64-return"),
+                )
+        elif valueclass_payload is not None:
             value = valueclass_payload
             valueclass_payload_fields_owned = (
                 self._valueclass_payload_expr_fields_are_owned(stmt.value)
@@ -330,11 +362,31 @@ class ReturnLoweringMixin:
         if self._builder_block_is_terminated():
             self._return_log("value terminated")
             return
-        skip_name = stmt.value.ident if isinstance(stmt.value, Name) else None
+        # A local object can be skipped only when its owned pointer is being
+        # transferred to a pointer-return ABI.  Exact-int locals returned
+        # through an i64 C ABI have already been unboxed at this point; their
+        # backing object must still be released during function cleanup.
+        skip_name = (
+            stmt.value.ident
+            if isinstance(stmt.value, Name)
+            and isinstance(value.type, ir.PointerType)
+            else None
+        )
         ret_root_slot, ret_root_ptr = self._enter_return_cleanup_root(value, stmt)
         self._return_log("value cleanup")
         self._emit_owned_local_cleanup(skip_name=skip_name)
         value = self._leave_return_cleanup_root(value, ret_root_slot, ret_root_ptr)
+        if value in getattr(self, "_cpy_values", ()):
+            self._guard_cpy_value_not_null(value)
+            if self._cpy_value_is_owned(value):
+                # Transfer the expression's existing new reference to the
+                # caller; no extra retain is needed.
+                self._forget_owned_cpy_value(value)
+            else:
+                # Parameters/module globals/other borrowed CPython values must
+                # be promoted so every successful function call returns an
+                # owned reference.
+                self.builder.call(self.runtime["py_cpy_incref"], [value])
         self._return_log("value ret")
         self.builder.ret(value)
         self._return_log("value end")

@@ -323,6 +323,168 @@ def _matrix(value: object, *, name: str, shape: tuple[int, int]) -> Matrix:
     return tuple(out)
 
 
+def execute_static_row_reduce_sum_reference(
+    module: KernelModule | PlainTirModule,
+    inputs: Mapping[str, Sequence[Sequence[Number]]],
+    *,
+    entry: str | None = None,
+) -> CpuReferenceResult:
+    """Execute the bounded TileLang static row ``reduce_sum`` subset.
+
+    This is a CPU correctness oracle for the importer-owned
+    ``tilelang.reduce_sum.static_row.v1`` shape, not a GPU execution claim.  It
+    deliberately validates the same finite contract as the Metal source path:
+    one static rank-2 f16/f32 input, last-dimension reduction, one f32
+    ``(rows, 1)`` output, and explicit shared scratch in frozen Kernel IR.
+    """
+
+    plain = _coerce_plain(module)
+    func = _select_func(plain, entry)
+    params = _records(func.get("params"), kind="params")
+    locals_ = _records(func.get("locals"), kind="locals")
+    ops = func.get("ops")
+    if not isinstance(ops, list):
+        raise KernelCpuReferenceError("row reduce_sum CPU reference requires an ops list")
+    reductions = [
+        op
+        for op in ops
+        if isinstance(op, dict) and op.get("tir_op") == "tir.reduce_loop"
+    ]
+    copies = [
+        op
+        for op in ops
+        if isinstance(op, dict) and op.get("tir_op") == "tir.copy_loop"
+    ]
+    unsupported = [
+        op.get("tir_op") if isinstance(op, dict) else type(op).__name__
+        for op in ops
+        if not isinstance(op, dict)
+        or op.get("tir_op") not in {"tir.reduce_loop", "tir.copy_loop"}
+    ]
+    if len(reductions) != 1 or len(copies) != 1 or unsupported:
+        raise KernelCpuReferenceError(
+            "row reduce_sum CPU reference requires exactly one reduction and "
+            f"one output copy; reductions={len(reductions)}, copies={len(copies)}, "
+            f"unsupported={unsupported}"
+        )
+
+    reduction = reductions[0]
+    reduction_args = reduction.get("args")
+    attrs = reduction.get("attrs")
+    copy_args = copies[0].get("args")
+    copy_attrs = copies[0].get("attrs")
+    if (
+        not isinstance(reduction_args, list)
+        or len(reduction_args) != 2
+        or not isinstance(copy_args, list)
+        or len(copy_args) != 2
+        or not isinstance(attrs, dict)
+        or not isinstance(copy_attrs, dict)
+    ):
+        raise KernelCpuReferenceError("row reduce_sum frozen ops are malformed")
+    source_name, scratch_name = map(str, reduction_args)
+    copy_source, output_name = map(str, copy_args)
+    if copy_source != scratch_name or copy_attrs.get("reduction_output") is not True:
+        raise KernelCpuReferenceError(
+            "row reduce_sum output copy must consume the explicit reduction scratch"
+        )
+    if attrs.get("import_kind") != "tilelang.reduce_sum.static_row.v1":
+        raise KernelCpuReferenceError(
+            "row reduce_sum CPU reference requires importer-owned v1 metadata"
+        )
+    if (
+        attrs.get("reduction") != "sum"
+        or attrs.get("dim") != 1
+        or attrs.get("clear") is not True
+        or attrs.get("batch") != 1
+    ):
+        raise KernelCpuReferenceError(
+            "row reduce_sum CPU reference supports only sum/dim=1/clear=True/batch=1"
+        )
+
+    source = params.get(source_name)
+    output = params.get(output_name)
+    scratch = locals_.get(scratch_name)
+    if source is None or output is None or scratch is None:
+        raise KernelCpuReferenceError(
+            "row reduce_sum source, output, and scratch records must all be present"
+        )
+    source_shape = _shape(source, name=source_name)
+    output_shape = _shape(output, name=output_name)
+    scratch_shape = _shape(scratch, name=scratch_name)
+    if len(source_shape) != 2:
+        raise KernelCpuReferenceError("row reduce_sum input must be rank 2")
+    rows, width = source_shape
+    if output_shape != (rows, 1):
+        raise KernelCpuReferenceError(
+            f"row reduce_sum output shape must be {(rows, 1)!r}, got {output_shape!r}"
+        )
+    if scratch_shape != (width,):
+        raise KernelCpuReferenceError(
+            f"row reduce_sum scratch shape must be {(width,)!r}, got {scratch_shape!r}"
+        )
+    source_dtype = source.get("dtype")
+    output_dtype = output.get("dtype")
+    scratch_dtype = scratch.get("dtype")
+    if source_dtype not in {"f16", "f32"} or output_dtype != "f32" or scratch_dtype != "f32":
+        raise KernelCpuReferenceError(
+            "row reduce_sum requires f16/f32 input and f32 output/scratch"
+        )
+    if func.get("grid") != [rows] or func.get("threads") != width:
+        raise KernelCpuReferenceError(
+            "row reduce_sum launch must use one threadgroup per row and one thread per column"
+        )
+    if attrs.get("extent") != rows * width or attrs.get("row_width") != width:
+        raise KernelCpuReferenceError("row reduce_sum extent metadata does not match shapes")
+    if set(inputs) != {source_name}:
+        raise KernelCpuReferenceError(
+            f"row reduce_sum expects only input {source_name!r}, got {sorted(inputs)}"
+        )
+
+    matrix = _matrix(inputs[source_name], name=source_name, shape=(rows, width))
+    output_rows: list[tuple[float, ...]] = []
+    for row in matrix:
+        try:
+            scratch = [
+                float(
+                    coerce_pod_scalar(
+                        "f32",
+                        coerce_pod_scalar(source_dtype, value),
+                    )
+                )
+                for value in row
+            ]
+            active = width
+            while active > 1:
+                partner_offset = (active + 1) >> 1
+                for tid in range(active >> 1):
+                    partner = tid + partner_offset
+                    if partner < active:
+                        scratch[tid] = float(
+                            coerce_pod_scalar(
+                                "f32",
+                                scratch[tid] + scratch[partner],
+                            )
+                        )
+                active = partner_offset
+            result = scratch[0]
+        except KernelScalarError as exc:
+            raise KernelCpuReferenceError(
+                f"row reduce_sum scalar conversion failed: {exc}"
+            ) from exc
+        output_rows.append((result,))
+    return CpuReferenceResult(
+        entry=str(func.get("name")),
+        outputs={output_name: tuple(output_rows)},
+        tiles_executed=rows,
+        k_tiles=0,
+        claim_mode=(
+            "Static TileLang-shaped last-dimension row reduce_sum CPU oracle; "
+            "not GPU execution"
+        ),
+    )
+
+
 def _int_matrix(value: object, *, name: str, shape: tuple[int, int]) -> IntMatrix:
     rows, cols = shape
     if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
@@ -1208,6 +1370,7 @@ __all__ = [
     "KernelCpuReferenceError",
     "execute_static_fill_reference",
     "execute_static_indexed_reference",
+    "execute_static_row_reduce_sum_reference",
     "execute_sparse_tiled_gemm_sp_reference",
     "execute_scalar_tiled_gemm_reference",
 ]

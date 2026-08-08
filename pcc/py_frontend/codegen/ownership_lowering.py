@@ -8,6 +8,7 @@ from pcc.llvm_capi.compat import ir
 from ..py_ast import (
     Attr,
     BinOp,
+    BoolLit,
     BoolType,
     BytesLit,
     Call,
@@ -20,6 +21,7 @@ from ..py_ast import (
     ListExpr,
     ListType,
     Name,
+    NoneLit,
     NoneType,
     StrLit,
     StrType,
@@ -40,10 +42,13 @@ _UNSAFE_RAW_POINTER_RETURNS = frozenset(
         "malloc",
         "cstr",
         "global_addr",
+        "function_addr",
         "global_load_ptr",
         "calloc",
         "realloc",
         "ptr_add",
+        "stack_alloc",
+        "int_to_ptr",
         "null",
         "tag_int",
         "load_ptr",
@@ -54,7 +59,16 @@ _UNSAFE_RAW_POINTER_RETURNS = frozenset(
         "target_sys_platform",
         "target_platform_machine",
         "call_ptr1",
+        "call_ptr0",
         "call_ptr2",
+        "call_ptr4",
+        "call_ptr3",
+        "dynamic_library_open",
+        "dynamic_library_open_global",
+        "dynamic_library_symbol",
+        "darwin_libsystem_symbol",
+        "darwin_errno_location",
+        "page_alloc",
     }
 )
 
@@ -97,17 +111,88 @@ class OwnershipLoweringMixin:
             [self._ptr_to_cstr(name_gv), obj],
         )
 
+    def _note_never_gc_object(self, value: ir.Value) -> None:
+        """Record a value that provably cannot be a GC-managed object.
+
+        Two kinds qualify:
+
+        * materialized tagged small ints -- `(v << 1) | 1` reinterpreted as a
+          pointer, an immediate rather than a heap object;
+        * the immortal singletons `py_None` / `py_True` / `py_False`, which
+          carry `PY_FLAG_IMMORTAL` and are never collected.
+
+        Both make `pcc_gc_pin` / `unpin` / `release` no-ops at run time (each
+        starts by testing for a tagged immediate or an immortal flag and
+        returning), so emitting the call buys nothing and still costs the GC
+        managed-pointer probe that profiles as a top leaf of a stage2 build.
+        Measured over 60 real modules, singleton-sourced barriers are ~3800 of
+        79766 barrier arguments.
+        Membership is tracked by identity rather than inspected from the IR
+        so the test stays exact — a wrong answer here would drop a real
+        barrier.
+        """
+        if not hasattr(self, "_never_gc_object_values"):
+            self._never_gc_object_values = set()
+        self._never_gc_object_values.add(value)
+
+    def _value_is_never_gc_object(self, value: ir.Value) -> bool:
+        return value in getattr(self, "_never_gc_object_values", ())
+
+    def _gc_pin(self, obj: ir.Value) -> None:
+        # pcc_gc_pin returns immediately for a tagged immediate, so emitting
+        # the call for one is pure overhead — and it also spares the GC
+        # managed-pointer table the lookup, which profiles as the hottest
+        # leaf of a `pcc1 -> pcc2` build.
+        if self._value_is_never_gc_object(obj):
+            return
+        self.builder.call(self.runtime["pcc_gc_pin"], [obj])
+
+    def _gc_unpin(self, obj: ir.Value) -> None:
+        if self._value_is_never_gc_object(obj):
+            return
+        self.builder.call(self.runtime["pcc_gc_unpin"], [obj])
+
     def _gc_release(self, obj: ir.Value, label: Optional[str] = None) -> None:
+        if self._value_is_never_gc_object(obj):
+            # pcc_gc_release starts with `ptr_is_null(o) or is_tagged_int(o)`
+            # and returns, so this call is a no-op for a tagged immediate.
+            return
         self._debug_check_release(
             obj,
             label or self._release_context_label("release"),
         )
         self.builder.call(self.runtime["pcc_gc_release"], [obj])
 
+    def _note_owned_dynamic_call_value(self, value: ir.Value) -> None:
+        """Record that *value* came from ``py_obj_call`` on the dynamic path.
+
+        The expression-shape classifier below cannot decide this: an
+        ``obj.method()`` on a DynType receiver may be intercepted by any of a
+        dozen native emitters that return borrowed values, or fall through to
+        generic dispatch.  Only the emitter knows which happened, and
+        ``py_obj_call`` unconditionally returns a NEW reference, so the emitter
+        records the value here instead of the classifier guessing from the AST.
+        Mirrors the existing ``_cpy_values`` / ``_owned_cpy_values`` split.
+        """
+        self._owned_dynamic_call_values.add(value)
+
+    def _value_is_owned_dynamic_call(self, value: ir.Value) -> bool:
+        return value in self._owned_dynamic_call_values
+
     def _gc_release_if_owned(self, obj: ir.Value, source_expr: Expr) -> None:
         if obj is None:
             return
         if not isinstance(obj.type, ir.PointerType):
+            return
+        if self._value_is_owned_dynamic_call(obj):
+            # Unconditionally owned, and not inferable from the AST shape; skip
+            # the shape classifier entirely.  Discarding this reference is what
+            # leaked the whole result object of every dynamic method call used
+            # as a statement.
+            if obj not in getattr(self, "_cpy_values", ()):
+                self._gc_release(
+                    obj, self._release_expr_label("owned.dyncall", source_expr)
+                )
             return
         if not self._raw_scaffold_object_rhs_is_owned(source_expr):
             return
@@ -117,6 +202,56 @@ class OwnershipLoweringMixin:
             return
         self._gc_release(obj, self._release_expr_label("owned", source_expr))
 
+    def _native_re_call_returns_owned_object(self, expr) -> bool:
+        """True when *expr* is a call the native ``re`` lowering will emit.
+
+        Every ``py_re_*`` runtime helper returns a NEW reference (or the
+        immortal ``py_None``, for which a release is a no-op), but the
+        classifier below saw only a DynType Call and answered "not owned", so
+        no release was ever emitted: **every native re match leaked its whole
+        Match object** — instance, six method funcs, six captures tuples, six
+        name strings.  A 300k-iteration ``pat.match(...)`` loop leaked 1.76 GB,
+        and the self-backend IR parser runs one match per operand, which is
+        what drove an oversized stage2 emit worker past 24 GB.
+
+        The shape conditions here MUST mirror the native emitters'
+        applicability gates in ``native_text_modules``: if the emitter falls
+        through to a generic path, this must answer False.
+        """
+        if expr.kwargs:
+            return False
+        func = expr.func
+        nargs = len(expr.args)
+        if isinstance(func, Attr) and isinstance(func.obj, Name):
+            root = func.obj.ident
+            if self._native_builtin_module_for_name(root) == "re":
+                if func.name in ("match", "search", "fullmatch"):
+                    return 2 <= nargs <= 3
+                if func.name == "findall":
+                    return 2 <= nargs <= 3
+                if func.name == "sub":
+                    return 3 <= nargs <= 4
+                if func.name == "escape":
+                    return nargs == 1
+                # ``re.split`` and ``re.compile`` have emitter gates that
+                # depend on evaluated flag/pattern constants and can fall
+                # through to generic lowering; classifying them here could
+                # over-release a borrowed fallback result.  They are cold
+                # (module scope) next to the per-operand match calls.
+                return False
+            if (
+                func.name in ("match", "search", "findall")
+                and nargs == 1
+                and self._native_re_compile_alias_for_name(root) is not None
+            ):
+                return True
+            return False
+        if isinstance(func, Name):
+            kind = self._native_builtin_value_for_name(func.ident)
+            if kind in ("re.match", "re.search", "re.fullmatch"):
+                return 2 <= nargs <= 3
+        return False
+
     def _expr_returns_owned_object(self, expr: Expr) -> bool:
         if self._expr_returns_unsafe_raw_pointer(expr):
             return False
@@ -124,9 +259,38 @@ class OwnershipLoweringMixin:
         if expr_ty is not None and self._is_valueclass_payload_type(expr_ty):
             return True
         if isinstance(expr, Call):
+            native_call = self._native_builtin_value_kind_for_expr(expr.func)
+            if (
+                native_call == "os._pcc_sha256_file_hex"
+                or native_call == "os._pcc_sha256_file_hex_bounded"
+            ):
+                return True
+            if (
+                native_call == "pcc.virtual_thread.spawn"
+                or native_call == "pcc.virtual_thread.call"
+                or native_call == "pcc.virtual_thread.join"
+                or native_call == "pcc.virtual_thread.current"
+                or native_call == "pcc.virtual_thread.result"
+                or native_call == "pcc.virtual_thread.exception"
+                or native_call == "pcc.virtual_thread.mpsc"
+                or native_call == "pcc.virtual_thread.oneshot"
+                or native_call == "pcc.virtual_thread.sender_clone"
+                or native_call == "pcc.virtual_thread.recv"
+                or native_call == "pcc.virtual_thread.select2"
+                or native_call == "pcc.virtual_thread.tcp_recv"
+            ):
+                # These intrinsics return a new/retained object reference even
+                # though their public Any result is represented as DynType.
+                # Keep scalar/None vthread operations out of this list: cancel,
+                # send, close, outcome, state, sleep and block_on_fd do not
+                # transfer an object owner to their caller.  Join, channel
+                # constructors/clone and receive/select result tuples do.
+                return True
             if self._weakref_constructor_kind_for_expr(expr) is not None:
                 return True
             if self._weakref_call_expr_returns_owned_object(expr):
+                return True
+            if self._native_re_call_returns_owned_object(expr):
                 return True
             if isinstance(expr.func, Name) and expr.func.ident == "__await__":
                 return True
@@ -350,13 +514,90 @@ class OwnershipLoweringMixin:
     ) -> bool:
         if is_cpy:
             return True
+        if isinstance(expr, (BoolLit, NoneLit, StrLit)):
+            # Literal strings are internal immortal globals; bool and None
+            # box/load the runtime's immortal singleton globals.  A container
+            # borrows those stable addresses, so there is no fresh temporary
+            # owner to consume.
+            return False
         if self._expr_returns_owned_object(expr):
             return True
+        if (
+            isinstance(value_ty, IntType)
+            and isinstance(expr, Name)
+            and self._int_expr_needs_exact_object_boundary(expr)
+        ):
+            # Exact-int locals are pointer-form borrowed loads.  Container
+            # stores retain them just like every other borrowed object; only
+            # the freshly boxed/raw scalar and fresh exact-expression lanes
+            # below need a balancing release.
+            return False
         return isinstance(value_ty, (IntType, FloatType, BoolType, NoneType))
+
+    def _pcc_pointer_source_needs_pin(self, expr: Expr) -> bool:
+        """Whether a native pointer result can move during later evaluation.
+
+        String literals are emitted as internal PY_FLAG_IMMORTAL globals;
+        bool and None literals resolve to the runtime's immortal singleton
+        globals.  Their addresses are fixed for the image lifetime, so
+        pinning each occurrence only duplicates cleanup IR.  Every other
+        pointer source remains conservative: dynamic strings and all heap
+        objects still pin across allocation/safepoint-capable operations.
+        """
+        return not isinstance(expr, (BoolLit, NoneLit, StrLit))
+
+    def _pcc_pointer_source_is_owned(self, expr: Expr) -> bool:
+        """Whether a pointer-form expression result carries a fresh pcc ref.
+
+        Most semantic ``int`` expressions use the raw i64 lane, so the generic
+        object-ownership classifier intentionally returns false for them.
+        Exact-int boundaries are different: literals/operations/calls produce
+        fresh bignum objects, while an exact-int ``Name`` loads a borrowed ref
+        from its rooted local slot.
+        """
+        if not self._raw_scaffold_object_rhs_is_owned(expr):
+            return False
+        if self._expr_returns_owned_object(expr):
+            return True
+        if isinstance(expr.ty, (IntType, BoolType)) and not isinstance(
+            expr,
+            Name,
+        ):
+            # This predicate is used only after codegen has observed an actual
+            # pointer value.  In that representation, a non-Name int/bool
+            # expression is a fresh boxed object even when its value would fit
+            # the raw scalar lane.  Exact-int Names remain borrowed local loads.
+            return True
+        return False
 
     def _raw_scaffold_object_rhs_is_owned(self, expr: Expr) -> bool:
         if not self._module_uses_raw_int_scaffold:
             return True
+        if isinstance(expr, Call):
+            native_call = self._native_builtin_value_kind_for_expr(expr.func)
+            if (
+                native_call == "os._pcc_sha256_file_hex"
+                or native_call == "os._pcc_sha256_file_hex_bounded"
+            ):
+                return True
+            if (
+                native_call == "pcc.virtual_thread.spawn"
+                or native_call == "pcc.virtual_thread.call"
+                or native_call == "pcc.virtual_thread.join"
+                or native_call == "pcc.virtual_thread.current"
+                or native_call == "pcc.virtual_thread.result"
+                or native_call == "pcc.virtual_thread.exception"
+                or native_call == "pcc.virtual_thread.mpsc"
+                or native_call == "pcc.virtual_thread.oneshot"
+                or native_call == "pcc.virtual_thread.sender_clone"
+                or native_call == "pcc.virtual_thread.recv"
+                or native_call == "pcc.virtual_thread.select2"
+            ):
+                # Mirror _expr_returns_owned_object even in C-ABI-exporting
+                # raw-scaffold modules.  These native calls still return an
+                # ordinary owned PyObject pointer whose local owner must be
+                # consumed on rebind/exit.
+                return True
         # Runtime ports / bootstrap modules that export C ABI symbols
         # usually manage object refs by hand. For ordinary user scripts
         # that import pcc.extern just to reach native APIs, track only
@@ -597,7 +838,11 @@ class OwnershipLoweringMixin:
             return
         if name in getattr(self, "_current_global_names", set()):
             return
-        if name in getattr(self, "_current_param_names", set()):
+        if (
+            name in getattr(self, "_current_param_names", set())
+            and not getattr(self, "_exact_int_env_flags", {}).get(name, False)
+            and name not in getattr(self, "_for_target_owned_names", set())
+        ):
             return
         self._ensure_local_gc_frame_root(
             name,
@@ -909,7 +1154,11 @@ class OwnershipLoweringMixin:
         for name in sorted(getattr(self, "_owned_local_names", set())):
             if name in getattr(self, "_current_global_names", set()):
                 continue
-            if name in getattr(self, "_current_param_names", set()):
+            if (
+                name in getattr(self, "_current_param_names", set())
+                and not getattr(self, "_exact_int_env_flags", {}).get(name, False)
+                and name not in getattr(self, "_for_target_owned_names", set())
+            ):
                 continue
             slot = self.env.get(name)
             if slot is None:

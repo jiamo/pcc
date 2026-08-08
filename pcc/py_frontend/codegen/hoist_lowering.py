@@ -1285,11 +1285,22 @@ class _HoistLoweringPass:
                         name=hoist_name,
                         body=tuple(new_class_body),
                     )
+                    # Keep the rewritten ClassDef in the enclosing body as
+                    # an executable statement.  Its methods are declared
+                    # from the module-level copy below, but Python constructs
+                    # a fresh class object (including bases, namespace and
+                    # decorators) every time execution reaches the statement.
+                    # Dropping it here turned a function-local class into a
+                    # one-shot module global and lost per-call identity and
+                    # closure captures.
+                    new_stmts.append(hoisted_cd)
                     hoisted.append(hoisted_cd)
-                    if class_free_names:
-                        hoisted_class_capture_params[hoist_name] = tuple(
-                            sorted(class_free_names)
-                        )
+                    # Presence in this table distinguishes a synthetic local
+                    # class from a source-level module class even when the
+                    # class captures no outer names.
+                    hoisted_class_capture_params[hoist_name] = tuple(
+                        sorted(class_free_names)
+                    )
                     if hoist_name != st.name:
                         rename_map[st.name] = hoist_name
                     continue

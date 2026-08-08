@@ -7,6 +7,7 @@
  *
  * Contains:
  *   py_exc_append_frame            (public)
+ *   py_runtime_error_if_unset      (public)
  *   py_exc_print_unhandled         (public)
  *   py_exc_traceback_format_exc    (public, traceback.format_exc)
  *   py_exc_traceback_print_exc     (public, traceback.print_exc)
@@ -20,10 +21,11 @@ extern void *py_tls_exc_get(void);
 extern void  py_tls_exc_set(void *exc);
 
 
-void py_exc_append_frame(PyObject *exc,
-                         const char *func_name,
-                         const char *filename,
-                         int32_t line) {
+void py_exc_append_frame_source(PyObject *exc,
+                                const char *func_name,
+                                const char *filename,
+                                const char *source_line,
+                                int32_t line) {
     if (exc == NULL || py_type_of(exc) != PY_TYPE_EXC) return;
     PyExceptionObject *e = (PyExceptionObject *)exc;
     if (e->n_frames == e->cap_frames) {
@@ -37,8 +39,39 @@ void py_exc_append_frame(PyObject *exc,
     PyFrameRecord *fr = &e->traceback[e->n_frames++];
     fr->func_name = func_name;
     fr->filename  = filename;
+    fr->source_line = source_line;
     fr->line      = line;
     fr->_pad      = 0;
+}
+
+
+void py_exc_append_frame(PyObject *exc,
+                         const char *func_name,
+                         const char *filename,
+                         int32_t line) {
+    py_exc_append_frame_source(exc, func_name, filename, NULL, line);
+}
+
+
+PyObject *py_runtime_error_if_unset(const char *helper_name,
+                                    const char *message) {
+    if (py_err_occurred()) return NULL;
+    if (helper_name == NULL) helper_name = "<pcc runtime>";
+    if (message == NULL) {
+        message = "runtime helper returned NULL without setting an exception";
+    }
+    PyObject *exc = py_exc_new(PY_EXC_RUNTIMEERROR, message);
+    if (exc != NULL) {
+        py_exc_append_frame_source(
+            exc,
+            helper_name,
+            "<pcc runtime>",
+            "runtime contract: NULL result without an exception",
+            0
+        );
+        py_raise_owned(exc);
+    }
+    return NULL;
 }
 
 
@@ -62,7 +95,7 @@ static int is_user_exception_instance(PyObject *exc) {
     if (exc == NULL || PY_IS_TAGGED_INT(exc)) return 0;
     exc = pcc_gc_note_relocation_read(exc);
     int32_t tag = py_type_of(exc);
-    if (tag != PY_TYPE_INSTANCE && tag < PY_TYPE_USER) return 0;
+    if (tag != PY_TYPE_INSTANCE && tag < PY_TYPE_USER_CLASS_START) return 0;
     PyClassObject *base = py_exc_builtin_class(PY_EXC_BASE);
     if (base == NULL) return 0;
     return py_isinstance(exc, base) != 0;
@@ -140,12 +173,15 @@ void py_exc_print_unhandled(PyObject *exc) {
     }
 
     fprintf(stderr, "Traceback (most recent call last):\n");
-    for (int32_t i = 0; i < e->n_frames; i++) {
+    for (int32_t i = e->n_frames - 1; i >= 0; i--) {
         PyFrameRecord *fr = &e->traceback[i];
         fprintf(stderr, "  File \"%s\", line %d, in %s\n",
                 fr->filename ? fr->filename : "<unknown>",
                 fr->line,
                 fr->func_name ? fr->func_name : "<module>");
+        if (fr->source_line != NULL && fr->source_line[0] != '\0') {
+            fprintf(stderr, "    %s\n", fr->source_line);
+        }
     }
     print_exc_heading(e);
 }
@@ -304,6 +340,11 @@ static void pcc_tb_format_into(PccTbBuf *b, PyObject *exc, int32_t depth) {
         pcc_tb_append(b, ", in ");
         pcc_tb_append(b, fr->func_name ? fr->func_name : "<module>");
         pcc_tb_append(b, "\n");
+        if (fr->source_line != NULL && fr->source_line[0] != '\0') {
+            pcc_tb_append(b, "    ");
+            pcc_tb_append(b, fr->source_line);
+            pcc_tb_append(b, "\n");
+        }
     }
     pcc_tb_append_exc_heading(b, e);
 }

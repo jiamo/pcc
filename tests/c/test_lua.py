@@ -23,8 +23,8 @@ import pcc.evaluater.c_evaluator as c_evaluator
 from pcc.codegen.c_codegen import postprocess_ir_text
 from pcc.project import collect_translation_units, translation_unit_include_dirs
 
-this_dir = os.path.dirname(__file__)
-project_dir = os.path.dirname(this_dir)
+this_dir = os.path.dirname(os.path.abspath(__file__))
+project_dir = os.path.dirname(os.path.dirname(this_dir))
 lua_src_dir = os.path.join(project_dir, "projects", "lua-5.5.0")
 lua_tests_dir = os.path.join(project_dir, "projects", "lua-5.5.0", "testes")
 

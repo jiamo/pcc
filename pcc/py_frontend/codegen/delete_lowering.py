@@ -46,6 +46,8 @@ class DeleteLoweringMixin:
                 self._weakref_env_flags.pop(target.ident, None)
                 continue
             if isinstance(target, Subscript):
+                if self._emit_native_os_environ_delitem(target):
+                    continue
                 if isinstance(target.idx, Slice):
                     obj = self._emit_expr(target.obj)
                     obj_ty = target.obj.ty
@@ -147,6 +149,9 @@ class DeleteLoweringMixin:
                         self.runtime["py_dict_del"],
                         [obj, idx_obj],
                     )
+                    self._emit_post_call_err_check(
+                        getattr(target, "span", None)
+                    )
                     continue
                 if isinstance(obj_ty, ListType):
                     idx_i64 = marshal.marshal_from_object(
@@ -161,6 +166,7 @@ class DeleteLoweringMixin:
                         [obj, idx_i64],
                         name=self._fresh("list.del.pop"),
                     )
+                    self._emit_post_call_err_check(getattr(target, "span", None))
                     self._gc_release(popped)
                     continue
                 if isinstance(obj_ty, (ClassType, DynType)):

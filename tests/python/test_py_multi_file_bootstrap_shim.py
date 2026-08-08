@@ -7,8 +7,11 @@ module's entry function from ``__main__.py``'s top-level body.
 
 from __future__ import annotations
 
+import ast
 import atexit
+import importlib.util
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -76,7 +79,9 @@ def _compile_repo_main_binary(main_py, exe):
         return
 
     global _COMPILED_REPO_MAIN_CACHE_DIR
-    repo_root = os.path.dirname(os.path.dirname(__file__))
+    repo_root = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
     key = (os.path.realpath(main_py), _repo_source_fingerprint(repo_root))
     cached = _COMPILED_REPO_MAIN_CACHE.get(key)
     if cached is None or not os.path.isfile(cached):
@@ -869,7 +874,9 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         """Compiling the real ``pcc/__main__.py`` should preserve the
         top-level ``--help`` path without crashes or spurious error
         output."""
-        repo_root = os.path.dirname(os.path.dirname(__file__))
+        repo_root = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
         main_py = os.path.join(repo_root, "pcc", "__main__.py")
         exe = os.path.join(self.td, "pcc_main.out")
         _compile_repo_main_binary(main_py, exe)
@@ -886,7 +893,9 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
     def test_compiled_repo_main_help_with_backend_option(self):
         """Global help should still win when a backend option appears
         before ``--help`` on the compiled real CLI."""
-        repo_root = os.path.dirname(os.path.dirname(__file__))
+        repo_root = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
         main_py = os.path.join(repo_root, "pcc", "__main__.py")
         exe = os.path.join(self.td, "pcc_main_help_backend.out")
         _compile_repo_main_binary(main_py, exe)
@@ -906,7 +915,9 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         leaving a direct CPython import of that sibling module."""
         from pcc.py_frontend.pipeline import compile_python
 
-        repo_root = os.path.dirname(os.path.dirname(__file__))
+        repo_root = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
         main_py = os.path.join(repo_root, "pcc", "__main__.py")
         out_ll = os.path.join(self.td, "pcc_main_self.ll")
         with mock.patch.dict(os.environ, {"PCC_PYTHON_IR_PASSES": "off"}):
@@ -926,7 +937,9 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
     def test_compiled_repo_main_can_compile_toy_python_program(self):
         """The compiled real CLI should preserve positional PATH
         parsing for a normal ``pcc file.py -o out`` invocation."""
-        repo_root = os.path.dirname(os.path.dirname(__file__))
+        repo_root = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
         main_py = os.path.join(repo_root, "pcc", "__main__.py")
         exe = os.path.join(self.td, "pcc_main_compile.out")
         _compile_repo_main_binary(main_py, exe)
@@ -964,7 +977,9 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
     def test_compiled_repo_main_missing_python_input_reports_error(self):
         """The compiled real CLI should return a friendly nonzero
         error for a missing Python source input."""
-        repo_root = os.path.dirname(os.path.dirname(__file__))
+        repo_root = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
         main_py = os.path.join(repo_root, "pcc", "__main__.py")
         exe = os.path.join(self.td, "pcc_main_missing.out")
         _compile_repo_main_binary(main_py, exe)
@@ -1009,7 +1024,9 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         """The bootstrap CLI's help path should stay available under
         CPython even after we replaced argparse with the self-host
         friendly manual parser."""
-        repo_root = os.path.dirname(os.path.dirname(__file__))
+        repo_root = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
         r = subprocess.run(
             [
                 os.environ.get("PYTHON", "python3"),
@@ -1025,12 +1042,98 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         self.assertIn("--entry MODULE", r.stdout)
         self.assertEqual(r.stderr, "")
 
+    def test_pcc_multi_pipeline_error_diagnostic_is_never_blank(self):
+        from pcc.py_frontend.pipeline import PyPipelineError
+
+        repo_root = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        )
+        source = os.path.join(repo_root, "scripts", "pcc_multi.py")
+        spec = importlib.util.spec_from_file_location(
+            "pcc_test_pcc_multi_diagnostic",
+            source,
+        )
+        self.assertIsNotNone(spec)
+        self.assertIsNotNone(spec.loader)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        emitted = []
+
+        with mock.patch(
+            "pcc.py_frontend.pipeline.compile_python_multi",
+            side_effect=PyPipelineError(),
+        ), mock.patch.object(
+            module,
+            "_write_text",
+            side_effect=lambda text, **_kwargs: emitted.append(text),
+        ):
+            status = module.main(
+                ["--entry", "pkg.main", "--out", "out", "pkg/main.py"]
+            )
+
+        self.assertEqual(status, 1)
+        self.assertIn("pcc_multi: PyPipelineError()", "".join(emitted))
+
+        emitted.clear()
+        with mock.patch.dict(
+            os.environ,
+            {"PCC_DEBUG_BOOTSTRAP_TRACE": "1"},
+        ), mock.patch.object(
+            module,
+            "_write_text",
+            side_effect=lambda text, **_kwargs: emitted.append(text),
+        ):
+            module._write_pipeline_error_debug(PyPipelineError())
+        self.assertIn(
+            "pcc_multi debug: exception_type=PyPipelineError",
+            "".join(emitted),
+        )
+
+    def test_self_backend_parser_initializes_target_state_for_pcc1(self):
+        """Imported dataclass default factories are not a pcc1 call-site ABI.
+
+        The parser constructs ``ParsedFunction`` across a module boundary, so
+        all mutable target-owned fields must be explicit fresh containers.
+        This lightweight contract catches the bootstrap-only missing-argument
+        failure before the full compiled-pcc_multi smoke is launched.
+        """
+        repo_root = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        )
+        source_path = os.path.join(
+            repo_root,
+            "pcc",
+            "backend",
+            "self_backend_parse.py",
+        )
+        with open(source_path, "r", encoding="utf-8") as stream:
+            module = ast.parse(stream.read(), filename=source_path)
+        calls = [
+            node
+            for node in ast.walk(module)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "ParsedFunction"
+        ]
+        self.assertEqual(len(calls), 1)
+        keywords = {item.arg: item.value for item in calls[0].keywords}
+        for name in (
+            "value_registers",
+            "aarch64_madd_fusions",
+            "aarch64_block_layout",
+            "aarch64_cold_fallthrough_edges",
+        ):
+            self.assertIn(name, keywords)
+            self.assertIsInstance(keywords[name], (ast.Dict, ast.List))
+
     def test_compiled_pcc_multi_can_compile_toy_module(self):
         """Compile ``scripts/pcc_multi.py`` + ``pipeline.py`` into a
         native pair binary, then use that compiled helper to build and
         run a one-file toy module. Guards the real bootstrap-facing
         path rather than just the CLI help surface."""
-        repo_root = os.path.dirname(os.path.dirname(__file__))
+        repo_root = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
         pair = os.path.join(self.td, "pcc_multi_pair")
         build = subprocess.run(
             [
@@ -1287,7 +1390,9 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         compile-only self-host baseline."""
         from pcc.py_frontend.pipeline import compile_python
 
-        repo_root = os.path.dirname(os.path.dirname(__file__))
+        repo_root = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
         cases = [
             (
                 os.path.join(repo_root, "pcc", "py_frontend", "codegen", "layer1.py"),
@@ -1340,6 +1445,12 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         in_ll = os.path.join(self.td, "in.ll")
         with open(in_ll, "w", encoding="utf-8") as f:
             f.write("define i32 @main() { ret i32 0 }\n")
+        runtime_archive = os.path.join(
+            self.td,
+            "libpy_runtime_libpython.a",
+        )
+        with open(runtime_archive + ".capi_syms", "w", encoding="utf-8") as f:
+            f.write("_PyCapsule_New\n")
         env = dict(os.environ)
         env["PCC_PYTHON_LDFLAGS"] = "-L/test/python -lpython9.9"
         env["PCC_PYTHON_CONFIG"] = "/definitely/missing/python-config"
@@ -1356,7 +1467,7 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
                     pipeline._link_with_clang(
                         [in_ll],
                         "/tmp/out",
-                        "/tmp/libpy_runtime_libpython.a",
+                        runtime_archive,
                         False,
                         needs_libpython=True,
                     )
@@ -1371,9 +1482,11 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         from pcc.py_frontend import pipeline
 
         make_cmds = []
+        built = {"done": False}
 
         def fake_run_runtime_make(cmd, *, verbose):
             make_cmds.append(cmd)
+            built["done"] = True
 
         with mock.patch(
             "pcc.py_frontend.pipeline._runtime_cc_mode", return_value="pcc"
@@ -1392,23 +1505,63 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
                         with mock.patch(
                             "pcc.py_frontend.pipeline.os.path.isfile"
                         ) as isfile:
-                            isfile.side_effect = lambda path: str(path).endswith(
-                                "Makefile"
+                            isfile.side_effect = lambda path: (
+                                str(path).endswith("Makefile")
+                                or (
+                                    built["done"]
+                                    and str(path).endswith(
+                                        "libpy_runtime_pcc_py_libpython.a"
+                                    )
+                                )
                             )
                             with mock.patch(
                                 "pcc.py_frontend.pipeline._run_runtime_make",
                                 side_effect=fake_run_runtime_make,
                             ):
-                                pipeline._ensure_runtime(
-                                    verbose=False,
-                                    needs_libpython=True,
-                                )
+                                with mock.patch(
+                                    "pcc.py_frontend.pipeline."
+                                    "_runtime_archive_c_bundle_valid",
+                                    return_value=True,
+                                ):
+                                    with mock.patch(
+                                        "pcc.py_frontend.pipeline."
+                                        "_write_runtime_archive_target_stamp"
+                                    ):
+                                        pipeline._ensure_runtime(
+                                            verbose=False,
+                                            needs_libpython=True,
+                                        )
 
         self.assertEqual(len(make_cmds), 1)
         python_args = [arg for arg in make_cmds[0] if arg.startswith("PYTHON=")]
         self.assertEqual(len(python_args), 1)
         self.assertTrue(os.path.isabs(python_args[0].split("=", 1)[1]))
         self.assertNotEqual(python_args[0], "PYTHON=/tmp/pcc1")
+
+    def test_host_python_prefers_source_root_venv_outside_repo_cwd(self):
+        from pcc.py_frontend import pipeline
+
+        source_root = "/work/pcc-source"
+        blessed = source_root + "/.venv/bin/python3"
+        unrelated = "/tmp/unrelated-app/.venv/bin/python3"
+
+        def fake_isfile(path):
+            return str(path) in (blessed, unrelated)
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch(
+                "pcc.py_frontend.pipeline.os.getcwd",
+                return_value="/tmp/unrelated-app",
+            ):
+                with mock.patch(
+                    "pcc.py_frontend.pipeline._pcc_source_root_for_host_subprocess",
+                    return_value=source_root,
+                ):
+                    with mock.patch(
+                        "pcc.py_frontend.pipeline.os.path.isfile",
+                        side_effect=fake_isfile,
+                    ):
+                        self.assertEqual(pipeline._host_python_command(), blessed)
 
     def test_runtime_archive_link_args_only_force_capi_for_native_extensions(self):
         from pcc.py_frontend import pipeline
@@ -1433,6 +1586,51 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
                 pipeline._native_extension_export_link_flags(True),
                 ["-Wl,-export_dynamic"],
             )
+
+    def test_libpython_link_hides_pcc_capi_from_dynamic_extensions(self):
+        from pcc.py_frontend import pipeline
+
+        archive = "/tmp/libpy_runtime_pcc_py_libpython.a"
+        with mock.patch(
+            "pcc.py_frontend.pipeline._capi_export_anchor_symbols",
+            return_value=["_PyCapsule_New", "__Py_NoneStruct"],
+        ):
+            with mock.patch("pcc.py_frontend.pipeline.sys.platform", "darwin"):
+                self.assertEqual(
+                    pipeline._libpython_capi_isolation_link_flags(archive, True),
+                    [
+                        "-Wl,-unexported_symbol,_PyCapsule_New",
+                        "-Wl,-unexported_symbol,__Py_NoneStruct",
+                    ],
+                )
+            with mock.patch("pcc.py_frontend.pipeline.sys.platform", "linux"):
+                self.assertEqual(
+                    pipeline._libpython_capi_isolation_link_flags(archive, True),
+                    ["-Wl,--exclude-libs,libpy_runtime_pcc_py_libpython.a"],
+                )
+        self.assertEqual(
+            pipeline._libpython_capi_isolation_link_flags(archive, False), []
+        )
+
+    def test_libpython_rejects_pcc_native_extension_object_model(self):
+        from pcc.py_frontend import pipeline
+
+        with self.assertRaisesRegex(
+            pipeline.PyPipelineError,
+            "pcc-native extension imports cannot be combined with libpython mode",
+        ):
+            pipeline._reject_mixed_extension_object_models(
+                needs_libpython=True,
+                needs_native_extension_exports=True,
+            )
+        pipeline._reject_mixed_extension_object_models(
+            needs_libpython=False,
+            needs_native_extension_exports=True,
+        )
+        pipeline._reject_mixed_extension_object_models(
+            needs_libpython=True,
+            needs_native_extension_exports=False,
+        )
 
     def test_absolute_from_import_detects_native_extension_alias(self):
         from pcc.parse.py_lift import parse_and_lift
@@ -1756,6 +1954,246 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
             all(pipeline._SELF_BACKEND_EMIT_BATCH_WORKER_ARG in cmd for cmd in commands)
         )
 
+    def test_self_native_emitter_serializes_only_residual_oversized_shards(self):
+        from pcc.py_frontend import pipeline
+
+        ir_text = (
+            'target triple = "arm64-apple-darwin23.6.0"\n'
+            "define i32 @main() {\nentry:\n  ret i32 0\n}\n"
+        )
+        oversized_ir = ir_text + ("; oversized padding\n" * 12)
+        smaller_oversized_ir = ir_text + ("; smaller oversized padding\n" * 6)
+        command_batches = []
+        profile = {}
+
+        def fake_worker_commands(commands, max_parallel=None):
+            command_batches.append((list(commands), max_parallel))
+            for command in commands:
+                parts = command.split()
+                self.assertIn(pipeline._SELF_BACKEND_EMIT_BATCH_WORKER_ARG, parts)
+                with open(parts[2], "r", encoding="utf-8") as f:
+                    payload = f.read().splitlines()[1:]
+                self.assertEqual(len(payload), 4)
+                result_path = payload[1]
+                obj_path = payload[2]
+                with open(obj_path, "w", encoding="utf-8") as f:
+                    f.write("object\n")
+                with open(result_path, "w", encoding="utf-8") as f:
+                    f.write("self-aarch64-darwin-v0\n" + obj_path)
+
+        def fake_run(cmd, **kwargs):
+            return subprocess.CompletedProcess(cmd, 0)
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "PCC_SELF_BACKEND_JOBS": "",
+                    "PCC_SELF_BACKEND_SPLIT_THRESHOLD_BYTES": "200",
+                },
+            ),
+            mock.patch.object(
+                pipeline, "_python_frontend_worker_executable", return_value="/tmp/pcc1"
+            ),
+            mock.patch.object(pipeline, "_self_backend_jobs", return_value=2),
+            mock.patch.object(pipeline, "_SELF_BACKEND_EMIT_BATCH_MAX_ITEMS", 1),
+            mock.patch.object(
+                pipeline,
+                "_run_python_frontend_worker_commands",
+                side_effect=fake_worker_commands,
+            ),
+            mock.patch(
+                "pcc.py_frontend.pipeline.subprocess.run",
+                side_effect=fake_run,
+            ),
+        ):
+            pairs = pipeline._emit_self_objects_many_in_process(
+                [
+                    smaller_oversized_ir,
+                    ir_text,
+                    oversized_ir,
+                    ir_text,
+                    ir_text,
+                    ir_text,
+                ],
+                self.td,
+                "cc",
+                split_large_modules=False,
+                profile=profile,
+            )
+
+        self.assertEqual(len(pairs), 6)
+        self.assertEqual(
+            [os.path.basename(obj_path) for _target, obj_path in pairs],
+            [f"self_backend_native_{index}.o" for index in range(6)],
+        )
+        self.assertEqual(len(command_batches), 2)
+        oversized_commands, oversized_parallel = command_batches[0]
+        safe_commands, safe_parallel = command_batches[1]
+        self.assertEqual(oversized_parallel, 1)
+        self.assertEqual(len(oversized_commands), 2)
+        self.assertTrue(
+            all(
+                "self_backend_emit_oversized_" in command
+                for command in oversized_commands
+            )
+        )
+        with open(oversized_commands[0].split()[2], "r", encoding="utf-8") as f:
+            first_oversized_input = f.read().splitlines()[1]
+        with open(oversized_commands[1].split()[2], "r", encoding="utf-8") as f:
+            second_oversized_input = f.read().splitlines()[1]
+        self.assertGreater(
+            os.path.getsize(first_oversized_input),
+            os.path.getsize(second_oversized_input),
+        )
+        self.assertEqual(safe_parallel, 2)
+        self.assertEqual(len(safe_commands), 4)
+        self.assertTrue(
+            all("self_backend_emit_small_" in command for command in safe_commands)
+        )
+        self.assertEqual(profile["counters"]["link_self_native_oversized_object_count"], 2)
+        self.assertEqual(profile["counters"]["link_self_native_safe_object_count"], 4)
+        self.assertEqual(profile["counters"]["link_self_native_configured_jobs"], 2)
+        self.assertEqual(profile["counters"]["link_self_native_safe_emit_jobs"], 2)
+        self.assertEqual(profile["counters"]["link_self_native_emit_jobs"], 2)
+        self.assertEqual(profile["counters"]["link_self_native_oversized_emit_jobs"], 1)
+        self.assertEqual(
+            profile["counters"]["link_self_native_oversized_emit_pool_processes"],
+            2,
+        )
+        self.assertEqual(
+            profile["counters"]["link_self_native_safe_emit_pool_processes"],
+            4,
+        )
+        self.assertEqual(profile["counters"]["link_self_native_emit_pool_processes"], 6)
+        self.assertGreaterEqual(
+            profile["phase_totals_ms"]["link_self_native_emit_oversized_workers"],
+            0,
+        )
+        self.assertGreaterEqual(
+            profile["phase_totals_ms"]["link_self_native_emit_safe_workers"],
+            0,
+        )
+
+    def test_self_native_emitter_preserves_explicit_oversized_worker_override(self):
+        from pcc.py_frontend import pipeline
+
+        ir_text = (
+            'target triple = "arm64-apple-darwin23.6.0"\n'
+            "define i32 @main() {\nentry:\n  ret i32 0\n}\n"
+            + ("; oversized padding\n" * 12)
+        )
+        pool_calls = []
+        profile = {}
+
+        def fake_pool(worker_prefix, worker_items, cc, tmp_dir, label, max_parallel):
+            pool_calls.append((label, max_parallel, len(worker_items)))
+            for result_path, obj_path, _ir_path in worker_items:
+                with open(obj_path, "w", encoding="utf-8") as f:
+                    f.write("object\n")
+                with open(result_path, "w", encoding="utf-8") as f:
+                    f.write("self-aarch64-darwin-v0\n" + obj_path)
+            return 1
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "PCC_SELF_BACKEND_JOBS": "2",
+                    "PCC_SELF_BACKEND_SPLIT_THRESHOLD_BYTES": "200",
+                },
+            ),
+            mock.patch.object(
+                pipeline, "_python_frontend_worker_executable", return_value="/tmp/pcc1"
+            ),
+            mock.patch.object(
+                pipeline,
+                "_plan_self_backend_object_cache",
+                side_effect=lambda items, *_args: [("", "off") for _item in items],
+            ),
+            mock.patch.object(
+                pipeline,
+                "_run_self_backend_emit_worker_pool",
+                side_effect=fake_pool,
+            ),
+        ):
+            pairs = pipeline._emit_self_objects_many_in_process(
+                [ir_text, ir_text],
+                self.td,
+                "cc",
+                split_large_modules=False,
+                profile=profile,
+            )
+
+        self.assertEqual(len(pairs), 2)
+        self.assertEqual(pool_calls, [("oversized", 2, 2)])
+        self.assertEqual(profile["counters"]["link_self_native_configured_jobs"], 2)
+        self.assertEqual(profile["counters"]["link_self_native_safe_emit_jobs"], 0)
+        self.assertEqual(profile["counters"]["link_self_native_emit_jobs"], 2)
+        self.assertEqual(profile["counters"]["link_self_native_oversized_emit_jobs"], 2)
+
+    def test_self_native_emitter_stops_before_safe_lane_on_oversized_failure(self):
+        from pcc.py_frontend import pipeline
+
+        small_ir = (
+            'target triple = "arm64-apple-darwin23.6.0"\n'
+            "define i32 @main() {\nentry:\n  ret i32 0\n}\n"
+        )
+        oversized_ir = small_ir + ("; oversized padding\n" * 12)
+        pool_calls = []
+
+        def fail_oversized_pool(
+            _worker_prefix,
+            _worker_items,
+            _cc,
+            _tmp_dir,
+            label,
+            _max_parallel,
+        ):
+            pool_calls.append(label)
+            if label == "oversized":
+                raise subprocess.CalledProcessError(1, ["/tmp/pcc1"])
+            raise AssertionError("safe lane must not start after oversized failure")
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {
+                    "PCC_SELF_BACKEND_JOBS": "",
+                    "PCC_SELF_BACKEND_SPLIT_THRESHOLD_BYTES": "200",
+                },
+            ),
+            mock.patch.object(
+                pipeline, "_python_frontend_worker_executable", return_value="/tmp/pcc1"
+            ),
+            mock.patch.object(pipeline, "_self_backend_jobs", return_value=2),
+            mock.patch.object(
+                pipeline,
+                "_plan_self_backend_object_cache",
+                side_effect=lambda items, *_args: [("", "off") for _item in items],
+            ),
+            mock.patch.object(
+                pipeline,
+                "_run_self_backend_emit_worker_pool",
+                side_effect=fail_oversized_pool,
+            ),
+            mock.patch.object(
+                pipeline,
+                "_publish_self_backend_object_cache",
+            ) as publish_cache,
+        ):
+            with self.assertRaises(subprocess.CalledProcessError):
+                pipeline._emit_self_objects_many_in_process(
+                    [oversized_ir, small_ir, small_ir],
+                    self.td,
+                    "cc",
+                    split_large_modules=False,
+                    profile={},
+                )
+
+        self.assertEqual(pool_calls, ["oversized"])
+        publish_cache.assert_not_called()
+
     def test_self_backend_emit_batch_worker_stops_on_first_failure(self):
         from pcc.py_frontend import pipeline
 
@@ -1785,6 +2223,7 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
             'target triple = "arm64-apple-darwin23.6.0"\n'
             "define i32 @main() {\nentry:\n  ret i32 0\n}\n"
         )
+        profile = {}
 
         def fake_cache_plan(worker_items, target_id, cc, tmp_dir):
             self.assertEqual(target_id, "self-aarch64-darwin-v0")
@@ -1823,12 +2262,17 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
                             self.td,
                             "cc",
                             split_large_modules=False,
-                            profile=None,
+                            profile=profile,
                         )
 
         self.assertEqual(len(pairs), 2)
         worker_commands_mock.assert_not_called()
         collect_mock.assert_not_called()
+        self.assertEqual(profile["counters"]["link_self_native_configured_jobs"], 0)
+        self.assertEqual(profile["counters"]["link_self_native_safe_emit_jobs"], 0)
+        self.assertEqual(profile["counters"]["link_self_native_emit_jobs"], 0)
+        self.assertEqual(profile["counters"]["link_self_native_oversized_emit_jobs"], 0)
+        self.assertEqual(profile["counters"]["link_self_native_object_cache_hits"], 2)
 
     def test_self_native_emitter_splits_large_ir_in_compiled_stage_worker(self):
         from pcc.py_frontend import pipeline
@@ -2006,6 +2450,42 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         self.assertEqual(status, 0)
         with open(result_path, "r", encoding="utf-8") as f:
             self.assertEqual(f.read(), "self-aarch64-darwin-v0\n.text\n")
+
+    def test_self_native_emit_worker_publishes_internal_asm_without_cc(self):
+        from pcc.py_frontend import pipeline
+
+        ir_path = os.path.join(self.td, "worker-internal.ll")
+        result_path = os.path.join(self.td, "worker-internal.result")
+        asm_path = os.path.join(self.td, "worker-internal.s")
+        with open(ir_path, "w", encoding="utf-8") as f:
+            f.write('target triple = "arm64-apple-darwin23.6.0"\n')
+        with (
+            mock.patch.object(
+                pipeline,
+                "_emit_aarch64_darwin_asm_native",
+                return_value=".text\n",
+            ),
+            mock.patch.object(
+                pipeline.subprocess,
+                "run",
+                side_effect=AssertionError("internal fast path invoked cc/as"),
+            ),
+        ):
+            status = pipeline.run_self_backend_emit_worker(
+                ir_path,
+                result_path,
+                asm_path,
+                "",
+            )
+
+        self.assertEqual(status, 0)
+        with open(asm_path, "r", encoding="utf-8") as f:
+            self.assertEqual(f.read(), ".text\n")
+        with open(result_path, "r", encoding="utf-8") as f:
+            self.assertEqual(
+                f.read(),
+                "self-aarch64-darwin-v0\n" + asm_path,
+            )
 
     def test_self_native_emit_worker_normalizes_missing_target_triple(self):
         from pcc.py_frontend import pipeline
@@ -2263,6 +2743,64 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
             self.assertIn(exported_name, shard)
             self.assertNotIn(exported_name + " = global i64 0", shard)
 
+    def test_self_backend_large_ir_split_keeps_frame_map_with_each_function(self):
+        """Precise stack-map analysis runs before split objects are linked.
+
+        Immutable frame-map descriptors therefore remain object-local in every
+        function shard that may reference them; treating them like ordinary
+        cross-object globals leaves the emitter unable to recover root count
+        and ownership.
+        """
+        from pcc.py_frontend import pipeline
+
+        ir_text = (
+            'target triple = "arm64-apple-darwin23.6.0"\n'
+            "@.pcc.gc.frame.map.1 = internal constant i32 1\n"
+            "declare void @pcc_gc_frame_enter(ptr, ptr)\n"
+            "declare void @pcc_gc_frame_leave(ptr)\n"
+            "\n"
+            "define void @root_a() {\n"
+            "entry:\n"
+            "  %slot = alloca ptr\n"
+            "  call void @pcc_gc_frame_enter(ptr @.pcc.gc.frame.map.1, ptr %slot)\n"
+            "  call void @pcc_gc_frame_leave(ptr %slot)\n"
+            "  ret void\n"
+            "}\n"
+            "\n"
+            "define void @root_b() {\n"
+            "entry:\n"
+            "  %slot = alloca ptr\n"
+            "  call void @pcc_gc_frame_enter(ptr @.pcc.gc.frame.map.1, ptr %slot)\n"
+            "  call void @pcc_gc_frame_leave(ptr %slot)\n"
+            "  ret void\n"
+            "}\n"
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "PCC_SELF_BACKEND_SPLIT_LARGE_MODULES": "1",
+                "PCC_SELF_BACKEND_SPLIT_THRESHOLD_BYTES": "1",
+                "PCC_SELF_BACKEND_SPLIT_SHARD_BYTES": "120",
+            },
+        ):
+            shards = pipeline._split_self_backend_large_ir_modules([ir_text])
+
+        function_shards = [shard for shard in shards if "define void @root_" in shard]
+        self.assertEqual(len(function_shards), 2)
+        from pcc.backend.self_backend_aarch64_darwin import (
+            emit_aarch64_darwin_asm,
+        )
+
+        for shard in function_shards:
+            self.assertIn(
+                "@.pcc.gc.frame.map.1 = internal constant i32 1",
+                shard,
+            )
+            self.assertNotIn("@__pco0_.pcc.gc.frame.map.1", shard)
+            asm_text = emit_aarch64_darwin_asm(shard, optimize=False)
+            self.assertIn("pcc_gc_frame_enter", asm_text)
+
     def test_self_backend_large_ir_module_split_namespaces_internal_symbols_per_module(
         self,
     ):
@@ -2336,6 +2874,7 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
             *,
             split_large_modules=False,
             profile=None,
+            internal_link=False,
         ):
             captured.extend(ir_texts)
             split_flags.append(split_large_modules)
@@ -2564,8 +3103,12 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
 
         with mock.patch.dict(os.environ, {}, clear=True):
             with mock.patch("sysconfig.get_config_var") as get_var:
-                with mock.patch("pcc.py_frontend.pipeline.os.path.isfile") as isfile:
-                    with mock.patch("pcc.py_frontend.pipeline.os.access") as access:
+                with mock.patch(
+                    "pcc.py_frontend.pipeline_libpython.os.path.isfile"
+                ) as isfile:
+                    with mock.patch(
+                        "pcc.py_frontend.pipeline_libpython.os.access"
+                    ) as access:
                         get_var.side_effect = lambda name: values.get(name)
                         isfile.side_effect = (
                             lambda path: path
@@ -2655,7 +3198,9 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         path."""
         from pcc.py_frontend.pipeline import compile_python
 
-        repo_root = os.path.dirname(os.path.dirname(__file__))
+        repo_root = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
         src = os.path.join(repo_root, "pcc", "py_frontend", "types.py")
         out_ll = os.path.join(self.td, "types_off.ll")
         compile_python(src, out_ll, emit_llvm_only=True, libpython_mode="off")
@@ -2667,7 +3212,9 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
     def test_native_parser_modules_self_compile_without_libpython(self):
         from pcc.py_frontend.pipeline import compile_python
 
-        repo_root = os.path.dirname(os.path.dirname(__file__))
+        repo_root = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
         cases = [
             (
                 os.path.join(repo_root, "pcc", "parse", "py_lex.py"),
@@ -2690,7 +3237,9 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
     def test_native_parser_pair_compiles_without_libpython(self):
         from pcc.py_frontend.pipeline import compile_python_multi
 
-        repo_root = os.path.dirname(os.path.dirname(__file__))
+        repo_root = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
         out_ll = os.path.join(self.td, "py_parse_pair.ll")
         compile_python_multi(
             [
@@ -2709,7 +3258,9 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
     def test_native_lift_stack_compiles_without_libpython(self):
         from pcc.py_frontend.pipeline import compile_python_multi
 
-        repo_root = os.path.dirname(os.path.dirname(__file__))
+        repo_root = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
         out_ll = os.path.join(self.td, "py_lift_stack.ll")
         compile_python_multi(
             [
@@ -2735,7 +3286,9 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
     def test_native_type_infer_stack_compiles_without_libpython(self):
         from pcc.py_frontend.pipeline import compile_python_multi
 
-        repo_root = os.path.dirname(os.path.dirname(__file__))
+        repo_root = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
         out_ll = os.path.join(self.td, "type_infer_stack.ll")
         compile_python_multi(
             [
@@ -2813,10 +3366,413 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         self.assertEqual(r.returncode, 0)
         self.assertEqual(r.stdout, "42\nTrue\nTrue\n")
 
+    def test_runtime_port_variadic_c_abi_inventory_is_explicit(self):
+        repo_root = os.path.dirname(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        )
+        runtime_dir = os.path.join(repo_root, "pcc", "py_runtime", "py")
+
+        # System and third-party entry points whose public C declarations are
+        # genuinely variadic.  Runtime-owned variadic exports are discovered
+        # below from @c_abi_variadic_export rather than duplicated here.
+        external_variadic_targets = {
+            "BIO_printf",
+            "BIO_snprintf",
+            "CFStringAppendFormat",
+            "CFStringCreateWithFormat",
+            "ERR_set_error",
+            "NSLog",
+            "asprintf",
+            "curl_easy_getinfo",
+            "curl_easy_setopt",
+            "dprintf",
+            "err",
+            "errx",
+            "execl",
+            "execle",
+            "execlp",
+            "fcntl",
+            "fprintf",
+            "fscanf",
+            "ioctl",
+            "mq_open",
+            "open",
+            "openat",
+            "prctl",
+            "printf",
+            "scanf",
+            "sem_open",
+            "snprintf",
+            "sprintf",
+            "sqlite3_config",
+            "sqlite3_db_config",
+            "sqlite3_mprintf",
+            "sqlite3_snprintf",
+            "sqlite3_test_control",
+            "sscanf",
+            "strfmon",
+            "syscall",
+            "syslog",
+            "warn",
+            "warnx",
+        }
+        dynamic_symbol_abis = {
+            "CGBitmapContextCreate": "fixed",
+            "CGContextFillRect": "fixed",
+            "CGContextRelease": "fixed",
+            "CGContextSetFillColorWithColor": "fixed",
+            "CGContextSetRGBFillColor": "fixed",
+            "CGContextStrokeLineSegments": "fixed",
+            "curl_easy_cleanup": "fixed",
+            "curl_easy_init": "fixed",
+            "curl_easy_perform": "fixed",
+            "curl_easy_setopt": "variadic",
+            "pcc_gui_metal_run_loop_pump": "fixed",
+            "pcc_gui_metal_window_close": "fixed",
+            "pcc_gui_metal_window_create": "fixed",
+            "pcc_gui_metal_window_is_closed": "fixed",
+            "pcc_gui_metal_window_render": "fixed",
+            "pcc_gui_metal_window_show": "fixed",
+            "pcc_metal_buffer_runtime_release": "fixed",
+            "uncompress": "fixed",
+        }
+        expected_variable_symbols = {
+            ("freestanding_metal_runtime.py", "dynamic_library_symbol", "symbol"),
+            ("pcc_gui_cg.py", "dynamic_library_symbol", "name"),
+            ("py_extension_loader_runtime.py", "dynamic_library_symbol", "symbol"),
+        }
+
+        variadic_exports = set()
+        extern_declarations = set()
+        dynamic_literals = set()
+        dynamic_variables = set()
+
+        def call_name(node):
+            if isinstance(node, ast.Name):
+                return node.id
+            return ""
+
+        def cstr_literal(node):
+            if (
+                isinstance(node, ast.Call)
+                and call_name(node.func) == "cstr"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+            ):
+                return node.args[0].value
+            return None
+
+        for filename in sorted(os.listdir(runtime_dir)):
+            if not filename.endswith(".py"):
+                continue
+            source_path = os.path.join(runtime_dir, filename)
+            with open(source_path, "r", encoding="utf-8") as f:
+                tree = ast.parse(f.read(), filename=source_path)
+            for node in ast.walk(tree):
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    for decorator in node.decorator_list:
+                        if (
+                            isinstance(decorator, ast.Call)
+                            and call_name(decorator.func) == "c_abi_variadic_export"
+                            and decorator.args
+                            and isinstance(decorator.args[0], ast.Constant)
+                            and isinstance(decorator.args[0].value, str)
+                        ):
+                            variadic_exports.add(decorator.args[0].value)
+                if not isinstance(node, ast.Call):
+                    continue
+                name = call_name(node.func)
+                if name == "extern" and node.args:
+                    symbol_node = node.args[0]
+                    if not (
+                        isinstance(symbol_node, ast.Constant)
+                        and isinstance(symbol_node.value, str)
+                    ):
+                        continue
+                    declared_variadic = False
+                    for keyword in node.keywords:
+                        if (
+                            keyword.arg == "variadic"
+                            and isinstance(keyword.value, ast.Constant)
+                        ):
+                            declared_variadic = keyword.value.value is True
+                    extern_declarations.add(
+                        (filename, symbol_node.value, declared_variadic)
+                    )
+                    continue
+                if name not in {"dynamic_library_symbol", "_cg_symbol"}:
+                    continue
+                symbol_index = 1 if name == "dynamic_library_symbol" else 0
+                if len(node.args) <= symbol_index:
+                    continue
+                symbol_node = node.args[symbol_index]
+                literal = cstr_literal(symbol_node)
+                if literal is not None:
+                    dynamic_literals.add(literal)
+                elif isinstance(symbol_node, ast.Name):
+                    dynamic_variables.add((filename, name, symbol_node.id))
+
+        self.assertEqual(dynamic_literals, set(dynamic_symbol_abis))
+        self.assertEqual(dynamic_variables, expected_variable_symbols)
+        self.assertEqual(
+            {
+                symbol
+                for symbol, abi_kind in dynamic_symbol_abis.items()
+                if abi_kind == "variadic"
+            },
+            dynamic_literals & external_variadic_targets,
+        )
+        all_variadic_targets = variadic_exports | external_variadic_targets
+        fixed_variadic_externs = {
+            (filename, symbol)
+            for filename, symbol, declared_variadic in extern_declarations
+            if symbol in all_variadic_targets and not declared_variadic
+        }
+        self.assertEqual(fixed_variadic_externs, set())
+        self.assertIn("PyOS_snprintf", variadic_exports)
+
+        http_source = os.path.join(runtime_dir, "py_http_runtime.py")
+        with open(http_source, "r", encoding="utf-8") as f:
+            http_text = f.read()
+        self.assertIn("call_variadic_i32_ptr_i32_ptr(setopt", http_text)
+        self.assertIn("call_variadic_i32_ptr_i32_i64(setopt", http_text)
+        self.assertNotIn("call_i64_ptr_i64_ptr(setopt", http_text)
+        self.assertNotIn("call_i64_ptr_i64_i64(setopt", http_text)
+
+        unsafe_lowering_path = os.path.join(
+            repo_root,
+            "pcc",
+            "py_frontend",
+            "codegen",
+            "unsafe_lowering.py",
+        )
+        with open(unsafe_lowering_path, "r", encoding="utf-8") as f:
+            unsafe_tree = ast.parse(f.read(), filename=unsafe_lowering_path)
+        named_c_declarations = []
+        for node in ast.walk(unsafe_tree):
+            if not isinstance(node, ast.Call):
+                continue
+            if not (
+                isinstance(node.func, ast.Attribute)
+                and node.func.attr == "_declare_external_function"
+                and node.args
+                and isinstance(node.args[0], ast.Constant)
+                and isinstance(node.args[0].value, str)
+            ):
+                continue
+            declared_variadic = False
+            for keyword in node.keywords:
+                if (
+                    keyword.arg == "var_arg"
+                    and isinstance(keyword.value, ast.Constant)
+                ):
+                    declared_variadic = keyword.value.value is True
+            named_c_declarations.append((node.args[0].value, declared_variadic))
+        for symbol in ("open", "fcntl"):
+            declarations = [
+                variadic
+                for declared_symbol, variadic in named_c_declarations
+                if declared_symbol == symbol
+            ]
+            self.assertTrue(declarations, msg=symbol)
+            self.assertTrue(all(declarations), msg=symbol)
+        self.assertFalse(
+            any(
+                symbol in {"ioctl", "syscall"}
+                for symbol, _variadic in named_c_declarations
+            ),
+            msg="ioctl/syscall must not gain a fixed libc declaration",
+        )
+
+        declaration_helpers_path = os.path.join(
+            repo_root,
+            "pcc",
+            "py_frontend",
+            "codegen",
+            "ir_decl_helpers.py",
+        )
+        with open(declaration_helpers_path, "r", encoding="utf-8") as f:
+            helpers_tree = ast.parse(f.read(), filename=declaration_helpers_path)
+        printf_variadic = False
+        for node in ast.walk(helpers_tree):
+            if not isinstance(node, ast.FunctionDef) or node.name != "_declare_printf":
+                continue
+            for child in ast.walk(node):
+                if not isinstance(child, ast.Call):
+                    continue
+                if not (
+                    isinstance(child.func, ast.Attribute)
+                    and child.func.attr == "FunctionType"
+                ):
+                    continue
+                for keyword in child.keywords:
+                    if (
+                        keyword.arg == "var_arg"
+                        and isinstance(keyword.value, ast.Constant)
+                        and keyword.value.value is True
+                    ):
+                        printf_variadic = True
+        self.assertTrue(printf_variadic)
+
+    def test_variadic_dynamic_call_intrinsics_emit_exact_c_abi(self):
+        from pcc.py_frontend.pipeline import compile_python
+
+        src = self._write(
+            "variadic_call_ir.py",
+            """
+            from pcc.unsafe import (
+                call_variadic_i32_ptr_i32_i64,
+                call_variadic_i32_ptr_i32_ptr,
+            )
+
+
+            def pointer_option(fn, handle, value) -> int:
+                return call_variadic_i32_ptr_i32_ptr(fn, handle, 10002, value)
+
+
+            def integer_option(fn, handle) -> int:
+                return call_variadic_i32_ptr_i32_i64(fn, handle, 52, 1)
+            """,
+        )
+        out_ll = os.path.join(self.td, "variadic_call_ir.ll")
+        compile_python(src, out_ll, emit_llvm_only=True, libpython_mode="off")
+        self._assert_no_libpython_fallback_calls(out_ll)
+        with open(out_ll, "r", encoding="utf-8") as f:
+            ir_text = f.read()
+        self.assertGreaterEqual(ir_text.count("call i32 (ptr, i32, ...)"), 2)
+        self.assertNotIn("call i64 (ptr, i64, ...)", ir_text)
+        self.assertIn("sext i32", ir_text)
+
+    def test_c_abi_i32_result_widens_before_python_int_ternary_phi(self):
+        from pcc.py_frontend.pipeline import compile_python
+
+        src = self._write(
+            "c_abi_i32_ternary.py",
+            """
+            from pcc.extern import c_abi_typed_export
+
+
+            @c_abi_typed_export("choose", "i32", ("i32", "i32"))
+            def choose(status: int, enabled: int) -> int:
+                return status if enabled != 0 else 0
+            """,
+        )
+        out_ll = os.path.join(self.td, "c_abi_i32_ternary.ll")
+        compile_python(src, out_ll, emit_llvm_only=True, libpython_mode="off")
+        with open(out_ll, "r", encoding="utf-8") as f:
+            ir_text = f.read()
+        self.assertIn("sext i32", ir_text)
+        self.assertRegex(
+            ir_text,
+            r"phi i64 \[.*sext.*%ternary_true\.",
+        )
+
+    def test_variadic_dynamic_call_intrinsics_match_c_va_arg(self):
+        from pcc.py_frontend.pipeline import compile_python
+
+        if sys.platform not in {"darwin", "linux"}:
+            self.skipTest("dynamic-library variadic ABI test supports Darwin/Linux")
+
+        helper_c = self._write(
+            "variadic_helper.c",
+            r"""
+            #include <stdarg.h>
+            #include <stdint.h>
+
+            int32_t pcc_test_variadic_ptr(void *expected, int32_t tag, ...) {
+                va_list ap;
+                va_start(ap, tag);
+                void *actual = va_arg(ap, void *);
+                va_end(ap);
+                return actual == expected ? tag : -tag;
+            }
+
+            int32_t pcc_test_variadic_i64(void *unused, int32_t tag, ...) {
+                (void)unused;
+                va_list ap;
+                va_start(ap, tag);
+                int64_t actual = va_arg(ap, int64_t);
+                va_end(ap);
+                return tag + (int32_t)actual;
+            }
+            """,
+        )
+        suffix = ".dylib" if sys.platform == "darwin" else ".so"
+        helper_library = os.path.join(self.td, "libvariadic_helper" + suffix)
+        shared_flag = "-dynamiclib" if sys.platform == "darwin" else "-shared"
+        command = ["clang", shared_flag]
+        if sys.platform == "linux":
+            command.append("-fPIC")
+        command.extend([helper_c, "-o", helper_library])
+        built = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        self.assertEqual(built.returncode, 0, msg=built.stdout + built.stderr)
+
+        src = self._write(
+            "variadic_call_run.py",
+            f"""
+            from pcc.unsafe import (
+                call_variadic_i32_ptr_i32_i64,
+                call_variadic_i32_ptr_i32_ptr,
+                cstr,
+                dynamic_library_close,
+                dynamic_library_open,
+                dynamic_library_symbol,
+                null,
+                ptr_is_null,
+            )
+
+
+            def main() -> None:
+                handle = dynamic_library_open(cstr({helper_library!r}))
+                if ptr_is_null(handle):
+                    print(-100)
+                else:
+                    pointer_fn = dynamic_library_symbol(
+                        handle, cstr("pcc_test_variadic_ptr")
+                    )
+                    integer_fn = dynamic_library_symbol(
+                        handle, cstr("pcc_test_variadic_i64")
+                    )
+                    marker = cstr("same-pointer")
+                    print(
+                        call_variadic_i32_ptr_i32_ptr(
+                            pointer_fn, marker, 7, marker
+                        )
+                    )
+                    print(
+                        call_variadic_i32_ptr_i32_i64(
+                            integer_fn, null(), 11, 31
+                        )
+                    )
+                    dynamic_library_close(handle)
+
+
+            main()
+            """,
+        )
+        exe = os.path.join(self.td, "variadic_call_run.out")
+        compile_python(src, exe, libpython_mode="off")
+        result = subprocess.run(
+            [exe],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertEqual(result.stdout, "7\n42\n")
+
     def test_py_gc_backend_runtime_file_compiles_without_libpython_fallback(self):
         from pcc.py_frontend.pipeline import compile_python
 
-        repo_root = os.path.dirname(os.path.dirname(__file__))
+        repo_root = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
         src = os.path.join(
             repo_root,
             "pcc",
@@ -2835,18 +3791,42 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         )
         self.assertTrue(os.path.isfile(out_ll))
         self._assert_no_libpython_fallback_calls(out_ll)
-        with open(out_ll, "r", encoding="utf-8") as f:
+        # ``pcc_gc_note_frame_enter`` moved from py_gc_backend.py to
+        # freestanding_gc_frame_registry.py (c079c05a). The hook is invoked
+        # from pcc_gc_frame_enter itself, so its definition must never
+        # self-root via pcc_gc_frame_enter — assert that at its new home.
+        reg_src = os.path.join(
+            repo_root,
+            "pcc",
+            "py_runtime",
+            "py",
+            "freestanding_gc_frame_registry.py",
+        )
+        reg_ll = os.path.join(self.td, "freestanding_gc_frame_registry.ll")
+        compile_python(
+            reg_src,
+            reg_ll,
+            emit_llvm_only=True,
+            libpython_mode="off",
+            python_library=True,
+        )
+        self._assert_no_libpython_fallback_calls(reg_ll)
+        with open(reg_ll, "r", encoding="utf-8") as f:
             ir_text = f.read()
-        marker = "@pcc_gc_note_frame_enter("
-        start = ir_text.rfind("\ndefine ", 0, ir_text.index(marker))
-        body = ir_text[start:]
+        match = re.search(
+            r"\ndefine [^\n]*@pcc_gc_note_frame_enter\(", ir_text
+        )
+        self.assertIsNotNone(match)
+        body = ir_text[match.start() + 1 :]
         body = body.split("\ndefine ", 1)[0]
         self.assertNotIn("@pcc_gc_frame_enter", body)
 
     def test_py_obj_runtime_refcount_primitives_do_not_self_root(self):
         from pcc.py_frontend.pipeline import compile_python
 
-        repo_root = os.path.dirname(os.path.dirname(__file__))
+        repo_root = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
         src = os.path.join(
             repo_root,
             "pcc",
@@ -2881,7 +3861,9 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
     def test_py_gc_telemetry_runtime_file_compiles_without_libpython_fallback(self):
         from pcc.py_frontend.pipeline import compile_python
 
-        repo_root = os.path.dirname(os.path.dirname(__file__))
+        repo_root = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
         src = os.path.join(
             repo_root,
             "pcc",
@@ -2891,7 +3873,13 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         )
         out_ll = os.path.join(self.td, "py_gc_telemetry.ll")
 
-        compile_python(src, out_ll, emit_llvm_only=True, libpython_mode="off")
+        compile_python(
+            src,
+            out_ll,
+            emit_llvm_only=True,
+            libpython_mode="off",
+            python_library=True,
+        )
         self.assertTrue(os.path.isfile(out_ll))
         self._assert_no_libpython_fallback_calls(out_ll)
 

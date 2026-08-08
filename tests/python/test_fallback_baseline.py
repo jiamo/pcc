@@ -73,6 +73,28 @@ def _count_py_cpy_calls(ir_text: str) -> int:
     return len(re.findall(r"\bcall [^\n]*@py_cpy_", ir_text))
 
 
+def _classify_py_cpy_calls(ir_text: str) -> dict[str, int]:
+    """Split semantic fallback actions from conversion/refcount plumbing.
+
+    The strict multi-file gate still counts every ``py_cpy_*`` call and must
+    remain zero.  Independent module probes lack cross-module export context;
+    there, the useful monotone signal is the number of dynamic actions, not
+    how thoroughly each action cleans up owned references on error paths.
+    """
+    from scripts.probe_fallback_categories import classify_py_cpy_symbol
+
+    symbols = re.findall(r"\bcall [^\n]*@(py_cpy_[a-z0-9_]+)", ir_text)
+    actions = 0
+    plumbing = 0
+    for symbol in symbols:
+        classification, _kind = classify_py_cpy_symbol(symbol)
+        if classification == "action":
+            actions += 1
+        else:
+            plumbing += 1
+    return {"total": len(symbols), "actions": actions, "plumbing": plumbing}
+
+
 def _split_py_cpy_calls(ir_text: str) -> dict[str, int]:
     symbols = re.findall(r"\bcall [^\n]*@(py_cpy_[a-z0-9_]+)", ir_text)
     bridge = sum(1 for sym in symbols if sym in _BRIDGE_CPY_SYMBOLS)
@@ -82,6 +104,84 @@ def _split_py_cpy_calls(ir_text: str) -> dict[str, int]:
         "bridge": bridge,
         "non_bridge": total - bridge,
     }
+
+
+def _per_module_action_failures(
+    actual_by_module: dict[str, int],
+    expected_by_module: dict[str, int],
+    *,
+    contextual_modules: set[str],
+    label: str,
+) -> list[str]:
+    """Return semantic-action ratchet failures for standalone probes.
+
+    ``-1`` means that a module needs sibling/contextual exports and therefore
+    cannot be compiled as an isolated source file.  The separate
+    ``per_module_pass`` gate owns that diagnostic population.  Treating the
+    same sentinel as an action regression conflates unsupported standalone
+    shape with a newly emitted CPython operation.
+    """
+    failures: list[str] = []
+    for mod, expected in expected_by_module.items():
+        if mod in contextual_modules:
+            continue
+        actual = actual_by_module.get(mod)
+        if actual is None:
+            failures.append(f"{mod}: missing from current run")
+            continue
+        if actual == -1:
+            continue
+        if not _within_ratchet(actual, expected):
+            failures.append(
+                f"{mod}: {actual} vs {label}baseline {expected} "
+                f"(+{_RATCHET_PERCENT}%)"
+            )
+
+    for mod, actual in actual_by_module.items():
+        if mod in contextual_modules or mod in expected_by_module:
+            continue
+        if actual == -1:
+            continue
+        if actual != 0:
+            failures.append(
+                f"{mod}: {actual} {label}fallbacks (baseline implicitly 0); "
+                f"a previously-clean {label}module regressed"
+            )
+    return failures
+
+
+def test_standalone_fallback_metric_counts_actions_not_ownership_plumbing():
+    ir_text = "\n".join(
+        (
+            "  %m = call ptr @py_cpy_import(ptr null)",
+            "  call void @py_cpy_decref(ptr %m)",
+            "  %h = call ptr @py_cpy_handle_get(ptr null)",
+        )
+    )
+
+    assert _classify_py_cpy_calls(ir_text) == {
+        "total": 3,
+        "actions": 1,
+        "plumbing": 2,
+    }
+
+
+def test_standalone_fallback_metric_rejects_unknown_bridge_symbols():
+    with pytest.raises(ValueError, match="unclassified py_cpy symbol"):
+        _classify_py_cpy_calls("  call void @py_cpy_new_unreviewed_edge()")
+
+
+def test_standalone_action_ratchet_defers_codegen_failures_to_pass_count():
+    failures = _per_module_action_failures(
+        {"needs.context": -1, "clean": 0, "regressed": 2},
+        {"needs.context": 0, "clean": 0, "regressed": 0},
+        contextual_modules=set(),
+        label="",
+    )
+
+    assert failures == [
+        "regressed: 2 vs baseline 0 (+5.0%)",
+    ]
 
 
 def _contextual_policy_modules(module_names) -> set[str]:
@@ -168,6 +268,7 @@ def _contextual_per_module_counts(srcs, mods, *, ir_scaffold_mode: str):
         mods,
         contextual_modules,
         ir_scaffold_mode=ir_scaffold_mode,
+        strict_no_libpython=(ir_scaffold_mode == "on"),
     )
 
 
@@ -290,32 +391,121 @@ def test_l1_codegen_active_handler_stack_is_initialized():
     assert codegen._active_handler_excs == []
 
 
-def test_pipeline_static_cross_module_exports_stay_clean():
-    """Focused regression for stale frontend static native export metadata.
+def test_pipeline_contextual_cross_module_exports_stay_clean():
+    """Focused regression for stale frontend closure export metadata.
 
-    ``pipeline.py`` raw per-module codegen calls into imported frontend
-    helpers such as ``type_infer.infer_module`` through the static export
-    table in ``layer1_support.py``. If that cross-module table drifts from
-    the real helper signature, codegen either fails before the baseline can
-    count it or falls back to ``py_cpy_*``. Keep this as a direct canary
-    rather than only discovering it through the full closure ratchet.
+    ``pipeline.py`` is now a facade over many sibling owner modules.  A raw
+    standalone probe intentionally lacks those siblings' export context and
+    is tracked only by the action/plumbing diagnostic ratchet.  The production
+    multi-file path supplies the contextual host contract; that exact mode
+    must resolve every cross-module helper without a CPython bridge.
+    """
+    import importlib.util as _imputil
+
+    from pcc.py_frontend.pipeline import (
+        compile_contextual_per_module_fallback_counts,
+    )
+
+    spec = _imputil.spec_from_file_location(
+        "_probe_stage1_pipeline_context",
+        str(_REPO_ROOT / "scripts" / "probe_stage1_closure.py"),
+    )
+    probe_mod = _imputil.module_from_spec(spec)
+    spec.loader.exec_module(probe_mod)
+    srcs, mods = probe_mod._tightened_closure(
+        str(_REPO_ROOT / "pcc" / "__main__.py")
+    )
+    target = "pcc.py_frontend.pipeline"
+    counts = compile_contextual_per_module_fallback_counts(
+        srcs,
+        mods,
+        {target},
+        ir_scaffold_mode="on",
+        strict_no_libpython=True,
+    )
+
+    assert counts[target] == 0
+
+
+def test_pipeline_subprocess_run_kwargs_resolve_without_cpython_bridge():
+    """Keep statement-only ``subprocess.run`` on the native process ABI.
+
+    The full per-module ratchet caught this only after compiling all of
+    ``pipeline.py``.  Preserve the exact ingredients that regressed in a small
+    canary: an imported-module alias, a starred argv tail, a computed boolean
+    keyword, and the timeout helper.  These calls intentionally discard
+    ``CompletedProcess``; they must lower through ``py_subprocess_run*`` and
+    never materialize ``py_cpy_import/getattr/call_kw``.
     """
     from pcc.parse.py_lift import parse_and_lift
     from pcc.py_frontend.type_infer import infer_module
     from pcc.py_frontend.codegen.layer1 import L1CodeGen
 
-    src = _REPO_ROOT / "pcc" / "py_frontend" / "pipeline.py"
-    with open(src, "r", encoding="utf-8") as f:
-        source = f.read()
-    ast_mod = parse_and_lift(source, str(src), "pcc.py_frontend.pipeline")
-    typed = infer_module(ast_mod)
-    codegen = L1CodeGen(
-        typed,
-        emit_cpy_main_exitcode=False,
-        ir_scaffold_mode="on",
+    source = textwrap.dedent(
+        """
+        import subprocess as process
+
+        def invoke(make_cmd: list[str], verbose: bool, seconds: int) -> None:
+            process.run(
+                ["sh", "-c", "true", *make_cmd],
+                check=True,
+                capture_output=not verbose,
+            )
+            process.run(make_cmd, check=True, timeout=seconds)
+        """
     )
-    ir_text = str(codegen.generate(typed))
+    module_name = "pcc.py_frontend.pipeline"
+    typed = infer_module(parse_and_lift(source, "subprocess_probe.py", module_name))
+    ir_text = str(
+        L1CodeGen(
+            typed,
+            emit_cpy_main_exitcode=False,
+            ir_scaffold_mode="on",
+        ).generate(typed)
+    )
+
+    assert "@py_subprocess_run(" in ir_text
+    assert "@py_subprocess_run_timeout(" in ir_text
     assert _count_py_cpy_calls(ir_text) == 0
+
+
+def test_capi_export_anchor_nm_fallback_keeps_native_stdout_contract(
+    tmp_path: Path,
+    monkeypatch,
+):
+    """The nm fallback must capture output without ``CompletedProcess``."""
+    from pcc.py_frontend import pipeline
+
+    archive = tmp_path / "libpy_runtime.a"
+    observed = {}
+
+    def fake_check_output(command, **kwargs):
+        observed["command"] = command
+        observed["kwargs"] = kwargs
+        return (
+            "00000000 T PyLong_FromLong\n"
+            "00000010 T _PyObject_Call\n"
+            "00000020 T helper\n"
+            "         U PyErr_SetString\n"
+            "00000000 T PyLong_FromLong\n"
+        )
+
+    monkeypatch.setattr(pipeline.subprocess, "check_output", fake_check_output)
+    monkeypatch.setattr(pipeline, "_host_python_command", lambda: "/host/python")
+    monkeypatch.setattr(
+        pipeline.subprocess,
+        "run",
+        lambda *_args, **_kwargs: pytest.fail("nm fallback used subprocess.run"),
+    )
+
+    assert pipeline._capi_export_anchor_symbols(str(archive)) == [
+        "PyLong_FromLong",
+        "_PyObject_Call",
+    ]
+    assert observed["command"][:2] == ["/host/python", "-c"]
+    assert "timeout=120" in observed["command"][2]
+    assert observed["command"][3] == str(archive)
+    assert observed["kwargs"] == {"text": True}
 
 
 def test_cli_bootstrap_package_schema_static_imports_stay_native():
@@ -421,6 +611,8 @@ def _per_module_and_multi(srcs, mods, *, ir_scaffold_mode: str):
     spec.loader.exec_module(probe_mod)
 
     per_module: dict[str, int] = {}
+    per_module_actions: dict[str, int] = {}
+    per_module_plumbing: dict[str, int] = {}
     per_module_ok = 0
     for src, mod in zip(srcs, mods):
         try:
@@ -435,10 +627,15 @@ def _per_module_and_multi(srcs, mods, *, ir_scaffold_mode: str):
             )
             ir = cg.generate(typed)
             ir_text = str(ir)
-            per_module[mod] = _count_py_cpy_calls(ir_text)
+            classified = _classify_py_cpy_calls(ir_text)
+            per_module[mod] = classified["total"]
+            per_module_actions[mod] = classified["actions"]
+            per_module_plumbing[mod] = classified["plumbing"]
             per_module_ok += 1
         except Exception:
             per_module[mod] = -1
+            per_module_actions[mod] = -1
+            per_module_plumbing[mod] = -1
     # The multi-file path doesn't take an ir_scaffold_mode kw today;
     # set the env var the pipeline reads so multi-file inherits the
     # mode for the duration of the call.
@@ -472,6 +669,8 @@ def _per_module_and_multi(srcs, mods, *, ir_scaffold_mode: str):
     return {
         "per_module_ok": per_module_ok,
         "per_module": per_module,
+        "per_module_actions": per_module_actions,
+        "per_module_plumbing": per_module_plumbing,
         "contextual_per_module": _contextual_per_module_counts(
             srcs,
             mods,
@@ -566,48 +765,24 @@ def test_total_fallbacks_under_ratchet(closure_compile):
 
 
 def test_per_module_fallbacks_under_ratchet(closure_compile):
-    """No single module's fallback count grows past baseline + ratchet.
+    """No module's semantic fallback actions grow past the ratchet.
 
-    Catches regressions localized to one file (e.g. someone adds a
-    dynamic idiom to layer1 that doubles its count). Also catches the
-    inverse: any module not in baseline (currently at 0) must stay 0,
-    so we don't lose ground we've already gained.
+    Ownership/conversion plumbing remains visible in ``closure_compile`` but
+    is not a dynamic Python idiom.  The strict multi-file tests below still
+    require every action and plumbing call together to remain exactly zero.
     """
     baseline = _load_baseline()
-    baseline_per_module = baseline["per_module"]
+    baseline_per_module = baseline["per_module_actions"]
     contextual_modules = _contextual_policy_modules(
         closure_compile["per_module"].keys()
     )
 
-    failures: list[str] = []
-    for mod, expected in baseline_per_module.items():
-        if mod in contextual_modules:
-            continue
-        actual = closure_compile["per_module"].get(mod)
-        if actual is None:
-            failures.append(f"{mod}: missing from current run")
-            continue
-        if actual == -1:
-            failures.append(f"{mod}: per-module codegen failed")
-            continue
-        if not _within_ratchet(actual, expected):
-            failures.append(
-                f"{mod}: {actual} vs baseline {expected} " f"(+{_RATCHET_PERCENT}%)"
-            )
-
-    for mod, actual in closure_compile["per_module"].items():
-        if mod in contextual_modules:
-            continue
-        if mod in baseline_per_module:
-            continue
-        if actual == -1:
-            failures.append(f"{mod}: per-module codegen failed")
-            continue
-        if actual != 0:
-            failures.append(
-                f"{mod}: {actual} fallbacks (baseline implicitly 0); "
-                f"a previously-clean module regressed"
-            )
+    failures = _per_module_action_failures(
+        closure_compile["per_module_actions"],
+        baseline_per_module,
+        contextual_modules=contextual_modules,
+        label="",
+    )
 
     assert not failures, "per-module fallback regressions:\n  " + "\n  ".join(failures)
 
@@ -625,6 +800,135 @@ def test_contextual_per_module_fallbacks_under_ratchet(closure_compile):
         enforce_ratchet=False,
         require_zero=False,
     )
+
+
+def test_contextual_for_target_domain_join_cleanup_names_compile():
+    """Cleanup loops must not shadow CPython-backed builder temporaries.
+
+    In contextual OFF mode, calls through the host IR builder intentionally
+    produce CPython-domain values.  Reusing that temporary's name as a later
+    pcc-list loop target asks one stack slot to carry two incompatible object
+    domains.  These four helpers only iterate separate cleanup collections, so
+    their loop targets must have distinct source bindings.  Strict ON mode
+    remains the production zero-fallback contract.
+    """
+    import importlib.util as _imputil
+
+    from pcc.py_frontend.pipeline import (
+        compile_contextual_per_module_fallback_counts,
+    )
+
+    spec = _imputil.spec_from_file_location(
+        "_probe_contextual_cleanup_target_names",
+        str(_REPO_ROOT / "scripts" / "probe_stage1_closure.py"),
+    )
+    probe_mod = _imputil.module_from_spec(spec)
+    spec.loader.exec_module(probe_mod)
+    srcs, mods = probe_mod._tightened_closure(
+        str(_REPO_ROOT / "pcc" / "__main__.py")
+    )
+    targets = {
+        "pcc.py_frontend.codegen.lambda_callback_lowering",
+        "pcc.py_frontend.codegen.lambda_helpers_lowering",
+        "pcc.py_frontend.codegen.native_virtual_thread",
+        "pcc.py_frontend.codegen.numeric_builtin_lowering",
+    }
+
+    off_counts = compile_contextual_per_module_fallback_counts(
+        srcs,
+        mods,
+        targets,
+        ir_scaffold_mode="off",
+        strict_no_libpython=False,
+    )
+    on_counts = compile_contextual_per_module_fallback_counts(
+        srcs,
+        mods,
+        targets,
+        ir_scaffold_mode="on",
+        strict_no_libpython=True,
+    )
+
+    assert set(off_counts) == targets
+    assert all(count >= 0 for count in off_counts.values()), off_counts
+    assert on_counts == {module_name: 0 for module_name in targets}
+
+
+def test_contextual_valueclass_arity_projection_remains_native():
+    """The dynamic struct-arity path must stay inside the strict closure."""
+    import importlib.util as _imputil
+
+    from pcc.py_frontend.pipeline import (
+        compile_contextual_per_module_fallback_counts,
+    )
+
+    spec = _imputil.spec_from_file_location(
+        "_probe_contextual_valueclass_arity",
+        str(_REPO_ROOT / "scripts" / "probe_stage1_closure.py"),
+    )
+    probe_mod = _imputil.module_from_spec(spec)
+    spec.loader.exec_module(probe_mod)
+    srcs, mods = probe_mod._tightened_closure(
+        str(_REPO_ROOT / "pcc" / "__main__.py")
+    )
+    targets = {
+        "pcc.py_frontend.codegen.class_gen",
+        "pcc.py_frontend.codegen.type_abi_lowering",
+    }
+
+    counts = compile_contextual_per_module_fallback_counts(
+        srcs,
+        mods,
+        targets,
+        ir_scaffold_mode="on",
+        strict_no_libpython=True,
+    )
+
+    assert counts == {module_name: 0 for module_name in targets}
+
+
+def test_contextual_frontend_type_tag_aliases_remain_native():
+    """Generated compiler tag aliases must not add contextual fallbacks."""
+    import importlib.util as _imputil
+
+    from pcc.py_frontend.pipeline import (
+        compile_contextual_per_module_fallback_counts,
+    )
+
+    spec = _imputil.spec_from_file_location(
+        "_probe_contextual_frontend_type_tags",
+        str(_REPO_ROOT / "scripts" / "probe_stage1_closure.py"),
+    )
+    probe_mod = _imputil.module_from_spec(spec)
+    spec.loader.exec_module(probe_mod)
+    srcs, mods = probe_mod._tightened_closure(
+        str(_REPO_ROOT / "pcc" / "__main__.py")
+    )
+    targets = {
+        "pcc.py_frontend.codegen.compare_membership_lowering",
+        "pcc.py_frontend.codegen.dict_lowering",
+        "pcc.py_frontend.codegen.guarded_loop_lowering",
+        "pcc.py_frontend.codegen.isinstance_lowering",
+        "pcc.py_frontend.codegen.list_method_lowering",
+        "pcc.py_frontend.codegen.method_call_expression_lowering",
+        "pcc.py_frontend.codegen.method_call_lowering",
+        "pcc.py_frontend.codegen.name_lowering",
+        "pcc.py_frontend.codegen.native_virtual_thread",
+        "pcc.py_frontend.codegen.numeric_builtin_lowering",
+        "pcc.py_frontend.codegen.set_lowering",
+        "pcc.py_frontend.codegen.stmt_misc_lowering",
+        "pcc.py_frontend.codegen.string_method_lowering",
+    }
+
+    counts = compile_contextual_per_module_fallback_counts(
+        srcs,
+        mods,
+        targets,
+        ir_scaffold_mode="on",
+        strict_no_libpython=True,
+    )
+
+    assert counts == {module_name: 0 for module_name in targets}
 
 
 # ---- ON-mode ratchets (closed-world Path A) ---------------------------
@@ -675,40 +979,17 @@ def test_on_mode_non_bridge_fallbacks_do_not_regress(closure_compile_on):
 
 def test_on_mode_per_module_fallbacks_under_ratchet(closure_compile_on):
     baseline = _load_baseline()
-    baseline_per_module = baseline["on_mode_per_module"]
+    baseline_per_module = baseline["on_mode_per_module_actions"]
     contextual_modules = _contextual_policy_modules(
         closure_compile_on["per_module"].keys()
     )
 
-    failures: list[str] = []
-    for mod, expected in baseline_per_module.items():
-        if mod in contextual_modules:
-            continue
-        actual = closure_compile_on["per_module"].get(mod)
-        if actual is None:
-            failures.append(f"{mod}: missing from current run")
-            continue
-        if actual == -1:
-            failures.append(f"{mod}: per-module ON codegen failed")
-            continue
-        if not _within_ratchet(actual, expected):
-            failures.append(
-                f"{mod}: {actual} vs ON baseline {expected} " f"(+{_RATCHET_PERCENT}%)"
-            )
-
-    for mod, actual in closure_compile_on["per_module"].items():
-        if mod in contextual_modules:
-            continue
-        if mod in baseline_per_module:
-            continue
-        if actual == -1:
-            failures.append(f"{mod}: per-module ON codegen failed")
-            continue
-        if actual != 0:
-            failures.append(
-                f"{mod}: {actual} ON fallbacks (baseline implicitly 0); "
-                f"a previously-clean ON-mode module regressed"
-            )
+    failures = _per_module_action_failures(
+        closure_compile_on["per_module_actions"],
+        baseline_per_module,
+        contextual_modules=contextual_modules,
+        label="ON ",
+    )
 
     assert not failures, "ON-mode per-module fallback regressions:\n  " + "\n  ".join(
         failures
@@ -797,8 +1078,8 @@ def test_marshal_raw_per_module_fallbacks_stay_under_ratchet():
         emit_cpy_main_exitcode=False,
         ir_scaffold_mode="off",
     )
-    actual = _count_py_cpy_calls(str(codegen.generate(typed)))
-    expected = _load_baseline()["per_module"][target]
+    actual = _classify_py_cpy_calls(str(codegen.generate(typed)))["actions"]
+    expected = _load_baseline()["per_module_actions"][target]
 
     assert _within_ratchet(
         actual, expected

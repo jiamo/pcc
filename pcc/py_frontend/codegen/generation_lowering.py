@@ -7,6 +7,7 @@ import sys
 import time
 from typing import Optional
 
+from pcc.codegen.c_varargs import postprocess_varargs_ir
 from pcc.llvm_capi.compat import ir
 
 from ..py_ast import (
@@ -22,6 +23,7 @@ from ..py_ast import (
     Module,
     Name,
     Stmt,
+    StrLit,
     Try,
     While,
     With,
@@ -32,10 +34,29 @@ from .layer1_support import (
     _is_import_from_stmt,
     _is_import_stmt,
 )
+from . import marshal
 from .hoist_lowering import hoist_nested_funcdefs
+from .errors import L1CodegenError
 from .runtime_abi import declare_runtime
+from .typed_int_bounded_proof import compute_bounded_int_abi_function_names
+from .vthread_effect_analysis import (
+    classify_vthread_park_boundaries,
+    compute_vthread_may_park_callables,
+)
 
 _UNSAFE_SCAFFOLD_MODULES = frozenset({"pcc.unsafe"})
+_TYPE_SCAFFOLD_MODULES = frozenset({"pcc"})
+_COMPILE_TIME_SCAFFOLD_MODULES = frozenset(
+    {"pcc.py_runtime.py.py_abi_constants"}
+)
+_FREESTANDING_MARKER = "__pcc_freestanding__"
+
+
+def _is_freestanding_marker_assign(stmt: Stmt) -> bool:
+    if not isinstance(stmt, Assign) or len(stmt.targets) != 1:
+        return False
+    target = stmt.targets[0]
+    return isinstance(target, Name) and target.ident == _FREESTANDING_MARKER
 
 
 def _codegen_log(parent, enabled: bool, label: str) -> None:
@@ -49,9 +70,9 @@ def _iter_module_block_decls(stmt: Stmt, static_bool_condition=None):
     """Yield ``def``/``class`` statements nested in module-scope blocks.
 
     Python treats ``def`` and ``class`` as executable statements, so packages
-    commonly put them under import-time ``if`` blocks. pcc still lowers the
-    callable/class bodies statically; the block execution step is a no-op for
-    those declarations.
+    commonly put them under import-time ``if`` blocks. pcc lowers the bodies
+    statically, then statement lowering publishes the callable/class binding
+    only when its containing path executes.
     """
     if isinstance(stmt, (FuncDef, ClassDef)):
         yield stmt
@@ -136,6 +157,7 @@ class GenerationLoweringMixin:
 
         _codegen_log(self, debug_codegen, "start")
         saved_skip_program_main = self._skip_program_main
+        saved_freestanding_module = self._freestanding_module
         saved_sibling_module_inits = self._sibling_module_inits
         saved_native_module_exports = self._native_module_exports
         if module is not None:
@@ -146,6 +168,10 @@ class GenerationLoweringMixin:
             setattr(self, "runtime", declare_runtime(self.module))
             setattr(self, "_printf", self._declare_printf())
             setattr(self, "functions", {})
+            setattr(self, "_funcdef_functions", {})
+            setattr(self, "_native_symbol_funcdefs", {})
+            setattr(self, "_function_definition_ordinals", {})
+            setattr(self, "_duplicate_module_function_names", set())
             setattr(self, "_c_abi_export_symbols", set())
             setattr(self, "_module_has_c_abi_export", False)
             setattr(self, "_fn_err_exit_blocks", {})
@@ -154,6 +180,9 @@ class GenerationLoweringMixin:
             setattr(self, "_fn_err_exit_gc_root_slots", {})
             setattr(self, "_fn_gc_root_exit_sites", {})
             setattr(self, "_post_call_frame_blocks", {})
+            setattr(self, "_source_file_lines_cache", {})
+            setattr(self, "_owned_dynamic_call_values", set())
+            marshal.reset_boxed_i64_constants()
             setattr(self, "_fmt_int", None)
             setattr(self, "_fmt_float", None)
             setattr(self, "_fmt_bool_true", None)
@@ -187,11 +216,22 @@ class GenerationLoweringMixin:
             setattr(self, "_cross_module_identity_decorators", {})
             setattr(self, "_cross_module_semantic_functions", {})
             setattr(self, "_module_block_func_defs", {})
+            setattr(self, "_module_block_funcdef_ids", set())
             setattr(self, "_unboxed_typed_int_abi_cache", {})
             setattr(self, "_typed_int_abi_call_arg_safety", [])
+            setattr(self, "_bounded_int_abi_function_names", [])
+            setattr(self, "_funcdef_yield_sentinel_cache", {})
+            setattr(self, "_vthread_binding_cache", {})
+            setattr(self, "_generator_func_names", set())
+            setattr(self, "_vthread_may_park_func_ids", set())
+            setattr(self, "_vthread_may_park_func_names", set())
+            setattr(self, "_vthread_may_park_method_ids", set())
+            setattr(self, "_vthread_may_park_method_keys", set())
+            setattr(self, "_vthread_rejected_park_boundaries", {})
             setattr(self, "current_class", None)
             setattr(self, "current_method_kind", None)
             setattr(self, "_skip_program_main", saved_skip_program_main)
+            setattr(self, "_freestanding_module", saved_freestanding_module)
             setattr(self, "_sibling_module_inits", saved_sibling_module_inits)
             setattr(self, "_native_module_exports", saved_native_module_exports)
 
@@ -212,10 +252,91 @@ class GenerationLoweringMixin:
         _codegen_log(self, debug_codegen, "hoist begin")
         hoisted = hoist_nested_funcdefs(self)
         _codegen_log(self, debug_codegen, "hoist end " + str(len(hoisted)))
+        # This fixed point must run after closure hoisting (so direct nested
+        # calls have their final symbols) and before declarations (so affected
+        # functions receive the resumable pointer ABI).  Both the analysis and
+        # the resulting lowering are compiled into pcc1; there is no host-only
+        # source rewrite in this path.
+        _codegen_log(self, debug_codegen, "vthread may-park begin")
+        (
+            may_park_ids,
+            may_park_names,
+            may_park_method_ids,
+            may_park_method_keys,
+        ) = compute_vthread_may_park_callables(
+            self.ast_module, self._native_module_exports
+        )
+        setattr(self, "_vthread_may_park_func_ids", may_park_ids)
+        setattr(self, "_vthread_may_park_func_names", may_park_names)
+        setattr(self, "_vthread_may_park_method_ids", may_park_method_ids)
+        setattr(self, "_vthread_may_park_method_keys", may_park_method_keys)
+        rejected_park_boundaries = classify_vthread_park_boundaries(
+            self.ast_module,
+            may_park_names,
+            self._native_module_exports,
+            may_park_method_keys,
+        )
+        setattr(
+            self,
+            "_vthread_rejected_park_boundaries",
+            rejected_park_boundaries,
+        )
+        for method_key in may_park_method_keys:
+            reason = rejected_park_boundaries.get(method_key)
+            if reason:
+                raise L1CodegenError(
+                    "may_park method boundary is not statically resumable: "
+                    + method_key
+                    + ": "
+                    + reason
+                )
+        _codegen_log(
+            self,
+            debug_codegen,
+            "vthread may-park end " + str(len(may_park_names)),
+        )
         # Modules importing ``traceback``: synthesize handler bindings so
         # ``traceback.format_exc()``/``print_exc()`` can read the handled
         # exception (see NativeModuleAliasMixin._rewrite_traceback_handler_bindings).
         self._rewrite_traceback_handler_bindings()
+
+        # ``def`` is an executable rebinding statement.  Distinct same-named
+        # definitions need distinct native bodies, and all reads/calls of that
+        # name must use the live module binding so an earlier function can
+        # escape before the later definition executes.  Preserve source order
+        # when declaring the widened globals; set iteration would make host
+        # and self-host IR order depend on hash-table details.
+        module_func_defs: list[FuncDef] = []
+        for candidate in self.ast_module.body:
+            if isinstance(candidate, FuncDef):
+                module_func_defs.append(candidate)
+                continue
+            if isinstance(candidate, (Try, With, If, While, For)):
+                for decl in _iter_module_block_decls(candidate):
+                    if isinstance(decl, FuncDef):
+                        module_func_defs.append(decl)
+
+        module_function_counts: dict[str, int] = {}
+        for candidate in module_func_defs:
+            module_function_counts[candidate.name] = (
+                module_function_counts.get(candidate.name, 0) + 1
+            )
+        duplicate_names: list[str] = []
+        duplicate_seen: set[str] = set()
+        for candidate in module_func_defs:
+            if module_function_counts.get(candidate.name, 0) < 2:
+                continue
+            if candidate.name in duplicate_seen:
+                continue
+            duplicate_seen.add(candidate.name)
+            duplicate_names.append(candidate.name)
+        self._duplicate_module_function_names = set(duplicate_names)
+        for duplicate_name in duplicate_names:
+            self._ensure_module_global_name(
+                duplicate_name,
+                DynType(name="dyn"),
+            )
+
         _codegen_log(self, debug_codegen, "module flags raw-int begin")
         setattr(
             self,
@@ -227,6 +348,11 @@ class GenerationLoweringMixin:
         setattr(self, "_module_has_c_abi_export", self._module_imports_c_abi_export())
         _codegen_log(self, debug_codegen, "module flags c-abi end")
         _codegen_log(self, debug_codegen, "module flags typed-int begin")
+        setattr(
+            self,
+            "_bounded_int_abi_function_names",
+            compute_bounded_int_abi_function_names(self.ast_module),
+        )
         setattr(
             self,
             "_typed_int_abi_call_arg_safety",
@@ -241,7 +367,7 @@ class GenerationLoweringMixin:
         # to modules reached through an import cycle.
         main_body: list[Stmt] = []
         module_block_decls: list[Stmt] = []
-        declared_module_funcs: set[str] = set()
+        declared_module_func_ids: set[int] = set()
         declared_module_classes: set[str] = set()
 
         stmt_index = 0
@@ -249,7 +375,16 @@ class GenerationLoweringMixin:
             if debug_codegen:
                 _codegen_log(self, debug_codegen, "declare begin")
             if isinstance(stmt, FuncDef):
-                declared_module_funcs.add(stmt.name)
+                if (
+                    self._freestanding_module
+                    and self._func_c_abi_export_symbol(stmt) is None
+                ):
+                    raise RuntimeError(
+                        "freestanding module functions require "
+                        "@c_abi_export: "
+                        + stmt.name
+                    )
+                declared_module_func_ids.add(id(stmt))
                 self._prescan_function_module_globals(stmt)
                 self._declare_user_function(stmt)
                 # Closure conversion appends synthetic ``__nested_*``
@@ -257,16 +392,33 @@ class GenerationLoweringMixin:
                 # be emitted.  They were never source-level module statements:
                 # executing them here would evaluate closure/default values in
                 # the wrong (module) scope.
-                if not stmt.name.startswith("__nested_"):
+                if (
+                    not self._freestanding_module
+                    and not stmt.name.startswith("__nested_")
+                ):
                     main_body.append(stmt)
             elif isinstance(stmt, ClassDef):
+                if self._freestanding_module:
+                    raise RuntimeError(
+                        "freestanding modules do not support class definitions: "
+                        + stmt.name
+                    )
                 declared_module_classes.add(stmt.name)
                 for class_stmt in stmt.body:
                     if isinstance(class_stmt, FuncDef):
                         self._prescan_function_module_globals(class_stmt)
                 self.class_lowering.declare_class(stmt)
-                main_body.append(stmt)
+                # Synthetic function-local classes are duplicated at module
+                # scope only so their method bodies can be declared/emitted.
+                # Their class object must be constructed by the executable
+                # ClassDef retained in the enclosing function body.
+                if stmt.name not in self._hoisted_class_capture_params:
+                    main_body.append(stmt)
             elif _is_import_stmt(stmt) and not _is_import_from_stmt(stmt):
+                if self._freestanding_module:
+                    raise RuntimeError(
+                        "freestanding modules only support scaffold from-imports"
+                    )
                 for mod_name, as_name in _import_names_from_stmt(stmt):
                     if self._is_test_facade_import_module(mod_name):
                         continue
@@ -282,7 +434,6 @@ class GenerationLoweringMixin:
                         "fileinput",
                         "shutil",
                         "shlex",
-                        "sysconfig",
                         "math",
                         "json",
                         "re",
@@ -295,7 +446,6 @@ class GenerationLoweringMixin:
                         "threading",
                         "pcc.virtual_thread",
                         "pcc",
-                        "importlib",
                         "inspect",
                         "contextlib",
                         "contextvars",
@@ -326,7 +476,6 @@ class GenerationLoweringMixin:
                             "fileinput",
                             "shutil",
                             "shlex",
-                            "sysconfig",
                             "math",
                             "json",
                             "re",
@@ -339,7 +488,6 @@ class GenerationLoweringMixin:
                             "threading",
                             "pcc.virtual_thread",
                             "pcc",
-                            "importlib",
                             "inspect",
                             "contextlib",
                             "contextvars",
@@ -384,12 +532,32 @@ class GenerationLoweringMixin:
                 # binding set now so extern decls that follow (and
                 # extern calls in user functions) see them.
                 import_module = _import_from_module_or_empty(stmt)
+                compile_time_scaffold = (
+                    import_module in _COMPILE_TIME_SCAFFOLD_MODULES
+                    and import_module in (self._native_module_exports or {})
+                )
+                if self._freestanding_module and not (
+                    self._is_extern_scaffold_import_module(import_module)
+                    or import_module in _UNSAFE_SCAFFOLD_MODULES
+                    or import_module in _TYPE_SCAFFOLD_MODULES
+                    or compile_time_scaffold
+                ):
+                    raise RuntimeError(
+                        "freestanding modules only support imports from "
+                        "pcc.extern, pcc.unsafe, and registered compile-time "
+                        "scaffolds: "
+                        + import_module
+                    )
                 if self._is_extern_scaffold_import_module(import_module):
                     self._register_extern_scaffold_imports(stmt)
                 elif self._is_test_facade_import_module(import_module):
                     pass
                 elif import_module in _UNSAFE_SCAFFOLD_MODULES:
                     self._register_unsafe_scaffold_imports(stmt)
+                elif import_module in _TYPE_SCAFFOLD_MODULES:
+                    # ``i64``/``u64`` are annotation-only compile-time
+                    # markers.  They deliberately create no runtime import.
+                    pass
                 elif self._register_native_builtin_import_from_aliases(
                     stmt,
                     self._resolve_relative_import(stmt),
@@ -474,7 +642,20 @@ class GenerationLoweringMixin:
                             self._cpy_modules()[local_name] = self._cpy_module_global(
                                 local_name
                             )
-                main_body.append(stmt)
+                if not self._freestanding_module:
+                    main_body.append(stmt)
+            elif self._freestanding_module and _is_freestanding_marker_assign(stmt):
+                # A compile-time contract marker, not a runtime module global.
+                pass
+            elif (
+                self._freestanding_module
+                and stmt_index == 0
+                and isinstance(stmt, ExprStmt)
+                and isinstance(stmt.expr, StrLit)
+            ):
+                # Module docstrings are compile-time metadata, not executable
+                # freestanding state.
+                pass
             elif isinstance(stmt, Assign) and self._maybe_register_extern_assign(stmt):
                 # Pre-register extern("symbol", ...) decls during the
                 # declare pass so user-function bodies emitted next can
@@ -492,6 +673,12 @@ class GenerationLoweringMixin:
             elif isinstance(
                 stmt, (ExprStmt, Assign, AugAssign, If, While, For, Try, With, Delete)
             ):
+                if self._freestanding_module:
+                    raise RuntimeError(
+                        "freestanding modules do not support executable "
+                        "module-scope statements: "
+                        + type(stmt).__name__
+                    )
                 # Top-level statements that belong in the synthetic
                 # module-main function so they execute at program
                 # start. Top-level ``Name = <expr>`` also declares a
@@ -516,9 +703,10 @@ class GenerationLoweringMixin:
                         self._static_bool_condition,
                     ):
                         if isinstance(decl, FuncDef):
-                            if decl.name in declared_module_funcs:
+                            decl_id = id(decl)
+                            if decl_id in declared_module_func_ids:
                                 continue
-                            declared_module_funcs.add(decl.name)
+                            declared_module_func_ids.add(decl_id)
                             self._ensure_module_global_name(
                                 decl.name,
                                 DynType("dyn"),
@@ -526,6 +714,7 @@ class GenerationLoweringMixin:
                             self._prescan_function_module_globals(decl)
                             self._declare_user_function(decl)
                             self._module_block_func_defs[decl.name] = decl
+                            self._module_block_funcdef_ids.add(decl_id)
                             module_block_decls.append(decl)
                             continue
                         if isinstance(decl, ClassDef):
@@ -630,15 +819,18 @@ class GenerationLoweringMixin:
                 self.class_lowering.emit_methods(decl)
                 _codegen_log(self, debug_codegen, "emit block class end " + decl.name)
 
-        _codegen_log(self, debug_codegen, "class module init begin")
-        self.class_lowering.emit_module_init()
-        _codegen_log(self, debug_codegen, "class module init end")
+        if not self._freestanding_module:
+            _codegen_log(self, debug_codegen, "class module init begin")
+            self.class_lowering.emit_module_init()
+            _codegen_log(self, debug_codegen, "class module init end")
         # Multi-file compile mode: non-entry modules emit a
         # ``_pcc_py_module_top_<mod>()`` initialiser instead of the
         # program entry ``@main``. The entry module's @main is
         # responsible for calling each other module's top-level init
         # before its own body runs.
-        if self._skip_program_main:
+        if self._freestanding_module:
+            pass
+        elif self._skip_program_main:
             _codegen_log(self, debug_codegen, "module top init begin")
             self._emit_module_top_init(main_body)
             _codegen_log(self, debug_codegen, "module top init end")
@@ -647,11 +839,13 @@ class GenerationLoweringMixin:
             self._emit_program_main(main_body)
             _codegen_log(self, debug_codegen, "program main end")
 
-        _codegen_log(self, debug_codegen, "module teardown begin")
-        self._emit_module_teardown()
-        _codegen_log(self, debug_codegen, "module teardown end")
+        if not self._freestanding_module:
+            _codegen_log(self, debug_codegen, "module teardown begin")
+            self._emit_module_teardown()
+            _codegen_log(self, debug_codegen, "module teardown end")
 
         _codegen_log(self, debug_codegen, "module str begin")
         out = str(self.module)
+        out = postprocess_varargs_ir(out)
         _codegen_log(self, debug_codegen, "module str end " + str(len(out)))
         return out

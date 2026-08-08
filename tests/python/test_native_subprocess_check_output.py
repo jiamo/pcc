@@ -1,4 +1,5 @@
 """``subprocess.check_output(..., text=True)`` native lowering."""
+
 from __future__ import annotations
 
 import re
@@ -6,13 +7,18 @@ import subprocess
 import textwrap
 from pathlib import Path
 
-
 _REPO_ROOT = Path(__file__).absolute().parents[2]
 _BUILD = _REPO_ROOT / "build"
 _BUILD.mkdir(parents=True, exist_ok=True)
 
 
-def _compile_to_ll(source: str, name: str, *, mode: str) -> str:
+def _compile_to_ll(
+    source: str,
+    name: str,
+    *,
+    mode: str,
+    recursive_stdlib: bool = False,
+) -> str:
     from pcc.py_frontend.pipeline import compile_python
 
     src = _BUILD / f"{name}.py"
@@ -23,6 +29,7 @@ def _compile_to_ll(source: str, name: str, *, mode: str) -> str:
         str(out),
         emit_llvm_only=True,
         ir_scaffold_mode=mode,
+        recursive_stdlib=recursive_stdlib,
     )
     return out.read_text(encoding="utf-8")
 
@@ -120,7 +127,12 @@ def test_run_check_true_expr_statement_dispatches_native():
         """
     )
 
-    ir_text = _compile_to_ll(program, "native_subprocess_run_ir", mode="on")
+    ir_text = _compile_to_ll(
+        program,
+        "native_subprocess_run_ir",
+        mode="on",
+        recursive_stdlib=True,
+    )
     body = _function_body(ir_text, "f")
 
     assert body is not None
@@ -140,7 +152,12 @@ def test_run_timeout_keyword_still_dispatches_native():
         """
     )
 
-    ir_text = _compile_to_ll(program, "native_subprocess_run_timeout_ir", mode="on")
+    ir_text = _compile_to_ll(
+        program,
+        "native_subprocess_run_timeout_ir",
+        mode="on",
+        recursive_stdlib=True,
+    )
     body = _function_body(ir_text, "f")
 
     assert body is not None
@@ -161,7 +178,12 @@ def test_run_capture_output_bool_expression_dispatches_native():
         """
     )
 
-    ir_text = _compile_to_ll(program, "native_subprocess_run_dyn_capture", mode="on")
+    ir_text = _compile_to_ll(
+        program,
+        "native_subprocess_run_dyn_capture",
+        mode="on",
+        recursive_stdlib=True,
+    )
     body = _function_body(ir_text, "f")
 
     assert body is not None

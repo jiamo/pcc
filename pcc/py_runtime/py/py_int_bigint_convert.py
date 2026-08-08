@@ -1,5 +1,10 @@
 """Phase 4c: pcc-Python port of py_int_bigint_convert.c."""
 from pcc.extern import c_abi_export
+from pcc.py_runtime.py.py_abi_constants import (
+    PYINTOBJECT_DIGITS_OFFSET,
+    PYINTOBJECT_NDIGITS_OFFSET,
+    PYINTOBJECT_SIGN_OFFSET,
+)
 from pcc.unsafe import load_i32, ptr_is_null, store_i32
 
 
@@ -18,21 +23,21 @@ def _load_u32(obj, offset: int) -> int:
 @c_abi_export("py_bigint_to_i64")
 def py_bigint_to_i64(b, overflow) -> int:
     _set_overflow(overflow, 0)
-    sign: int = load_i32(b, 16)
+    sign: int = load_i32(b, PYINTOBJECT_SIGN_OFFSET)
     if sign == 0:
         return 0
 
-    ndigits: int = load_i32(b, 20)
+    ndigits: int = load_i32(b, PYINTOBJECT_NDIGITS_OFFSET)
     if ndigits > 2:
         _set_overflow(overflow, 1)
         return 0
     if ndigits <= 0:
         return 0
 
-    low: int = _load_u32(b, 24)
+    low: int = _load_u32(b, PYINTOBJECT_DIGITS_OFFSET)
     high: int = 0
     if ndigits == 2:
-        high = _load_u32(b, 28)
+        high = _load_u32(b, PYINTOBJECT_DIGITS_OFFSET + 4)
 
     if sign > 0:
         if high > 2147483647:

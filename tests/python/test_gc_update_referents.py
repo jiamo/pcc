@@ -21,11 +21,34 @@ from tests.runtime_build_cache import cached_c_runtime
 
 REPO_ROOT = Path(__file__).absolute().parents[2]
 RUNTIME_DIR = REPO_ROOT / "pcc" / "py_runtime"
+STRICT_OBJECT_SLOTS = RUNTIME_DIR / "py" / "freestanding_gc_object_slots.py"
+STRICT_BACKEND0_SLOTS = (
+    RUNTIME_DIR / "py" / "freestanding_gc_backend0_slots.py"
+)
+STRICT_BACKEND0_COLLECTOR = (
+    RUNTIME_DIR / "py" / "freestanding_gc_backend0_collector.py"
+)
+STRICT_COMMON_MARK_CYCLE = (
+    RUNTIME_DIR / "py" / "freestanding_gc_common_mark_cycle.py"
+)
+STRICT_GENERATIONAL_PROMOTION = (
+    RUNTIME_DIR / "py" / "freestanding_gc_generational_promotion.py"
+)
+STRICT_RELOCATION_REMAP = (
+    RUNTIME_DIR / "py" / "freestanding_gc_relocation_remap.py"
+)
+STRICT_RELOCATION_PAYLOAD = (
+    RUNTIME_DIR / "py" / "freestanding_gc_relocation_payload.py"
+)
+STRICT_SWEEP_SLOTS = RUNTIME_DIR / "py" / "freestanding_gc_sweep_slots.py"
+STRICT_TRACING_SWEEP_COLLECTOR = (
+    RUNTIME_DIR / "py" / "freestanding_gc_tracing_sweep_collector.py"
+)
 
 
 def test_backend4_relocation_reuses_shared_slot_contract():
     c_source = (RUNTIME_DIR / "src" / "py_gc_backend.c").read_text(encoding="utf-8")
-    py_source = (RUNTIME_DIR / "py" / "py_gc_backend.py").read_text(encoding="utf-8")
+    py_source = STRICT_RELOCATION_PAYLOAD.read_text(encoding="utf-8")
 
     c_contract = c_source.split("typedef struct {\n    PyObject ***from_slots;", 1)[1]
     c_contract = c_contract.split("static int pcc_gc_backend_uses_forwarding", 1)[0]
@@ -36,14 +59,13 @@ def test_backend4_relocation_reuses_shared_slot_contract():
     assert "py_incref(" not in c_payload
     assert "pcc_gc_backend4_remembered_set_retarget_slot_unlocked(" not in c_payload
 
-    py_contract = py_source.split("def _relocate_slot_pairs_prepare(", 1)[1]
-    py_contract = py_contract.split("def _backend_uses_forwarding", 1)[0]
-    assert "_py_obj_visit_covered_slots(from_obj" in py_contract
-    assert "_py_obj_visit_covered_slots(to_obj" in py_contract
-    assert "_remap_heal_slot" in py_contract
-    py_payload = py_contract.split("def _relocate_copy_payload(", 1)[1]
+    assert "pcc_gc_visit_object_slots(from_obj, _relocate_count_slot" in py_source
+    assert "pcc_gc_visit_object_slots(from_obj, _relocate_from_slot" in py_source
+    assert "pcc_gc_visit_object_slots(to_obj, _relocate_to_slot" in py_source
+    assert "pcc_gc_backend4_remap_heal_slot" in py_source
+    py_payload = py_source.split("def pcc_gc_relocate_copy_payload(", 1)[1]
     assert "py_incref(" not in py_payload
-    assert "_backend4_remembered_set_retarget_" not in py_payload
+    assert "pcc_gc_backend4_remembered_set_retarget_slot(" not in py_payload
 
 
 def _cc() -> str:
@@ -157,25 +179,21 @@ def test_pyclass_layout_matches_pcc_python_mirror(tmp_path):
     assert f"r = malloc({class_size})" in object_root
     assert f"memset(r, 0, {class_size})" in object_root
 
-    for visitor_path, signature in (
-        ("py_obj_gc.py", "def _py_obj_gc_visit_class_slots("),
-        ("py_gc_backend.py", "def _py_obj_visit_class_slots("),
+    visitor_source = STRICT_OBJECT_SLOTS.read_text(encoding="utf-8")
+    visitor = visitor_source.split("def _visit_class_slots(", 1)[1].split(
+        "\ndef ", 1
+    )[0]
+    for field, accessor in (
+        ("n_bases", "load_i32"),
+        ("bases", "load_ptr"),
+        ("n_mro", "load_i32"),
+        ("mro", "load_ptr"),
+        ("n_methods", "load_i32"),
+        ("methods", "load_ptr"),
     ):
-        visitor_source = (RUNTIME_DIR / "py" / visitor_path).read_text(
-            encoding="utf-8"
-        )
-        visitor = visitor_source.split(signature, 1)[1].split("\ndef ", 1)[0]
-        for field, accessor in (
-            ("n_bases", "load_i32"),
-            ("bases", "load_ptr"),
-            ("n_mro", "load_i32"),
-            ("mro", "load_ptr"),
-            ("n_methods", "load_i32"),
-            ("methods", "load_ptr"),
-        ):
-            assert f"{accessor}(o, {c_layout[f'class.{field}']})" in visitor
-        for field in ("del_method", "attrs", "metaclass"):
-            assert f"{c_layout[f'class.{field}']}," in visitor
+        assert f"{accessor}(o, {c_layout[f'class.{field}']})" in visitor
+    for field in ("del_method", "attrs", "metaclass"):
+        assert f"{c_layout[f'class.{field}']}," in visitor
 
     internal_header = (RUNTIME_DIR / "src" / "py_internal.h").read_text(
         encoding="utf-8"
@@ -189,7 +207,7 @@ def test_del_method_is_update_only_in_both_runtime_sources():
     py_dunder = (RUNTIME_DIR / "py" / "py_dunder.py").read_text(encoding="utf-8")
     c_class = (RUNTIME_DIR / "src" / "py_class.c").read_text(encoding="utf-8")
     py_class = (RUNTIME_DIR / "py" / "py_class.py").read_text(encoding="utf-8")
-    py_gc = (RUNTIME_DIR / "py" / "py_gc_backend.py").read_text(encoding="utf-8")
+    py_gc = STRICT_OBJECT_SLOTS.read_text(encoding="utf-8")
 
     c_dispatch = c_dunder.split("void py_user_del_dispatch(PyObject *o)", 1)[1]
     c_dispatch = c_dispatch.split("\n}", 1)[0]
@@ -206,13 +224,12 @@ def test_del_method_is_update_only_in_both_runtime_sources():
     py_add = py_add.split("\n@c_abi_export", 1)[0]
     assert "cls->del_method = func" in c_add
     assert "class_note_borrowed_metadata_slot_store" in c_add
-    assert "store_ptr(cls, 96, func)" in py_add
+    assert "store_ptr(cls, PYCLASSOBJECT_DEL_METHOD_OFFSET, func)" in py_add
     assert "_class_note_borrowed_metadata_slot_store" in py_add
 
-    py_gc_class = py_gc.split("def _py_obj_visit_class_slots(", 1)[1]
+    py_gc_class = py_gc.split("def _visit_class_slots(", 1)[1]
     py_gc_class = py_gc_class.split("\ndef ", 1)[0]
-    assert "96," in py_gc_class
-    assert "_PY_OBJ_SLOT_BORROWED_UPDATE_ONLY" in py_gc_class
+    assert 'abi_constant("object.class.del_method_offset")' in py_gc_class
 
 
 def test_c_finalizer_ignores_stale_update_only_del_alias(tmp_path):
@@ -606,7 +623,7 @@ def test_capi_extension_object_slot_contract_source():
     source = (RUNTIME_DIR / "src" / "py_gc_backend.c").read_text(encoding="utf-8")
     header = (RUNTIME_DIR / "src" / "py_internal.h").read_text(encoding="utf-8")
     shim_source = (RUNTIME_DIR / "src" / "py_capi_shim.c").read_text(encoding="utf-8")
-    libpython_source = (RUNTIME_DIR / "src" / "py_libpython.c").read_text(
+    visit_port = (RUNTIME_DIR / "py" / "py_capi_visit_runtime.py").read_text(
         encoding="utf-8"
     )
 
@@ -664,78 +681,56 @@ def test_capi_extension_object_slot_contract_source():
     assert "pcc_capi_visit_cext_object_slot_ref" in shim_body
     assert "PY_OBJ_SLOT_OWNED" in adapter_body
 
-    assert "int pcc_capi_visit_cext_object_slots(" in libpython_source
+    assert '@c_abi_typed_export("pcc_capi_visit_cext_object_slots"' in visit_port
 
 
 def test_pcc_python_cext_object_slot_bridge_source():
     header = (RUNTIME_DIR / "src" / "py_internal.h").read_text(encoding="utf-8")
     shim_source = (RUNTIME_DIR / "src" / "py_capi_shim.c").read_text(encoding="utf-8")
-    libpython_source = (RUNTIME_DIR / "src" / "py_libpython.c").read_text(
+    visit_port = (RUNTIME_DIR / "py" / "py_capi_visit_runtime.py").read_text(
         encoding="utf-8"
     )
-    gc_backend_py = (RUNTIME_DIR / "py" / "py_gc_backend.py").read_text(
-        encoding="utf-8"
-    )
+    strict_slots_py = STRICT_OBJECT_SLOTS.read_text(encoding="utf-8")
+    gc_backend_py = (RUNTIME_DIR / "py" / "py_gc_backend.py").read_text(encoding="utf-8")
     obj_gc_py = (RUNTIME_DIR / "py" / "py_obj_gc.py").read_text(encoding="utf-8")
+    collector_py = STRICT_BACKEND0_COLLECTOR.read_text(encoding="utf-8")
 
     assert "PccPyObjSlotVisitorI64" in header
     assert "int pcc_capi_visit_cext_object_slots_i64(" in header
     assert "int pcc_capi_visit_cext_object_slots_i64(" in shim_source
     assert "pcc_capi_visit_cext_object_slot_i64_adapter" in shim_source
-    assert "int pcc_capi_visit_cext_object_slots_i64(" in libpython_source
+    assert '@c_abi_typed_export("pcc_capi_visit_cext_object_slots_i64"' in visit_port
 
-    assert "pcc_capi_visit_cext_object_slots_i64 = extern(" in gc_backend_py
-    assert "pcc_capi_visit_cext_object_slots_i64 = extern(" in obj_gc_py
-
-    gc_callback = gc_backend_py[
-        gc_backend_py.index(
-            "def _py_obj_visit_cext_object_slot("
-        ) : gc_backend_py.index("def _py_obj_visit_cext_object_slots(")
-    ]
-    gc_bridge = gc_backend_py[
-        gc_backend_py.index(
-            "def _py_obj_visit_cext_object_slots("
-        ) : gc_backend_py.index("def _py_obj_visit_instance_owner_slots(")
-    ]
-    assert "_py_obj_visit_slot(slot, 0, role, mode, recurse)" in gc_callback
-    assert "pcc_capi_visit_cext_object_slots_i64(" in gc_bridge
-    assert "_py_obj_visit_cext_object_slot" in gc_bridge
-
-    covered_body = gc_backend_py[
-        gc_backend_py.index("def _py_obj_visit_covered_slots(") : gc_backend_py.index(
-            "def _trace_referents("
-        )
-    ]
-    cext_call = "_py_obj_visit_cext_object_slots("
-    assert cext_call in covered_body
-    assert covered_body.index(cext_call) < covered_body.index(
-        "_py_obj_visit_instance_owner_slots("
+    assert "pcc_capi_visit_cext_object_slots_i64 = extern(" in strict_slots_py
+    strict_dispatch = strict_slots_py.split(
+        "def pcc_gc_visit_object_slots(o, visitor, context) -> int:", 1
+    )[1]
+    cext_call = "pcc_capi_visit_cext_object_slots_i64("
+    assert cext_call in strict_dispatch
+    assert strict_dispatch.index(cext_call) < strict_dispatch.index(
+        "_visit_instance_slots(o, visitor, context)"
     )
 
-    obj_callback = obj_gc_py[
-        obj_gc_py.index("def _py_obj_gc_visit_cext_object_slot(") : obj_gc_py.index(
-            "def _py_obj_gc_visit_cext_object_slots("
-        )
-    ]
-    obj_bridge = obj_gc_py[
-        obj_gc_py.index("def _py_obj_gc_visit_cext_object_slots(") : obj_gc_py.index(
-            "def _py_obj_gc_visit_instance_owner_slots("
-        )
-    ]
-    assert "_py_obj_gc_visit_slot(slot, 0, role, mode, out)" in obj_callback
-    assert "pcc_capi_visit_cext_object_slots_i64(" in obj_bridge
-    assert "_py_obj_gc_visit_cext_object_slot" in obj_bridge
+    assert "pcc_gc_visit_object_slots = extern(" in gc_backend_py
+    covered_body = gc_backend_py.split(
+        "def _py_obj_visit_covered_slots(o, mode: int, recurse: int) -> int:",
+        1,
+    )[1].split("\ndef ", 1)[0]
+    assert "pcc_gc_visit_object_slots(" in covered_body
+    assert "_py_obj_visit_" in covered_body
+    assert "pcc_capi_visit_cext_object_slots_i64" not in gc_backend_py
 
-    obj_covered = obj_gc_py[
-        obj_gc_py.index("def _py_obj_gc_visit_covered_slots(") : obj_gc_py.index(
-            "def _visit_subtract("
-        )
-    ]
-    cext_call = "_py_obj_gc_visit_cext_object_slots("
-    assert cext_call in obj_covered
-    assert obj_covered.index(cext_call) < obj_covered.index(
-        "_py_obj_gc_visit_instance_owner_slots("
-    )
+    assert "pcc_gc_visit_object_slots = extern(" in obj_gc_py
+    append_body = obj_gc_py.split(
+        "def _append_referents_to(o, out) -> None:", 1
+    )[1].split("\ndef ", 1)[0]
+    assert "pcc_gc_visit_object_slots(" in append_body
+    assert "_py_obj_gc_visit_append_slot" in append_body
+    assert "pcc_capi_visit_cext_object_slots_i64" not in obj_gc_py
+
+    backend0_slots = STRICT_BACKEND0_SLOTS.read_text(encoding="utf-8")
+    assert "pcc_gc_visit_object_slots = extern(" in backend0_slots
+    assert "pcc_capi_visit_cext_object_slots_i64" not in backend0_slots
 
 
 def test_capi_extension_dynamic_tags_do_not_use_instance_layout_source():
@@ -746,10 +741,16 @@ def test_capi_extension_dynamic_tags_do_not_use_instance_layout_source():
         encoding="utf-8"
     )
     obj_gc_py = (RUNTIME_DIR / "py" / "py_obj_gc.py").read_text(encoding="utf-8")
+    collector_py = STRICT_BACKEND0_COLLECTOR.read_text(encoding="utf-8")
+    tracing_collector_py = STRICT_TRACING_SWEEP_COLLECTOR.read_text(
+        encoding="utf-8"
+    )
     obj_dealloc_py = (RUNTIME_DIR / "py" / "py_obj_dealloc.py").read_text(
         encoding="utf-8"
     )
     dunder_py = (RUNTIME_DIR / "py" / "py_dunder.py").read_text(encoding="utf-8")
+    strict_slots_py = STRICT_OBJECT_SLOTS.read_text(encoding="utf-8")
+    relocation_payload = STRICT_RELOCATION_PAYLOAD.read_text(encoding="utf-8")
 
     obj_maybe_body = obj_gc_c[
         obj_gc_c.index("static int py_gc_maybe_finalize_unreachable(") : obj_gc_c.index(
@@ -770,7 +771,7 @@ def test_capi_extension_dynamic_tags_do_not_use_instance_layout_source():
     obj_dealloc_cext = "pcc_capi_dealloc_cext_object(o, (int64_t)h->type_tag) != 0"
     assert obj_dealloc_cext in obj_dealloc_body
     assert obj_dealloc_body.index(obj_dealloc_cext) < obj_dealloc_body.index(
-        "h->type_tag >= PY_TYPE_USER"
+        "h->type_tag >= PY_TYPE_USER_CLASS_START"
     )
 
     tracing_dealloc_body = gc_backend_c[
@@ -802,38 +803,40 @@ def test_capi_extension_dynamic_tags_do_not_use_instance_layout_source():
     assert obj_maybe_guard in c_del_body
 
     assert "pcc_capi_is_cext_type_tag = extern(" in gc_backend_py
-    assert "pcc_capi_dealloc_cext_object = extern(" in gc_backend_py
-    py_instance_body = gc_backend_py[
-        gc_backend_py.index(
-            "def _py_obj_visit_instance_owner_slots("
-        ) : gc_backend_py.index("def _py_obj_has_no_pointer_slots(")
-    ]
+    assert "pcc_capi_dealloc_cext_object = extern(" in tracing_collector_py
+    py_instance_body = strict_slots_py.split(
+        "def _visit_instance_slots(o, visitor, context) -> int:", 1
+    )[1].split("\ndef ", 1)[0]
     assert "pcc_capi_is_cext_type_tag(tag) != 0" in py_instance_body
+    assert py_instance_body.index("pcc_capi_is_cext_type_tag(tag) != 0") < (
+        py_instance_body.index('tag != abi_constant("object.type.instance")')
+    )
+    assert 'tag != abi_constant("object.type.valuebox")' in py_instance_body
+    assert 'tag < abi_constant("object.type.user_class_start")' in py_instance_body
 
-    py_colored_body = gc_backend_py[
-        gc_backend_py.index(
-            "def _colored_relocate_copy_supported_tag("
-        ) : gc_backend_py.index("def _relocate_copy_payload(")
-    ]
+    relocation_remap = STRICT_RELOCATION_REMAP.read_text(encoding="utf-8")
+    py_colored_body = relocation_remap.split(
+        "def pcc_gc_backend4_relocate_copy_supported_tag", 1
+    )[1].split('@c_abi_export("pcc_gc_backend4_remap_heal_slot")', 1)[0]
     py_cext_guard = "if pcc_capi_is_cext_type_tag(tag) != 0:"
     assert py_cext_guard in py_colored_body
     assert py_colored_body.index(py_cext_guard) < py_colored_body.index(
-        "if tag == 11 or tag >= 104:"
+        'tag == abi_constant("object.type.instance")'
     )
+    assert 'tag >= abi_constant("object.type.user_class_start")' in py_colored_body
 
-    py_relocate_start = gc_backend_py.index("def _relocate_copy_payload(")
-    py_relocate_body = gc_backend_py[
-        py_relocate_start : gc_backend_py.index(
-            "if tag == 6:  # PY_TYPE_DICT", py_relocate_start
+    py_relocate_start = relocation_payload.index("def pcc_gc_relocate_copy_payload(")
+    py_relocate_body = relocation_payload[
+        py_relocate_start : relocation_payload.index(
+            'if tag == abi_constant("object.type.dict")', py_relocate_start
         )
     ]
     assert py_cext_guard in py_relocate_body
     assert py_relocate_body.index(py_cext_guard) < py_relocate_body.index(
-        "if tag == 11 or tag >= 104:"
+        'tag == abi_constant("object.type.instance")'
     )
-    assert "cls = pcc_gc_load_ptr_extern(from_obj, ptr_add(from_obj, 16))" in (
-        py_relocate_body
-    )
+    assert 'tag >= abi_constant("object.type.user_class_start")' in py_relocate_body
+    assert "cls = pcc_gc_load_ptr(" in py_relocate_body
     assert "_relocate_slot_pairs_prepare(from_obj, to_obj, size)" in py_relocate_body
     assert "_relocate_copy_payload_finish(" in py_relocate_body
     assert (
@@ -854,52 +857,52 @@ def test_capi_extension_dynamic_tags_do_not_use_instance_layout_source():
         c_relocate_body
     )
 
-    py_finalize_body = gc_backend_py[
-        gc_backend_py.index(
-            "def _finalize_unreachable(o) -> None:"
-        ) : gc_backend_py.index("def _recheck_reachability_after_finalizers")
+    py_finalize_body = tracing_collector_py[
+        tracing_collector_py.index(
+            "def pcc_gc_tracing_finalize_unreachable(obj) -> None:"
+        ) : tracing_collector_py.index(
+            '@c_abi_export("pcc_gc_tracing_recheck_reachability_after_finalizers")'
+        )
     ]
-    assert "pcc_capi_dealloc_cext_object(o, tag) != 0" in py_finalize_body
+    assert "pcc_capi_dealloc_cext_object(obj, tag) == 0" in py_finalize_body
     assert py_finalize_body.index(
-        "pcc_capi_dealloc_cext_object(o, tag) != 0"
-    ) < py_finalize_body.index("if tag >= 104:")
+        "pcc_capi_dealloc_cext_object(obj, tag) == 0"
+    ) < py_finalize_body.index(
+        'if tag >= abi_constant("object.type.user_class_start"):'
+    )
 
-    py_sweep_body = gc_backend_py[
-        gc_backend_py.index(
-            "def _sweep_unreachable(budget: int) -> int:"
-        ) : gc_backend_py.index("    _recheck_reachability_after_finalizers()")
+    py_sweep_body = tracing_collector_py[
+        tracing_collector_py.index(
+            "def pcc_gc_tracing_sweep_unreachable(budget: int) -> int:"
+        ) : tracing_collector_py.index(
+            "    pcc_gc_tracing_recheck_reachability_after_finalizers()"
+        )
     ]
     assert "pcc_capi_is_cext_type_tag(tag) == 0" in py_sweep_body
     assert py_sweep_body.index("pcc_capi_is_cext_type_tag(tag) == 0") < (
-        py_sweep_body.index("py_user_del_dispatch(o)")
+        py_sweep_body.index("py_user_del_dispatch(obj)")
     )
 
-    assert "pcc_capi_is_cext_type_tag = extern(" in obj_gc_py
-    assert "pcc_capi_dealloc_cext_object = extern(" in obj_gc_py
-    py_obj_instance_body = obj_gc_py[
-        obj_gc_py.index("def _py_obj_gc_visit_instance_owner_slots(") : obj_gc_py.index(
-            "def _py_obj_gc_has_no_pointer_slots("
-        )
-    ]
-    assert "pcc_capi_is_cext_type_tag(tag) != 0" in py_obj_instance_body
-    assert py_obj_instance_body.index(
-        "pcc_capi_is_cext_type_tag(tag) != 0"
-    ) < py_obj_instance_body.index("tag != 11 and tag != 200 and tag < 104")
-    py_obj_maybe_body = obj_gc_py[
-        obj_gc_py.index("def _maybe_finalize_unreachable(") : obj_gc_py.index(
-            "def _visit_mark(o)"
+    assert "pcc_capi_is_cext_type_tag = extern(" in collector_py
+    assert "pcc_capi_dealloc_cext_object = extern(" in collector_py
+    assert "pcc_gc_visit_object_slots = extern(" in obj_gc_py
+    py_obj_maybe_body = collector_py[
+        collector_py.index("def _maybe_finalize_unreachable(") : collector_py.index(
+            "def _dealloc_unreachable(obj)"
         )
     ]
     assert "pcc_capi_is_cext_type_tag(tag) == 0" in py_obj_maybe_body
-    py_obj_dealloc_body = obj_gc_py[
-        obj_gc_py.index("def _dealloc_unreachable(o) -> None:") : obj_gc_py.index(
-            '@c_abi_export("py_gc_init")'
+    py_obj_dealloc_body = collector_py[
+        collector_py.index("def _dealloc_unreachable(obj) -> None:") : collector_py.index(
+            '@c_abi_export("py_gc_collect")'
         )
     ]
-    assert "pcc_capi_dealloc_cext_object(o, tag) != 0" in py_obj_dealloc_body
+    assert "pcc_capi_dealloc_cext_object(obj, tag) != 0" in py_obj_dealloc_body
     assert py_obj_dealloc_body.index(
-        "pcc_capi_dealloc_cext_object(o, tag) != 0"
-    ) < py_obj_dealloc_body.index("elif tag >= 100:")
+        "pcc_capi_dealloc_cext_object(obj, tag) != 0"
+    ) < py_obj_dealloc_body.index(
+        'elif tag >= abi_constant("object.type.user_class_start"):'
+    )
 
     py_refcount_body = obj_dealloc_py[
         obj_dealloc_py.index(
@@ -909,7 +912,7 @@ def test_capi_extension_dynamic_tags_do_not_use_instance_layout_source():
     assert "pcc_capi_dealloc_cext_object(o, tag) != 0" in py_refcount_body
     assert py_refcount_body.index(
         "pcc_capi_dealloc_cext_object(o, tag) != 0"
-    ) < py_refcount_body.index("if tag >= 100:")
+    ) < py_refcount_body.index("if tag >= PY_TYPE_USER_CLASS_START:")
 
     py_del_body = dunder_py[
         dunder_py.index("def py_user_del_dispatch(o) -> None:") : dunder_py.index(
@@ -1182,6 +1185,7 @@ def test_weakref_target_is_update_only_slot_contract_source():
     c_source = (RUNTIME_DIR / "src" / "py_gc_backend.c").read_text(encoding="utf-8")
     py_source = (RUNTIME_DIR / "py" / "py_gc_backend.py").read_text(encoding="utf-8")
     py_obj_gc_source = (RUNTIME_DIR / "py" / "py_obj_gc.py").read_text(encoding="utf-8")
+    strict_source = STRICT_OBJECT_SLOTS.read_text(encoding="utf-8")
 
     c_helper_start = c_source.index("static int pcc_gc_visit_weakref_slots(")
     c_helper_end = c_source.index(
@@ -1209,38 +1213,43 @@ def test_weakref_target_is_update_only_slot_contract_source():
     assert "pcc_gc_visit_weakref_slots(" in c_visit_body
     assert "py_obj_visit_borrowed_update_only_slot" in c_visit_body
 
-    for source, prefix, covered_name, fixed_name, weak_name in (
-        (
-            py_source,
-            "_py_obj",
-            "def _py_obj_visit_covered_slots(o, mode: int, recurse: int)",
-            "_py_obj_visit_fixed_owner_slots",
-            "_py_obj_visit_weakref_slots",
-        ),
-        (
-            py_obj_gc_source,
-            "_py_obj_gc",
-            "def _py_obj_gc_visit_covered_slots(o, mode: int, out)",
-            "_py_obj_gc_visit_fixed_owner_slots",
-            "_py_obj_gc_visit_weakref_slots",
-        ),
+    weak_body = strict_source.split(
+        "def _visit_weakref_slots(o, visitor, context) -> int:", 1
+    )[1].split("\ndef ", 1)[0]
+    weak_compact = "".join(weak_body.split())
+    assert '!=abi_constant("object.type.weakref")' in weak_compact
+    assert "_visit_slot(o,16,3,visitor,context)" in weak_compact
+    assert "_visit_slot(o,24,1,visitor,context)" in weak_compact
+
+    fixed_body = strict_source.split(
+        "def _visit_fixed_owner_slots(o, visitor, context) -> int:", 1
+    )[1].split("def _visit_weakref_slots(", 1)[0]
+    assert 'tag == abi_constant("object.type.weakref")' not in fixed_body
+
+    dispatch = strict_source.split(
+        "def pcc_gc_visit_object_slots(o, visitor, context) -> int:", 1
+    )[1]
+    assert "_visit_weakref_slots(o, visitor, context)" in dispatch
+    assert "pcc_gc_visit_object_slots = extern(" in py_source
+    covered_body = py_source.split(
+        "def _py_obj_visit_covered_slots(o, mode: int, recurse: int) -> int:",
+        1,
+    )[1].split("\ndef ", 1)[0]
+    assert "pcc_gc_visit_object_slots(" in covered_body
+
+    backend0_slots = STRICT_BACKEND0_SLOTS.read_text(encoding="utf-8")
+    sweep_slots = STRICT_SWEEP_SLOTS.read_text(encoding="utf-8")
+    assert "pcc_gc_visit_object_slots = extern(" in backend0_slots
+    for callback in (
+        "pcc_gc_backend0_subtract_slot",
+        "pcc_gc_backend0_mark_slot",
     ):
-        helper_start = source.index(f"def {weak_name}(")
-        helper_end = source.index("\ndef ", helper_start + 1)
-        helper_body = source[helper_start:helper_end]
-        helper_compact = "".join(helper_body.split())
-        assert "tag != 21" in helper_body
-        assert f"{prefix}_visit_slot(o,16,3," in helper_compact
-        assert f"{prefix}_visit_slot(o,24,1," in helper_compact
-
-        fixed_start = source.index(f"def {fixed_name}(")
-        fixed_end = source.index(f"def {weak_name}(", fixed_start)
-        fixed_body = source[fixed_start:fixed_end]
-        assert "tag == 21" not in fixed_body
-
-        covered_body = source.split(covered_name, 1)[1]
-        covered_body = covered_body.split("\ndef ", 1)[0]
-        assert f"{weak_name}(o," in covered_body
+        assert callback in backend0_slots
+    assert "pcc_gc_backend0_clear_slot" in sweep_slots
+    append_body = py_obj_gc_source.split(
+        "def _append_referents_to(o, out) -> None:", 1
+    )[1].split("\ndef ", 1)[0]
+    assert "pcc_gc_visit_object_slots(" in append_body
 
 
 def test_object_slot_contract_has_named_visit_and_update_entrypoints_source():
@@ -1371,6 +1380,7 @@ def test_backend0_cycle_collector_consumes_object_slot_contract_source():
 def test_trace_and_subtract_slot_visitors_read_through_load_barrier_source():
     c_source = (RUNTIME_DIR / "src" / "py_gc_backend.c").read_text(encoding="utf-8")
     py_source = (RUNTIME_DIR / "py" / "py_gc_backend.py").read_text(encoding="utf-8")
+    mark_source = STRICT_COMMON_MARK_CYCLE.read_text(encoding="utf-8")
 
     c_trace_start = c_source.index("static void pcc_gc_trace_owner_slot(")
     c_update_start = c_source.index(
@@ -1382,32 +1392,31 @@ def test_trace_and_subtract_slot_visitors_read_through_load_barrier_source():
     assert "trace_ctx->visit(child)" in c_trace_body
     assert "trace_ctx->visit(*slot)" not in c_trace_body
 
-    py_visit_start = py_source.index("def _py_obj_visit_slot(")
-    py_core_start = py_source.index(
-        "def _py_obj_visit_core_container_owner_slots",
-        py_visit_start,
-    )
-    py_visit_body = py_source[py_visit_start:py_core_start]
-    assert "pcc_gc_load_ptr_extern(" in py_visit_body
-    assert "ptr_add(slot_base, slot_offset)" in py_visit_body
-    trace_case = py_visit_body.split("if mode == 1:", 1)[1].split(
-        "if mode == 2:",
-        1,
+    trace_case = mark_source.split("def pcc_gc_trace_slot(", 1)[1].split(
+        "@c_abi_export", 1
+    )[0]
+    assert "child = pcc_gc_load_ptr(null(), slot)" in trace_case
+    assert "pcc_gc_trace_mark_gray_if_known(child)" in trace_case
+    assert "load_ptr(slot, 0)" not in trace_case
+
+    py_visit_body = py_source.split("def _py_obj_visit_slot(", 1)[1].split(
+        "def _py_obj_visit_update_slot(", 1
     )[0]
     subtract_case = py_visit_body.split("if mode == 4:", 1)[1].split(
-        "if mode == 5:",
+        "if mode == 6:",
         1,
     )[0]
-    for case in (trace_case, subtract_case):
-        assert "child = pcc_gc_load_ptr_extern(" in case
-        assert "null()," in case
-        assert "ptr_add(slot_base, slot_offset)" in case
-        assert "load_ptr(slot_base, slot_offset)" not in case
+    assert "child = pcc_gc_load_ptr_extern(" in subtract_case
+    assert "null()," in subtract_case
+    assert "ptr_add(slot_base, slot_offset)" in subtract_case
+    assert "load_ptr(slot_base, slot_offset)" not in subtract_case
 
 
 def test_no_pointer_slot_families_are_explicitly_classified_source():
     c_source = (RUNTIME_DIR / "src" / "py_gc_backend.c").read_text(encoding="utf-8")
     py_source = (RUNTIME_DIR / "py" / "py_gc_backend.py").read_text(encoding="utf-8")
+    strict_source = STRICT_OBJECT_SLOTS.read_text(encoding="utf-8")
+    mark_source = STRICT_COMMON_MARK_CYCLE.read_text(encoding="utf-8")
 
     c_helper_start = c_source.index("static int py_obj_has_no_pointer_slots(")
     c_helper_end = c_source.index("int py_obj_visit_slots(", c_helper_start)
@@ -1438,45 +1447,62 @@ def test_no_pointer_slot_families_are_explicitly_classified_source():
     c_visit_body = c_source[c_visit_start:c_visit_end]
     assert "if (py_obj_has_no_pointer_slots(o)) return 1;" in c_visit_body
 
-    py_helper_start = py_source.index("def _py_obj_has_no_pointer_slots(o) -> int:")
-    py_helper_end = py_source.index("def _trace_referents(o)", py_helper_start)
-    py_helper_body = py_source[py_helper_start:py_helper_end]
+    py_helper_start = strict_source.index("def _has_no_pointer_slots(o) -> int:")
+    py_helper_end = strict_source.index(
+        "def pcc_gc_visit_object_slots(", py_helper_start
+    )
+    py_helper_body = strict_source[py_helper_start:py_helper_end]
     for token in (
-        "tag == 0:  # PY_TYPE_NONE",
-        "tag == 1:  # PY_TYPE_BOOL",
-        "tag == 2:  # PY_TYPE_INT",
-        "tag == 3:  # PY_TYPE_FLOAT",
-        "tag == 4:  # PY_TYPE_STR",
-        "tag == 16:  # PY_TYPE_COMPLEX",
-        "tag == 17:  # PY_TYPE_BYTES",
-        "tag == 18:  # PY_TYPE_BYTEARRAY",
-        "tag == 13:  # PY_TYPE_FILE",
-        "tag == 22:  # PY_TYPE_THREAD_LOCK",
-        "tag == 23:  # PY_TYPE_THREAD_RLOCK",
-        "tag == 24:  # PY_TYPE_THREAD_EVENT",
-        "tag == 25:  # PY_TYPE_THREAD_CONDITION",
-        "tag == 26:  # PY_TYPE_THREAD_SEMAPHORE",
-        "tag == 32:  # PY_TYPE_CPY_HANDLE",
+        'abi_constant("object.type.none")',
+        'abi_constant("object.type.bool")',
+        'abi_constant("object.type.int")',
+        'abi_constant("object.type.float")',
+        'abi_constant("object.type.str")',
+        'abi_constant("object.type.complex")',
+        'abi_constant("object.type.bytes")',
+        'abi_constant("object.type.bytearray")',
+        'abi_constant("object.type.file")',
+        'abi_constant("object.type.cpy_handle")',
+        'abi_constant("object.type.thread_lock")',
+        'abi_constant("object.type.thread_rlock")',
+        'abi_constant("object.type.thread_event")',
+        'abi_constant("object.type.thread_condition")',
+        'abi_constant("object.type.thread_semaphore")',
     ):
         assert token in py_helper_body
 
-    py_covered_start = py_source.index(
-        "def _py_obj_visit_covered_slots(o, mode: int, recurse: int) -> int:"
-    )
-    py_covered_end = py_source.index("def _trace_referents(o)", py_covered_start)
-    py_covered_body = py_source[py_covered_start:py_covered_end]
-    assert "if _py_obj_has_no_pointer_slots(o) != 0:" in py_covered_body
+    py_covered_body = strict_source.split(
+        "def pcc_gc_visit_object_slots(o, visitor, context) -> int:", 1
+    )[1]
+    assert "if _has_no_pointer_slots(o) != 0:" in py_covered_body
     assert "return 1" in py_covered_body
 
-    for func_name in (
-        "def _trace_referents(o)",
-        "def _subtract_referent_refs(o)",
-        "def _trace_referents_for_promotion_mode(o, recurse: int)",
-        "def _remap_referents(o)",
-        "def _clear_referents(o)",
-    ):
-        body = py_source.split(func_name, 1)[1].split("\ndef ", 1)[0]
-        assert "_py_obj_has_no_pointer_slots(o)" in body
+    trace_body = mark_source.split("def pcc_gc_trace_referents(obj)", 1)[1].split(
+        "\n@c_abi_export", 1
+    )[0]
+    assert "pcc_gc_visit_object_slots(obj," in trace_body
+    assert "_has_no_pointer_slots(obj)" not in trace_body
+
+    subtract_body = py_source.split("def _subtract_referent_refs(o)", 1)[1].split(
+        "\n@c_abi_export", 1
+    )[0]
+    assert "_py_obj_visit_covered_slots(o," in subtract_body
+    assert "_has_no_pointer_slots(o)" not in subtract_body
+    remap_source = STRICT_RELOCATION_REMAP.read_text(encoding="utf-8")
+    remap_body = remap_source.split(
+        "def pcc_gc_backend4_remap_referents(obj)", 1
+    )[1]
+    assert "pcc_gc_visit_object_slots(" in remap_body
+    assert "_has_no_pointer_slots(obj)" not in remap_body
+
+    promotion_source = STRICT_GENERATIONAL_PROMOTION.read_text(encoding="utf-8")
+    promotion_body = promotion_source.split(
+        "def pcc_gc_trace_referents_for_promotion_mode", 1
+    )[1].split(
+        '@c_abi_export("pcc_gc_trace_referents_for_promotion")', 1
+    )[0]
+    assert "pcc_gc_visit_object_slots(" in promotion_body
+    assert "_has_no_pointer_slots(" not in promotion_body
 
 
 def test_current_runtime_type_tags_have_a_finite_slot_classification_source():
@@ -1529,10 +1555,15 @@ def test_current_runtime_type_tags_have_a_finite_slot_classification_source():
         "PY_TYPE_TASK",
         "PY_TYPE_CONTINUATION",
         "PY_TYPE_VIRTUAL_THREAD",
+        "PY_TYPE_PROPERTY",
+        "PY_TYPE_CLASSMETHOD",
+        "PY_TYPE_STATICMETHOD",
         "PY_TYPE_VALUEBOX",
     }
-    # PY_TYPE_USER is the dynamic-tag threshold, not a concrete allocation tag.
-    assert current_tags == pointerless | slot_bearing | {"PY_TYPE_USER"}
+    # These names mark the reserved user-tag range; descriptors and concrete
+    # user-class tags are classified separately above / by the instance walker.
+    dynamic_boundaries = {"PY_TYPE_USER", "PY_TYPE_USER_CLASS_START"}
+    assert current_tags == pointerless | slot_bearing | dynamic_boundaries
 
     no_pointer_body = c_source.split(
         "static int py_obj_has_no_pointer_slots(", 1
@@ -1559,32 +1590,40 @@ def test_current_runtime_type_tags_have_a_finite_slot_classification_source():
         "PY_TYPE_CLASSMETHOD",
         "PY_TYPE_STATICMETHOD",
     ):
-        assert f"#define {descriptor_tag}" in internal_header
+        assert descriptor_tag in type_enum
         assert descriptor_tag in c_source
-    assert "#define PY_TYPE_USER_CLASS_START" in internal_header
+    assert "PY_TYPE_USER_CLASS_START" in type_enum
     assert "tag < PY_TYPE_USER_CLASS_START" in c_source
 
 
 def test_unreachable_file_uses_file_deallocator_in_c_and_python_mirror():
     c_source = (RUNTIME_DIR / "src" / "py_gc_backend.c").read_text(encoding="utf-8")
-    py_source = (RUNTIME_DIR / "py" / "py_gc_backend.py").read_text(encoding="utf-8")
+    py_source = STRICT_TRACING_SWEEP_COLLECTOR.read_text(encoding="utf-8")
 
     c_start = c_source.index("static void pcc_gc_finalize_unreachable(")
     c_end = c_source.index("static void pcc_gc_seed_roots(", c_start)
     c_body = c_source[c_start:c_end]
     assert "case PY_TYPE_FILE:      py_dealloc_file(o);" in c_body
 
-    py_start = py_source.index("def _finalize_unreachable(o) -> None:")
-    py_end = py_source.index("def _recheck_reachability_after_finalizers", py_start)
+    py_start = py_source.index(
+        "def pcc_gc_tracing_finalize_unreachable(obj) -> None:"
+    )
+    py_end = py_source.index(
+        '@c_abi_export("pcc_gc_tracing_recheck_reachability_after_finalizers")',
+        py_start,
+    )
     py_body = py_source[py_start:py_end]
-    file_case = py_body.split("if tag == 13:", 1)[1].split("if tag ==", 1)[0]
-    assert "py_dealloc_file(o)" in file_case
-    assert "_finish_delayed_zpage_freeing_note" in file_case
-    assert "return" in file_case
+    file_case = py_body.split("elif tag == 13:", 1)[1].split("elif tag ==", 1)[0]
+    assert "py_dealloc_file(obj)" in file_case
+    assert "if delay_zpage_freeing_note != 0:" in py_body
 
 
 def test_pcc_python_gc_backend_consumers_share_slot_family_helper_source():
     py_source = (RUNTIME_DIR / "py" / "py_gc_backend.py").read_text(encoding="utf-8")
+    mark_source = STRICT_COMMON_MARK_CYCLE.read_text(encoding="utf-8")
+    promotion_source = STRICT_GENERATIONAL_PROMOTION.read_text(encoding="utf-8")
+    sweep_source = STRICT_SWEEP_SLOTS.read_text(encoding="utf-8")
+    relocation_payload = STRICT_RELOCATION_PAYLOAD.read_text(encoding="utf-8")
 
     def body_after(signature: str) -> str:
         return py_source.split(signature, 1)[1].split("\ndef ", 1)[0]
@@ -1592,196 +1631,178 @@ def test_pcc_python_gc_backend_consumers_share_slot_family_helper_source():
     helper_body = body_after(
         "def _py_obj_visit_covered_slots(o, mode: int, recurse: int)"
     )
-    helper_sequence = (
-        "_py_obj_visit_core_container_owner_slots(o, mode, recurse)",
-        "_py_obj_visit_fixed_owner_slots(o, mode, recurse)",
-        "_py_obj_visit_weakref_slots(o, mode, recurse)",
-        "_py_obj_visit_continuation_owner_slots(o, mode, recurse)",
-        "_py_obj_visit_class_slots(o, mode, recurse)",
-        "_py_obj_visit_cext_object_slots(o, mode, recurse)",
-        "_py_obj_visit_instance_owner_slots(o, mode, recurse)",
+    assert "pcc_gc_visit_object_slots(" in helper_body
+    for callback in (
+        "_py_obj_visit_update_slot",
+        "_py_obj_visit_subtract_slot",
+    ):
+        assert callback in helper_body
+    assert "pcc_gc_visit_object_slots(from_obj, _relocate_count_slot" in (
+        relocation_payload
     )
-    last_pos = -1
-    for helper_call in helper_sequence:
-        pos = helper_body.index(helper_call)
-        assert pos > last_pos
-        last_pos = pos
+    assert "pcc_gc_visit_object_slots(from_obj, _relocate_from_slot" in (
+        relocation_payload
+    )
+    assert "pcc_gc_visit_object_slots(to_obj, _relocate_to_slot" in (
+        relocation_payload
+    )
 
-    consumer_modes = (
-        ("def _trace_referents(o)", "1", "0"),
-        ("def _subtract_referent_refs(o)", "4", "0"),
-        ("def _trace_referents_for_promotion_mode(o, recurse: int)", "2", "recurse"),
-        ("def _remap_referents(o)", "3", "0"),
-        ("def _clear_referents(o)", "5", "0"),
+    promotion_body = promotion_source.split(
+        "def pcc_gc_trace_referents_for_promotion_mode", 1
+    )[1].split(
+        '@c_abi_export("pcc_gc_trace_referents_for_promotion")', 1
+    )[0]
+    assert "pcc_gc_visit_object_slots(" in promotion_body
+    assert "pcc_gc_generational_promote_slot" in promotion_body
+    assert "pcc_gc_generational_promote_shallow_slot" in promotion_body
+
+    trace_body = mark_source.split("def pcc_gc_trace_referents(obj)", 1)[1].split(
+        "\n@c_abi_export", 1
+    )[0]
+    assert "pcc_gc_visit_object_slots(obj, pcc_gc_trace_slot, null())" in trace_body
+    clear_body = sweep_source.split(
+        "def pcc_gc_tracing_clear_referents(obj)", 1
+    )[1].split("\n@c_abi_export", 1)[0]
+    assert (
+        "pcc_gc_visit_object_slots(\n        obj, pcc_gc_tracing_clear_slot, null()"
+        in clear_body
     )
-    direct_helpers = tuple(name.split("(", 1)[0] for name in helper_sequence)
-    for signature, mode, recurse in consumer_modes:
-        consumer_body = body_after(signature)
-        assert f"_py_obj_visit_covered_slots(o, {mode}, {recurse})" in consumer_body
-        for helper_name in direct_helpers:
-            assert helper_name not in consumer_body
+
+    subtract_body = body_after("def _subtract_referent_refs(o)")
+    assert "_py_obj_visit_covered_slots(o, 4, 0)" in subtract_body
+    assert "pcc_gc_visit_object_slots(" not in subtract_body
+    remap_source = STRICT_RELOCATION_REMAP.read_text(encoding="utf-8")
+    remap_body = remap_source.split(
+        "def pcc_gc_backend4_remap_referents(obj)", 1
+    )[1]
+    assert "pcc_gc_visit_object_slots(" in remap_body
+    assert "pcc_gc_backend4_remap_slot" in remap_body
 
 
 def test_pcc_python_backend0_cycle_collector_reuses_slot_helpers_source():
-    py_source = (RUNTIME_DIR / "py" / "py_obj_gc.py").read_text(encoding="utf-8")
+    py_source = STRICT_BACKEND0_COLLECTOR.read_text(encoding="utf-8")
+    strict_source = STRICT_OBJECT_SLOTS.read_text(encoding="utf-8")
+    backend0_slots = STRICT_BACKEND0_SLOTS.read_text(encoding="utf-8")
+    sweep_slots = STRICT_SWEEP_SLOTS.read_text(encoding="utf-8")
 
-    slot_adapter_start = py_source.index("def _py_obj_gc_visit_slot(")
-    helper_start = py_source.index(
-        "def _py_obj_gc_visit_core_container_owner_slots(",
-        slot_adapter_start,
-    )
-    slot_adapter_body = py_source[slot_adapter_start:helper_start]
-    assert "pcc_gc_load_ptr_extern(" in slot_adapter_body
-    assert "ptr_add(slot_base, slot_offset)" in slot_adapter_body
-    assert "role != 3" in slot_adapter_body
-    assert "role == 1" in slot_adapter_body
-
-    for helper_name in (
-        "_py_obj_gc_visit_core_container_owner_slots",
-        "_py_obj_gc_visit_fixed_owner_slots",
-        "_py_obj_gc_visit_weakref_slots",
-        "_py_obj_gc_visit_continuation_owner_slots",
-        "_py_obj_gc_visit_class_slots",
-        "_py_obj_gc_visit_instance_owner_slots",
+    assert "__pcc_freestanding__ = True" in backend0_slots
+    assert "pcc_gc_visit_object_slots = extern(" in backend0_slots
+    for action in (
+        "pcc_gc_backend0_visit_subtract",
+        "pcc_gc_backend0_mark_reachable",
+        "pcc_gc_backend0_clear_referents",
     ):
-        assert f"def {helper_name}(" in py_source
-
-    covered_body = py_source.split(
-        "def _py_obj_gc_visit_covered_slots(o, mode: int, out)",
-        1,
+        assert f"{action} = extern(" in py_source
+        assert f'"{action}"' in py_source
+    recompute_body = py_source.split(
+        "def _recompute_reachability() -> None:", 1
     )[1].split("\ndef ", 1)[0]
-    assert "_py_obj_gc_has_no_pointer_slots(o)" in covered_body
-    for helper_name in (
-        "_py_obj_gc_visit_core_container_owner_slots",
-        "_py_obj_gc_visit_fixed_owner_slots",
-        "_py_obj_gc_visit_weakref_slots",
-        "_py_obj_gc_visit_continuation_owner_slots",
-        "_py_obj_gc_visit_class_slots",
-        "_py_obj_gc_visit_instance_owner_slots",
-    ):
-        assert f"{helper_name}(o, mode, out)" in covered_body
+    assert "pcc_gc_backend0_visit_subtract(" in recompute_body
+    assert "pcc_gc_backend0_mark_reachable(" in recompute_body
+    collect_body = py_source.split(
+        '@c_abi_export("py_gc_collect")', 1
+    )[1]
+    assert "pcc_gc_backend0_clear_referents(obj)" in collect_body
 
-    for func_name, mode in (
-        ("def _visit_subtract(o)", "1"),
-        ("def _append_referents_to(o, out)", "2"),
-        ("def _visit_mark(o)", "3"),
-        ("def _clear_referents(o)", "4"),
-    ):
-        body = py_source.split(func_name, 1)[1].split("\ndef ", 1)[0]
-        assert f"_py_obj_gc_visit_covered_slots(o, {mode}," in body
-
-    subtract_body = py_source.split("def _visit_subtract(o)", 1)[1].split(
-        "\ndef ",
-        1,
-    )[0]
-    for old_direct_case in (
-        "if tag == 5:",
-        "if tag == 6:",
-        "if tag == 8:",
-        "if tag == 29:",
-        "if tag == 11 or tag >= 100:",
-    ):
-        assert old_direct_case not in subtract_body
-
-    continuation_body = py_source.split(
-        "def _py_obj_gc_visit_continuation_owner_slots(o, mode: int, out)",
-        1,
+    subtract_body = backend0_slots.split(
+        "def pcc_gc_backend0_subtract_slot(", 1
     )[1].split("\ndef ", 1)[0]
-    assert "if ptr_is_null(slots) != 0:" in continuation_body
-    assert "_py_obj_gc_visit_slot(slots, i * 8, 1, mode, out)" in continuation_body
+    mark_body = backend0_slots.split(
+        "def pcc_gc_backend0_mark_slot(", 1
+    )[1].split("\ndef ", 1)[0]
+    clear_body = sweep_slots.split(
+        "def pcc_gc_backend0_clear_slot(", 1
+    )[1].split("\ndef ", 1)[0]
+    assert "role == 3" in subtract_body
+    assert "pcc_gc_load_ptr(" in subtract_body
+    assert "role == 3" in mark_body
+    assert "pcc_gc_backend0_mark_reachable(" in mark_body
+    assert "role != 1" in clear_body
+    assert "py_decref(child)" in clear_body
 
-    clear_metadata_body = py_source.split(
-        "def _py_obj_gc_clear_container_metadata(o, tag: int)",
+    continuation_body = strict_source.split(
+        "def _visit_continuation_slots(o, visitor, context) -> int:", 1
+    )[1].split("\ndef ", 1)[0]
+    assert "if ptr_is_null(slots) == 0:" in continuation_body
+    assert "_visit_slot(slots, index * 8, 1, visitor, context)" in continuation_body
+
+    clear_metadata_body = sweep_slots.split(
+        "def pcc_gc_clear_container_metadata(obj, tag: int)",
         1,
-    )[1].split("\ndef _clear_referents(o)", 1)[0]
-    set_clear_body = clear_metadata_body.split("if tag == 8:", 1)[1]
-    assert "store_ptr(key_slot, 0, null())" in set_clear_body
-    assert "store_i64(entries, i * 16, 0)" in set_clear_body
-    assert "ptr_eq(key, dummy)" not in set_clear_body
-    assert "if ptr_is_null(key)" not in set_clear_body
+    )[1].split("\n@c_abi_export", 1)[0]
+    set_clear_body = clear_metadata_body.split("if tag == PY_TYPE_SET:", 1)[1]
+    assert "store_ptr(entries, index * 16 + 8, null())" in set_clear_body
+    assert "store_i64(entries, index * 16, 0)" in set_clear_body
 
 
 def test_pcc_python_function_slot_walkers_match_current_layout_source():
     """Backend #0 and the tracing backends must see every owned function slot."""
     expected_offsets = (24, 32, 40, 64, 80, 88)
-    sources_and_signatures = (
-        (
-            RUNTIME_DIR / "py" / "py_obj_gc.py",
-            "def _py_obj_gc_visit_fixed_owner_slots(o, mode: int, out) -> int:",
-            "_py_obj_gc_visit_slot",
-        ),
-        (
-            RUNTIME_DIR / "py" / "py_gc_backend.py",
-            "def _py_obj_visit_fixed_owner_slots(o, mode: int, recurse: int) -> int:",
-            "_py_obj_visit_slot",
-        ),
-    )
-    for path, signature, visitor in sources_and_signatures:
-        source = path.read_text(encoding="utf-8")
-        body = source.split(signature, 1)[1].split("\n    if tag == 14:", 1)[0]
-        func_case = body.split("if tag == 9:", 1)[1]
-        for offset in expected_offsets:
-            assert f"{visitor}(o, {offset}, 1, mode," in func_case
+    source = STRICT_OBJECT_SLOTS.read_text(encoding="utf-8")
+    body = source.split(
+        "def _visit_fixed_owner_slots(o, visitor, context) -> int:", 1
+    )[1].split('if tag == abi_constant("object.type.iter"):', 1)[0]
+    func_case = body.split('if tag == abi_constant("object.type.func"):', 1)[1]
+    for offset in expected_offsets:
+        assert f"_visit_slot(o, {offset}, 1, visitor, context)" in func_case
 
 
 def test_pcc_python_backend0_runtime_roots_reuse_root_slot_helpers_source():
-    py_source = (RUNTIME_DIR / "py" / "py_obj_gc.py").read_text(encoding="utf-8")
+    py_source = STRICT_BACKEND0_COLLECTOR.read_text(encoding="utf-8")
 
     for helper_name in (
-        "_py_obj_gc_mapped_root_count",
-        "_py_obj_gc_mark_root_slot",
-        "_py_obj_gc_mark_root_slots",
-        "_py_obj_gc_visit_mapped_root_slots",
-        "_py_obj_gc_visit_scheduler_root_slots",
+        "_mapped_root_count",
+        "_mark_root_slot",
+        "_mark_root_slots",
+        "_visit_mapped_root_slots",
+        "_visit_scheduler_root_slots",
     ):
         assert f"def {helper_name}(" in py_source
 
     count_body = py_source.split(
-        "def _py_obj_gc_mapped_root_count(frame_map) -> int:",
+        "def _mapped_root_count(frame_map) -> int:",
         1,
-    )[1].split("\ndef ", 1)[0]
+    )[1].split("\n@c_abi_export", 1)[0]
     assert "if root_count < 0:" in count_body
     assert "root_count = 0 - root_count" in count_body
     assert "if root_count > 100000:" in count_body
 
     root_slot_body = py_source.split(
-        "def _py_obj_gc_mark_root_slot(slot_base, slot_offset: int)",
+        "def _mark_root_slot(slot_base, slot_offset: int)",
         1,
-    )[1].split("\ndef ", 1)[0]
-    assert "pcc_gc_load_ptr_extern(" in root_slot_body
+    )[1].split("\n@c_abi_export", 1)[0]
+    assert "pcc_gc_load_ptr(" in root_slot_body
     assert "ptr_add(slot_base, slot_offset)" in root_slot_body
-    assert "_mark_reachable(child)" in root_slot_body
+    assert "pcc_gc_backend0_mark_reachable(child)" in root_slot_body
 
     mapped_body = py_source.split(
-        "def _py_obj_gc_visit_mapped_root_slots(frame_map, root_slots)",
+        "def _visit_mapped_root_slots(frame_map, root_slots)",
         1,
-    )[1].split("\ndef ", 1)[0]
-    assert "_py_obj_gc_mapped_root_count(frame_map)" in mapped_body
-    assert "_py_obj_gc_mark_root_slots(root_slots, root_count)" in mapped_body
+    )[1].split("\n@c_abi_export", 1)[0]
+    assert "_mapped_root_count(frame_map)" in mapped_body
+    assert "_mark_root_slots(root_slots, root_count)" in mapped_body
 
     root_slots_body = py_source.split(
-        "def _py_obj_gc_mark_root_slots(root_slots, root_count: int)",
+        "def _mark_root_slots(root_slots, root_count: int)",
         1,
-    )[1].split("\ndef ", 1)[0]
-    assert "_py_obj_gc_mark_root_slot(root_slots, i * 8)" in root_slots_body
+    )[1].split("\n@c_abi_export", 1)[0]
+    assert "_mark_root_slot(root_slots, i * 8)" in root_slots_body
 
     scheduler_body = py_source.split(
-        "def _py_obj_gc_visit_scheduler_root_slots()",
+        "def _visit_scheduler_root_slots()",
         1,
     )[
         1
-    ].split("\ndef ", 1)[0]
+    ].split("\n@c_abi_export", 1)[0]
     assert 'global_load_ptr("pcc_gc_scheduler_root_head")' in scheduler_body
-    assert "_py_obj_gc_mark_root_slot(slot, 0)" in scheduler_body
+    assert "_mark_root_slot(slot, 0)" in scheduler_body
     assert "node = load_ptr(node, 8)" in scheduler_body
 
     runtime_body = py_source.split("def _mark_runtime_roots() -> None:", 1)[1]
-    runtime_body = runtime_body.split("\ndef ", 1)[0]
-    assert "_py_obj_gc_mark_root_slots(root_slots, load_i32(" in runtime_body
-    assert "_py_obj_gc_visit_mapped_root_slots(frame_map, slots)" in runtime_body
-    assert "_py_obj_gc_visit_scheduler_root_slots()" in runtime_body
-    assert "def _mark_root_slots(" not in py_source
-    assert "\n        _mark_root_slots(" not in runtime_body
+    runtime_body = runtime_body.split("\n@c_abi_export", 1)[0]
+    assert "_mark_root_slots(" in runtime_body
+    assert "_visit_mapped_root_slots(frame_map, slots)" in runtime_body
+    assert "_visit_scheduler_root_slots()" in runtime_body
     assert "_mark_reachable(load_ptr(slot, 0))" not in runtime_body
 
 
@@ -1897,38 +1918,38 @@ def test_capi_py_visit_routes_native_module_state_slots_through_load_barrier_sou
     python_h = (REPO_ROOT / "utils" / "fake_libc_include" / "Python.h").read_text(
         encoding="utf-8"
     )
-    shim_source = (RUNTIME_DIR / "src" / "py_capi_shim.c").read_text(encoding="utf-8")
+    # The visit + module-state-roots helpers are owned by pcc-Python runtime
+    # modules now (py_capi_visit_runtime.py / py_capi_module_state_runtime.py);
+    # the C shim only carries guarded externs.
+    visit_source = (RUNTIME_DIR / "py" / "py_capi_visit_runtime.py").read_text(
+        encoding="utf-8"
+    )
+    module_state_source = (
+        RUNTIME_DIR / "py" / "py_capi_module_state_runtime.py"
+    ).read_text(encoding="utf-8")
 
     assert "int pcc_capi_visit_slot(" in python_h
     assert "PyObject **slot" in python_h
     assert "pcc_capi_visit_slot((PyObject **)&(op), visit, arg)" in python_h
     assert "visit((PyObject *)(op), arg)" not in python_h
 
-    helper_start = shim_source.index("int pcc_capi_visit_slot(")
-    state_visit_start = shim_source.index(
-        "typedef struct PccCapiModuleStateVisitCtx",
-        helper_start,
-    )
-    helper_body = shim_source[helper_start:state_visit_start]
-    assert "PyObject **slot" in helper_body
-    assert "pcc_gc_load_ptr(NULL, slot)" in helper_body
-    assert "visit(obj, arg)" in helper_body
+    assert 'def pcc_capi_visit_slot(slot, visit, arg) -> int:' in visit_source
+    assert "pcc_gc_load_ptr(null(), slot)" in visit_source
+    assert "call_i64_ptr2(visit, obj, arg)" in visit_source
 
-    roots_start = shim_source.index("void pcc_capi_visit_extension_module_state_roots(")
-    module_exec_start = shim_source.index(
-        "PyObject *pcc_capi_module_from_def(",
-        roots_start,
-    )
-    roots_body = shim_source[roots_start:module_exec_start]
-    assert "pcc_capi_visit_module_state_ref" in roots_body
     assert (
-        "traverse(n->module, pcc_capi_visit_module_state_ref, &visit_ctx)" in roots_body
+        "def pcc_capi_visit_extension_module_state_roots(visit, ctx) -> None:"
+        in module_state_source
     )
+    assert "pcc_capi_visit_module_state_ref" in module_state_source
+    assert "call_i64_ptr3(" in module_state_source
 
 
 def test_builtin_exception_cache_uses_the_shared_runtime_root_slot_contract():
     c_source = (RUNTIME_DIR / "src" / "py_gc_backend.c").read_text(encoding="utf-8")
-    py_source = (RUNTIME_DIR / "py" / "py_gc_backend.py").read_text(encoding="utf-8")
+    mapped_source = (
+        RUNTIME_DIR / "py" / "freestanding_gc_mapped_roots.py"
+    ).read_text(encoding="utf-8")
 
     c_helper = c_source.split(
         "static int64_t pcc_gc_visit_builtin_exception_cache_slots_unlocked(",
@@ -1960,14 +1981,23 @@ def test_builtin_exception_cache_uses_the_shared_runtime_root_slot_contract():
         ].split("static void pcc_gc_seed_roots", 1)[0]
     )
 
-    py_helper = py_source.split("def _py_visit_builtin_exception_cache_slots(", 1)[
-        1
-    ].split("def _gray_mapped_roots", 1)[0]
-    assert 'global_addr("py_exc_classes")' in py_helper
-    assert "_py_visit_mapped_root_slots(" in py_helper
-    assert "_py_visit_builtin_exception_cache_slots(1, 1)" in py_source
-    assert "_py_visit_builtin_exception_cache_slots(2, 0)" in py_source
-    assert "_py_visit_builtin_exception_cache_slots(3, 0)" in py_source
+    py_helper = mapped_source.split(
+        "def pcc_gc_visit_builtin_exception_cache_slots(", 1
+    )[1].split('@c_abi_export("pcc_gc_gray_mapped_roots")', 1)[0]
+    assert "py_subs_exc_cache_slot(0)" in py_helper
+    assert "pcc_gc_visit_mapped_root_slots(" in py_helper
+    object_root_seeding = (
+        RUNTIME_DIR / "py" / "freestanding_gc_object_root_seeding.py"
+    ).read_text(encoding="utf-8")
+    assert "pcc_gc_visit_registered_root_slots(1, 1)" in object_root_seeding
+    generational_scheduler = (
+        RUNTIME_DIR / "py" / "freestanding_gc_generational_scheduler.py"
+    ).read_text(encoding="utf-8")
+    forwarding_retirement = (
+        RUNTIME_DIR / "py" / "freestanding_gc_forwarding_retirement.py"
+    ).read_text(encoding="utf-8")
+    assert "pcc_gc_visit_registered_root_slots(2, 0)" in generational_scheduler
+    assert "pcc_gc_visit_registered_root_slots(3, 0)" in forwarding_retirement
 
 
 def test_builtin_exception_cache_is_visible_as_a_runtime_root(tmp_path):

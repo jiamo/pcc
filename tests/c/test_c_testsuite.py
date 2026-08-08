@@ -38,17 +38,21 @@ def _case_path(filename: str) -> Path:
     return C_TESTSUITE_DIR / filename
 
 
-@pytest.mark.parametrize("filename", _case_params(C_TESTSUITE_RUNTIME_RETURNCODE_CASES))
-def test_c_testsuite_runtime_returncode_matches_native(filename):
-    case_path = _case_path(filename)
-    assert case_path.is_file(), f"missing c-testsuite case: {case_path}"
+if C_TESTSUITE_RUNTIME_RETURNCODE_CASES:
 
-    native_result = run_native(case_path, REPO_ROOT)
-    pcc_result = run_pcc(case_path, REPO_ROOT)
+    @pytest.mark.parametrize(
+        "filename", _case_params(C_TESTSUITE_RUNTIME_RETURNCODE_CASES)
+    )
+    def test_c_testsuite_runtime_returncode_matches_native(filename):
+        case_path = _case_path(filename)
+        assert case_path.is_file(), f"missing c-testsuite case: {case_path}"
 
-    assert (
-        pcc_result.returncode == native_result.returncode
-    ), f"{filename} return code mismatch:\nnative={native_result.returncode}\npcc={pcc_result.returncode}\npcc stderr:\n{pcc_result.stderr}"
+        native_result = run_native(case_path, REPO_ROOT)
+        pcc_result = run_pcc(case_path, REPO_ROOT)
+
+        assert (
+            pcc_result.returncode == native_result.returncode
+        ), f"{filename} return code mismatch:\nnative={native_result.returncode}\npcc={pcc_result.returncode}\npcc stderr:\n{pcc_result.stderr}"
 
 
 @pytest.mark.parametrize(

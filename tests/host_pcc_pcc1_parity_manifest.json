@@ -1,0 +1,8 @@
+{
+  "candidate_count": 175,
+  "candidate_names_sha256": "13b45c471182a224ae3fddd671dc3be359417b716e523f2a0b1fd9c4da17e468",
+  "default_classification": "applicable",
+  "exclusions": [],
+  "registry": "tests.python.test_self_host_oracle_diff.CASES",
+  "schema": "pcc.host-pcc-pcc1-parity-manifest.v1"
+}

@@ -5,7 +5,7 @@ round-trips when the floating-point type can represent every integer
 value of that width exactly.
 """
 
-import shutil
+import pytest
 import unittest
 
 import llvmlite.binding as llvm
@@ -15,7 +15,9 @@ from pcc.ir_passes.manager import AnalysisManager
 from pcc.ir_passes.parity import assert_ir_parity
 
 
-_OPT = shutil.which("opt")
+from pcc.passes.llvm_text_pipeline import find_opt_binary
+
+_OPT = find_opt_binary()
 
 
 class Float2IntRoundTripTests(unittest.TestCase):
@@ -164,7 +166,7 @@ entry:
         self.assertIn("trunc i64 %", pass_.rewritten_ir)
 
 
-@unittest.skipUnless(_OPT, "requires LLVM opt")
+@pytest.mark.pcc_gate(unavailable=None if _OPT else "matching LLVM opt not installed")
 class UpstreamParityTests(unittest.TestCase):
     def test_i32_via_double_matches_upstream(self):
         report = assert_ir_parity("""

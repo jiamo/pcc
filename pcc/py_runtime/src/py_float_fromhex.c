@@ -18,10 +18,9 @@
  * and if a ``p`` exponent marker is present at least one decimal digit must
  * follow it.
  *
- * C-only helper (OBJ_PY_CC_HELPERS pattern): one implementation compiled by
- * cc and archived into BOTH the C-runtime and the pcc-Python port tiers, so
- * there is no separate pcc-Python port to keep in sync.  Same pattern as
- * py_format.c / py_complex_pow.c.
+ * This C implementation remains the host-C and pcc-C oracle.  The production
+ * pcc-Python archive owns the same ABI in py_obj_stubs.py and does not archive
+ * this hand-written C object.
  */
 #include "py_internal.h"
 #include <math.h>

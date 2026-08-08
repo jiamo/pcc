@@ -76,6 +76,11 @@ PyObject *py_bigint_to_pyobject(PyIntObject *b) {
         free(b);
         return py_tag_int(v);
     }
+    b->h.flags |= PY_FLAG_GC_MALLOC_ALLOC;
+    if (pcc_gc_pointer_register((PyObject *)b) < 0) {
+        free(b);
+        return NULL;
+    }
     return (PyObject *)b;
 }
 
@@ -94,6 +99,12 @@ PyIntObject *py_bigint_from_any(PyObject *o) {
  * range. Used for the py_int_value_i64 path. */
 PyObject *py_int_new_heap(int64_t v) {
     PyIntObject *b = py_bigint_from_i64(v);
+    if (b == NULL) return NULL;
+    b->h.flags |= PY_FLAG_GC_MALLOC_ALLOC;
+    if (pcc_gc_pointer_register((PyObject *)b) < 0) {
+        free(b);
+        return NULL;
+    }
     return (PyObject *)b;
 }
 
@@ -162,7 +173,7 @@ PyObject *py_int_from_i64(int64_t v) {
     if (v >= PY_TAGGED_INT_MIN && v <= PY_TAGGED_INT_MAX) {
         return py_tag_int(v);
     }
-    return (PyObject *)py_bigint_from_i64(v);
+    return py_bigint_to_pyobject(py_bigint_from_i64(v));
 }
 
 double py_bigint_to_double(const PyIntObject *b) {

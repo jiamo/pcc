@@ -14,6 +14,79 @@ _CSTR = _I8.as_pointer()
 _VOID = ir.VoidType()
 
 
+def _typed_c_abi_ir_type(name: str) -> ir.Type:
+    name = name.strip()
+    if name.startswith("{") and name.endswith("}"):
+        body = name[1:-1].strip()
+        if not body:
+            raise ValueError("typed C ABI aggregate cannot be empty")
+        fields: list[ir.Type] = []
+        depth = 0
+        start = 0
+        index = 0
+        while index < len(body):
+            ch = body[index]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth < 0:
+                    raise ValueError("unbalanced typed C ABI aggregate: " + name)
+            elif ch == "," and depth == 0:
+                field_name = body[start:index].strip()
+                if not field_name:
+                    raise ValueError("empty typed C ABI aggregate field: " + name)
+                field_type = _typed_c_abi_ir_type(field_name)
+                if isinstance(field_type, ir.VoidType):
+                    raise ValueError("void typed C ABI aggregate field: " + name)
+                fields.append(field_type)
+                start = index + 1
+            index += 1
+        if depth != 0:
+            raise ValueError("unbalanced typed C ABI aggregate: " + name)
+        field_name = body[start:].strip()
+        if not field_name:
+            raise ValueError("empty typed C ABI aggregate field: " + name)
+        field_type = _typed_c_abi_ir_type(field_name)
+        if isinstance(field_type, ir.VoidType):
+            raise ValueError("void typed C ABI aggregate field: " + name)
+        fields.append(field_type)
+        return ir.LiteralStructType(fields)
+    if name == "void":
+        return _VOID
+    if name == "ptr":
+        return _CSTR
+    if name in ("i8", "u8"):
+        return _I8
+    if name in ("i16", "u16"):
+        return ir.IntType(16)
+    if name in ("i32", "u32"):
+        return ir.IntType(32)
+    if name in ("i64", "u64"):
+        return ir.IntType(64)
+    if name == "f32":
+        return ir.FloatType()
+    if name == "f64":
+        return ir.DoubleType()
+    raise ValueError("unsupported typed C ABI type: " + name)
+
+
+def _is_none_semantic_type(value) -> bool:
+    """Recognize explicit ``None`` across independently compiled modules.
+
+    During pcc1 self-host, ``FuncDef.return_ty`` can come from a separately
+    compiled copy of the type module. ``isinstance`` then sees a foreign class
+    identity even though the semantic type remains ``None``. The stable type
+    name closes that module-identity boundary. A raw ``None`` means that the
+    source omitted its return annotation and therefore keeps the dynamic
+    object ABI.
+    """
+    return (
+        isinstance(value, NoneType)
+        or getattr(value, "name", "") == "None"
+    )
+
+
 class UserFunctionDeclLoweringMixin:
     def _user_symbol(self, name: str) -> str:
         """Mangled LLVM symbol for a user function.
@@ -58,6 +131,22 @@ class UserFunctionDeclLoweringMixin:
                 + "\n"
             )
         c_abi_sym: str | None = self._func_c_abi_export_symbol(fd)
+        c_abi_variadic = False
+        c_abi_typed_signature = None
+        c_abi_decorators = self._func_decorators(fd)
+        c_abi_index = 0
+        while c_abi_index < len(c_abi_decorators):
+            typed_signature = self._decorator_c_abi_typed_signature(
+                c_abi_decorators[c_abi_index]
+            )
+            if typed_signature is not None:
+                c_abi_typed_signature = typed_signature
+            if self._decorator_is_c_abi_variadic_export(
+                c_abi_decorators[c_abi_index]
+            ):
+                c_abi_variadic = True
+                break
+            c_abi_index += 1
         if debug_bootstrap:
             sys.stderr.write("debug: declare_user_function c_abi resolved\n")
         decorators = self._func_decorators(fd)
@@ -125,20 +214,34 @@ class UserFunctionDeclLoweringMixin:
             )
             param_types.append(ir_ty)
 
-        is_generator = fd.name in getattr(
-            self, "_generator_func_names", set()
-        ) or self._funcdef_has_yield_sentinel(fd)
+        if c_abi_typed_signature is not None:
+            typed_result, typed_params = c_abi_typed_signature
+            if len(typed_params) != len(param_types):
+                raise ValueError(
+                    "typed C ABI parameter count mismatch for " + fd.name
+                )
+            param_types = [_typed_c_abi_ir_type(name) for name in typed_params]
+
+        is_generator = self._funcdef_has_yield_sentinel(fd)
+        if (
+            not is_generator
+            and fd.name not in self._duplicate_module_function_names
+        ):
+            is_generator = fd.name in getattr(
+                self, "_generator_func_names", set()
+            )
         if is_generator:
             if not hasattr(self, "_generator_func_names"):
                 self._generator_func_names = set()
             self._generator_func_names.add(fd.name)
-        if is_generator:
+        return_is_none = _is_none_semantic_type(fd.return_ty)
+        if c_abi_typed_signature is not None:
+            ret_ty = _typed_c_abi_ir_type(c_abi_typed_signature[0])
+        elif is_generator:
             ret_ty = _CSTR
-        elif fd.is_async and (
-            fd.return_ty is None or isinstance(fd.return_ty, NoneType)
-        ):
+        elif fd.is_async and return_is_none:
             ret_ty = _CSTR
-        elif fd.return_ty is None or isinstance(fd.return_ty, NoneType):
+        elif return_is_none:
             # ``-> None`` maps to ``ret void`` — bare ``return`` works
             # without materialising the py_None global.
             ret_ty = _VOID
@@ -147,9 +250,26 @@ class UserFunctionDeclLoweringMixin:
         else:
             ret_ty = self._map_type(fd.return_ty)
 
-        fnty = ir.FunctionType(ret_ty, param_types, var_arg=False)
-        sym = c_abi_sym if c_abi_sym is not None else self._user_symbol(fd.name)
+        fnty = ir.FunctionType(ret_ty, param_types, var_arg=c_abi_variadic)
+        definition_ordinal = self._function_definition_ordinals.get(fd.name, 0)
+        self._function_definition_ordinals[fd.name] = definition_ordinal + 1
+        duplicate_python_name = fd.name in self._duplicate_module_function_names
+        if c_abi_sym is not None:
+            sym = c_abi_sym
+        elif duplicate_python_name:
+            sym = (
+                self._user_symbol(fd.name)
+                + ".definition."
+                + str(definition_ordinal)
+            )
+        else:
+            sym = self._user_symbol(fd.name)
         existing = self.module.globals.get(sym)
+        if duplicate_python_name and isinstance(existing, ir.Function):
+            raise ValueError(
+                "duplicate function definition resolves to an existing native symbol: "
+                + sym
+            )
         if isinstance(existing, ir.Function):
             fn = existing
         else:
@@ -167,4 +287,6 @@ class UserFunctionDeclLoweringMixin:
         runtime_args = [a for a in fd.args if a.name != ""]
         for ir_arg, ast_arg in zip(fn.args, runtime_args):
             ir_arg.name = ast_arg.name
+        self._funcdef_functions[id(fd)] = fn
+        self._native_symbol_funcdefs[fn.name] = fd
         self.functions[fd.name] = fn

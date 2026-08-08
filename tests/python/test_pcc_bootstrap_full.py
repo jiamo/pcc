@@ -30,8 +30,10 @@ import signal
 import subprocess
 
 from pcc.dependency_verdict import probe_platform_capability
-from pcc.backend.self_backend_cache_identity import (
-    self_backend_emitter_source_identity,
+from pcc.bootstrap_cache_identity import (
+    bootstrap_object_cache_identity,
+    bootstrap_source_files,
+    bootstrap_source_sha256,
 )
 import shutil
 import sys
@@ -147,34 +149,17 @@ def _sha256_path(path: Path) -> str:
 
 @functools.lru_cache(maxsize=1)
 def _bootstrap_source_files() -> tuple[Path, ...]:
-    suffixes = {".py", ".c", ".h", ".sh"}
-    files: list[Path] = []
-    for root in (_REPO_ROOT / "pcc", _BOOTSTRAP_SH):
-        if root.is_file():
-            files.append(root)
-            continue
-        files.extend(
-            path
-            for path in root.rglob("*")
-            if path.is_file() and path.suffix in suffixes
-        )
-    return tuple(sorted(files, key=lambda path: str(path.relative_to(_REPO_ROOT))))
+    return bootstrap_source_files(_REPO_ROOT)
 
 
 @functools.lru_cache(maxsize=1)
 def _bootstrap_source_sha256() -> str:
-    digest = hashlib.sha256()
-    for path in _bootstrap_source_files():
-        relative = str(path.relative_to(_REPO_ROOT)).encode("utf-8")
-        digest.update(len(relative).to_bytes(8, "big"))
-        digest.update(relative)
-        digest.update(bytes.fromhex(_sha256_path(path)))
-    return digest.hexdigest()
+    return bootstrap_source_sha256(_REPO_ROOT)
 
 
 @functools.lru_cache(maxsize=1)
 def _bootstrap_self_backend_object_identity() -> str:
-    return self_backend_emitter_source_identity(_REPO_ROOT)
+    return bootstrap_object_cache_identity(_REPO_ROOT)
 
 
 def _prepare_bootstrap_profile_dir(gc_backend: str) -> Path:

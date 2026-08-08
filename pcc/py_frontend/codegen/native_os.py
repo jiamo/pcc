@@ -144,6 +144,33 @@ class NativeOsLoweringMixin:
                 self._gc_release(v_obj)
         return True
 
+    def _emit_native_os_environ_delitem(self, target: Subscript) -> bool:
+        """Delete ``os.environ[key]`` with CPython mapping semantics.
+
+        ``os.unsetenv`` itself deliberately does not raise for a missing
+        variable.  Mapping deletion must raise ``KeyError``, so compose the
+        existing raising getitem operation with unsetenv.  The key expression
+        is evaluated once and shared by both calls.
+        """
+        if isinstance(target.idx, Slice):
+            return False
+        if not self._is_os_environ_attr(target.obj):
+            return False
+        key_obj = self._emit_as_object(target.idx)
+        previous = self.builder.call(
+            self.runtime["py_os_environ_getitem"],
+            [key_obj],
+            name=self._fresh("os.environ.delitem.previous"),
+        )
+        self._emit_post_call_err_check(getattr(target, "span", None))
+        self._gc_release(previous)
+        self.builder.call(
+            self.runtime["py_os_unsetenv"],
+            [key_obj],
+            name=self._fresh("os.environ.delitem"),
+        )
+        return True
+
     def _emit_native_os_call(self, expr: Call) -> Optional[ir.Value]:
         attr = expr.func
         assert isinstance(attr, Attr)
@@ -151,13 +178,16 @@ class NativeOsLoweringMixin:
             isinstance(attr.obj, Name)
             and self._native_builtin_module_for_name(attr.obj.ident) == "os"
             and attr.name == "makedirs"
-            and len(expr.args) == 1
+            and 1 <= len(expr.args) <= 3
         ):
+            mode = ir.Constant(_I64, 0o777)
             exist_ok = ir.Constant(_I32, 0)
-            if expr.kwargs:
-                if len(expr.kwargs) != 1 or expr.kwargs[0][0] != "exist_ok":
-                    return None
-                value_expr = expr.kwargs[0][1]
+            mode_supplied = len(expr.args) >= 2
+            exist_ok_supplied = len(expr.args) >= 3
+            if mode_supplied:
+                mode = self._emit_expr_as_i64(expr.args[1])
+            if exist_ok_supplied:
+                value_expr = expr.args[2]
                 raw = self._emit_expr(value_expr)
                 truthy = self._truthy(raw, value_expr.ty)
                 exist_ok = self.builder.zext(
@@ -165,9 +195,27 @@ class NativeOsLoweringMixin:
                     _I32,
                     name=self._fresh("os.makedirs.exist_ok"),
                 )
+            for keyword, value_expr in expr.kwargs:
+                if keyword == "mode" and not mode_supplied:
+                    mode = self._emit_expr_as_i64(value_expr)
+                    mode_supplied = True
+                    continue
+                if keyword == "exist_ok" and not exist_ok_supplied:
+                    raw = self._emit_expr(value_expr)
+                    truthy = self._truthy(raw, value_expr.ty)
+                    exist_ok = self.builder.zext(
+                        truthy,
+                        _I32,
+                        name=self._fresh("os.makedirs.exist_ok"),
+                    )
+                    exist_ok_supplied = True
+                    continue
+                if keyword != "mode" and keyword != "exist_ok":
+                    return None
+                return None
             result = self.builder.call(
                 self.runtime["py_os_makedirs"],
-                [self._emit_as_object(expr.args[0]), exist_ok],
+                [self._emit_as_object(expr.args[0]), mode, exist_ok],
                 name=self._fresh("os.makedirs"),
             )
             self._emit_post_call_err_check(getattr(expr, "span", None))
@@ -256,6 +304,42 @@ class NativeOsLoweringMixin:
                 _I64,
                 name=self._fresh("os.write.res"),
             )
+        if name in ("unlink", "remove") and len(expr.args) == 1:
+            result = self.builder.call(
+                self.runtime["py_os_unlink"],
+                [self._emit_os_path_arg_object(expr.args[0])],
+                name=self._fresh("os." + name),
+            )
+            self._emit_post_call_err_check(getattr(expr, "span", None))
+            return result
+        if name in ("replace", "rename") and len(expr.args) == 2:
+            result = self.builder.call(
+                self.runtime["py_os_replace"],
+                [
+                    self._emit_os_path_arg_object(expr.args[0]),
+                    self._emit_os_path_arg_object(expr.args[1]),
+                ],
+                name=self._fresh("os." + name),
+            )
+            self._emit_post_call_err_check(getattr(expr, "span", None))
+            return result
+        if name == "chmod" and len(expr.args) == 2:
+            mode = self._emit_expr_as_i64(expr.args[1])
+            result = self.builder.call(
+                self.runtime["py_os_chmod"],
+                [self._emit_os_path_arg_object(expr.args[0]), mode],
+                name=self._fresh("os.chmod"),
+            )
+            self._emit_post_call_err_check(getattr(expr, "span", None))
+            return result
+        if name == "fsync" and len(expr.args) == 1:
+            result = self.builder.call(
+                self.runtime["py_os_fsync"],
+                [self._emit_expr_as_i64(expr.args[0])],
+                name=self._fresh("os.fsync"),
+            )
+            self._emit_post_call_err_check(getattr(expr, "span", None))
+            return result
         if name == "access" and len(expr.args) == 2:
             if not self._native_os_path_arg_can_stay_native(expr.args[0]):
                 return None
@@ -291,6 +375,49 @@ class NativeOsLoweringMixin:
                 [self._emit_as_object(expr.args[0])],
                 name=self._fresh("os.pcc_sha256_file_hex"),
             )
+        if name == "_pcc_sha256_file_hex_bounded" and len(expr.args) == 2:
+            path_object = self._emit_as_object(expr.args[0])
+            path_root = self._enter_container_temp_root(
+                path_object,
+                "os.pcc_sha256_file_hex_bounded.path",
+            )
+            path_lifetime = (
+                path_root,
+                self._pcc_pointer_source_is_owned(expr.args[0]),
+            )
+            max_bytes = self._emit_expr_with_cpy_operand_cleanup(
+                expr.args[1],
+                (),
+                as_i64=True,
+                rooted_pcc_lifetimes=(path_lifetime,),
+            )
+            rooted_path = self.builder.call(
+                self.runtime["pcc_gc_load_ptr"],
+                [
+                    ir.Constant(_PYOBJ, None),
+                    self._as_gc_ptr(
+                        path_root,
+                        name=self._fresh("os.sha256.path.root.ptr"),
+                    ),
+                ],
+                name=self._fresh("os.sha256.path.rooted"),
+            )
+            result = self.builder.call(
+                self.runtime["py_sha256_file_hex_bounded"],
+                [rooted_path, max_bytes],
+                name=self._fresh("os.pcc_sha256_file_hex_bounded"),
+            )
+            # The owned digest result is not in a Python local yet.  Keep this
+            # fresh string immobile while earlier operand roots are unwound
+            # and while the post-call error flag is inspected.
+            self._gc_pin(result)
+            self._release_rooted_pcc_lifetimes((path_lifetime,))
+            self._emit_post_call_err_check(
+                getattr(expr, "span", None),
+                pinned_release_on_error=((result, True),),
+            )
+            self._gc_unpin(result)
+            return result
         return None
 
     def _emit_native_os_uname_attr(self, expr: Attr) -> Optional[ir.Value]:

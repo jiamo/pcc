@@ -30,6 +30,9 @@ _SCALAR_TYPE_TOKEN = (
     r'(?:void|ptr|float|double|i\d+|%(?:"[^"]+"|(?:[A-Za-z_.$][\w.$-]*|\d+)))'
 )
 _AGG_ELEM_TYPE_TOKEN = rf"(?:{_SCALAR_TYPE_TOKEN})(?:\*+)?"
+# These regex fragments only recognize simple instruction fast paths.  Type
+# completeness and every nested boundary are owned by the tokenizer/parser
+# below; structured instruction fallbacks must feed their type text to it.
 _STRUCT_LITERAL_TYPE_TOKEN = r"\{[^{}]+\}"
 _BASE_TYPE_TOKEN = (
     rf"(?:{_SCALAR_TYPE_TOKEN}|"
@@ -44,7 +47,7 @@ _VALUE_REF_TOKEN = (
 _LABEL_REF_TOKEN = r'%(?:"[^"]+"|(?:[A-Za-z_.$][\w.$-]*|\d+))'
 _TARGET_TRIPLE_RE = re.compile(r'^target triple = "([^"]+)"$', re.MULTILINE)
 _NAMED_TYPEDEF_RE = re.compile(
-    r'^(?P<name>%(?:"[^"]+"|[A-Za-z_.$][\w.$-]*)) = type \{(?P<fields>[^}]*)\}$',
+    r'^(?P<name>%(?:"[^"]+"|[A-Za-z_.$][\w.$-]*)) = type (?P<body>.+)$',
     re.MULTILINE,
 )
 _GLOBAL_PTR_GEP_RE = re.compile(
@@ -77,11 +80,74 @@ _PLAIN_LABEL_RE = re.compile(
     r'^(?:"(?P<quoted>[^"]+)"|(?P<plain>[A-Za-z_.$][\w.$-]*|\.[0-9A-Za-z_.$-]+|\d+)):(?:\s*;.*)?$'
 )
 _SYMBOL_NAME_RE = re.compile(r"^[A-Za-z_.$][A-Za-z0-9_.$]*$")
-_INT_RE = re.compile(r"^-?\d+$")
-_HEX_RE = re.compile(r"^0x[0-9A-Fa-f]+$")
-_FLOAT_RE = re.compile(
-    r"^-?(?:(?:\d+\.\d*|\d*\.\d+|\d+)(?:[eE][+-]?\d+)?|\d+[eE][+-]?\d+)$"
-)
+_HEX_DIGITS = "0123456789abcdefABCDEF"
+
+
+# Token classifiers, not regexes: these three ran 7.8M of the 11.0M regex
+# calls needed to parse one 27 MB module.  Under pcc1 every call enters the
+# pcc-Python regex engine (pattern-cache walk + matcher), which is orders of
+# magnitude more expensive than the str methods below; that per-call cost is
+# what made `pcc1 -> pcc2` take minutes per huge module.  Each helper uses
+# whole-string runtime calls (`isdecimal`/`find`/`strip`) rather than per-index
+# character reads, because `text[i]` allocates a fresh one-character str in the
+# pcc runtime.
+#
+# `str.isdecimal()` accepts exactly the Unicode Nd set that `\d` matches in a
+# str pattern, so these stay equivalent to the retired
+# `^-?\d+$` / `^0x[0-9A-Fa-f]+$` / float patterns for every token the IR
+# parser sees.  The one deliberate difference: `$` also matches just before a
+# trailing newline, so a trailing "\n" is trimmed first to preserve that.
+
+
+_U64_MASK = (1 << 64) - 1  # computed, NOT a literal: see M5-SELFHOST-BIG-INT-LITERAL
+
+
+def _without_trailing_newline(text: str) -> str:
+    if text.endswith("\n"):
+        return text[:-1]
+    return text
+
+
+def _is_int_token(text: str) -> bool:
+    body = _without_trailing_newline(text)
+    if body.startswith("-"):
+        body = body[1:]
+    return body.isdecimal()
+
+
+def _is_hex_token(text: str) -> bool:
+    body = _without_trailing_newline(text)
+    if not body.startswith("0x") or len(body) < 3:
+        return False
+    # strip() removes maximal runs of the allowed set from both ends, so the
+    # result is empty exactly when every character is a hex digit.
+    return body[2:].strip(_HEX_DIGITS) == ""
+
+
+def _is_float_token(text: str) -> bool:
+    body = _without_trailing_newline(text)
+    if body.startswith("-"):
+        body = body[1:]
+    exponent_at = body.find("e")
+    if exponent_at < 0:
+        exponent_at = body.find("E")
+    if exponent_at >= 0:
+        exponent = body[exponent_at + 1:]
+        body = body[:exponent_at]
+        if exponent.startswith("-") or exponent.startswith("+"):
+            exponent = exponent[1:]
+        if not exponent.isdecimal():
+            return False
+    dot_at = body.find(".")
+    if dot_at < 0:
+        return body.isdecimal()
+    whole = body[:dot_at]
+    fraction = body[dot_at + 1:]
+    if whole and not whole.isdecimal():
+        return False
+    if fraction and not fraction.isdecimal():
+        return False
+    return bool(whole) or bool(fraction)
 _ARG_RE = re.compile(
     rf"^(?P<type>{_TYPE_TOKEN})(?:\s+[A-Za-z_][A-Za-z0-9_.$-]*)*\s+"
     r'(?P<name>%(?:"[^"]+"|[A-Za-z_.$][\w.$-]*))$'
@@ -96,6 +162,41 @@ _STORE_RE = re.compile(
 _LOAD_RE = re.compile(
     rf"^(?P<dest>%.*)\s*=\s*load\s+(?P<val_type>{_TYPE_TOKEN}),\s+"
     rf"(?P<ptr_type>{_TYPE_TOKEN})\s+(?P<ptr>{_VALUE_REF_TOKEN})(?:,\s+align\s+\d+)?$"
+)
+_LOAD_ATOMIC_RE = re.compile(
+    rf"^(?P<dest>%.*)\s*=\s*load\s+atomic\s+(?P<val_type>{_TYPE_TOKEN}),\s+"
+    rf"(?P<ptr_type>{_TYPE_TOKEN})\s+(?P<ptr>{_VALUE_REF_TOKEN})\s+"
+    r"(?P<ordering>unordered|monotonic|acquire|seq_cst)(?:,\s+align\s+\d+)?$"
+)
+_STORE_ATOMIC_RE = re.compile(
+    rf"^store\s+atomic\s+(?P<val_type>{_TYPE_TOKEN})\s+(?P<value>.+?),\s+"
+    rf"(?P<ptr_type>{_TYPE_TOKEN})\s+(?P<ptr>{_VALUE_REF_TOKEN})\s+"
+    r"(?P<ordering>unordered|monotonic|release|seq_cst)(?:,\s+align\s+\d+)?$"
+)
+_ATOMICRMW_RE = re.compile(
+    rf"^(?P<dest>%.*)\s*=\s*atomicrmw\s+(?P<op>add|sub|and|or|xchg)\s+"
+    rf"(?P<ptr_type>{_TYPE_TOKEN})\s+(?P<ptr>{_VALUE_REF_TOKEN}),\s+"
+    rf"(?P<val_type>{_TYPE_TOKEN})\s+(?P<value>.+?)\s+"
+    r"(?P<ordering>monotonic|acquire|release|acq_rel|seq_cst)(?:,\s+align\s+\d+)?$"
+)
+_CMPXCHG_RE = re.compile(
+    rf"^(?P<dest>%.*)\s*=\s*cmpxchg\s+(?:weak\s+)?"
+    rf"(?P<ptr_type>{_TYPE_TOKEN})\s+(?P<ptr>{_VALUE_REF_TOKEN}),\s+"
+    rf"(?P<expected_type>{_TYPE_TOKEN})\s+(?P<expected>.+?),\s+"
+    rf"(?P<desired_type>{_TYPE_TOKEN})\s+(?P<desired>.+?)\s+"
+    r"(?P<success>monotonic|acquire|release|acq_rel|seq_cst)\s+"
+    r"(?P<failure>monotonic|acquire|seq_cst)(?:,\s+align\s+\d+)?$"
+)
+_FENCE_RE = re.compile(
+    r"^fence\s+(?P<ordering>acquire|release|acq_rel|seq_cst)$"
+)
+# The one inline-asm shape pcc emits (pcc.unsafe.syscall6, musl x86_64 ABI).
+# Anything else containing " asm " stays fail-closed in the call parser.
+_SYSCALL6_ASM_RE = re.compile(
+    r"^(?P<dest>%.*)\s*=\s*call\s+i64\s+asm\s+sideeffect\s+"
+    r'"syscall",\s*"=\{rax\},\{rax\},\{rdi\},\{rsi\},\{rdx\},\{r10\},\{r8\},\{r9\},'
+    r'~\{rcx\},~\{r11\},~\{memory\}"\s*'
+    r"\((?P<args>[^)]*)\)(?:\s+#\d+)?(?:,\s*!.*)?$"
 )
 _BINOP_RE = re.compile(
     r"^(?P<dest>%.*)\s*=\s*"
@@ -175,9 +276,6 @@ _RET_VOID_RE = re.compile(r"^ret\s+void$")
 _RET_RE = re.compile(rf"^ret\s+(?P<type>{_TYPE_TOKEN})\s+(?P<value>.+)$")
 _UNREACHABLE_RE = re.compile(r"^unreachable$")
 _INDEX_RE = re.compile(r"^(?P<type>i\d+)\s+(?P<value>.+)$")
-_TYPED_INIT_RE = re.compile(rf"^(?P<type>{_TYPE_TOKEN})\s+(?P<init>.+)$")
-
-
 _NAMED_TYPES: dict[str, TypeDesc] = {}
 _TYPE_CACHE: dict[str, TypeDesc] = {}
 _CALL_SIGNATURE_CACHE: dict[str, tuple[int, bool]] = {}
@@ -295,24 +393,15 @@ def strip_typed_initializer(item: str) -> str:
     text = item.strip()
     if not text or text == "zeroinitializer":
         return text
-    if text.startswith("["):
-        depth = 0
-        for index, ch in enumerate(text):
-            if ch == "[":
-                depth += 1
-            elif ch == "]":
-                depth -= 1
-                if depth == 0:
-                    rest = text[index + 1 :].strip()
-                    if rest:
-                        return rest
-                    break
-    match = _TYPED_INIT_RE.match(text)
-    if match is not None:
-        return match.group("init").strip()
+    try:
+        _type_text, initializer = _extract_leading_type_token(text)
+    except BackendUnavailable:
+        initializer = ""
+    if initializer:
+        return initializer
     if text.startswith(('c"', "{", "[", "@", "null", "gep0:")):
         return text
-    if _INT_RE.match(text) or _HEX_RE.match(text):
+    if _is_int_token(text) or _is_hex_token(text):
         return text
     return text
 
@@ -372,7 +461,7 @@ def decode_value_token(token: str) -> str:
             break
         if token.startswith("%") or token.startswith("@"):
             break
-        if _INT_RE.match(token) or _HEX_RE.match(token) or _FLOAT_RE.match(token):
+        if _is_int_token(token) or _is_hex_token(token) or _is_float_token(token):
             break
         if token.startswith(("inttoptr ", "ptrtoint ", "trunc ", "zext ", "sext ")):
             break
@@ -418,11 +507,11 @@ def decode_value_token(token: str) -> str:
         return f"gepconst:{base}:{offset}"
     if gep := _GEP_INIT_RE.match(token):
         return f"gep0:{decode_global_name(gep.group('base'))}"
-    if _INT_RE.match(token):
+    if _is_int_token(token):
         return token
-    if _HEX_RE.match(token):
+    if _is_hex_token(token):
         return token
-    if _FLOAT_RE.match(token):
+    if _is_float_token(token):
         return token
     if token.startswith("%"):
         return decode_ssa_name(token)
@@ -441,18 +530,258 @@ def _decode_simple_value_token(token: str) -> str | None:
         return decode_ssa_name(token)
     if first == "@":
         return "@" + decode_global_name(token)
-    if first == "0" and token.startswith("0x") and _HEX_RE.match(token):
+    if first == "0" and token.startswith("0x") and _is_hex_token(token):
         return token
     if first.isdigit():
-        if token.isdigit() or _FLOAT_RE.match(token):
+        if token.isdigit() or _is_float_token(token):
             return token
         return None
     if first == "-":
         if len(token) > 1 and token[1:].isdigit():
             return token
-        if _FLOAT_RE.match(token):
+        if _is_float_token(token):
             return token
     return None
+
+
+_IR_TYPE_PUNCTUATION = "{}[]<>,*()"
+
+
+def _next_ir_type_token(
+    text: str,
+    index: int,
+) -> tuple[tuple[str, str, int, int], int]:
+    """Return one token and the next character offset.
+
+    Keeping this cursor lazy matters for globals with large initializers: a
+    leading-type query must not materialize tokens for the value suffix.
+    """
+    while index < len(text) and text[index].isspace():
+        index += 1
+    if index >= len(text):
+        return ("eof", "", index, index), index
+    ch = text[index]
+    if ch in _IR_TYPE_PUNCTUATION:
+        return ("punct", ch, index, index + 1), index + 1
+
+    start = index
+    quote_index = -1
+    if ch == '"':
+        quote_index = index
+    elif ch in {"%", "@"} and index + 1 < len(text) and text[index + 1] == '"':
+        quote_index = index + 1
+    if quote_index >= 0:
+        index = quote_index + 1
+        escaped = False
+        closed = False
+        while index < len(text):
+            current = text[index]
+            if escaped:
+                escaped = False
+            elif current == "\\":
+                escaped = True
+            elif current == '"':
+                index += 1
+                closed = True
+                break
+            index += 1
+        if not closed:
+            raise BackendUnavailable(
+                f"self backend saw unterminated quoted LLVM type token in {text!r}"
+            )
+        return ("atom", text[start:index], start, index), index
+
+    while (
+        index < len(text)
+        and not text[index].isspace()
+        and text[index] not in _IR_TYPE_PUNCTUATION
+        and text[index] != '"'
+    ):
+        index += 1
+    if index == start:
+        raise BackendUnavailable(
+            f"self backend does not understand LLVM type token at {text[start:]!r}"
+        )
+    return ("atom", text[start:index], start, index), index
+
+
+def _tokenize_ir_type(text: str) -> list[tuple[str, str, int, int]]:
+    """Materialize the small LLVM type token stream for diagnostics/tests."""
+    tokens: list[tuple[str, str, int, int]] = []
+    index = 0
+    while True:
+        token, index = _next_ir_type_token(text, index)
+        if token[0] == "eof":
+            return tokens
+        tokens.append(token)
+
+
+def _ir_type_parse_error(text: str, detail: str) -> Exception:
+    """Build a parse failure through the stable builtin exception ABI.
+
+    Returning the imported concrete subclass in the public annotation made a
+    self-hosted multi-module compile create two nominal
+    ``BackendUnavailable`` identities.  The value is intentionally raised by
+    every caller, so the builtin base class is the honest cross-module return
+    contract while preserving the concrete diagnostic at runtime.
+    """
+    return BackendUnavailable(
+        f"self backend does not understand LLVM type {text.strip()!r}: {detail}"
+    )
+
+
+def _parse_ir_type_tokens(
+    text: str,
+    index: int,
+    *,
+    resolve_named=None,
+) -> tuple[TypeDesc, int]:
+    """Recursively parse one TypeDesc from the lazy token cursor."""
+    token_info, index = _next_ir_type_token(text, index)
+    if token_info[0] == "eof":
+        raise _ir_type_parse_error(text, "expected a type")
+    token = token_info[1]
+
+    if token == "[" or token == "<":
+        close = "]" if token == "[" else ">"
+        count_info, index = _next_ir_type_token(text, index)
+        if count_info[0] == "eof" or not count_info[1].isdigit():
+            kind = "array" if token == "[" else "vector"
+            raise _ir_type_parse_error(text, f"expected {kind} element count")
+        count = int(count_info[1])
+        x_info, index = _next_ir_type_token(text, index)
+        if x_info[0] == "eof" or x_info[1] != "x":
+            raise _ir_type_parse_error(text, "expected 'x' after aggregate count")
+        elem, index = _parse_ir_type_tokens(
+            text,
+            index,
+            resolve_named=resolve_named,
+        )
+        close_info, index = _next_ir_type_token(text, index)
+        if close_info[0] == "eof" or close_info[1] != close:
+            raise _ir_type_parse_error(text, f"expected closing {close!r}")
+        base = TypeDesc("array", count=count, elem=elem)
+    elif token == "{":
+        fields: list[TypeDesc] = []
+        next_info, next_offset = _next_ir_type_token(text, index)
+        if next_info[1] == "}":
+            index = next_offset
+        else:
+            while True:
+                field, index = _parse_ir_type_tokens(
+                    text,
+                    index,
+                    resolve_named=resolve_named,
+                )
+                fields.append(field)
+                delimiter_info, next_offset = _next_ir_type_token(text, index)
+                if delimiter_info[0] == "eof":
+                    raise _ir_type_parse_error(text, "expected closing '}'")
+                delimiter = delimiter_info[1]
+                index = next_offset
+                if delimiter == "}":
+                    break
+                if delimiter != ",":
+                    raise _ir_type_parse_error(
+                        text,
+                        f"expected ',' or '}}', got {delimiter!r}",
+                    )
+                field_info, _field_offset = _next_ir_type_token(text, index)
+                if field_info[0] == "eof" or field_info[1] == "}":
+                    raise _ir_type_parse_error(text, "expected type after ','")
+        base = TypeDesc("struct", fields=tuple(fields))
+    elif token == "void":
+        base = TypeDesc("void")
+    elif token == "ptr":
+        base = TypeDesc("ptr", pointee=TypeDesc("void"))
+    elif token == "float":
+        base = TypeDesc("fp", 32)
+    elif token == "double":
+        base = TypeDesc("fp", 64)
+    elif token.startswith("i") and token[1:].isdigit():
+        base = TypeDesc("int", int(token[1:]))
+    elif token.startswith("%"):
+        if token not in _NAMED_TYPES and resolve_named is not None:
+            resolve_named(token)
+        if token not in _NAMED_TYPES:
+            raise BackendUnavailable(
+                f"self backend does not know named LLVM type {token!r}"
+            )
+        base = _NAMED_TYPES[token]
+    else:
+        raise _ir_type_parse_error(text, f"unsupported token {token!r}")
+
+    while True:
+        star_index = index
+        while star_index < len(text) and text[star_index].isspace():
+            star_index += 1
+        if star_index >= len(text) or text[star_index] != "*":
+            break
+        base = TypeDesc("ptr", pointee=base)
+        index = star_index + 1
+    return base, index
+
+
+def _parse_ir_type_prefix(
+    text: str,
+    *,
+    resolve_named=None,
+) -> tuple[TypeDesc, int]:
+    return _parse_ir_type_tokens(
+        text,
+        0,
+        resolve_named=resolve_named,
+    )
+
+
+def _parse_ir_type_list(
+    text: str,
+    *,
+    allow_vararg: bool = False,
+    resolve_named=None,
+) -> tuple[tuple[TypeDesc, ...], bool]:
+    parsed: list[TypeDesc] = []
+    index = 0
+    is_vararg = False
+    while True:
+        item_info, next_offset = _next_ir_type_token(text, index)
+        if item_info[0] == "eof":
+            return tuple(parsed), is_vararg
+        if item_info[1] == "...":
+            if not allow_vararg:
+                raise _ir_type_parse_error(
+                    text,
+                    "variadic marker is not allowed here",
+                )
+            is_vararg = True
+            trailing_info, _trailing_offset = _next_ir_type_token(
+                text,
+                next_offset,
+            )
+            if trailing_info[0] != "eof":
+                raise _ir_type_parse_error(
+                    text,
+                    "variadic marker must terminate the type list",
+                )
+            return tuple(parsed), is_vararg
+        item, index = _parse_ir_type_tokens(
+            text,
+            index,
+            resolve_named=resolve_named,
+        )
+        parsed.append(item)
+        delimiter_info, next_offset = _next_ir_type_token(text, index)
+        if delimiter_info[0] == "eof":
+            return tuple(parsed), is_vararg
+        if delimiter_info[1] != ",":
+            raise _ir_type_parse_error(
+                text,
+                f"expected ',' between types, got {delimiter_info[1]!r}",
+            )
+        index = next_offset
+        trailing_info, _trailing_offset = _next_ir_type_token(text, index)
+        if trailing_info[0] == "eof":
+            raise _ir_type_parse_error(text, "trailing comma in type list")
 
 
 def parse_ir_type(text: str) -> TypeDesc:
@@ -694,17 +1023,17 @@ def const_int_from_value(value: str) -> int | None:
         return 0
     if value == "true":
         return 1
-    if _INT_RE.match(value):
+    if _is_int_token(value):
         return int(value)
     return None
 
 
 def is_hex_literal(value: str) -> bool:
-    return _HEX_RE.match(value) is not None
+    return _is_hex_token(value)
 
 
 def is_float_literal(value: str) -> bool:
-    return _FLOAT_RE.match(value) is not None and not value.startswith(".")
+    return _is_float_token(value) and not value.startswith(".")
 
 
 def is_aggregate_literal_value(value: str) -> bool:
@@ -813,7 +1142,7 @@ def aggregate_literal_to_bytes(value_type: TypeDesc, value: str) -> bytes:
                 bits = float32_to_bits(float(text))
             return bits.to_bytes(4, "little")
         if text.startswith("0x"):
-            bits = int(text, 16) & 0xFFFFFFFFFFFFFFFF
+            bits = int(text, 16) & _U64_MASK
         else:
             bits = float64_to_bits(float(text))
         return bits.to_bytes(8, "little")
@@ -877,68 +1206,33 @@ def parse_constant_gep(text: str) -> tuple[str, int]:
 
 
 def _arg_list_is_vararg(args_text: str) -> bool:
-    pieces = [piece.strip() for piece in (args_text or "").split(",") if piece.strip()]
+    pieces = [
+        piece.strip()
+        for piece in split_top_level(args_text or "")
+        if piece.strip()
+    ]
     return bool(pieces) and pieces[-1] == "..."
 
 
 def _parse_type(text: str, *, resolve_named=None) -> TypeDesc:
     token = text.strip()
-    stars: int = 0
-    while token.endswith("*"):
-        stars -= -1
-        token = token[:-1]
-    if token == "void":
-        base = TypeDesc("void")
-    elif token == "ptr":
-        base = TypeDesc("ptr", pointee=TypeDesc("void"))
-    elif token == "float":
-        base = TypeDesc("fp", 32)
-    elif token == "double":
-        base = TypeDesc("fp", 64)
-    elif token.startswith("[") and token.endswith("]"):
-        inner = token[1:-1].strip()
-        count_text, elem_text = inner.split(" x ", 1)
-        base = TypeDesc(
-            "array",
-            count=int(count_text),
-            elem=_parse_type(elem_text.strip(), resolve_named=resolve_named),
+    if not token:
+        raise BackendUnavailable("self backend does not understand empty LLVM type")
+    if resolve_named is None:
+        cached = _TYPE_CACHE.get(token)
+        if cached is not None:
+            return cached
+    base, end = _parse_ir_type_tokens(
+        token,
+        0,
+        resolve_named=resolve_named,
+    )
+    trailing_info, _trailing_offset = _next_ir_type_token(token, end)
+    if trailing_info[0] != "eof":
+        raise _ir_type_parse_error(
+            token,
+            f"unexpected trailing token {trailing_info[1]!r}",
         )
-    elif token.startswith("<") and token.endswith(">") and " x " in token:
-        inner = token[1:-1].strip()
-        count_text, elem_text = inner.split(" x ", 1)
-        if not count_text.isdigit():
-            raise BackendUnavailable(
-                f"self backend does not understand LLVM vector type {token!r}"
-            )
-        base = TypeDesc(
-            "array",
-            count=int(count_text),
-            elem=_parse_type(elem_text.strip(), resolve_named=resolve_named),
-        )
-    elif token.startswith("{") and token.endswith("}"):
-        inner = token[1:-1].strip()
-        fields = tuple(
-            _parse_type(chunk.strip(), resolve_named=resolve_named)
-            for chunk in split_top_level(inner)
-            if chunk.strip()
-        )
-        base = TypeDesc("struct", fields=fields)
-    elif token.startswith("%"):
-        if token not in _NAMED_TYPES and resolve_named is not None:
-            resolve_named(token)
-        if token not in _NAMED_TYPES:
-            raise BackendUnavailable(
-                f"self backend does not know named LLVM type {token!r}"
-            )
-        base = _NAMED_TYPES[token]
-    elif token.startswith("i") and token[1:].isdigit():
-        base = TypeDesc("int", int(token[1:]))
-    else:
-        raise BackendUnavailable(
-            f"self backend does not understand LLVM type {token!r}"
-        )
-    for _ in range(stars):
-        base = TypeDesc("ptr", pointee=base)
     if resolve_named is None:
         _TYPE_CACHE[token] = base
     return base
@@ -960,7 +1254,12 @@ def _parse_named_types(ir_text: str) -> None:
         match = _NAMED_TYPEDEF_RE.search(ir_text, search_pos)
         if match is None:
             break
-        pending[match.group("name")] = match.group("fields").strip()
+        body_text = match.group("body").strip()
+        # Preserve the existing boundary for opaque and packed declarations:
+        # they may be present but unused.  A reference still fails closed as
+        # an unknown named type; regular structs are parsed structurally.
+        if body_text.startswith("{"):
+            pending[match.group("name")] = body_text
         search_pos = match.end()
 
     def resolve(name: str) -> TypeDesc:
@@ -971,15 +1270,19 @@ def _parse_named_types(ir_text: str) -> None:
             raise BackendUnavailable(
                 f"self backend has no definition for named type {name!r}"
             )
-        field_text = pending[name]
+        body_text = pending[name]
         placeholder = TypeDesc("struct", name=name)
         _NAMED_TYPES[name] = placeholder
-        fields = tuple(
-            _parse_type(chunk.strip(), resolve_named=resolve)
-            for chunk in field_text.split(",")
-            if chunk.strip()
+        parsed = _parse_type(body_text, resolve_named=resolve)
+        if not parsed.is_struct:
+            raise BackendUnavailable(
+                f"self backend named LLVM type {name!r} must be a struct, got {body_text!r}"
+            )
+        resolved = TypeDesc(
+            "struct",
+            name=name,
+            fields=parsed.fields,
         )
-        resolved = TypeDesc("struct", name=name, fields=fields)
         _NAMED_TYPES[name] = resolved
         return resolved
 
@@ -1012,6 +1315,16 @@ def _parse_functions(ir_text: str) -> list[ParsedFunction]:
                 alloca_slots={},
                 block_map={},
                 used_values=[],
+                # Keep every target-owned mutable field explicit here.  Host
+                # Python applies dataclass ``default_factory`` values, but the
+                # pcc1 closed-world constructor signature cannot currently
+                # materialize those factories at an imported class call site.
+                # Explicit fresh containers preserve the same per-function
+                # ownership without making bootstrap depend on that fallback.
+                value_registers={},
+                aarch64_madd_fusions=[],
+                aarch64_block_layout=[],
+                aarch64_cold_fallthrough_edges=[],
                 hidden_sret_slot=None,
                 frame_size=0,
             )
@@ -1147,70 +1460,16 @@ def _find_matching_paren(text: str, open_index: int) -> int:
 
 
 def _split_trailing_type_token(text: str) -> tuple[str, str]:
-    depth_square = 0
-    depth_brace = 0
-    depth_paren = 0
-    depth_angle = 0
-    in_quote = False
-    escape = False
-    last_split: int | None = None
-
-    for index, ch in enumerate(text):
-        if in_quote:
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == '"':
-                in_quote = False
+    source = text.strip()
+    tokens = _tokenize_ir_type(source)
+    for token in tokens:
+        start = token[2]
+        candidate = source[start:].strip()
+        try:
+            _parse_type(candidate)
+        except BackendUnavailable:
             continue
-        if ch == '"':
-            in_quote = True
-            continue
-        if ch == "[":
-            depth_square += 1
-            continue
-        if ch == "]":
-            depth_square -= 1
-            continue
-        if ch == "{":
-            depth_brace += 1
-            continue
-        if ch == "}":
-            depth_brace -= 1
-            continue
-        if ch == "(":
-            depth_paren += 1
-            continue
-        if ch == ")":
-            depth_paren -= 1
-            continue
-        if ch == "<":
-            depth_angle += 1
-            continue
-        if ch == ">":
-            depth_angle -= 1
-            continue
-        if (
-            ch.isspace()
-            and depth_square == 0
-            and depth_brace == 0
-            and depth_paren == 0
-            and depth_angle == 0
-        ):
-            last_split = index
-
-    if last_split is None:
-        ret = text.strip()
-        if ret:
-            return "", ret
-        raise BackendUnavailable(
-            f"self backend could not split trailing type token from {text!r}"
-        )
-    prefix = text[:last_split].rstrip()
-    ret = text[last_split + 1 :].strip()
-    if ret:
-        return prefix, ret
+        return source[:start].rstrip(), candidate
     raise BackendUnavailable(
         f"self backend could not split trailing type token from {text!r}"
     )
@@ -1234,31 +1493,7 @@ def _parse_function_header(header_text: str) -> tuple[str, str, str, str]:
             f"self backend could not decode function name from header: {header_text!r}"
         )
     prefix_and_ret = text[: name_match.start()].rstrip()
-    prefix = ""
-    ret = ""
-    simple_return_types = (
-        "void",
-        "ptr",
-        "float",
-        "double",
-        "i1",
-        "i8",
-        "i16",
-        "i32",
-        "i64",
-        "i128",
-    )
-    for candidate in simple_return_types:
-        if prefix_and_ret == candidate:
-            ret = candidate
-            break
-        suffix = " " + candidate
-        if prefix_and_ret.endswith(suffix):
-            prefix = prefix_and_ret[: -len(suffix)].rstrip()
-            ret = candidate
-            break
-    if not ret:
-        prefix, ret = _split_trailing_type_token(prefix_and_ret)
+    prefix, ret = _split_trailing_type_token(prefix_and_ret)
     try:
         _parse_type(ret)
     except BackendUnavailable:
@@ -1275,6 +1510,52 @@ def _parse_function_header(header_text: str) -> tuple[str, str, str, str]:
     )
 
 
+def _thread_local_models(prefix: str, line: str) -> list[str]:
+    """Decode LLVM's finite ``thread_local[(model)]`` prefix syntax.
+
+    This deliberately uses string operations rather than Python's general
+    regex iterator surface.  The parser is part of the pcc1 self-host closure,
+    whose no-libpython ``re`` implementation does not own ``finditer`` or this
+    pattern's word-boundary/named-group combination.
+    """
+
+    needle = "thread_local"
+    models: list[str] = []
+    search_pos = 0
+    while True:
+        index = prefix.find(needle, search_pos)
+        if index < 0:
+            return models
+        after = index + len(needle)
+        search_pos = after
+        before_char = prefix[index - 1] if index > 0 else ""
+        after_char = prefix[after] if after < len(prefix) else ""
+        if before_char and (before_char.isalnum() or before_char == "_"):
+            continue
+        if after_char and (after_char.isalnum() or after_char == "_"):
+            continue
+        if after_char != "(":
+            models.append("default")
+            continue
+        close = prefix.find(")", after + 1)
+        if close < 0:
+            raise BackendUnavailable(
+                f"self backend found an unterminated thread_local model: {line!r}"
+            )
+        raw_model = prefix[after + 1 : close]
+        if "(" in raw_model:
+            raise BackendUnavailable(
+                f"self backend found a nested thread_local model: {line!r}"
+            )
+        model = raw_model.strip().lower()
+        if not model:
+            raise BackendUnavailable(
+                f"self backend found an empty thread_local model: {line!r}"
+            )
+        models.append(model)
+        search_pos = close + 1
+
+
 def _parse_globals(ir_text: str) -> list[GlobalDef]:
     globals_: list[GlobalDef] = []
     seen: set[str] = set()
@@ -1284,64 +1565,41 @@ def _parse_globals(ir_text: str) -> list[GlobalDef]:
         match = _GLOBAL_HEADER_RE.match(line)
         if match is None:
             continue
-        if "external" in (match.group("prefix") or "").split():
+        prefix = match.group("prefix") or ""
+        tls_models = _thread_local_models(prefix, line)
+        if len(tls_models) > 1:
+            raise BackendUnavailable(
+                f"self backend found duplicate thread_local storage classes: {line!r}"
+            )
+        tls_model = tls_models[0] if tls_models else ""
+        if "external" in prefix.split():
+            if tls_model:
+                raise BackendUnavailable(
+                    "self backend target TLS lowering does not support external "
+                    f"thread-local declarations yet: {line!r}"
+                )
             continue
         name = decode_global_name(match.group("name"))
         if name in seen:
             continue
         check_simple_symbol_name(name)
         body_text = match.group("body")
-        type_text = ""
-        initializer = ""
-        depth_square = 0
-        depth_brace = 0
-        depth_paren = 0
-        in_quote = False
-        escape = False
-        for index, ch in enumerate(body_text):
-            if in_quote:
-                if escape:
-                    escape = False
-                elif ch == "\\":
-                    escape = True
-                elif ch == '"':
-                    in_quote = False
-                continue
-            if ch == '"':
-                in_quote = True
-                continue
-            if ch == "[":
-                depth_square += 1
-                continue
-            if ch == "]":
-                depth_square -= 1
-                continue
-            if ch == "{":
-                depth_brace += 1
-                continue
-            if ch == "}":
-                depth_brace -= 1
-                continue
-            if ch == "(":
-                depth_paren += 1
-                continue
-            if ch == ")":
-                depth_paren -= 1
-                continue
-            if (
-                ch == " "
-                and depth_square == 0
-                and depth_brace == 0
-                and depth_paren == 0
-            ):
-                type_text = body_text[:index].strip()
-                initializer = body_text[index + 1 :].strip()
-                break
+        try:
+            type_text, initializer = _extract_leading_type_token(body_text)
+        except BackendUnavailable as exc:
+            raise BackendUnavailable(
+                f"self backend could not split global type from initializer: {body_text!r}"
+            ) from exc
         if not type_text or not initializer:
             raise BackendUnavailable(
                 f"self backend could not split global type from initializer: {body_text!r}"
             )
-        initializer = _strip_global_trailing_attrs(initializer)
+        initializer, trailing_attributes = _split_global_trailing_attrs(initializer)
+        alignment = 0
+        for attribute in trailing_attributes:
+            align_match = re.fullmatch(r"align\s+(\d+)", attribute)
+            if align_match is not None:
+                alignment = int(align_match.group(1))
         if gep := _GLOBAL_PTR_GEP_RE.match(line):
             initializer = f"gep0:{decode_global_name(gep.group('base'))}"
         try:
@@ -1354,8 +1612,11 @@ def _parse_globals(ir_text: str) -> list[GlobalDef]:
                 type=parsed_type,
                 initializer=initializer,
                 is_constant=match.group("kind") == "constant",
-                is_internal=("internal" in match.group("prefix"))
-                or ("private" in match.group("prefix")),
+                is_internal=("internal" in prefix) or ("private" in prefix),
+                tls_model=tls_model,
+                alignment=alignment,
+                ir_prefix=prefix.strip(),
+                trailing_attributes=trailing_attributes,
             )
         )
         seen.add(name)
@@ -1368,16 +1629,25 @@ _GLOBAL_TRAILING_ATTR_RE = re.compile(
 
 
 def _strip_global_trailing_attrs(initializer: str) -> str:
+    current, _attributes = _split_global_trailing_attrs(initializer)
+    return current
+
+
+def _split_global_trailing_attrs(initializer: str) -> tuple[str, tuple[str, ...]]:
     current = initializer + ""
+    attributes: list[str] = []
     while True:
         last_comma = _last_top_level_comma(current)
         if last_comma < 0:
-            return current
+            attributes.reverse()
+            return current, tuple(attributes)
         head, tail = current[:last_comma], current[last_comma:]
         if _GLOBAL_TRAILING_ATTR_RE.match(tail):
+            attributes.append(tail[1:].strip())
             current = head.rstrip()
             continue
-        return current
+        attributes.reverse()
+        return current, tuple(attributes)
 
 
 def _last_top_level_comma(text: str) -> int:
@@ -1416,127 +1686,33 @@ def _last_top_level_comma(text: str) -> int:
     return last
 
 
-def _split_leading_type_token(text: str) -> tuple[str, str]:
-    depth_square = 0
-    depth_brace = 0
-    depth_paren = 0
-    in_quote = False
-    escape = False
-
-    for index, ch in enumerate(text):
-        if in_quote:
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == '"':
-                in_quote = False
-            continue
-        if ch == '"':
-            in_quote = True
-            continue
-        if ch == "[":
-            depth_square += 1
-            continue
-        if ch == "]":
-            depth_square -= 1
-            continue
-        if ch == "{":
-            depth_brace += 1
-            continue
-        if ch == "}":
-            depth_brace -= 1
-            continue
-        if ch == "(":
-            depth_paren += 1
-            continue
-        if ch == ")":
-            depth_paren -= 1
-            continue
-        if ch == " " and depth_square == 0 and depth_brace == 0 and depth_paren == 0:
-            type_text = text[:index].strip()
-            initializer = text[index + 1 :].strip()
-            if type_text and initializer:
-                return type_text + "", initializer + ""
-            break
-
-    raise BackendUnavailable(
-        f"self backend could not split global type from initializer: {text!r}"
-    )
-
-
 def _extract_leading_type_token(text: str) -> tuple[str, str]:
-    depth_square = 0
-    depth_brace = 0
-    depth_paren = 0
-    depth_angle = 0
-    in_quote = False
-    escape = False
-    saw_type_char = False
-
-    for index, ch in enumerate(text):
-        if in_quote:
-            if escape:
-                escape = False
-            elif ch == "\\":
-                escape = True
-            elif ch == '"':
-                in_quote = False
-            continue
-        if ch == '"':
-            in_quote = True
-            saw_type_char = True
-            continue
-        if ch == "[":
-            depth_square += 1
-            saw_type_char = True
-            continue
-        if ch == "]":
-            depth_square -= 1
-            continue
-        if ch == "{":
-            depth_brace += 1
-            saw_type_char = True
-            continue
-        if ch == "}":
-            depth_brace -= 1
-            continue
-        if ch == "(":
-            depth_paren += 1
-            saw_type_char = True
-            continue
-        if ch == ")":
-            depth_paren -= 1
-            continue
-        if ch == "<":
-            depth_angle += 1
-            saw_type_char = True
-            continue
-        if ch == ">":
-            depth_angle -= 1
-            continue
-        if (
-            ch in {" ", ","}
-            and depth_square == 0
-            and depth_brace == 0
-            and depth_paren == 0
-            and depth_angle == 0
-            and saw_type_char
-        ):
-            type_text = text[:index].strip()
-            rest = text[index:].lstrip(" ,")
-            if type_text:
-                return type_text, rest
-            break
-        if not ch.isspace():
-            saw_type_char = True
-
-    type_text = text.strip()
-    if type_text:
-        return type_text, ""
-    raise BackendUnavailable(
-        f"self backend could not extract leading type token from {text!r}"
-    )
+    source = text.lstrip()
+    if not source:
+        raise BackendUnavailable(
+            f"self backend could not extract leading type token from {text!r}"
+        )
+    parsed, end = _parse_ir_type_prefix(source)
+    if end < len(source) and not source[end].isspace() and source[end] != ",":
+        raise BackendUnavailable(
+            f"self backend found no boundary after leading LLVM type in {text!r}"
+        )
+    type_text = source[:end].strip()
+    _TYPE_CACHE[type_text] = parsed
+    rest = source[end:].lstrip()
+    if rest.startswith("addrspace"):
+        raise BackendUnavailable(
+            f"self backend does not support address-space LLVM types in {text!r}"
+        )
+    if rest.startswith("("):
+        close = _find_matching_paren(rest, 0)
+        if rest[close + 1 :].lstrip().startswith("*"):
+            raise BackendUnavailable(
+                f"self backend does not support LLVM function types in {text!r}"
+            )
+    if rest.startswith(","):
+        rest = rest[1:].lstrip()
+    return type_text, rest
 
 
 def _split_top_level_once(text: str, sep: str) -> tuple[str, str]:
@@ -1797,6 +1973,29 @@ def _block_index_for_name(
     return -1
 
 
+def _block_branches_to(block: ParsedBlock, target_name: str) -> bool:
+    """Return whether the canonicalized terminator still owns this CFG edge."""
+    for successor in _terminator_successors(block.terminator):
+        if successor == target_name:
+            return True
+    return False
+
+
+def _indexed_phi_edge_survives(
+    blocks: list[ParsedBlock],
+    indices_by_key: dict[int, list[int]],
+    reachable_indices: set[int],
+    predecessor_name: str,
+    target_name: str,
+) -> bool:
+    predecessor_index = _block_index_for_name(
+        blocks, indices_by_key, predecessor_name
+    )
+    if predecessor_index not in reachable_indices:
+        return False
+    return _block_branches_to(blocks[predecessor_index], target_name)
+
+
 def _filter_reachable_blocks(blocks: list[ParsedBlock]) -> list[ParsedBlock]:
     if not blocks:
         return blocks
@@ -1827,9 +2026,6 @@ def _filter_reachable_blocks(blocks: list[ParsedBlock]) -> list[ParsedBlock]:
             if successor_index >= 0 and successor_index not in reachable_indices:
                 worklist.append(successor_index)
 
-    if len(reachable_indices) == len(blocks):
-        return blocks
-
     filtered = [
         block for index, block in enumerate(blocks) if index in reachable_indices
     ]
@@ -1843,8 +2039,13 @@ def _filter_reachable_blocks(blocks: list[ParsedBlock]) -> list[ParsedBlock]:
                 incoming=tuple(
                     incoming
                     for incoming in phi.incoming
-                    if _block_index_for_name(blocks, indices_by_key, incoming.label)
-                    in reachable_indices
+                    if _indexed_phi_edge_survives(
+                        blocks,
+                        indices_by_key,
+                        reachable_indices,
+                        incoming.label,
+                        block.name,
+                    )
                 ),
             )
             for phi in block.phis
@@ -1874,6 +2075,20 @@ def _name_in_list_linear(names: list[str], name: str) -> bool:
         if item == name:
             return True
     return False
+
+
+def _linear_phi_edge_survives(
+    blocks: list[ParsedBlock],
+    reachable_names: list[str],
+    predecessor_name: str,
+    target_name: str,
+) -> bool:
+    if not _name_in_list_linear(reachable_names, predecessor_name):
+        return False
+    predecessor = _block_for_name_linear(blocks, predecessor_name)
+    if predecessor is None:
+        return False
+    return _block_branches_to(predecessor, target_name)
 
 
 def _filter_reachable_blocks_linear(blocks: list[ParsedBlock]) -> list[ParsedBlock]:
@@ -1907,7 +2122,12 @@ def _filter_reachable_blocks_linear(blocks: list[ParsedBlock]) -> list[ParsedBlo
                 incoming=tuple(
                     incoming
                     for incoming in phi.incoming
-                    if _name_in_list_linear(reachable, incoming.label)
+                    if _linear_phi_edge_survives(
+                        blocks,
+                        reachable,
+                        incoming.label,
+                        block.name,
+                    )
                 ),
             )
             for phi in block.phis
@@ -1926,6 +2146,9 @@ def _filtered_blocks_drop_referenced_target(
             if _blocks_contain_name_linear(blocks, successor):
                 return True
     return False
+
+
+_EMPTY_BLOCK_LINES: tuple = ()
 
 
 def _parse_block(function_name: str, block: ParsedBlock) -> None:
@@ -1979,6 +2202,12 @@ def _parse_block(function_name: str, block: ParsedBlock) -> None:
     for line in instruction_lines:
         block.instructions.append(_parse_instruction(function_name, block.name, line))
     block.terminator = _parse_terminator(function_name, block.name, terminator_line)
+    # Release the source lines: this is their only consumer, and every later
+    # phase reads the parsed instruction arena instead.  Holding them kept one
+    # Python str per IR line alive for the whole emit -- 423698 of them for a
+    # single 43 MB module -- which is pure duplication of text the emitter has
+    # already finished with.
+    block.raw_lines = _EMPTY_BLOCK_LINES
 
 
 def _parse_binop_instruction(line: str) -> ParsedInstr | None:
@@ -2007,15 +2236,17 @@ def _parse_binop_instruction(line: str) -> ParsedInstr | None:
     }:
         return None
     rest = pieces[1].strip()
+    arithmetic_flags: list[str] = []
     while True:
-        type_text, remainder = _extract_leading_type_token(rest)
         try:
+            type_text, remainder = _extract_leading_type_token(rest)
             value_type = _parse_type(type_text)
             break
         except BackendUnavailable:
             attr_pieces = rest.split(None, 1)
             if len(attr_pieces) != 2:
                 return None
+            arithmetic_flags.append(attr_pieces[0])
             rest = attr_pieces[1].strip()
     lhs_text, rhs_text = _split_top_level_once(remainder, ",")
     return ParsedInstr(
@@ -2027,6 +2258,7 @@ def _parse_binop_instruction(line: str) -> ParsedInstr | None:
             decode_value_token(lhs_text),
             decode_value_token(rhs_text),
         ),
+        arithmetic_flags=tuple(arithmetic_flags),
     )
 
 
@@ -2187,6 +2419,7 @@ def _call_instr_from_parts(
 ) -> ParsedInstr:
     ret_type = _parse_type(ret_text)
     fixed_arg_count, is_vararg_call = _parse_call_signature(sig_text)
+    args, arg_alignments = _parse_call_args(function_name, args_text)
     if ret_type.is_void and dest is not None:
         raise BackendUnavailable(
             f"self backend saw void call with SSA destination in {function_name!r}/{block_name!r}: {line}"
@@ -2206,9 +2439,10 @@ def _call_instr_from_parts(
                 else decode_ssa_name(callee_token)
             ),
             callee_token.startswith("%"),
-            tuple(_parse_call_args(function_name, args_text)),
+            tuple(args),
             fixed_arg_count,
             is_vararg_call,
+            arg_alignments,
         ),
     )
 
@@ -2252,8 +2486,8 @@ def _parse_call_instruction(
         )
 
     while True:
-        ret_text, rest_after_ret = _extract_leading_type_token(rest)
         try:
+            ret_text, rest_after_ret = _extract_leading_type_token(rest)
             _parse_type(ret_text)
             break
         except BackendUnavailable:
@@ -2302,8 +2536,112 @@ def _parse_instruction(function_name: str, block_name: str, line: str) -> Parsed
         return ParsedInstr(
             "alloca", (decode_ssa_name(dest_text.strip()), _parse_type(type_text))
         )
+    if line.startswith("store atomic "):
+        if match := _STORE_ATOMIC_RE.match(line):
+            return ParsedInstr(
+                "store_atomic",
+                (
+                    _parse_type(match.group("val_type")),
+                    decode_value_token(match.group("value")),
+                    _parse_type(match.group("ptr_type")),
+                    decode_value_token(match.group("ptr")),
+                    match.group("ordering"),
+                ),
+            )
+        raise BackendUnavailable(
+            f"self backend malformed atomic store in {function_name!r}/{block_name!r}: {line}"
+        )
+    if "= load atomic " in line:
+        if match := _LOAD_ATOMIC_RE.match(line):
+            return ParsedInstr(
+                "load_atomic",
+                (
+                    decode_ssa_name(match.group("dest").strip()),
+                    _parse_type(match.group("val_type")),
+                    _parse_type(match.group("ptr_type")),
+                    decode_value_token(match.group("ptr")),
+                    match.group("ordering"),
+                ),
+            )
+        raise BackendUnavailable(
+            f"self backend malformed atomic load in {function_name!r}/{block_name!r}: {line}"
+        )
+    if "= atomicrmw " in line:
+        if match := _ATOMICRMW_RE.match(line):
+            return ParsedInstr(
+                "atomicrmw",
+                (
+                    decode_ssa_name(match.group("dest").strip()),
+                    match.group("op"),
+                    _parse_type(match.group("ptr_type")),
+                    decode_value_token(match.group("ptr")),
+                    _parse_type(match.group("val_type")),
+                    decode_value_token(match.group("value")),
+                    match.group("ordering"),
+                ),
+            )
+        raise BackendUnavailable(
+            f"self backend atomicrmw shape not supported in {function_name!r}/{block_name!r}: {line}"
+        )
+    if "= cmpxchg " in line:
+        if match := _CMPXCHG_RE.match(line):
+            value_type_text = match.group("expected_type")
+            if value_type_text != match.group("desired_type"):
+                raise BackendUnavailable(
+                    f"self backend cmpxchg operand types disagree in {function_name!r}/{block_name!r}: {line}"
+                )
+            value_type = _parse_type(value_type_text)
+            pair_type = _parse_type("{ " + value_type_text + ", i1 }")
+            return ParsedInstr(
+                "cmpxchg",
+                (
+                    decode_ssa_name(match.group("dest").strip()),
+                    pair_type,
+                    _parse_type(match.group("ptr_type")),
+                    decode_value_token(match.group("ptr")),
+                    value_type,
+                    decode_value_token(match.group("expected")),
+                    decode_value_token(match.group("desired")),
+                    match.group("success"),
+                    match.group("failure"),
+                ),
+            )
+        raise BackendUnavailable(
+            f"self backend cmpxchg shape not supported in {function_name!r}/{block_name!r}: {line}"
+        )
+    if line.startswith("fence "):
+        if match := _FENCE_RE.match(line):
+            return ParsedInstr("fence", (match.group("ordering"),))
+        raise BackendUnavailable(
+            f"self backend fence shape not supported in {function_name!r}/{block_name!r}: {line}"
+        )
+    if " asm " in line and "= call " in line:
+        if match := _SYSCALL6_ASM_RE.match(line):
+            arg_values = []
+            for piece in split_top_level(match.group("args")):
+                arg_type_text, arg_value_text = _extract_leading_type_token(
+                    piece.strip()
+                )
+                if arg_type_text != "i64" or not arg_value_text:
+                    raise BackendUnavailable(
+                        f"self backend syscall6 argument must be i64 in {function_name!r}/{block_name!r}: {line}"
+                    )
+                arg_values.append(decode_value_token(arg_value_text))
+            if len(arg_values) != 7:
+                raise BackendUnavailable(
+                    f"self backend syscall6 expects 7 arguments in {function_name!r}/{block_name!r}: {line}"
+                )
+            return ParsedInstr(
+                "syscall6",
+                (decode_ssa_name(match.group("dest").strip()), tuple(arg_values)),
+            )
+        raise BackendUnavailable(
+            f"self backend inline asm shape not supported in {function_name!r}/{block_name!r}: {line}"
+        )
     if line.startswith("store "):
-        rest = _strip_volatile_memory_op_prefix(line[len("store ") :])
+        raw_rest = line[len("store ") :]
+        is_volatile = raw_rest.strip().startswith("volatile ")
+        rest = _strip_volatile_memory_op_prefix(raw_rest)
         val_type_text, rest = _extract_leading_type_token(rest)
         value_text, rest = _split_top_level_once(rest, ",")
         ptr_type_text, rest = _extract_leading_type_token(rest)
@@ -2316,9 +2654,11 @@ def _parse_instruction(function_name: str, block_name: str, line: str) -> Parsed
                 _parse_type(ptr_type_text),
                 decode_value_token(ptr_text),
             ),
+            is_volatile,
         )
     if "= load " in line:
         dest_text, rest = line.split("= load ", 1)
+        is_volatile = rest.strip().startswith("volatile ")
         rest = _strip_volatile_memory_op_prefix(rest)
         val_type_text, rest = _split_top_level_once(rest.strip(), ",")
         ptr_type_text, rest = _extract_leading_type_token(rest)
@@ -2331,6 +2671,7 @@ def _parse_instruction(function_name: str, block_name: str, line: str) -> Parsed
                 _parse_type(ptr_type_text),
                 decode_value_token(ptr_text),
             ),
+            is_volatile,
         )
     if "= getelementptr" in line:
         dest_text, rest = line.split("= getelementptr", 1)
@@ -2581,23 +2922,44 @@ def _parse_instruction(function_name: str, block_name: str, line: str) -> Parsed
     )
 
 
-def _parse_call_args(function_name: str, args_text: str) -> list[tuple[TypeDesc, str]]:
+def _parse_call_arg_alignment(value_text: str) -> int:
+    # LLVM call-argument attributes are whitespace-delimited here.  Parse the
+    # finite ``align N`` pair directly: the previous regex used a lookahead,
+    # which host Python accepted but pcc's strict no-libpython regex engine
+    # correctly rejected while a compiled pcc was emitting its own output.
+    pieces = value_text.split()
+    align_index = -1
+    for index, piece in enumerate(pieces):
+        if piece == "align":
+            align_index = index
+            break
+    if align_index < 0:
+        return 0
+    if align_index + 1 >= len(pieces):
+        raise BackendUnavailable(
+            "self backend call argument has an align attribute without a value"
+        )
+    try:
+        alignment = int(pieces[align_index + 1])
+    except ValueError as exc:
+        raise BackendUnavailable(
+            "self backend call argument has a non-integer alignment"
+        ) from exc
+    if alignment <= 0 or alignment & (alignment - 1):
+        raise BackendUnavailable(
+            f"self backend call argument has invalid alignment {alignment}"
+        )
+    return alignment
+
+
+def _parse_call_args(
+    function_name: str, args_text: str
+) -> tuple[list[tuple[TypeDesc, str]], tuple[int, ...]]:
     text = (args_text or "").strip()
     if not text:
-        return []
+        return [], ()
     args: list[tuple[TypeDesc, str]] = []
-    if not _has_split_nesting_markers(text):
-        for chunk in text.split(","):
-            piece = chunk.strip()
-            if not piece:
-                continue
-            type_text, sep, value_text = piece.partition(" ")
-            if not sep or not value_text.strip():
-                raise BackendUnavailable(
-                    f"self backend call arg missing value in {function_name!r}: {piece}"
-                )
-            args.append((_parse_type(type_text), decode_value_token(value_text)))
-        return args
+    alignments: list[int] = []
     chunks = [chunk.strip() for chunk in split_top_level(text) if chunk.strip()]
     for chunk in chunks:
         try:
@@ -2610,8 +2972,21 @@ def _parse_call_args(function_name: str, args_text: str) -> list[tuple[TypeDesc,
             raise BackendUnavailable(
                 f"self backend call arg missing value in {function_name!r}: {chunk}"
             )
-        args.append((_parse_type(type_text), decode_value_token(value_text)))
-    return args
+        alignments.append(_parse_call_arg_alignment(value_text))
+        arg_type = _parse_type(type_text)
+        arg_value = decode_value_token(value_text)
+        # Keep the internal call ABI canonical: integer operands are numeric
+        # strings throughout the emitters.  LLVM permits the aliases
+        # ``true``/``false`` for i1, but preserving them here made call parsing
+        # depend on every downstream intrinsic/materializer remembering both
+        # spellings (and diverged from calls emitted with i1 0/1).
+        if arg_type.is_int and arg_type.width == 1:
+            if arg_value == "false":
+                arg_value = "0"
+            elif arg_value == "true":
+                arg_value = "1"
+        args.append((arg_type, arg_value))
+    return args, tuple(alignments)
 
 
 def _parse_extractvalue_indices(indices_text: str) -> list[int]:
@@ -2641,16 +3016,16 @@ def _parse_call_signature(sig_text: str | None) -> tuple[int, bool]:
         result = (0, False)
         _CALL_SIGNATURE_CACHE[text] = result
         return result
+    if not (text.startswith("(") and text.endswith(")")):
+        raise BackendUnavailable(
+            f"self backend malformed explicit call signature {text!r}"
+        )
     inner = text[1:-1].strip()
     if not inner:
         result = (0, False)
         _CALL_SIGNATURE_CACHE[text] = result
         return result
-    pieces = split_top_level(inner)
-    is_vararg = bool(pieces) and pieces[-1] == "..."
-    fixed = pieces[:-1] if is_vararg else pieces
-    for piece in fixed:
-        _parse_type(piece)
+    fixed, is_vararg = _parse_ir_type_list(inner, allow_vararg=True)
     result = (len(fixed), is_vararg)
     _CALL_SIGNATURE_CACHE[text] = result
     return result

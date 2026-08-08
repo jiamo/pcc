@@ -1,18 +1,56 @@
-"""Float literals with exponents round-trip precisely, no-libpython.
-
-The parsers (`py_parse.py` / `py_lift.py`) computed a float literal as
-``mantissa * 10.0**exp`` via repeated float multiplication, accumulating error
-(``1e100`` parsed to ``1.0000000000000006e+100``; ``6.022e23`` to
-``6.0219999999999996e+23``). Fix scales the integer mantissa by an EXACT
-``10**net`` and rounds once via ``float(bignum)`` (correctly rounded), for the
-common magnitude range (|exponent| <= 308). Extreme tails (overflow->inf,
-subnormal underflow like 5e-324) keep the graceful imprecise fallback.
-"""
+"""Float literals round through the native string-to-binary64 owner."""
 from __future__ import annotations
 
+import os
+import struct
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
+
+from pcc1_gate import find_current_pcc1, skip_or_fail_no_current_pcc1
+
+
+REPO = Path(__file__).absolute().parents[2]
+
+
+def test_parser_mirrors_match_python_binary64_conversion():
+    from pcc.parse.py_lift import _parse_float_literal_lift
+    from pcc.parse.py_parse import _parse_float_literal
+
+    for text in (
+        "1e100",
+        "6.022e23",
+        "8.98846567431158e307",
+        "2.004168360008973e-292",
+        "5e-324",
+        "1_234.5_6e-7",
+    ):
+        expected = float(text.replace("_", ""))
+        assert _parse_float_literal(text).hex() == expected.hex()
+        assert _parse_float_literal_lift(text).hex() == expected.hex()
+
+
+def test_float_unary_minus_uses_ieee_fneg_and_preserves_negative_zero(tmp_path):
+    from pcc.py_frontend.pipeline import compile_python
+
+    src = tmp_path / "float_unary_minus.py"
+    llvm_ir = tmp_path / "float_unary_minus.ll"
+    src.write_text(
+        "def negate(value: float) -> float:\n"
+        "    return -value\n",
+        encoding="utf-8",
+    )
+    compile_python(
+        str(src),
+        str(llvm_ir),
+        emit_llvm_only=True,
+        libpython_mode="off",
+        python_library=True,
+    )
+    text = llvm_ir.read_text(encoding="utf-8")
+    assert "fneg double %value" in text
+    assert "fsub double 0.000000e+00, %value" not in text
 
 
 def test_float_literal_precision_matches_cpython(tmp_path, monkeypatch):
@@ -57,3 +95,40 @@ def test_float_literal_precision_matches_cpython(tmp_path, monkeypatch):
     )
     assert result.returncode == 0, result.stderr
     assert result.stdout == cpython
+
+
+def test_current_pcc1_parses_large_and_tiny_finite_float_literals(tmp_path):
+    pcc1 = find_current_pcc1(REPO)
+    if pcc1 is None:
+        skip_or_fail_no_current_pcc1(
+            "no current pcc1 binary for finite float literal parser regression"
+        )
+    src = tmp_path / "finite_float_literals.py"
+    llvm_ir = tmp_path / "finite_float_literals.ll"
+    src.write_text(
+        "large: float = 8.98846567431158e307\n"
+        "tiny: float = 2.004168360008973e-292\n",
+        encoding="utf-8",
+    )
+    env = os.environ.copy()
+    env.pop("LC_ALL", None)
+    env["PCC_HOST_PYTHON"] = "/usr/bin/false"
+    proc = subprocess.run(
+        [
+            str(pcc1),
+            "--python-library",
+            "--python-libpython=off",
+            "--emit-llvm=" + str(llvm_ir),
+            str(src),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=180,
+        env=env,
+    )
+
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    ir_text = llvm_ir.read_text(encoding="utf-8")
+    for text in ("8.98846567431158e307", "2.004168360008973e-292"):
+        expected_bits = struct.unpack(">Q", struct.pack(">d", float(text)))[0]
+        assert f"0x{expected_bits:016X}" in ir_text

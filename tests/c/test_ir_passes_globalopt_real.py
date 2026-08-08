@@ -1,6 +1,6 @@
 """Real-transform tests for GlobalOptPass (subset)."""
 
-import shutil
+import pytest
 
 import unittest
 
@@ -8,7 +8,9 @@ from pcc.ir_passes.globalopt import GlobalOptPass, globalopt_text
 from pcc.ir_passes.parity import assert_ir_parity, run_pcc_ir_pass, run_upstream_opt
 
 
-_OPT = shutil.which("opt")
+from pcc.passes.llvm_text_pipeline import find_opt_binary
+
+_OPT = find_opt_binary()
 
 
 class GlobalOptTests(unittest.TestCase):
@@ -493,7 +495,7 @@ entry:
         self.assertIn("and i32 %x, 255", out)
 
 
-@unittest.skipUnless(_OPT, "requires LLVM opt")
+@pytest.mark.pcc_gate(unavailable=None if _OPT else "matching LLVM opt not installed")
 class UpstreamParityTests(unittest.TestCase):
     def _structural_parity(self, ir: str):
         report = assert_ir_parity(ir, GlobalOptPass(), "globalopt")

@@ -19,7 +19,12 @@ Startup route for active goal work and direct human task intake:
    a new actionable task, normalize it into `docs/goal/task-board.yaml` and
    validate the board before selecting active work.
 5. Use `docs/investigations/INDEX.md` to find relevant prior investigations
-   before opening or continuing a non-trivial bug.
+   before opening or continuing a non-trivial bug. Then **read the matching
+   file end to end, including every `[DENIED]` verdict and every "did not
+   help" note, before writing code** — those sections record fixes already
+   written, measured, and disproved, and re-deriving one wastes a full
+   rebuild/measure cycle on a change known not to work. See the Investigation
+   Workflow section below for what this rule keeps catching.
 6. **Task-conditional, required — not optional reference.** The moment the task
    becomes *debugging a failure*, read and follow
    [`docs/debugging-playbook.md`](docs/debugging-playbook.md) before guessing.
@@ -203,39 +208,37 @@ CPU oracles). This thread **must not displace the self-host -> 5-GC -> value ->
 runtime-efficiency spine**: it is M5 breadth, and calling a GPU slice "done"
 requires the same mode-labeled claim hygiene as every pillar.
 
-**Runtime layering: shrink the C runtime to a kernel; do not eliminate it.**
-pcc does not aim to eliminate all low-level native runtime code. The long-term
-goal is to minimize the C-level runtime into a small ABI kernel — allocation,
-object headers, atomics/refcount barriers, platform syscalls, threading
-primitives, dynamic loading, C-extension entrypoints, safepoints/stack maps,
-and GC primitives — while Python *semantics* migrate into pcc-Python and are
-compiled by pcc itself. The C kernel remains as the machine boundary; **it must
-not become a second, hand-maintained C version of the Python semantic runtime
-running in parallel with the pcc-Python one.** Distinguish four layers (do not
-say "C runtime" loosely — it conflates them):
+**Runtime layering: the production runtime is authored in pcc-Python, including
+the low-level kernel.** The long-term goal is not a smaller hand-written C
+runtime. Allocation, object headers, atomics/refcount barriers, platform
+syscalls, threading primitives, dynamic loading, extension ABI entrypoints,
+safepoints/stack maps, and all five GC implementations migrate to a strict
+freestanding pcc-Python subset and are compiled by pcc into native code. The
+machine boundary is compiler-owned raw-memory/syscall/atomic intrinsics and a
+specified ABI, not a permanently hand-maintained C kernel. Existing C and
+vendored libc sources are transition implementations and differential oracles;
+they are not the final production dependency. Distinguish these layers:
 
 ```text
-C-level kernel        KEEP (minimize): platform/ABI, alloc, atomics, threads,
-                      dlopen, syscalls, safepoints, GC slot/root primitives.
-                      Knows no high-level Python semantics (no list/dict/dunder/
-                      valueclass/import policy; no `if package == "numpy"`).
-C semantic runtime    SHRINK: hand-written C list/dict/str/dunder/exception
-                      semantics -> migrate to pcc-Python.
-pcc-Python runtime    GROW: the migration target; Python semantics authored in
-                      pcc-Python, self-hostable, testable, compiled by pcc.
-C-API shim            KEEP but spec/generate: the ABI surface extensions see;
-                      != CPython/libpython.
+compiler intrinsics   KEEP: raw memory, atomics, syscall/host-ABI entry and
+                      machine operations; no Python object semantics.
+freestanding pcc-Py   GROW: allocator, threads, safepoints, GC, libc-like
+                      substrate and ABI shims; no heap/boxing/GC dependency
+                      while bootstrapping those facilities themselves.
+semantic pcc-Python   GROW: list/dict/str/dunder/exception/import semantics.
+C/libc sources        REMOVE from the production dependency after differential
+                      and fixed-point gates; retain only as attributed oracles.
 ```
 
-This does not contradict no-libpython: no-libpython means not depending on the
-CPython runtime, NOT that the final binary contains zero C-level runtime. It
-ties directly to the **5-GC Production Equality Rule** (`docs/goal/goal-prompt.md`,
-G-track): all five GC backends, the C kernel, and the pcc-Python mirror must
-consume ONE slot-based trace/update contract (`py_obj_visit_slots` /
-`py_obj_update_slot` / root + frame + native-handle registration) so there is
-never a second parallel set of object-graph rules to drift. The C kernel and
-the pcc-Python semantic runtime are connected by a stable, spec'd runtime ABI
-(Layer 1) precisely to prevent that drift.
+This is stronger than no-libpython: the final Linux zero-libc claim requires no
+production C/libc runtime dependency either. Darwin may still enter the OS
+through named libSystem ABI calls and must not be labeled zero-libc. The
+**5-GC Production Equality Rule** (`docs/goal/goal-prompt.md`, G-track) still
+requires every backend to consume ONE slot-based trace/update contract
+(`py_obj_visit_slots` / `py_obj_update_slot` / root + frame + native-handle
+registration). During migration the C oracle and pcc-Python implementation must
+stay differential-equal; completion removes the C implementation from the
+production link rather than preserving two implementations indefinitely.
 
 ## Project Summary
 
@@ -284,7 +287,7 @@ Do not do that here.
   harmless for other users. See https://github.com/openai/codex/issues/14723.
 
   ```bash
-  env -u LC_ALL uv run pytest -q
+  gtimeout 120s env -u LC_ALL uv run pytest -q -x
   env -u LC_ALL uv run pcc hello.c
   ```
 
@@ -296,13 +299,13 @@ Do not do that here.
   A five-backend bootstrap matrix should normally look like:
 
   ```bash
-  gtimeout 1800s env -u LC_ALL uv run pytest -q -m integration tests/python/gc/test_pcc_bootstrap_full_gc*.py
+  gtimeout 1800s env -u LC_ALL uv run pytest -q -x -m integration tests/python/gc/test_pcc_bootstrap_full_gc*.py
   ```
 
   Use the single-backend form only for focused diagnosis:
 
   ```bash
-  gtimeout 360s env -u LC_ALL uv run pytest -q -n0 -m integration tests/python/gc/test_pcc_bootstrap_full_gc4.py
+  gtimeout 360s env -u LC_ALL uv run pytest -q -x -n0 -m integration tests/python/gc/test_pcc_bootstrap_full_gc4.py
   ```
 
   Long bootstrap gates must provide meaningful progress updates: name the exact
@@ -311,6 +314,44 @@ Do not do that here.
   and terminate leftover `pytest`, `bootstrap.sh`, `pcc`, `pcc1`, `pcc2`, and
   `pcc3` children. A run without a final pytest summary is not green evidence,
   no matter how many progress dots were printed.
+- **Every pytest invocation must stop at the first failure or error.** Pass
+  `-x` (or the exact equivalent `--maxfail=1`) on every pytest command,
+  including focused, default, integration, bootstrap, and GC gates. Do not let
+  a suite continue after the first `F` or `E`. The only exception is an
+  explicit human request in the current conversation to collect multiple
+  failures; a task document, historical command, or desire for broader
+  evidence is not enough to override this rule. With xdist, stop scheduling
+  new work at the first reported failure and preserve the first failing node's
+  traceback before doing anything else.
+- **Never spend a long pytest run producing dots-only evidence.** Before any
+  pytest command expected to run longer than 60 seconds, arrange durable,
+  incremental failure evidence outside pytest's end-of-session summary. At a
+  minimum, run with node IDs visible (for example `-vv`) and persist the live
+  output to a named artifact; for a diagnostic run also use `-x --tb=short` so
+  the first current failure is reported promptly. A broad run that may reach
+  its watchdog must use an incremental report hook/logger that records each
+  failed node ID and traceback as the report arrives. If that facility is not
+  available, shard the suite into commands that fit their watchdog instead of
+  launching the broad run. `F`/`E` counts and percentage progress without node
+  IDs and tracebacks are not useful failure evidence and must never be reported
+  as if they were. Leave enough outer-watchdog grace for pytest to flush its
+  report and summary; if the measured suite cannot finish within that budget,
+  stop and shard it before rerunning rather than merely widening the timeout.
+- **Broad suites are final evidence, never a discovery mechanism or a way to
+  decide what to implement next.** Do not start the default suite, full
+  integration suite, five-GC matrix, or a full `pcc1 -> pcc2 -> pcc3` chain
+  until the implementation slice being closed has met all of these readiness
+  conditions: its known code changes are complete; its focused regression has
+  passed with `-x`; every agent editing an overlapping subsystem has reported
+  source-stable; no relevant source or generated artifact is changing; and the
+  exact frozen source identity plus expected time/cache envelope has been
+  recorded. If any condition is false, continue implementation or run one
+  focused diagnostic only. Never launch a broad gate merely because a task
+  card lists it, because progress feels slow, or because accumulated edits need
+  "a general check." After readiness, build bootstrap stages in dependency
+  order (`pcc0 -> pcc1`, then `pcc1 -> pcc2`, then `pcc2 -> pcc3`) and stop at
+  the first failed stage; do not hide stage causality inside an unrelated full
+  pytest run.
 - **A completed tool call is not ongoing work.** Once no shell/tool/agent job is
   running, send a concrete progress update or end the turn within 60 seconds.
   Do not remain silent in model-side analysis; if the next action is not ready,
@@ -388,6 +429,20 @@ Do not do that here.
   directories unless the user explicitly names the files/directories to
   remove.** Treat `rm`, scripted deletion, and bulk cleanup of docs as
   destructive operations, even when git could recover them.
+
+
+## Interrupting tasks
+
+A short operational request received while another task is unfinished is an
+interrupting subtask, not a replacement.
+
+- Push it onto the active task stack.
+- Complete and verify the interrupting task.
+- Automatically resume every unfinished parent task.
+- Do not end the turn until the parent task is answered.
+- Replace or abandon the parent task only when the user explicitly says:
+  “stop”, “cancel the previous task”, or “switch to this instead”.
+- Before the final response, list all active requests and verify each is complete.
 
 
 ## Repository Map
@@ -537,10 +592,10 @@ Required sequence for bootstrap / pcc1 / no-libpython regressions:
 ### Dedicated gates for Python-frontend / bootstrap edits
 
 ```bash
-env -u LC_ALL uv run pytest tests/python/test_py_multi_file_compile.py tests/python/test_py_multi_file_bootstrap_shim.py -q -n0
-env -u LC_ALL uv run pytest tests/c/test_llvm_capi_ir_parity.py tests/c/test_llvm_capi_end_to_end.py -q -n0
-env -u LC_ALL uv run pytest tests/python/test_fallback_baseline.py tests/python/test_ir_py_fallback_baseline.py -q -n0
-env -u LC_ALL uv run pytest tests/python/test_bootstrap_gate_baseline.py -q -n0
+gtimeout 120s env -u LC_ALL uv run pytest tests/python/test_py_multi_file_compile.py tests/python/test_py_multi_file_bootstrap_shim.py -q -x -n0
+gtimeout 120s env -u LC_ALL uv run pytest tests/c/test_llvm_capi_ir_parity.py tests/c/test_llvm_capi_end_to_end.py -q -x -n0
+gtimeout 120s env -u LC_ALL uv run pytest tests/python/test_fallback_baseline.py tests/python/test_ir_py_fallback_baseline.py -q -x -n0
+gtimeout 120s env -u LC_ALL uv run pytest tests/python/test_bootstrap_gate_baseline.py -q -x -n0
 ```
 
 ### Active self-host / package work
@@ -582,23 +637,129 @@ Rules when working on GC code:
   not re-derive — read.
 - **Each backend gets its own focused gate**, not a shared one. Example:
   ```bash
-  PCC_GC_BACKEND=1 env -u LC_ALL uv run pytest -n0 tests/python/test_gc_*.py
-  PCC_GC_BACKEND=2 PCC_WITH_THREADS=1 env -u LC_ALL uv run pytest -n0 tests/python/test_gc_*.py
-  PCC_GC_BACKEND=3 env -u LC_ALL uv run pytest -n0 tests/python/test_gc_*.py
+  gtimeout 120s env -u LC_ALL PCC_GC_BACKEND=1 uv run pytest -x -n0 tests/python/test_gc_*.py
+  gtimeout 120s env -u LC_ALL PCC_GC_BACKEND=2 PCC_WITH_THREADS=1 uv run pytest -x -n0 tests/python/test_gc_*.py
+  gtimeout 120s env -u LC_ALL PCC_GC_BACKEND=3 uv run pytest -x -n0 tests/python/test_gc_*.py
   ```
 - **Do not let backend X regress backend #0.** `PCC_GC_BACKEND=0` (default) is
   the reference; any new backend must keep stage2 / stage3 green.
 - **One backend per PR** with one investigation file under
   `docs/investigations/`. No multi-backend bundle commits.
-- **Mirror C and pcc-Python runtimes.** Most GC code has a C source file
-  under `pcc/py_runtime/src/` and a pcc-Python port under
-  `pcc/py_runtime/py/`. They must stay in sync.
+- **Keep migration mirrors differential-equal, then remove the C production
+  dependency.** Most GC code currently has a C source file under
+  `pcc/py_runtime/src/` and a pcc-Python port under `pcc/py_runtime/py/`.
+  They must stay in sync while both exist; the end state links the
+  freestanding pcc-Python implementation and retains C only as an oracle.
 
 The `layer1.py` split has landed: `layer1.py` is now a facade, with behavior
 split across focused `*_lowering.py` mixins plus `native_*.py` modules. When
 adding Python lowering, choose the narrowest existing mixin or native module;
 do not grow `layer1.py` again.
 
+
+## Evidence Discipline (read before any measure/verify loop)
+
+Every rule here was written after the same failure repeated in one session. The
+common root is **treating something that looks like evidence as evidence**. Each
+rule names the cheap check that would have caught it.
+
+- **Never infer about new code from an old artifact.** A binary, `.o`, `.ll`,
+  manifest, cache entry, or temp directory older than your edit tells you
+  nothing about your edit. Check the timestamps before drawing a conclusion:
+  ```bash
+  stat -f '%Sm %N' -t '%d %H:%M' build/bootstrap/pcc1 <the-file-you-changed>
+  ```
+  Cost when skipped: a batch manifest produced at 12:51 by a `pcc1` built at
+  12:17 was used to conclude that a fix made at 12:55 "did not take effect".
+  See also `pcc/py_runtime/build_py/*.o`, which is keyed by SOURCE hash and
+  does not invalidate when the compiler changes.
+
+- **Never trial-and-error through a tool that swallows errors.** Get the error
+  out FIRST, then debug. `scripts/bootstrap.sh` discards worker stderr and
+  reports an unrelated downstream symptom ("linker has no inputs"); eight
+  hypotheses were tested against it at 6-10 minutes each, all wrong, while the
+  real message — `no-libpython function unavailable: run_worker_commands` —
+  appeared instantly when `pcc1` was invoked directly. If a failure path has no
+  diagnostic, **adding the diagnostic is the first fix**, not a detour.
+
+- **Host-green is not pcc1-green, and it never will be.** Anything under
+  `pcc/py_frontend/`, `pcc/backend/`, or `pcc/py_runtime/py/` is compiled by pcc
+  itself and obeys a smaller language. Measured in one session: `wait -n` (macOS
+  ships bash 3.2), `isinstance(x, str)` / `"\0" in x` rejecting plain decimal
+  strings, a comprehension reusing a name already planned as an exact-int local,
+  and `tempfile` / `shlex` / `os.mkfifo` simply being unavailable in the
+  no-libpython closure. **Run the 30-second closure check before anything
+  longer:**
+  ```bash
+  env -u LC_ALL uv run pcc --backend self --python-libpython=off \
+      --ir-scaffold=on --python-library --emit-llvm=/tmp/chk.ll <the-file>
+  ```
+  If it fails, first re-run it on the `git show HEAD:<file>` version — several
+  files do not compile in the closure at HEAD either, and that is not your bug.
+
+- **Build the fast loop before the slow one.** In escalating cost:
+  ```text
+  ~30 s   closure check (above)
+  ~5 s    pcc1-compiled microbenchmark for a cost-model question
+  ~2 min  ./build/bootstrap/pcc1 ... pcc/__main__.py   (real errors, no wrapper)
+  ~10 min scripts/bootstrap.sh --stage 1
+  40 min+ full cold chain -- FINAL CONFIRMATION ONLY
+  ```
+  Never answer a question at a higher tier than it needs. Batch several verified
+  changes into one expensive run rather than paying it per change.
+
+- **Look up the historical number before calling a current one normal.** The
+  repo records its own baselines (`docs/goal/task-board.yaml` baseline_metric,
+  `docs/investigations/*.md`, `docs/issues/performance-gaps.md`). A stage2 at
+  90 minutes and a cold stage1 at 589 s were both treated as "how slow it is"
+  until a search found 434 s and 311 s recorded days earlier — they were
+  regressions, and knowing that changes where you look.
+
+- **Do not edit source a running measurement depends on.** Workers spawned
+  later import the edited module mid-run and silently corrupt the result. Wait,
+  or prototype in a scratch copy and apply afterwards.
+
+- **A smoke input that omits the feature proves nothing.** The chained pcc1
+  smoke check used `print(1)`. A module with no function has no phi node, which
+  turned out to be the *only* shape that still compiled -- pcc1 could not build
+  any program containing a `def` for a full day, invisibly, because the smoke
+  input dodged the broken path. Every pcc1 gate also stopped at `--emit-llvm`,
+  which returns *before* the self-backend, so the emit path had no pcc1-side
+  coverage at all. A smoke input must contain a function definition and must
+  compile through to a binary with `-o`, then run.
+
+- **Never run pcc1/bootstrap tests while a bootstrap stage is in flight.** They
+  trigger a runtime-archive `make` and fight over `build_py/`. The compile
+  "failure" that comes back is contention, not a defect, and it can corrupt the
+  concurrent stage.
+
+- **An `id()`-keyed cache must keep its keyed objects alive.** Free one and the
+  allocator can reuse the address, so a stale fingerprint *hits* and returns
+  another key's answer. "Distinct objects just miss, so it can only lose an
+  optimization" is wrong, and was written into a comment here before the bug was
+  found. Store the keys with the answer: `entry = (answer, tuple(keys))`. Expect
+  host-green/pcc1-red from any such structure -- the host often keeps the keys
+  alive incidentally.
+
+- **When the only surface is an empty error message, fix the message first.**
+  `PCC-PY-COMPILE-001 ... exception_type=Exception` with no text cost four
+  probed-and-denied hypotheses before the cause was reachable. Two small
+  diagnostics made it a five-minute job: `str(exc) or type(exc).__name__` at the
+  pipeline's re-raise sites, and `PCC_DEBUG_SELF_BACKEND_TRACE` phase markers in
+  the emitter. Prefer cheap probes against the *existing* binary (seconds) over
+  a rebuild (~8 min) when testing a hypothesis about pcc1 behavior.
+
+- **`sample` names the leaf; only `cProfile` names the caller.** A stripped pcc1
+  gives `sample` nothing but C leaves, and acting on them is how you optimize the
+  wrong function: the leaf `_dot_numeric_text_key_id` was genuinely 100M calls,
+  but memoizing it measured 1.6x because the real defect was a caller scanning a
+  whole dict on every miss (fixed: 1.89x, byte-identical output). Get Python-level
+  attribution on a representative input before editing. A microbenchmark that
+  contradicts a profile is evidence, not noise -- record the denial.
+
+- **One change per expensive verification.** Three changes landed together cost
+  a full bisection when the run failed. If a batch is unavoidable, make each
+  change individually revertible and bisect by disabling, not by rewriting.
 
 ## Debugging Playbook
 
@@ -762,12 +923,12 @@ do not claim the fix if stage1→stage2→stage3 is not demonstrated.
 Recommended focused gates for high-risk changes:
 
 ```bash
-env -u LC_ALL uv run pytest tests/c/test_c_parser.py -q -n0
-env -u LC_ALL uv run pytest 'tests/c/test_lua.py::test_onelua_compile_and_link' -q -n0
-env -u LC_ALL uv run pytest 'tests/c/test_lua.py::test_pcc_runtime_matches_native[math.lua]' -q -n0
-env -u LC_ALL uv run pytest tests/c/test_lz4.py -q -n0
-env -u LC_ALL uv run pytest tests/integration/test_sqlite.py -q -n0
-env -u LC_ALL uv run pytest tests/c/test_unsigned_loads.py -q -n0
+gtimeout 120s env -u LC_ALL uv run pytest tests/c/test_c_parser.py -q -x -n0
+gtimeout 120s env -u LC_ALL uv run pytest 'tests/c/test_lua.py::test_onelua_compile_and_link' -q -x -n0
+gtimeout 120s env -u LC_ALL uv run pytest 'tests/c/test_lua.py::test_pcc_runtime_matches_native[math.lua]' -q -x -n0
+gtimeout 120s env -u LC_ALL uv run pytest tests/c/test_lz4.py -q -x -n0
+gtimeout 120s env -u LC_ALL uv run pytest tests/integration/test_sqlite.py -q -x -n0
+gtimeout 120s env -u LC_ALL uv run pytest tests/c/test_unsigned_loads.py -q -x -n0
 ```
 
 Python frontend / bootstrap gates: see *Python Frontend / Bootstrap* above.
@@ -788,8 +949,8 @@ GC backend gates: see *Runtime & GC Backends* above.
 Commit-level bootstrap validation (mandatory before considering work complete):
 
 ```bash
-env -u LC_ALL uv run pytest tests/python/test_bootstrap_gate_baseline.py -q -n0
-env -u LC_ALL uv run pytest tests/python/test_fallback_baseline.py tests/python/test_ir_py_fallback_baseline.py -q -n0
+gtimeout 120s env -u LC_ALL uv run pytest tests/python/test_bootstrap_gate_baseline.py -q -x -n0
+gtimeout 120s env -u LC_ALL uv run pytest tests/python/test_fallback_baseline.py tests/python/test_ir_py_fallback_baseline.py -q -x -n0
 ```
 
 Repair principle: prefer elegant fixes (API/ABI correctness, boundary semantics, readability, and maintainability). When possible, prioritize bootstrap-driven capability first and then add compatibility patches as follow-up.
@@ -857,6 +1018,27 @@ inline so they bind even if the linked file is skipped:
   `## Update` block or link to it as predecessor. One investigation = one file
   under `docs/investigations/<specific-slug>.md`; existing files are historical
   record — never delete or rewrite them.
+- **Read the matching investigation END TO END before writing any code, and
+  read its `[DENIED]` and "did not help" sections first.** They are the most
+  valuable part of the file and the part agents skip. Every one of them is a
+  fix somebody already wrote, measured, and disproved — re-deriving it costs a
+  full rebuild/measure cycle and produces a change that is known not to work.
+  These docs are long on purpose. Skimming the headings is not reading them.
+  If you are about to make a change that an investigation already recorded as
+  refuted, you must either cite new evidence that overturns that verdict, or
+  not make the change. Concrete recurring examples this rule exists for:
+  - A `sample`/profiler "direct child" is often a **grandchild** whose parent
+    frame the tail-call pass elided. Read the real lowered IR for the function
+    (from the bootstrap's own `self_backend_module_*.ll`, not a standalone
+    `--python-library` emit, which can lower a closure to a `raise` stub)
+    before believing a caller attribution or optimizing the wrong callee.
+  - A profile tells you **where to look**, not what to change. Changes made
+    from profile shape alone have repeatedly measured zero or negative;
+    the wins came from reading the code and the IR at the spot the profile
+    pointed to.
+  - `pcc/py_runtime/build_py/*.o` is keyed by **source** hash and does not
+    invalidate when the compiler changes, so a codegen change measured without
+    wiping the objects measures nothing.
 - **Regenerate the index** after adding/editing any `docs/investigations/*.md`:
   ```bash
   env -u LC_ALL uv run python scripts/regen_investigations_index.py

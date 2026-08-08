@@ -32,6 +32,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .manager import AnalysisKey, AnalysisManager, AnalysisResult, PreservedAnalyses
+from .integer_fold_contract import (
+    FOLD_CONSTANT,
+    fold_llvm_integer_binary,
+    fold_llvm_integer_compare,
+)
 
 
 @dataclass(frozen=True)
@@ -120,6 +125,7 @@ def evaluate_binary(
     op: str,
     lhs: LatticeValue,
     rhs: LatticeValue,
+    flags=(),
 ) -> LatticeValue:
     """Fold a binary op applied to two lattice values."""
     if lhs.is_top() or rhs.is_top():
@@ -128,52 +134,15 @@ def evaluate_binary(
         return _OVERDEF
     assert lhs.bit_width == rhs.bit_width, "bit-width mismatch"
     w = lhs.bit_width or 32
-    a = _to_unsigned(lhs.constant or 0, w)
-    b = _to_unsigned(rhs.constant or 0, w)
-    sa = _to_signed(a, w)
-    sb = _to_signed(b, w)
-
-    if op == "add":
-        return LatticeValue.const(_to_unsigned(a + b, w), w)
-    if op == "sub":
-        return LatticeValue.const(_to_unsigned(a - b, w), w)
-    if op == "mul":
-        return LatticeValue.const(_to_unsigned(a * b, w), w)
-    if op == "udiv":
-        if b == 0:
-            return _OVERDEF
-        return LatticeValue.const(a // b, w)
-    if op == "sdiv":
-        if sb == 0:
-            return _OVERDEF
-        # C99/LLVM: truncation toward zero.
-        q = abs(sa) // abs(sb)
-        if (sa < 0) ^ (sb < 0):
-            q = -q
-        return LatticeValue.const(_to_unsigned(q, w), w)
-    if op == "urem":
-        if b == 0:
-            return _OVERDEF
-        return LatticeValue.const(a % b, w)
-    if op == "srem":
-        if sb == 0:
-            return _OVERDEF
-        q = abs(sa) // abs(sb)
-        if (sa < 0) ^ (sb < 0):
-            q = -q
-        return LatticeValue.const(_to_unsigned(sa - q * sb, w), w)
-    if op == "and":
-        return LatticeValue.const(a & b, w)
-    if op == "or":
-        return LatticeValue.const(a | b, w)
-    if op == "xor":
-        return LatticeValue.const(a ^ b, w)
-    if op == "shl":
-        return LatticeValue.const(_to_unsigned(a << b, w), w)
-    if op == "lshr":
-        return LatticeValue.const(a >> b, w)
-    if op == "ashr":
-        return LatticeValue.const(_to_unsigned(sa >> b, w), w)
+    status, value = fold_llvm_integer_binary(
+        op,
+        w,
+        lhs.constant or 0,
+        rhs.constant or 0,
+        flags,
+    )
+    if status == FOLD_CONSTANT:
+        return LatticeValue.const(value, w)
     return _OVERDEF
 
 
@@ -188,31 +157,14 @@ def evaluate_compare(
     if lhs.is_overdefined() or rhs.is_overdefined():
         return _OVERDEF
     w = lhs.bit_width or 32
-    a = _to_unsigned(lhs.constant or 0, w)
-    b = _to_unsigned(rhs.constant or 0, w)
-    sa = _to_signed(a, w)
-    sb = _to_signed(b, w)
-
-    if pred == "eq":
-        return LatticeValue.const(1 if a == b else 0, 1)
-    if pred == "ne":
-        return LatticeValue.const(1 if a != b else 0, 1)
-    if pred == "ult":
-        return LatticeValue.const(1 if a < b else 0, 1)
-    if pred == "ule":
-        return LatticeValue.const(1 if a <= b else 0, 1)
-    if pred == "ugt":
-        return LatticeValue.const(1 if a > b else 0, 1)
-    if pred == "uge":
-        return LatticeValue.const(1 if a >= b else 0, 1)
-    if pred == "slt":
-        return LatticeValue.const(1 if sa < sb else 0, 1)
-    if pred == "sle":
-        return LatticeValue.const(1 if sa <= sb else 0, 1)
-    if pred == "sgt":
-        return LatticeValue.const(1 if sa > sb else 0, 1)
-    if pred == "sge":
-        return LatticeValue.const(1 if sa >= sb else 0, 1)
+    status, value = fold_llvm_integer_compare(
+        pred,
+        w,
+        lhs.constant or 0,
+        rhs.constant or 0,
+    )
+    if status == FOLD_CONSTANT:
+        return LatticeValue.const(value, 1)
     return _OVERDEF
 
 

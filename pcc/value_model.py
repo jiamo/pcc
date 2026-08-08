@@ -128,6 +128,142 @@ class array:
         return self.values[integer]
 
 
+_I64_MIN = -(1 << 63)
+_I64_MAX = (1 << 63) - 1
+_GUARDED_LOOP_COUNTER_NAMES = (
+    "candidate",
+    "guard_hit",
+    "guard_miss",
+    "overflow",
+    "scalar_fallback",
+    "fast_result",
+)
+_GUARDED_LOOP_COUNTERS = {name: 0 for name in _GUARDED_LOOP_COUNTER_NAMES}
+
+
+class _I64BufferAlias:
+    """Host-Python constructor for one fixed-length readonly i64 buffer."""
+
+    def __init__(self, length: int) -> None:
+        if type(length) is not int:
+            raise TypeError("pcc.i64_buffer length must be an integer literal")
+        if length < 1 or length > 1_048_576:
+            raise ValueError("pcc.i64_buffer length must be between 1 and 1048576")
+        self.length = length
+
+    def __call__(self, *values: int) -> bytes:
+        if len(values) != self.length:
+            raise TypeError(
+                f"pcc.i64_buffer[{self.length}] expects exactly "
+                f"{self.length} elements"
+            )
+        out = bytearray(self.length * 8)
+        for index, value in enumerate(values):
+            if type(value) is not int:
+                raise TypeError(
+                    f"pcc.i64_buffer element {index + 1} must be an exact int"
+                )
+            if value < _I64_MIN or value > _I64_MAX:
+                raise OverflowError(
+                    f"pcc.i64_buffer element {index + 1} does not fit signed i64"
+                )
+            out[index * 8 : index * 8 + 8] = value.to_bytes(
+                8,
+                "little",
+                signed=True,
+            )
+        return bytes(out)
+
+
+class i64_buffer:
+    """Fixed-length readonly signed-i64 buffer surface.
+
+    The public value is an ordinary immutable ``bytes`` object.  The distinct
+    subscription syntax carries the element count into pcc's typed frontend;
+    it does not introduce a second runtime object layout.
+    """
+
+    def __init__(self, *values: int) -> None:
+        raise TypeError("construct buffers as pcc.i64_buffer[N](...)")
+
+    @classmethod
+    def __class_getitem__(cls, length: object) -> _I64BufferAlias:
+        if type(length) is not int:
+            raise TypeError("pcc.i64_buffer length must be an integer literal")
+        return _I64BufferAlias(length)
+
+
+def _i64_buffer_values(value: object, label: str) -> tuple[int, ...]:
+    if not isinstance(value, (bytes, bytearray, memoryview)):
+        raise TypeError(f"{label} must be a bytes-like signed-i64 buffer")
+    raw = bytes(value)
+    if len(raw) % 8 != 0:
+        raise ValueError(f"{label} byte length must be divisible by 8")
+    return tuple(
+        int.from_bytes(raw[offset : offset + 8], "little", signed=True)
+        for offset in range(0, len(raw), 8)
+    )
+
+
+def _guarded_i64_dot_scalar(left: object, right: object) -> int:
+    left_values = _i64_buffer_values(left, "left buffer")
+    right_values = _i64_buffer_values(right, "right buffer")
+    if len(left_values) != len(right_values):
+        raise ValueError("guarded_i64_dot buffers must have equal lengths")
+    result = 0
+    for index in range(len(left_values)):
+        result = result + left_values[index] * right_values[index]
+    return result
+
+
+def guarded_i64_dot(left: object, right: object) -> int:
+    """Dot product with an exact checked-i64 fast lane and Python-int fallback.
+
+    Exact immutable ``bytes`` values take the host oracle's fast lane.  A type
+    guard miss or checked multiply/add overflow restarts the scalar operation
+    at index zero, preserving Python arbitrary-precision integer semantics.
+    Compiled pcc code lowers the same contract to owner-neutral IR.
+    """
+
+    _GUARDED_LOOP_COUNTERS["candidate"] += 1
+    if type(left) is not bytes or type(right) is not bytes or left is right:
+        _GUARDED_LOOP_COUNTERS["guard_miss"] += 1
+        _GUARDED_LOOP_COUNTERS["scalar_fallback"] += 1
+        return _guarded_i64_dot_scalar(left, right)
+
+    left_values = _i64_buffer_values(left, "left buffer")
+    right_values = _i64_buffer_values(right, "right buffer")
+    if len(left_values) != len(right_values):
+        _GUARDED_LOOP_COUNTERS["guard_miss"] += 1
+        _GUARDED_LOOP_COUNTERS["scalar_fallback"] += 1
+        return _guarded_i64_dot_scalar(left, right)
+
+    _GUARDED_LOOP_COUNTERS["guard_hit"] += 1
+    result = 0
+    for index in range(len(left_values)):
+        product = left_values[index] * right_values[index]
+        if product < _I64_MIN or product > _I64_MAX:
+            _GUARDED_LOOP_COUNTERS["overflow"] += 1
+            _GUARDED_LOOP_COUNTERS["scalar_fallback"] += 1
+            return _guarded_i64_dot_scalar(left, right)
+        updated = result + product
+        if updated < _I64_MIN or updated > _I64_MAX:
+            _GUARDED_LOOP_COUNTERS["overflow"] += 1
+            _GUARDED_LOOP_COUNTERS["scalar_fallback"] += 1
+            return _guarded_i64_dot_scalar(left, right)
+        result = updated
+    _GUARDED_LOOP_COUNTERS["fast_result"] += 1
+    return result
+
+
+def guarded_loop_counter(name: str) -> int:
+    """Return one process-local host-oracle guarded-loop counter."""
+
+    if name not in _GUARDED_LOOP_COUNTERS:
+        raise ValueError("unknown guarded-loop counter " + repr(name))
+    return _GUARDED_LOOP_COUNTERS[name]
+
+
 def valueclass(
     cls: type[T] | None = None, **kwargs: Any
 ) -> type[T] | Callable[[type[T]], type[T]]:

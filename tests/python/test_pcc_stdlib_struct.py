@@ -13,9 +13,20 @@ format codes are out of scope (the port is intentionally minimal).
 """
 from __future__ import annotations
 
+import os
+from pathlib import Path
+import subprocess
 import struct as _cpy_struct
+import sys
+import textwrap
 
 import pytest
+
+from pcc1_gate import find_current_pcc1, skip_or_fail_no_current_pcc1
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+FLOAT_BITS_SOURCE = REPO_ROOT / "pcc" / "stdlib" / "_float_bits.py"
 
 
 @pytest.fixture(scope="module")
@@ -25,6 +36,54 @@ def pcc_struct():
     import importlib
     import pcc.stdlib  # ensures the package is on sys.path
     return importlib.import_module("pcc.stdlib.struct")
+
+
+@pytest.fixture(scope="module")
+def native_struct():
+    """Ordinary ``import struct`` provider used by compiled pcc modules."""
+    import importlib
+
+    return importlib.import_module("pcc.py_stdlib.struct")
+
+
+@pytest.mark.parametrize(
+    "fmt,values",
+    [
+        ("<8sHBBI", (b"PCCSMAP1", 1, 2, 8, 7)),
+        ("<QQIIII", (1, 2, 3, 4, 5, 6)),
+        ("<QIIIHHBBHI", (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)),
+        ("<BBHHhiI", (1, 2, 3, 4, -1, -7, 8)),
+    ],
+)
+def test_native_struct_object_matches_precise_stackmap_layouts(
+    native_struct,
+    fmt,
+    values,
+):
+    shape = native_struct.Struct(fmt)
+    expected = _cpy_struct.Struct(fmt)
+    assert shape.size == expected.size
+    payload = shape.pack(*values)
+    assert payload == expected.pack(*values)
+    assert shape.unpack(payload) == expected.unpack(payload)
+    padded = b"xx" + payload + b"yy"
+    assert shape.unpack_from(padded, 2) == values
+
+
+def test_native_struct_pack_into_matches_cpython(native_struct):
+    fmt = "<IIQ"
+    expected = bytearray(b"_" * 24)
+    actual = bytearray(expected)
+    _cpy_struct.pack_into(fmt, expected, 3, 4, 5, 6)
+    native_struct.pack_into(fmt, actual, 3, 4, 5, 6)
+    assert actual == expected
+
+
+def test_float_bits_negative_zero_does_not_depend_on_string_rendering():
+    source = FLOAT_BITS_SOURCE.read_text(encoding="utf-8")
+    assert "str(f)" not in source
+    assert "repr(f)" not in source
+    assert 'float("' not in source
 
 
 # ---------------------------------------------------------------------------
@@ -47,6 +106,17 @@ def pcc_struct():
     (">e", 1.0),
     (">e", -1.0),
     (">e", 0.5),
+    (">d", 2.0 ** -1074),
+    (">d", -(2.0 ** -1074)),
+    (">d", float.fromhex("0x0.fffffffffffffp-1022")),
+    (">f", 2.0 ** -149),
+    (">f", -(2.0 ** -149)),
+    (">f", (2.0 ** -126) - (2.0 ** -149)),
+    (">f", (2.0 ** -126) - (2.0 ** -150)),
+    (">e", 2.0 ** -24),
+    (">e", -(2.0 ** -24)),
+    (">e", (2.0 ** -14) - (2.0 ** -24)),
+    (">e", (2.0 ** -14) - (2.0 ** -25)),
 ])
 def test_pack_matches_cpython(pcc_struct, fmt, value):
     expected = _cpy_struct.pack(fmt, value)
@@ -77,6 +147,87 @@ def test_pack_then_unpack_round_trips(pcc_struct, fmt, value):
         assert actual_unpacked != actual_unpacked
     else:
         assert actual_unpacked == expected_unpacked
+
+
+@pytest.mark.parametrize(
+    "fmt,value",
+    [
+        (">f", 2.0 ** -150),
+        (">f", 3.0 * (2.0 ** -150)),
+        (">f", (2.0 ** -150) + (2.0 ** -151)),
+        (">e", 2.0 ** -25),
+        (">e", 3.0 * (2.0 ** -25)),
+        (">e", (2.0 ** -25) + (2.0 ** -26)),
+    ],
+)
+def test_subnormal_halfway_cases_round_to_even(pcc_struct, fmt, value):
+    expected = _cpy_struct.pack(fmt, value)
+    actual = pcc_struct.pack(fmt, value)
+    assert actual == expected
+    assert pcc_struct.unpack(fmt, actual) == _cpy_struct.unpack(fmt, expected)
+
+
+@pytest.mark.parametrize("fmt", [">d", ">f", ">e"])
+def test_negative_zero_preserves_its_sign_bit(pcc_struct, fmt):
+    assert pcc_struct.pack(fmt, -0.0) == _cpy_struct.pack(fmt, -0.0)
+
+
+@pytest.mark.parametrize("fmt,value", [(">f", 1e40), (">e", 1e10)])
+def test_finite_overflow_matches_cpython(pcc_struct, fmt, value):
+    with pytest.raises(OverflowError) as expected:
+        _cpy_struct.pack(fmt, value)
+    with pytest.raises(OverflowError) as actual:
+        pcc_struct.pack(fmt, value)
+    assert str(actual.value) == str(expected.value)
+
+
+@pytest.mark.parametrize("fmt", [">d", ">f", ">e"])
+@pytest.mark.parametrize("value", [float("inf"), float("-inf"), float("nan")])
+def test_nonfinite_pack_class_matches_cpython(pcc_struct, fmt, value):
+    expected = _cpy_struct.pack(fmt, value)
+    actual = pcc_struct.pack(fmt, value)
+    if value == value:
+        assert actual == expected
+    else:
+        payload_and_exponent = int.from_bytes(actual, "big") & (
+            (1 << (8 * len(actual) - 1)) - 1
+        )
+        assert payload_and_exponent != 0
+
+
+def test_every_binary16_finite_pattern_round_trips_exactly(pcc_struct):
+    for raw_bits in range(1 << 16):
+        raw = raw_bits.to_bytes(2, "big")
+        expected = _cpy_struct.unpack(">e", raw)[0]
+        actual = pcc_struct.unpack(">e", raw)[0]
+        if expected != expected:
+            assert actual != actual
+            continue
+        assert pcc_struct.pack(">d", actual) == _cpy_struct.pack(">d", expected)
+        assert pcc_struct.pack(">e", expected) == raw
+
+
+@pytest.mark.parametrize(
+    "fmt,raw_bits,width",
+    [
+        (">d", 0x0000000000000001, 8),
+        (">d", 0x000FFFFFFFFFFFFF, 8),
+        (">d", 0x8000000000000001, 8),
+        (">f", 0x00000001, 4),
+        (">f", 0x007FFFFF, 4),
+        (">f", 0x80000001, 4),
+    ],
+)
+def test_binary32_and_binary64_subnormal_decode_matches_cpython(
+    pcc_struct,
+    fmt,
+    raw_bits,
+    width,
+):
+    raw = raw_bits.to_bytes(width, "big")
+    expected = _cpy_struct.unpack(fmt, raw)[0]
+    actual = pcc_struct.unpack(fmt, raw)[0]
+    assert pcc_struct.pack(">d", actual) == _cpy_struct.pack(">d", expected)
 
 
 @pytest.mark.parametrize("value", [0, 1, 42, 0xFF, 0xFFFFFFFF, 0xFFFFFFFFFFFFFFFF])
@@ -117,3 +268,84 @@ def test_ir_py_float32_round_pattern(pcc_struct, value):
     expected = _cpy_struct.unpack(">f", _cpy_struct.pack(">f", value))[0]
     actual = pcc_struct.unpack(">f", pcc_struct.pack(">f", value))[0]
     assert actual == expected
+
+
+@pytest.mark.integration
+def test_host_pcc_and_current_pcc1_pack_subnormals_without_libpython(
+    tmp_path: Path,
+    pcc_py_runtime_archive: Path,
+):
+    pcc1 = find_current_pcc1(REPO_ROOT)
+    if pcc1 is None:
+        skip_or_fail_no_current_pcc1(
+            "no current pcc1 for IEEE subnormal struct parity"
+        )
+        return
+
+    source = tmp_path / "struct_subnormal.py"
+    source.write_text(
+        textwrap.dedent(
+            """
+            import struct
+
+            def power2_negative(count: int) -> float:
+                value = 1.0
+                index = 0
+                while index < count:
+                    value = value * 0.5
+                    index = index + 1
+                return value
+
+            print(struct.pack(">d", power2_negative(1074)))
+            print(struct.pack(">d", -0.0))
+            print(struct.pack(">f", power2_negative(149)))
+            print(struct.pack(">e", power2_negative(24)))
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    expected = subprocess.run(
+        [sys.executable, str(source)],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=True,
+    ).stdout
+    env = os.environ.copy()
+    env.pop("LC_ALL", None)
+    env["PCC_RUNTIME_ARCHIVE"] = str(pcc_py_runtime_archive)
+    for label, compiler in (
+        ("host-pcc", ["uv", "run", "pcc"]),
+        ("current-pcc1", [str(pcc1)]),
+    ):
+        executable = tmp_path / ("struct_subnormal_" + label)
+        compiled = subprocess.run(
+            compiler
+            + [
+                "--backend=self",
+                "--python-libpython=off",
+                "--ir-scaffold=on",
+                str(source),
+                "-o",
+                str(executable),
+            ],
+            cwd=REPO_ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=180,
+        )
+        assert compiled.returncode == 0, (
+            label + ": " + compiled.stdout + compiled.stderr
+        )
+        run = subprocess.run(
+            [str(executable)],
+            cwd=REPO_ROOT,
+            env=env,
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        assert run.returncode == 0, label + ": " + run.stdout + run.stderr
+        assert run.stdout == expected, label

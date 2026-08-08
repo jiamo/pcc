@@ -40,6 +40,20 @@ REQUIRED_V2_TASK_FIELDS = {
     "exit_criteria",
 }
 
+MAX_OPEN_BOUNDARY_CHARS = 2000
+MAX_TASK_EXPANSION_LIMIT = 6
+REQUIRED_OPEN_PERFORMANCE_FIELDS = {
+    "scope_limit",
+    "baseline_metric",
+    "success_threshold",
+    "failure_disposition",
+}
+PERFORMANCE_EXECUTION_STATUSES = VALID_STATUSES - {
+    "DISCOVERED",
+    "TODO_NEEDS_DESIGN",
+    "DONE_STRONG",
+}
+
 
 def _parse_scalar(raw: str) -> Any:
     raw = raw.strip()
@@ -169,6 +183,58 @@ def validate(board: dict[str, Any], root: Path = ROOT) -> list[str]:
         open_boundary = task.get("open_boundary", "")
         if status == "DONE_STRONG" and open_boundary:
             errors.append(f"{task_id}: DONE_STRONG must have empty open_boundary")
+        if (
+            isinstance(open_boundary, str)
+            and len(open_boundary) > MAX_OPEN_BOUNDARY_CHARS
+        ):
+            errors.append(
+                f"{task_id}: open_boundary exceeds "
+                f"{MAX_OPEN_BOUNDARY_CHARS} characters"
+            )
+
+        track = task.get("track", "")
+        is_open_performance = (
+            status != "DONE_STRONG"
+            and isinstance(track, str)
+            and track.startswith("performance/")
+        )
+        if is_open_performance:
+            scope_limit = task.get("scope_limit")
+            if not isinstance(scope_limit, str) or not scope_limit.strip():
+                errors.append(
+                    f"{task_id}: unfinished performance task missing scope_limit"
+                )
+        if is_open_performance and status in PERFORMANCE_EXECUTION_STATUSES:
+            for field in sorted(REQUIRED_OPEN_PERFORMANCE_FIELDS - {"scope_limit"}):
+                value = task.get(field)
+                if not isinstance(value, str) or not value.strip():
+                    errors.append(
+                        f"{task_id}: execution-ready performance task missing {field}"
+                    )
+            baseline_evidence = task.get("baseline_evidence")
+            if not isinstance(baseline_evidence, str) or not baseline_evidence.strip():
+                errors.append(
+                    f"{task_id}: execution-ready performance task missing "
+                    "baseline_evidence"
+                )
+            elif not (root / baseline_evidence).exists():
+                errors.append(
+                    f"{task_id}: baseline_evidence missing: {baseline_evidence}"
+                )
+
+        if task.get("produces_tasks") is True:
+            expansion_limit = task.get("task_expansion_limit")
+            if (
+                not isinstance(expansion_limit, int)
+                or isinstance(expansion_limit, bool)
+                or expansion_limit < 1
+                or expansion_limit > MAX_TASK_EXPANSION_LIMIT
+            ):
+                errors.append(
+                    f"{task_id}: produces_tasks requires a positive "
+                    "task_expansion_limit no greater than "
+                    f"{MAX_TASK_EXPANSION_LIMIT}"
+                )
 
         if version >= 2:
             missing = sorted(REQUIRED_V2_TASK_FIELDS - task.keys())

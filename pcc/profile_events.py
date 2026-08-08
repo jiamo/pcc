@@ -8,11 +8,10 @@ large dependency cycle.
 """
 from __future__ import annotations
 
-from contextlib import contextmanager
 from dataclasses import dataclass, field
 import json
 import time
-from typing import Any, Iterator, Optional
+from typing import Any, Optional
 
 
 @dataclass(frozen=True)
@@ -34,6 +33,40 @@ class ProfileEvent:
         }
 
 
+class _ProfilePhase:
+    """Self-hostable context manager for one timed profile phase."""
+
+    def __init__(
+        self,
+        recorder,
+        name: str,
+        category: str,
+        metadata: Optional[dict[str, Any]],
+    ) -> None:
+        self.recorder = recorder
+        self.name = name
+        self.category = category
+        self.metadata = dict(metadata or {})
+        self.start_ns = 0
+
+    def __enter__(self):
+        self.start_ns = time.perf_counter_ns()
+        return None
+
+    def __exit__(self, exc_type, exc_value, traceback) -> bool:
+        end_ns = time.perf_counter_ns()
+        recorder = self.recorder
+        recorder.events.append(ProfileEvent(
+            name=self.name,
+            category=self.category,
+            start_ns=self.start_ns - recorder.started_ns,
+            duration_ns=end_ns - self.start_ns,
+            metadata=dict(self.metadata),
+        ))
+        # Never suppress the exception raised by the profiled phase.
+        return False
+
+
 class ProfileRecorder:
     def __init__(self, *, schema: str = "pcc.profile.v1") -> None:
         self.schema = schema
@@ -42,26 +75,14 @@ class ProfileRecorder:
         self.counters: dict[str, int] = {}
         self.metadata: dict[str, Any] = {}
 
-    @contextmanager
     def phase(
         self,
         name: str,
         *,
         category: str = "phase",
         metadata: Optional[dict[str, Any]] = None,
-    ) -> Iterator[None]:
-        start = time.perf_counter_ns()
-        try:
-            yield
-        finally:
-            end = time.perf_counter_ns()
-            self.events.append(ProfileEvent(
-                name=name,
-                category=category,
-                start_ns=start - self.started_ns,
-                duration_ns=end - start,
-                metadata=dict(metadata or {}),
-            ))
+    ) -> _ProfilePhase:
+        return _ProfilePhase(self, name, category, metadata)
 
     def record_event(
         self,

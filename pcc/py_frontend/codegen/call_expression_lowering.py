@@ -31,9 +31,16 @@ from ..py_ast import (
     TupleType,
     ValueArrayType,
 )
+from .bootstrap_trace import bootstrap_trace_enabled
 from . import marshal
 from .builtin_exceptions import BUILTIN_EXC_TAG as _BUILTIN_EXC_TAG
 from .errors import L1CodegenError
+from .generator_lowering import emit_generator_may_park_call
+from .guarded_loop_lowering import (
+    emit_guarded_i64_dot,
+    emit_guarded_loop_counter,
+    emit_i64_buffer_constructor,
+)
 
 _I1 = ir.IntType(1)
 _I32 = ir.IntType(32)
@@ -384,6 +391,7 @@ class CallExpressionLoweringMixin:
                 [dict_obj, key_obj],
                 name=self._fresh("method.dict.fallback.fn"),
             )
+            self._emit_post_call_err_check(self._expr_span_or_none(expr))
             args_owned = not self._is_starred_unpack(expr.args)
             args_tuple = self._emit_dynamic_call_args_tuple(expr.args)
             kwargs_obj = self._emit_dynamic_call_kwargs_object(
@@ -495,6 +503,12 @@ class CallExpressionLoweringMixin:
             self.builder.position_at_end(continue_bb)
 
         for class_name, info in self.class_lowering.classes.items():
+            if class_name in getattr(
+                self,
+                "_hoisted_class_capture_params",
+                {},
+            ):
+                continue
             cls_obj = self.builder.load(
                 info.global_var,
                 name=self._fresh(f"globals.cls.{class_name}"),
@@ -555,7 +569,16 @@ class CallExpressionLoweringMixin:
         while i < len(args):
             arg = args[i]
             if isinstance(arg, Call):
-                raw = self._emit_expr(arg)
+                if isinstance(arg.ty, IntType):
+                    # Stage an `int` argument as an OBJECT, never as a raw i64.
+                    # `_emit_expr` unboxes an int-typed call, and an i64 staging
+                    # slot cannot hold a bignum: `Lit(int(text, 0))` silently
+                    # became `Lit(0)` above 2**63-1 while the same value through
+                    # a local was fine.  `int` is arbitrary-precision, so its
+                    # staging slot has to be the object projection.
+                    raw = self._emit_exact_int_operand_object(arg)
+                else:
+                    raw = self._emit_expr(arg)
                 base = "__pcc_ctor_arg_" + str(i) + "_" + str(len(self.env))
                 name = base
                 suffix = 0
@@ -722,7 +745,7 @@ class CallExpressionLoweringMixin:
         return False
 
     def _emit_call(self, expr: Call) -> ir.Value:
-        if self.module.name == "pcc.parse.py_lift":
+        if bootstrap_trace_enabled(self.module.name):
             import os
             import sys
 
@@ -751,10 +774,18 @@ class CallExpressionLoweringMixin:
         value_array = self._maybe_emit_value_array_constructor(expr)
         if value_array is not None:
             return value_array
+        i64_buffer = emit_i64_buffer_constructor(self, expr)
+        if i64_buffer is not None:
+            return i64_buffer
         func_expr = expr.func
         func_name = _call_name_ident(func_expr)
         func_attr_name = _call_attr_name(func_expr)
         func_attr_obj = _call_attr_obj(func_expr)
+        pcc_intrinsic = self._native_builtin_value_kind_for_expr(func_expr)
+        if pcc_intrinsic == "pcc.guarded_i64_dot":
+            return emit_guarded_i64_dot(self, expr)
+        if pcc_intrinsic == "pcc.guarded_loop_counter":
+            return emit_guarded_loop_counter(self, expr)
         if (
             (func_name == "cast")
             or (
@@ -803,6 +834,7 @@ class CallExpressionLoweringMixin:
                         "expr",
                         expr.args,
                         expr.kwargs,
+                        expr.operand_order,
                     )
                 return self._emit_cpy_func_call(fn_val, "expr", expr.args)
             kwdict_unpack = self._split_starstar_kwargs_unpack(expr.args)
@@ -829,6 +861,18 @@ class CallExpressionLoweringMixin:
             self._emit_post_call_err_check(self._expr_span_or_none(expr))
             return result
         name = func_name
+        # A closed-world ``may_park`` callee has a generator ABI even though
+        # source code uses an ordinary blocking-looking call.  While lowering
+        # its affected caller, transparently drive/delegate that child state
+        # machine so the expression resumes with the callee's actual return
+        # value instead of exposing a generator object to user code.
+        if (
+            len(getattr(self, "_generator_ctx_stack", ())) > 0
+            and name in getattr(self, "_vthread_may_park_func_names", set())
+        ):
+            delegated = emit_generator_may_park_call(self, expr, name)
+            if delegated is not None:
+                return delegated
         unsafe_intrinsic = self._unsafe_intrinsic_for_name(name)
         if unsafe_intrinsic is not None:
             return self._emit_unsafe_intrinsic_call(unsafe_intrinsic, expr)
@@ -853,12 +897,26 @@ class CallExpressionLoweringMixin:
             self._emit_print_call(expr)
             return ir.Constant(_I1, 0)
         if name == "__import__" and len(expr.args) == 1 and not expr.kwargs:
-            imported = self._native_importlib_literal_module(expr)
+            imported = self._native_literal_dunder_import_module(expr)
             if imported is not None:
                 return self._emit_native_module_placeholder(imported)
             if isinstance(expr.args[0], StrLit):
+                if expr.args[0].value == "":
+                    self._emit_builtin_exception_and_branch(
+                        "ValueError",
+                        "Empty module name",
+                        self._expr_span_or_none(expr),
+                    )
+                    return ir.Constant(_CSTR, None)
+                if "\x00" in expr.args[0].value:
+                    self._emit_builtin_exception_and_branch(
+                        "ValueError",
+                        "module name contains a null character",
+                        self._expr_span_or_none(expr),
+                    )
+                    return ir.Constant(_CSTR, None)
                 self._emit_builtin_exception_and_branch(
-                    "ImportError",
+                    "ModuleNotFoundError",
                     f"No module named {expr.args[0].value!r}",
                     self._expr_span_or_none(expr),
                 )
@@ -936,6 +994,7 @@ class CallExpressionLoweringMixin:
         if builtin_value in (
             "math.floor",
             "math.ceil",
+            "math.copysign",
             "math.sqrt",
             "math.pow",
             "math.trunc",
@@ -1005,6 +1064,7 @@ class CallExpressionLoweringMixin:
                 builtin_value,
                 expr.args,
                 expr.kwargs,
+                expr,
             )
             if result is not None:
                 return result
@@ -1532,7 +1592,7 @@ class CallExpressionLoweringMixin:
             if result is not None:
                 return result
         if name == "tuple" and len(expr.args) <= 1:
-            if self.module.name == "pcc.parse.py_lift":
+            if bootstrap_trace_enabled(self.module.name):
                 import os
                 import sys
 
@@ -1543,7 +1603,7 @@ class CallExpressionLoweringMixin:
                         + "\n"
                     )
             result = self._maybe_emit_tuple_builtin(expr)
-            if self.module.name == "pcc.parse.py_lift":
+            if bootstrap_trace_enabled(self.module.name):
                 import os
                 import sys
 
@@ -1723,11 +1783,15 @@ class CallExpressionLoweringMixin:
                     "hasattr",
                     tuple(expr.args),
                 )
+                self._guard_cpy_value_not_null(got)
                 as_i32 = self.builder.call(
                     self.runtime["py_cpy_truthy"],
                     [got],
                     name=self._fresh("hasattr.cpy.i32"),
                 )
+                self._guard_cpy_status_not_negative(as_i32, (got,))
+                self.builder.call(self.runtime["py_cpy_decref"], [got])
+                self._forget_owned_cpy_value(got)
                 return self.builder.icmp_signed(
                     "!=",
                     as_i32,
@@ -1892,9 +1956,9 @@ class CallExpressionLoweringMixin:
                 if metaclass_name is not None:
                     meta_info = self.class_lowering.classes.get(metaclass_name)
                     if meta_info is not None and "__call__" in meta_info.methods:
-                        cls_ptr = self.builder.load(
-                            class_info.global_var,
-                            name=self._fresh(".meta.call.cls"),
+                        cls_ptr = self.class_lowering._load_class_object(
+                            class_info,
+                            ".meta.call.cls",
                         )
                         return self._emit_direct_method_call(
                             meta_info.methods["__call__"],
@@ -1929,7 +1993,12 @@ class CallExpressionLoweringMixin:
                         self.runtime["py_obj_setattr"],
                         [
                             inst,
-                            self._attr_name_ptr(f"__pcc_cap_{fv}"),
+                            self._attr_name_ptr(
+                                self.class_lowering.mangle_private_attr_name(
+                                    class_info,
+                                    f"__pcc_cap_{fv}",
+                                )
+                            ),
                             v_obj,
                         ],
                     )
@@ -1953,9 +2022,9 @@ class CallExpressionLoweringMixin:
                 if new_info is not None:
                     new_fn = new_info.methods.get("__new__")
                     if new_fn is not None:
-                        cls_ptr = self.builder.load(
-                            class_info.global_var,
-                            name=self._fresh(f"cls.{class_name}.__new__"),
+                        cls_ptr = self.class_lowering._load_class_object(
+                            class_info,
+                            f"cls.{class_name}.__new__",
                         )
                         return attach_hoisted_class_captures(
                             self._emit_direct_method_call(
@@ -2097,6 +2166,7 @@ class CallExpressionLoweringMixin:
                         name,
                         expr.args,
                         expr.kwargs,
+                        expr.operand_order,
                     )
                 return self._emit_cpy_func_call(fn_val, name, expr.args)
             kwdict_unpack = self._split_starstar_kwargs_unpack(expr.args)
@@ -2126,9 +2196,10 @@ class CallExpressionLoweringMixin:
             # attribute/op lowering uses py_cpy_* (a native getattr on a raw
             # PyObject* segfaults). Mirrors the direct-funcdef path below.
             if self._name_binds_cpy_returning_callable(name):
-                if not hasattr(self, "_cpy_values"):
-                    self._cpy_values = set()
-                self._cpy_values.add(result)
+                # Every callable result crosses this ABI as a new reference.
+                # Downstream CPython consumers therefore own and must consume
+                # it, just like the direct user-function call path.
+                self._mark_owned_cpy_value(result)
             return result
 
         fn = self.functions.get(name)
@@ -2175,6 +2246,7 @@ class CallExpressionLoweringMixin:
                         name,
                         expr.args,
                         expr.kwargs,
+                        expr.operand_order,
                     )
                 return self._emit_cpy_func_call(fn_val, name, expr.args)
             star_val = self._load_from_cpy_star_imports(name)
@@ -2185,6 +2257,7 @@ class CallExpressionLoweringMixin:
                         name,
                         expr.args,
                         expr.kwargs,
+                        expr.operand_order,
                     )
                 return self._emit_cpy_func_call(star_val, name, expr.args)
             # Fallback: route well-known CPython stdlib builtins
@@ -2201,6 +2274,7 @@ class CallExpressionLoweringMixin:
                         name,
                         expr.args,
                         expr.kwargs,
+                        expr.operand_order,
                     )
                 return self._emit_cpy_func_call(fn_val, name, expr.args)
             # Local variable holding a callable (e.g. ``klass = self.
@@ -2228,6 +2302,7 @@ class CallExpressionLoweringMixin:
                             name,
                             expr.args,
                             expr.kwargs,
+                            expr.operand_order,
                         )
                     return self._emit_cpy_func_call(fn_val, name, expr.args)
                 kwdict_unpack = self._split_starstar_kwargs_unpack(expr.args)
@@ -2397,7 +2472,7 @@ class CallExpressionLoweringMixin:
                 runtime_formals.append(a)
             i += 1
         args_ir: list[ir.Value] = []
-        owned_arg_temps: list[ir.Value] = []
+        pinned_arg_temps: list[tuple[ir.Value, bool]] = []
         i = 0
         while i < len(resolved_args) and i < len(runtime_formals) and i < len(fn.args):
             ast_arg = resolved_args[i]
@@ -2410,13 +2485,21 @@ class CallExpressionLoweringMixin:
                     target_ty,
                     box_int_abi=self._should_box_python_ints(),
                 )
-            v = self._emit_arg_for_abi_param(ast_arg, target_ty, param_ir_ty)
+            v = self._emit_arg_for_abi_param_with_cleanup(
+                ast_arg,
+                target_ty,
+                param_ir_ty,
+                tuple(pinned_arg_temps),
+            )
             if (
-                getattr(self, "_last_call_arg_owned_temp", False)
+                not getattr(self, "_freestanding_module", False)
+                and not getattr(self, "_module_has_c_abi_export", False)
                 and isinstance(v.type, ir.PointerType)
                 and v not in getattr(self, "_cpy_values", ())
             ):
-                owned_arg_temps.append(v)
+                owned = getattr(self, "_last_call_arg_owned_temp", False)
+                self._gc_pin(v)
+                pinned_arg_temps.append((v, owned))
             args_ir.append(v)
             i += 1
         call_name = (
@@ -2435,14 +2518,18 @@ class CallExpressionLoweringMixin:
             call_name,
             span=self._expr_span_or_none(expr),
             root_result=self._is_object(ast_func_def.return_ty) and not returns_cpython,
+            pinned_arg_temps=tuple(pinned_arg_temps),
         )
-        for owned_arg in owned_arg_temps:
-            self._gc_release(
-                owned_arg,
-                self._release_context_label("direct_call_arg"),
-            )
+        for arg_value, owned in pinned_arg_temps:
+            self._gc_unpin(arg_value)
+            if owned:
+                self._gc_release(
+                    arg_value,
+                    self._release_context_label("direct_call_arg"),
+                )
         if returns_cpython:
-            if not hasattr(self, "_cpy_values"):
-                self._cpy_values = set()
-            self._cpy_values.add(result)
+            # Python/C-API call convention: a successful function result is
+            # a new reference owned by the caller.  The callee promotes any
+            # borrowed CPython return before returning it.
+            self._mark_owned_cpy_value(result)
         return result

@@ -7,12 +7,15 @@ from ..py_ast import (
     Attr,
     ByteArrayType,
     Call,
+    BoolType,
     DynType,
     ExprStmt,
+    IntType,
     Name,
     Subscript,
 )
 from .errors import L1CodegenError
+from .freestanding_abi_constants import PY_TYPE_BYTEARRAY, PY_TYPE_LIST
 
 _I64 = ir.IntType(64)
 
@@ -44,6 +47,12 @@ class StmtMiscLoweringMixin:
             return
         # Otherwise evaluate for side-effects.
         value = self._emit_expr(expr)
+        if value in getattr(self, "_cpy_values", ()):
+            if self._cpy_value_is_owned(value):
+                self._guard_cpy_value_not_null(value)
+                self.builder.call(self.runtime["py_cpy_decref"], [value])
+                self._forget_owned_cpy_value(value)
+            return
         self._gc_release_if_owned(value, expr)
 
     def _maybe_emit_bytearray_extend_stmt(self, expr: Call) -> bool:
@@ -93,7 +102,7 @@ class StmtMiscLoweringMixin:
         is_bytearray = self.builder.icmp_signed(
             "==",
             tag,
-            ir.Constant(_I64, 18),
+            ir.Constant(_I64, PY_TYPE_BYTEARRAY),
             name=self._fresh("dyn.extend.recv.is_bytearray"),
         )
         fn = self.current_function
@@ -127,7 +136,7 @@ class StmtMiscLoweringMixin:
         is_list = self.builder.icmp_signed(
             "==",
             tag,
-            ir.Constant(_I64, 5),
+            ir.Constant(_I64, PY_TYPE_LIST),
             name=self._fresh("dyn.extend.recv.is_list"),
         )
         self.builder.cbranch(is_list, list_bb, generic_bb)
@@ -237,7 +246,7 @@ class StmtMiscLoweringMixin:
         is_bytearray = self.builder.icmp_signed(
             "==",
             tag,
-            ir.Constant(_I64, 18),
+            ir.Constant(_I64, PY_TYPE_BYTEARRAY),
             name=self._fresh("dyn.append.recv.is_bytearray"),
         )
         fn = self.current_function
@@ -271,7 +280,7 @@ class StmtMiscLoweringMixin:
         is_list = self.builder.icmp_signed(
             "==",
             tag,
-            ir.Constant(_I64, 5),
+            ir.Constant(_I64, PY_TYPE_LIST),
             name=self._fresh("dyn.append.recv.is_list"),
         )
         self.builder.cbranch(is_list, list_bb, generic_bb)
@@ -306,9 +315,18 @@ class StmtMiscLoweringMixin:
             value_expr.ty,
             value_expr,
         )
+        exact_value = None
+        if (
+            value_payload is None
+            and self._walrus_target_needs_exact_int(target)
+            and isinstance(value_expr.ty, (IntType, BoolType))
+        ):
+            exact_value = self._emit_exact_int_operand_object(value_expr)
         value = (
             value_payload
             if value_payload is not None
+            else exact_value
+            if exact_value is not None
             else self._emit_expr(value_expr)
         )
         if isinstance(target, Call) and self._is_walrus_sentinel(target):
@@ -323,11 +341,11 @@ class StmtMiscLoweringMixin:
                 target,
                 value,
                 value_expr.ty,
-                value_is_owned=(
-                    value_payload is None
-                    and self._raw_scaffold_object_rhs_is_owned(value_expr)
-                    and self._expr_returns_owned_object(value_expr)
-                ),
+                # A walrus target and the surrounding expression both own the
+                # value.  Store as borrowed so the binding takes an
+                # independent ref; preserve the original result for the
+                # enclosing assignment/expression consumer.
+                value_is_owned=False,
             )
         else:
             if isinstance(target, Attr):
@@ -351,6 +369,19 @@ class StmtMiscLoweringMixin:
             and expr.func.ident in ("_walrus", "__walrus__")
             and len(expr.args) == 2
         )
+
+    def _walrus_target_needs_exact_int(self, target) -> bool:
+        if isinstance(target, Name):
+            return (
+                target.ident
+                in getattr(self, "_planned_exact_int_local_names", set())
+                and isinstance(target.ty, IntType)
+            )
+        if isinstance(target, Call) and self._is_walrus_sentinel(target):
+            return self._walrus_target_needs_exact_int(
+                target.args[0]
+            ) or self._walrus_target_needs_exact_int(target.args[1])
+        return False
 
     def _store_walrus_single_target(self, target, value: ir.Value, value_ty) -> None:
         if isinstance(target, Name):

@@ -5,6 +5,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 from pcc1_gate import repo_root
 
 REPO = repo_root()
@@ -958,6 +960,7 @@ def _compile_type_vectorcall_extension(tmp_path: Path) -> Path:
         "                             size_t nargsf, PyObject *kwnames) {\n"
         "    Py_ssize_t nargs = (Py_ssize_t)PyVectorcall_NARGS(nargsf);\n"
         "    Py_ssize_t nkwargs = kwnames == NULL ? 0 : PyTuple_Size(kwnames);\n"
+        "    long offset_bonus = (nargsf & PY_VECTORCALL_ARGUMENTS_OFFSET) ? 1000 : 0;\n"
         "    long first = 0;\n"
         "    long second = 0;\n"
         "    (void)self;\n"
@@ -969,8 +972,8 @@ def _compile_type_vectorcall_extension(tmp_path: Path) -> Path:
         "    if (PyErr_Occurred() != NULL) return NULL;\n"
         "    second = PyLong_AsLong(args[1]);\n"
         "    if (PyErr_Occurred() != NULL) return NULL;\n"
-        "    if (nkwargs == 0) return PyLong_FromLong(first * 10 + second);\n"
-        "    return PyLong_FromLong(first * 100 + second * 10 + nkwargs);\n"
+        "    if (nkwargs == 0) return PyLong_FromLong(first * 10 + second + offset_bonus);\n"
+        "    return PyLong_FromLong(first * 100 + second * 10 + nkwargs + offset_bonus);\n"
         "}\n"
         "\n"
         "static PyObject *vector_new(PyTypeObject *type, PyObject *args,\n"
@@ -1071,6 +1074,30 @@ def _compile_type_vectorcall_extension(tmp_path: Path) -> Path:
         "    return result;\n"
         "}\n"
         "\n"
+        "static PyObject *call_method_offset(PyObject *self, PyObject *args) {\n"
+        "    PyObject *storage[4] = {NULL, NULL, NULL, NULL};\n"
+        "    PyObject **values = &storage[1];\n"
+        '    PyObject *name = PyUnicode_FromString("offset_target");\n'
+        "    PyObject *result = NULL;\n"
+        "    (void)args;\n"
+        "    values[0] = self;\n"
+        "    values[1] = PyLong_FromLong(2);\n"
+        "    values[2] = PyLong_FromLong(4);\n"
+        "    if (name == NULL || values[1] == NULL || values[2] == NULL) {\n"
+        "        Py_XDECREF(name);\n"
+        "        Py_XDECREF(values[1]);\n"
+        "        Py_XDECREF(values[2]);\n"
+        "        return NULL;\n"
+        "    }\n"
+        "    result = PyObject_VectorcallMethod(\n"
+        "        name, values, ((size_t)3) | PY_VECTORCALL_ARGUMENTS_OFFSET, NULL\n"
+        "    );\n"
+        "    Py_DECREF(values[1]);\n"
+        "    Py_DECREF(values[2]);\n"
+        "    Py_DECREF(name);\n"
+        "    return result;\n"
+        "}\n"
+        "\n"
         "static PyObject *check_builtin_type(PyObject *self, PyObject *arg) {\n"
         "    (void)self;\n"
         "    return PyLong_FromLong(\n"
@@ -1081,6 +1108,7 @@ def _compile_type_vectorcall_extension(tmp_path: Path) -> Path:
         "static PyMethodDef Methods[] = {\n"
         '    {"make", make_vector, METH_VARARGS, "make a vectorcall object"},\n'
         '    {"call_keyword", call_keyword, METH_VARARGS, "call with keyword"},\n'
+        '    {"call_method_offset", call_method_offset, METH_VARARGS, "preserve vectorcall offset bit"},\n'
         '    {"check_builtin_type", check_builtin_type, METH_O, "check int type token"},\n'
         "    {NULL, NULL, 0, NULL},\n"
         "};\n"
@@ -1090,8 +1118,20 @@ def _compile_type_vectorcall_extension(tmp_path: Path) -> Path:
         "};\n"
         "\n"
         "PyMODINIT_FUNC PyInit_typevcdemo(void) {\n"
+        "    PyObject *module_obj = NULL;\n"
+        "    PyObject *empty = NULL;\n"
+        "    PyObject *target = NULL;\n"
         "    if (PyType_Ready(&VectorType) < 0) return NULL;\n"
-        "    return PyModule_Create(&module);\n"
+        "    module_obj = PyModule_Create(&module);\n"
+        "    if (module_obj == NULL) return NULL;\n"
+        "    empty = PyTuple_New(0);\n"
+        "    if (empty == NULL) return NULL;\n"
+        "    target = vector_new(&VectorType, empty, NULL);\n"
+        "    Py_DECREF(empty);\n"
+        "    if (target == NULL) return NULL;\n"
+        '    if (PyObject_SetAttrString(module_obj, "offset_target", target) != 0) return NULL;\n'
+        "    Py_DECREF(target);\n"
+        "    return module_obj;\n"
         "}\n",
     )
 
@@ -11284,6 +11324,42 @@ def _compile_buffer_extension(tmp_path: Path) -> Path:
         "    return PyLong_FromLong(score);\n"
         "}\n"
         "\n"
+        "static PyObject *buffer_two_live_views_score(PyObject *self, PyObject *args) {\n"
+        "    PyObject *left = NULL;\n"
+        "    PyObject *right = NULL;\n"
+        "    PyObject *left_mv = NULL;\n"
+        "    PyObject *right_mv = NULL;\n"
+        "    Py_buffer *left_view = NULL;\n"
+        "    Py_buffer *right_view = NULL;\n"
+        "    long score = 0;\n"
+        "    (void)self;\n"
+        "    if (!PyArg_ParseTuple(args, \"OO\", &left, &right)) return NULL;\n"
+        "    left_mv = PyMemoryView_FromObject(left);\n"
+        "    if (left_mv == NULL) return NULL;\n"
+        "    right_mv = PyMemoryView_FromObject(right);\n"
+        "    if (right_mv == NULL) {\n"
+        "        Py_DECREF(left_mv);\n"
+        "        return NULL;\n"
+        "    }\n"
+        "    left_view = PyMemoryView_GET_BUFFER(left_mv);\n"
+        "    right_view = PyMemoryView_GET_BUFFER(right_mv);\n"
+        "    if (left_view != NULL && right_view != NULL) score += 1;\n"
+        "    if (left_view != right_view) score += 2;\n"
+        "    if (left_view != NULL && left_view->obj == left) score += 4;\n"
+        "    if (right_view != NULL && right_view->obj == right) score += 8;\n"
+        "    if (left_view != NULL && left_view->len == 3\n"
+        "            && ((unsigned char *)left_view->buf)[0] == 'A'\n"
+        "            && ((unsigned char *)left_view->buf)[2] == 'C') score += 16;\n"
+        "    if (right_view != NULL && right_view->len == 3\n"
+        "            && ((unsigned char *)right_view->buf)[0] == 'x'\n"
+        "            && ((unsigned char *)right_view->buf)[2] == 'z') score += 32;\n"
+        "    if (PyMemoryView_GET_BASE(left_mv) == left\n"
+        "            && PyMemoryView_GET_BASE(right_mv) == right) score += 64;\n"
+        "    Py_DECREF(right_mv);\n"
+        "    Py_DECREF(left_mv);\n"
+        "    return PyLong_FromLong(score);\n"
+        "}\n"
+        "\n"
         "static PyObject *buffer_check_score(PyObject *self, PyObject *args) {\n"
         "    PyObject *bytes_obj = NULL;\n"
         "    PyObject *bytearray_obj = NULL;\n"
@@ -11307,6 +11383,7 @@ def _compile_buffer_extension(tmp_path: Path) -> Path:
         '    {"from_memory_sum", buffer_from_memory_sum, METH_VARARGS, "sum PyMemoryView_FromMemory"},\n'
         '    {"from_memory_write_sum", buffer_from_memory_write_sum, METH_VARARGS, "writable PyMemoryView_FromMemory"},\n'
         '    {"memoryview_inspect_score", buffer_memoryview_inspect_score, METH_VARARGS, "memoryview inspect macro smoke"},\n'
+        '    {"two_live_views_score", buffer_two_live_views_score, METH_VARARGS, "two live memoryviews keep distinct buffers"},\n'
         '    {"check_score", buffer_check_score, METH_VARARGS, "PyObject_CheckBuffer smoke"},\n'
         "    {NULL, NULL, 0, NULL},\n"
         "};\n"
@@ -11403,6 +11480,59 @@ def _compile_call_extension(tmp_path: Path) -> Path:
         "PyMODINIT_FUNC PyInit_calldemo(void) {\n"
         "    return PyModule_Create(&callmodule);\n"
         "}\n",
+    )
+
+
+def _compile_generic_vectorcall_extension(tmp_path: Path) -> Path:
+    return _compile_extension(
+        tmp_path,
+        "genericvcdemo",
+        "#include <Python.h>\n"
+        "static PyObject *target(PyObject *self, PyObject *args) {\n"
+        "    PyObject *arg = NULL;\n"
+        '    if (!PyArg_ParseTuple(args, "O", &arg)) return NULL;\n'
+        "    return PyLong_FromLong(arg == self);\n"
+        "}\n"
+        "static PyObject *call_one(PyObject *self, PyObject *args) {\n"
+        "    PyObject *callable = PyObject_GetAttrString(self, \"target\");\n"
+        "    PyObject *result = NULL;\n"
+        "    (void)args;\n"
+        "    if (callable == NULL) return NULL;\n"
+        "    result = PyObject_CallOneArg(callable, self);\n"
+        "    Py_DECREF(callable);\n"
+        "    return result;\n"
+        "}\n"
+        "static PyObject *vectorcall_one(PyObject *self, PyObject *args) {\n"
+        "    PyObject *callable = PyObject_GetAttrString(self, \"target\");\n"
+        "    PyObject *values[1] = {self};\n"
+        "    PyObject *result = NULL;\n"
+        "    (void)args;\n"
+        "    if (callable == NULL) return NULL;\n"
+        "    result = PyObject_Vectorcall(callable, values, 1, NULL);\n"
+        "    Py_DECREF(callable);\n"
+        "    return result;\n"
+        "}\n"
+        "static PyObject *vectorcall_method_one(PyObject *self, PyObject *args) {\n"
+        "    PyObject *name = PyUnicode_FromString(\"target\");\n"
+        "    PyObject *values[2] = {self, self};\n"
+        "    PyObject *result = NULL;\n"
+        "    (void)args;\n"
+        "    if (name == NULL) return NULL;\n"
+        "    result = PyObject_VectorcallMethod(name, values, 2, NULL);\n"
+        "    Py_DECREF(name);\n"
+        "    return result;\n"
+        "}\n"
+        "static PyMethodDef Methods[] = {\n"
+        '    {"target", target, METH_VARARGS, "one-argument target"},\n'
+        '    {"call_one", call_one, METH_NOARGS, "PyObject_CallOneArg reference"},\n'
+        '    {"vectorcall_one", vectorcall_one, METH_NOARGS, "generic vectorcall"},\n'
+        '    {"vectorcall_method_one", vectorcall_method_one, METH_NOARGS, "generic method vectorcall"},\n'
+        "    {NULL, NULL, 0, NULL},\n"
+        "};\n"
+        "static PyModuleDef module = {\n"
+        '    PyModuleDef_HEAD_INIT, "genericvcdemo", NULL, -1, Methods,\n'
+        "};\n"
+        "PyMODINIT_FUNC PyInit_genericvcdemo(void) { return PyModule_Create(&module); }\n",
     )
 
 
@@ -13063,6 +13193,49 @@ def _compile_object_api_extension(tmp_path: Path) -> Path:
     )
 
 
+def _compile_errno_extension(tmp_path: Path) -> Path:
+    return _compile_extension(
+        tmp_path,
+        "errnoapi",
+        "#define PY_SSIZE_T_CLEAN\n"
+        "#include <Python.h>\n"
+        "#include <errno.h>\n"
+        "extern int *__error(void);\n"
+        "static PyObject *fetch_message(PyObject *filename, int code) {\n"
+        "  PyObject *type = NULL, *value = NULL, *traceback = NULL;\n"
+        "  *__error() = code;\n"
+        "  if (filename == NULL) PyErr_SetFromErrno(PyExc_OSError);\n"
+        "  else PyErr_SetFromErrnoWithFilenameObject(PyExc_OSError, filename);\n"
+        "  PyErr_Fetch(&type, &value, &traceback);\n"
+        "  if (value == NULL) { Py_XDECREF(type); Py_XDECREF(traceback); return NULL; }\n"
+        "  PyObject *text = PyObject_Str(value);\n"
+        "  Py_XDECREF(type); Py_DECREF(value); Py_XDECREF(traceback);\n"
+        "  return text;\n"
+        "}\n"
+        "static PyObject *message(PyObject *self, PyObject *args) {\n"
+        "  (void)self; (void)args; return fetch_message(NULL, ENOENT);\n"
+        "}\n"
+        "static PyObject *filename_message(PyObject *self, PyObject *args) {\n"
+        "  (void)self; (void)args;\n"
+        "  PyObject *name = PyUnicode_FromString(\"missing.dat\");\n"
+        "  if (name == NULL) return NULL;\n"
+        "  PyObject *result = fetch_message(name, ENOENT);\n"
+        "  Py_DECREF(name); return result;\n"
+        "}\n"
+        "static PyObject *unknown_message(PyObject *self, PyObject *args) {\n"
+        "  (void)self; (void)args; return fetch_message(NULL, 9999);\n"
+        "}\n"
+        "static PyMethodDef Methods[] = {\n"
+        "  {\"message\", message, METH_NOARGS, NULL},\n"
+        "  {\"filename_message\", filename_message, METH_NOARGS, NULL},\n"
+        "  {\"unknown_message\", unknown_message, METH_NOARGS, NULL},\n"
+        "  {NULL, NULL, 0, NULL}\n"
+        "};\n"
+        "static PyModuleDef module = { PyModuleDef_HEAD_INIT, \"errnoapi\", NULL, -1, Methods };\n"
+        "PyMODINIT_FUNC PyInit_errnoapi(void) { return PyModule_Create(&module); }\n",
+    )
+
+
 def _compile_missing_init_extension(tmp_path: Path) -> Path:
     return _compile_extension(
         tmp_path,
@@ -13186,12 +13359,12 @@ def _compile_numpy_25_capi_batch_extension(tmp_path: Path) -> Path:
 
 
 def _compile_main(
-    site: Path, main: Path, exe: Path
+    site: Path, main: Path, exe: Path, *, runtime_cc: str = "cc"
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     env.pop("LC_ALL", None)
     env["PCC_PACKAGE_SITE"] = str(site)
-    env["PCC_RUNTIME_CC"] = "cc"
+    env["PCC_RUNTIME_CC"] = runtime_cc
     return subprocess.run(
         [
             "uv",
@@ -13440,7 +13613,7 @@ def test_pcc_native_custom_type_pytype_ready_under_self_backend_no_libpython(tmp
     env = os.environ.copy()
     env.pop("LC_ALL", None)
     env["PCC_PACKAGE_SITE"] = str(site)
-    env["PCC_RUNTIME_CC"] = "cc"
+    env["PCC_RUNTIME_CC"] = "pcc"
     proc = subprocess.run(
         [
             "uv",
@@ -13664,7 +13837,7 @@ def test_pcc_native_extension_numeric_conversion_slots(tmp_path):
         encoding="utf-8",
     )
     exe = tmp_path / "main_bin"
-    proc = _compile_main(site, main, exe)
+    proc = _compile_main(site, main, exe, runtime_cc="pcc")
     assert proc.returncode == 0, proc.stderr
     run = _run_main(site, exe)
     assert run.returncode == 0, run.stderr
@@ -13868,7 +14041,7 @@ def test_pcc_native_eval_getbuiltins_under_self_backend_no_libpython(tmp_path):
     env = os.environ.copy()
     env.pop("LC_ALL", None)
     env["PCC_PACKAGE_SITE"] = str(site)
-    env["PCC_RUNTIME_CC"] = "cc"
+    env["PCC_RUNTIME_CC"] = "pcc"
     proc = subprocess.run(
         [
             "uv",
@@ -13949,7 +14122,7 @@ def test_pcc_native_import_and_vectorcall_under_self_backend_no_libpython(tmp_pa
     env = os.environ.copy()
     env.pop("LC_ALL", None)
     env["PCC_PACKAGE_SITE"] = str(site)
-    env["PCC_RUNTIME_CC"] = "cc"
+    env["PCC_RUNTIME_CC"] = "pcc"
     proc = subprocess.run(
         [
             "uv",
@@ -13994,15 +14167,15 @@ def test_pcc_native_type_vectorcall_dispatch_under_self_backend_no_libpython(tmp
         "    items.append(item)\n"
         "print('typevc', vector(2, 3), vector(2, scale=4), "
         "typevcdemo.call_keyword(target), items, slice_vector(vector), "
-        "typevcdemo.check_builtin_type(int))\n",
+        "typevcdemo.check_builtin_type(int), typevcdemo.call_method_offset())\n",
         encoding="utf-8",
     )
     exe = tmp_path / "main_bin"
-    proc = _compile_main(site, main, exe)
+    proc = _compile_main(site, main, exe, runtime_cc="pcc")
     assert proc.returncode == 0, proc.stderr
     run = _run_main(site, exe)
     assert run.returncode == 0, run.stderr
-    assert "typevc 23 241 8 [5, 6] 73 1" in run.stdout, run.stdout
+    assert "typevc 23 241 8 [5, 6] 73 1 1024" in run.stdout, run.stdout
 
 
 def test_pcc_native_type_number_slot_subtract_under_self_backend_no_libpython(
@@ -14124,7 +14297,7 @@ def test_pcc_native_seqiter_under_self_backend_no_libpython(tmp_path):
     env = os.environ.copy()
     env.pop("LC_ALL", None)
     env["PCC_PACKAGE_SITE"] = str(site)
-    env["PCC_RUNTIME_CC"] = "cc"
+    env["PCC_RUNTIME_CC"] = "pcc"
     proc = subprocess.run(
         [
             "uv",
@@ -15752,7 +15925,7 @@ def test_pcc_native_extension_buffer_protocol_for_bytes_bytearray_memoryview(tmp
         encoding="utf-8",
     )
     exe = tmp_path / "main_bin"
-    proc = _compile_main(site, main, exe)
+    proc = _compile_main(site, main, exe, runtime_cc="pcc")
     assert proc.returncode == 0, proc.stderr
     run = _run_main(site, exe)
     assert run.returncode == 0, run.stderr
@@ -15770,6 +15943,22 @@ def test_pcc_native_extension_buffer_protocol_for_bytes_bytearray_memoryview(tmp
         "711113111",
         "1111",
     ]
+
+
+def test_pcc_native_extension_memoryviews_keep_distinct_owned_buffers(tmp_path):
+    site = _compile_buffer_extension(tmp_path)
+    main = tmp_path / "main.py"
+    main.write_text(
+        "import bufdemo\n"
+        "print(bufdemo.two_live_views_score(b'ABC', b'xyz'))\n",
+        encoding="utf-8",
+    )
+    exe = tmp_path / "main_bin"
+    proc = _compile_main(site, main, exe, runtime_cc="pcc")
+    assert proc.returncode == 0, proc.stderr
+    run = _run_main(site, exe)
+    assert run.returncode == 0, run.stderr
+    assert run.stdout == "127\n"
 
 
 def test_pcc_native_extension_pyobject_call_class_constructor(tmp_path):
@@ -15791,11 +15980,29 @@ def test_pcc_native_extension_pyobject_call_class_constructor(tmp_path):
         encoding="utf-8",
     )
     exe = tmp_path / "main_bin"
-    proc = _compile_main(site, main, exe)
+    proc = _compile_main(site, main, exe, runtime_cc="pcc")
     assert proc.returncode == 0, proc.stderr
     run = _run_main(site, exe)
     assert run.returncode == 0, run.stderr
     assert run.stdout.splitlines() == ["True", "1", "42", "42", "True"]
+
+
+def test_pcc_native_extension_generic_vectorcall_preserves_one_argument(tmp_path):
+    site = _compile_generic_vectorcall_extension(tmp_path)
+    main = tmp_path / "main.py"
+    main.write_text(
+        "import genericvcdemo\n"
+        "print(genericvcdemo.call_one())\n"
+        "print(genericvcdemo.vectorcall_one())\n"
+        "print(genericvcdemo.vectorcall_method_one())\n",
+        encoding="utf-8",
+    )
+    exe = tmp_path / "main_bin"
+    proc = _compile_main(site, main, exe, runtime_cc="pcc")
+    assert proc.returncode == 0, proc.stderr
+    run = _run_main(site, exe)
+    assert run.returncode == 0, run.stderr
+    assert run.stdout.splitlines() == ["1", "1", "1"]
 
 
 def test_pcc_native_extension_pyobject_call_receives_none_return(tmp_path):
@@ -15883,7 +16090,7 @@ def test_pcc_native_extension_tuple_dict_attr_helpers(tmp_path):
         encoding="utf-8",
     )
     exe = tmp_path / "main_bin"
-    proc = _compile_main(site, main, exe)
+    proc = _compile_main(site, main, exe, runtime_cc="pcc")
     assert proc.returncode == 0, proc.stderr
     run = _run_main(site, exe)
     assert run.returncode == 0, run.stderr
@@ -15940,6 +16147,34 @@ def test_pcc_native_extension_tuple_dict_attr_helpers(tmp_path):
         "12",
         "ok",
     ]
+
+
+@pytest.mark.skipif(
+    sys.platform != "darwin",
+    reason="Darwin host-extension errno is a named libSystem boundary",
+)
+def test_pcc_native_extension_errno_messages_use_saved_thread_errno(tmp_path):
+    site = _compile_errno_extension(tmp_path)
+    main = tmp_path / "main.py"
+    main.write_text(
+        "import errnoapi\n"
+        "print(errnoapi.message())\n"
+        "print(errnoapi.filename_message())\n"
+        "print(errnoapi.unknown_message())\n",
+        encoding="utf-8",
+    )
+    exe = tmp_path / "main_bin"
+    proc = _compile_main(site, main, exe, runtime_cc="pcc")
+    assert proc.returncode == 0, proc.stderr
+    run = _run_main(site, exe)
+    assert run.returncode == 0, run.stderr
+    lines = run.stdout.splitlines()
+    assert lines[:2] == [
+        "No such file or directory",
+        "No such file or directory: missing.dat",
+    ]
+    assert len(lines) == 3
+    assert "9999" in lines[2]
 
 
 def test_pcc_native_extension_missing_pyinit_symbol_fails_at_runtime(tmp_path):
@@ -16001,3 +16236,227 @@ def test_pcc_native_extension_init_returning_null_without_error_reports_import_f
     assert run.returncode != 0
     assert "native extension init failed" in run.stderr
     assert "silentnullinit" in run.stderr
+
+
+def _compile_phasedemo_extension(tmp_path: Path) -> Path:
+    # numpy-shaped multi-phase (PEP 489) extension covering the C-API shim
+    # semantics the C->pcc-Python migration dropped (2026-08-08, see
+    # docs/investigations/pcc1-pip-numpy-runtime-import-capi-regressions.md):
+    # m_slots@64 (not m_doc@40), Py_mod_exec == 2, PyDict_SetItemString into
+    # the live module dict, Py_BuildValue "{..}" pairs, sys.flags.optimize,
+    # PyObject_CallFunction full formats, METH_FASTCALL|METH_KEYWORDS nargs,
+    # PyArg_ParseTupleAndKeywords, PyMemberDef T_CHAR/T_PYSSIZET codes,
+    # tp_richcompare both-operand protocol, and nb_* right-operand dispatch.
+    return _compile_extension(
+        tmp_path,
+        "phasedemo",
+        "#define PY_SSIZE_T_CLEAN\n"
+        "#include <Python.h>\n"
+        "#include <structmember.h>\n"
+        "\n"
+        "typedef struct { PyObject_HEAD Py_ssize_t psize; char letter; } PhObject;\n"
+        "\n"
+        "static PyObject *disp_richcompare(PyObject *l, PyObject *r, int op) {\n"
+        "    (void)l;\n"
+        "    (void)r;\n"
+        "    if (op == Py_EQ) return PyBool_FromLong(1);\n"
+        "    Py_RETURN_NOTIMPLEMENTED;\n"
+        "}\n"
+        "\n"
+        "static PyMemberDef DispMembers[] = {\n"
+        '    {"psize", T_PYSSIZET, __builtin_offsetof(PhObject, psize), READONLY, NULL},\n'
+        '    {"letter", T_CHAR, __builtin_offsetof(PhObject, letter), READONLY, NULL},\n'
+        "    {NULL, 0, 0, 0, NULL},\n"
+        "};\n"
+        "\n"
+        "static PyTypeObject DispType = {\n"
+        "    PyVarObject_HEAD_INIT(NULL, 0)\n"
+        '    .tp_name = "phasedemo.Disp",\n'
+        "    .tp_basicsize = sizeof(PhObject),\n"
+        "    .tp_flags = Py_TPFLAGS_DEFAULT,\n"
+        "    .tp_members = DispMembers,\n"
+        "    .tp_richcompare = disp_richcompare,\n"
+        "    .tp_new = PyType_GenericNew,\n"
+        "};\n"
+        "\n"
+        "static PyTypeObject NoCmpType = {\n"
+        "    PyVarObject_HEAD_INIT(NULL, 0)\n"
+        '    .tp_name = "phasedemo.NoCmp",\n'
+        "    .tp_basicsize = sizeof(PhObject),\n"
+        "    .tp_flags = Py_TPFLAGS_DEFAULT,\n"
+        "    .tp_new = PyType_GenericNew,\n"
+        "};\n"
+        "\n"
+        "static PyObject *ph_mul(PyObject *a, PyObject *b) {\n"
+        "    long v = PyLong_AsLong(a);\n"
+        "    if (PyErr_Occurred()) {\n"
+        "        PyErr_Clear();\n"
+        "        v = PyLong_AsLong(b);\n"
+        "    }\n"
+        "    if (PyErr_Occurred()) {\n"
+        "        PyErr_Clear();\n"
+        "        Py_RETURN_NOTIMPLEMENTED;\n"
+        "    }\n"
+        "    return PyLong_FromLong(v * 7);\n"
+        "}\n"
+        "\n"
+        "static PyNumberMethods NumAsNumber = {\n"
+        "    .nb_multiply = ph_mul,\n"
+        "};\n"
+        "\n"
+        "static PyTypeObject NumType = {\n"
+        "    PyVarObject_HEAD_INIT(NULL, 0)\n"
+        '    .tp_name = "phasedemo.Num",\n'
+        "    .tp_basicsize = sizeof(PhObject),\n"
+        "    .tp_flags = Py_TPFLAGS_DEFAULT,\n"
+        "    .tp_as_number = &NumAsNumber,\n"
+        "    .tp_new = PyType_GenericNew,\n"
+        "};\n"
+        "\n"
+        "static PyObject *ph_callback(PyObject *self, PyObject *fn) {\n"
+        "    (void)self;\n"
+        '    return PyObject_CallFunction(fn, "Os", Py_None, "alias");\n'
+        "}\n"
+        "\n"
+        "static PyObject *ph_fastkw(PyObject *self, PyObject *const *args,\n"
+        "                           Py_ssize_t nargs, PyObject *kwnames) {\n"
+        "    (void)self;\n"
+        "    (void)args;\n"
+        "    Py_ssize_t kwn = kwnames == NULL ? 0 : PyTuple_Size(kwnames);\n"
+        '    return Py_BuildValue("nn", nargs, kwn);\n'
+        "}\n"
+        "\n"
+        "static PyObject *ph_kwparse(PyObject *self, PyObject *args, PyObject *kwargs) {\n"
+        "    (void)self;\n"
+        "    long a = 0;\n"
+        "    long b = 0;\n"
+        '    static char *kwlist[] = {"a", "b", NULL};\n'
+        '    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "l|l:kwparse", kwlist, &a, &b)) {\n'
+        "        return NULL;\n"
+        "    }\n"
+        "    return PyLong_FromLong(a + b);\n"
+        "}\n"
+        "\n"
+        "static PyMethodDef PhaseMethods[] = {\n"
+        '    {"callback", ph_callback, METH_O, "call fn via CallFunction Os"},\n'
+        '    {"fastkw", (PyCFunction)ph_fastkw, METH_FASTCALL | METH_KEYWORDS, "report nargs/kw"},\n'
+        '    {"kwparse", (PyCFunction)ph_kwparse, METH_VARARGS | METH_KEYWORDS, "a+b"},\n'
+        "    {NULL, NULL, 0, NULL},\n"
+        "};\n"
+        "\n"
+        "static int phase_exec(PyObject *m) {\n"
+        "    PyObject *d = PyModule_GetDict(m);\n"
+        "    if (d == NULL) return -1;\n"
+        "    if (PyType_Ready(&DispType) < 0) return -1;\n"
+        "    if (PyType_Ready(&NoCmpType) < 0) return -1;\n"
+        "    if (PyType_Ready(&NumType) < 0) return -1;\n"
+        "    Py_INCREF((PyObject *)&DispType);\n"
+        '    if (PyDict_SetItemString(d, "Disp", (PyObject *)&DispType) < 0) return -1;\n'
+        "    Py_INCREF((PyObject *)&NoCmpType);\n"
+        '    if (PyDict_SetItemString(d, "NoCmp", (PyObject *)&NoCmpType) < 0) return -1;\n'
+        "    Py_INCREF((PyObject *)&NumType);\n"
+        '    if (PyDict_SetItemString(d, "Num", (PyObject *)&NumType) < 0) return -1;\n'
+        '    PyObject *bv = Py_BuildValue("{ss}", "k", "v");\n'
+        "    if (bv == NULL) return -1;\n"
+        '    if (PyDict_SetItemString(d, "bv", bv) < 0) { Py_DECREF(bv); return -1; }\n'
+        "    Py_DECREF(bv);\n"
+        '    PyObject *flags = PySys_GetObject("flags");\n'
+        "    if (flags == NULL) return -1;\n"
+        '    PyObject *opt = PyObject_GetAttrString(flags, "optimize");\n'
+        "    if (opt == NULL) return -1;\n"
+        '    if (PyDict_SetItemString(d, "optimize", opt) < 0) { Py_DECREF(opt); return -1; }\n'
+        "    Py_DECREF(opt);\n"
+        "    return 0;\n"
+        "}\n"
+        "\n"
+        "static PyModuleDef_Slot phase_slots[] = {\n"
+        "    {Py_mod_exec, phase_exec},\n"
+        "    {0, NULL},\n"
+        "};\n"
+        "\n"
+        "static struct PyModuleDef phasemodule = {\n"
+        "    PyModuleDef_HEAD_INIT,\n"
+        '    .m_name = "phasedemo",\n'
+        '    .m_doc = "m_doc canary: reading m_doc as m_slots must not happen",\n'
+        "    .m_size = 0,\n"
+        "    .m_methods = PhaseMethods,\n"
+        "    .m_slots = phase_slots,\n"
+        "};\n"
+        "\n"
+        "PyMODINIT_FUNC PyInit_phasedemo(void) {\n"
+        "    return PyModuleDef_Init(&phasemodule);\n"
+        "}\n",
+    )
+
+
+def test_pcc_native_multiphase_capi_surface_default_runtime(tmp_path):
+    """Multi-phase (PEP 489) numpy-shaped C-API surface under the DEFAULT
+    runtime (pcc-Python ports linked; no PCC_RUNTIME_CC=cc): every assertion
+    here corresponds to a hole the 93cfbca5-era C->pcc-Python migration
+    dropped and numpy 2.4.6 import tripped over."""
+    site = _compile_phasedemo_extension(tmp_path)
+    main = tmp_path / "main.py"
+    main.write_text(
+        "import phasedemo\n"
+        'print("disp", phasedemo.Disp is not None)\n'
+        'print("bv", phasedemo.bv["k"])\n'
+        'print("opt", phasedemo.optimize)\n'
+        "def f(a, b):\n"
+        "    return (a is None, b)\n"
+        'print("cb", phasedemo.callback(f))\n'
+        'print("fk", phasedemo.fastkw(1, 2, c=3))\n'
+        'print("kw", phasedemo.kwparse(5, b=7))\n'
+        "d = phasedemo.Disp()\n"
+        'print("mem", d.psize, len(d.letter))\n'
+        'print("eq", d == 42, 42 == d)\n'
+        "n = phasedemo.NoCmp()\n"
+        'print("ncmp", n == 42, n == n)\n'
+        "x = phasedemo.Num()\n"
+        'print("mul", 6 * x, x * 6)\n',
+        encoding="utf-8",
+    )
+    exe = tmp_path / "main_bin"
+    env = os.environ.copy()
+    env.pop("LC_ALL", None)
+    env.pop("PCC_RUNTIME_CC", None)
+    env["PCC_PACKAGE_SITE"] = str(site)
+    proc = subprocess.run(
+        [
+            "uv",
+            "run",
+            "pcc",
+            "--backend",
+            "self",
+            "--python-libpython=off",
+            "--ir-scaffold=on",
+            str(main),
+            "-o",
+            str(exe),
+        ],
+        text=True,
+        capture_output=True,
+        timeout=300,
+        env=env,
+    )
+    assert proc.returncode == 0, proc.stderr
+    run_env = env.copy()
+    run_env["PCC_HOST_PYTHON"] = "/usr/bin/false"
+    run = subprocess.run(
+        [str(exe)],
+        text=True,
+        capture_output=True,
+        timeout=30,
+        env=run_env,
+    )
+    assert run.returncode == 0, run.stderr
+    lines = run.stdout.splitlines()
+    assert "disp True" in lines, run.stdout
+    assert "bv v" in lines, run.stdout
+    assert "opt 0" in lines, run.stdout
+    assert "cb (True, 'alias')" in lines, run.stdout
+    assert "fk (2, 1)" in lines, run.stdout
+    assert "kw 12" in lines, run.stdout
+    assert "mem 0 1" in lines, run.stdout
+    assert "eq True True" in lines, run.stdout
+    assert "ncmp False True" in lines, run.stdout
+    assert "mul 42 42" in lines, run.stdout

@@ -1,4 +1,10 @@
-/* pcc-native extension loader.
+/* Host-C oracle for the production pcc-Python extension loader.
+ *
+ * The production no-libpython archive owns these ABIs in
+ * py/py_extension_loader_runtime.py; this source remains an explicit host-C
+ * and pcc-C oracle input.
+ *
+ * pcc-native extension loader.
  *
  * Loads package-installed extension artifacts without libpython. The loaded
  * extension must be built against pcc's narrow Python.h/C-API shim and export
@@ -39,7 +45,7 @@ static char *pcc_ext_strdup(const char *s) {
  * docs/investigations/numpy-loader-probe-cext-reimport-load-once.md. */
 static int pcc_ext_debug(void) {
     static int v = -1;
-    if (v < 0) v = getenv("PCC_DEBUG_EXT_IMPORT") != NULL ? 1 : 0;
+    if (v < 0) v = pcc_runtime_getenv("PCC_DEBUG_EXT_IMPORT") != NULL ? 1 : 0;
     return v;
 }
 
@@ -305,7 +311,7 @@ PyObject *py_native_extension_import_by_name(const char *module_name) {
         return cached->module;
     }
 
-    const char *sites = getenv("PCC_PACKAGE_SITE");
+    const char *sites = pcc_runtime_getenv("PCC_PACKAGE_SITE");
     if (sites == NULL || sites[0] == '\0') return NULL;
     char *rel = pcc_extension_module_relpath(module_name);
     if (rel == NULL) return NULL;

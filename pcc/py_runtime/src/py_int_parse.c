@@ -217,6 +217,32 @@ static char *build_bad_literal_message(const char *s, int base) {
  * ``base`` is the ORIGINAL argument (0 stays "base 0"; the resolved base is not
  * shown), and the repr is a CPython-accurate repr of the whole original string
  * (whitespace and all), with CPython quote selection and \\x/\\n/\\r/\\t escapes. */
+/* int(o[, base]) with an OBJECT result.
+ *
+ * The frontend's `int(<dyn>)` lowering unboxes every branch to i64 and phis
+ * them, which truncates a bignum to 0.  Callers that want the object
+ * projection emit ONE call to this instead, so no basic blocks are created in
+ * the frontend probe that asks for it.
+ *
+ * Returns a NEW reference, or NULL with a pending exception.  `base` applies
+ * only to the string case, matching the existing lowering.
+ */
+PyObject *py_obj_as_int_object(PyObject *o, int base) {
+    if (o == NULL) return NULL;
+    int64_t tag = py_obj_type_tag(o);
+    if (tag == PY_TYPE_STR) {
+        return py_int_from_cstr_or_raise(py_str_utf8(o), base);
+    }
+    if (tag == PY_TYPE_FLOAT) {
+        return py_int_from_i64((int64_t)py_float_to_f64(o));
+    }
+    if (tag == PY_TYPE_BOOL) {
+        return py_int_from_i64(py_obj_truthy(o));
+    }
+    py_incref(o);
+    return o;
+}
+
 PyObject *py_int_from_cstr_or_raise(const char *s, int base) {
     if (base != 0 && (base < 2 || base > 36)) {
         py_raise(py_exc_new(PY_EXC_VALUEERROR,

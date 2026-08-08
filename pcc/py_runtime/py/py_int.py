@@ -1,5 +1,10 @@
 """pcc-Python replacement for the residual py_runtime/src/py_int.c."""
 from pcc.extern import extern, c_abi_export, c_int64, c_ptr
+from pcc.py_runtime.py.py_abi_constants import (
+    PYINTOBJECT_DIGITS_OFFSET,
+    PYINTOBJECT_NDIGITS_OFFSET,
+    PYINTOBJECT_SIGN_OFFSET,
+)
 from pcc.unsafe import free, load_i32, ptr_is_null, store_i32, store_ptr
 
 
@@ -18,33 +23,33 @@ def _load_u32(obj, offset: int) -> int:
 
 
 def _copy_abs(a):
-    ndigits: int = load_i32(a, 20)
+    ndigits: int = load_i32(a, PYINTOBJECT_NDIGITS_OFFSET)
     r = py_bigint_alloc(ndigits)
     if ptr_is_null(r):
         return r
-    if ndigits == 0 or load_i32(a, 16) == 0:
-        store_i32(r, 16, 0)
-        store_i32(r, 20, 0)
+    if ndigits == 0 or load_i32(a, PYINTOBJECT_SIGN_OFFSET) == 0:
+        store_i32(r, PYINTOBJECT_SIGN_OFFSET, 0)
+        store_i32(r, PYINTOBJECT_NDIGITS_OFFSET, 0)
         return r
-    store_i32(r, 16, 1)
+    store_i32(r, PYINTOBJECT_SIGN_OFFSET, 1)
     i: int = 0
     while i < ndigits:
-        store_i32(r, 24 + i * 4, load_i32(a, 24 + i * 4))
+        store_i32(r, PYINTOBJECT_DIGITS_OFFSET + i * 4, load_i32(a, PYINTOBJECT_DIGITS_OFFSET + i * 4))
         i = i + 1
     return r
 
 
 def _abs_cmp(a, b) -> int:
-    na: int = load_i32(a, 20)
-    nb: int = load_i32(b, 20)
+    na: int = load_i32(a, PYINTOBJECT_NDIGITS_OFFSET)
+    nb: int = load_i32(b, PYINTOBJECT_NDIGITS_OFFSET)
     if na != nb:
         if na < nb:
             return -1
         return 1
     i: int = na - 1
     while i >= 0:
-        av: int = _load_u32(a, 24 + i * 4)
-        bv: int = _load_u32(b, 24 + i * 4)
+        av: int = _load_u32(a, PYINTOBJECT_DIGITS_OFFSET + i * 4)
+        bv: int = _load_u32(b, PYINTOBJECT_DIGITS_OFFSET + i * 4)
         if av != bv:
             if av < bv:
                 return -1
@@ -54,10 +59,10 @@ def _abs_cmp(a, b) -> int:
 
 
 def _bit_length_mag(a) -> int:
-    ndigits: int = load_i32(a, 20)
+    ndigits: int = load_i32(a, PYINTOBJECT_NDIGITS_OFFSET)
     if ndigits <= 0:
         return 0
-    top: int = _load_u32(a, 24 + (ndigits - 1) * 4)
+    top: int = _load_u32(a, PYINTOBJECT_DIGITS_OFFSET + (ndigits - 1) * 4)
     bits: int = (ndigits - 1) * 32
     while top > 0:
         bits = bits + 1
@@ -76,7 +81,7 @@ def _one_shifted(bits: int):
 
 @c_abi_export("py_bigint_divmod")
 def py_bigint_divmod(a, b, q_out, r_out) -> int:
-    if load_i32(b, 16) == 0:
+    if load_i32(b, PYINTOBJECT_SIGN_OFFSET) == 0:
         return -1
 
     q = py_bigint_alloc(0)
@@ -137,22 +142,22 @@ def py_bigint_divmod(a, b, q_out, r_out) -> int:
 
     free(bpos)
 
-    sa: int = load_i32(a, 16)
-    sb: int = load_i32(b, 16)
+    sa: int = load_i32(a, PYINTOBJECT_SIGN_OFFSET)
+    sb: int = load_i32(b, PYINTOBJECT_SIGN_OFFSET)
     if sa != 0:
         if sa == sb:
-            store_i32(q, 16, 1)
+            store_i32(q, PYINTOBJECT_SIGN_OFFSET, 1)
         else:
-            store_i32(q, 16, -1)
-        if load_i32(q, 20) == 0:
-            store_i32(q, 16, 0)
+            store_i32(q, PYINTOBJECT_SIGN_OFFSET, -1)
+        if load_i32(q, PYINTOBJECT_NDIGITS_OFFSET) == 0:
+            store_i32(q, PYINTOBJECT_SIGN_OFFSET, 0)
 
-        if load_i32(r, 20) == 0:
-            store_i32(r, 16, 0)
+        if load_i32(r, PYINTOBJECT_NDIGITS_OFFSET) == 0:
+            store_i32(r, PYINTOBJECT_SIGN_OFFSET, 0)
         else:
-            store_i32(r, 16, sa)
+            store_i32(r, PYINTOBJECT_SIGN_OFFSET, sa)
 
-    if sa * sb < 0 and load_i32(r, 20) > 0:
+    if sa * sb < 0 and load_i32(r, PYINTOBJECT_NDIGITS_OFFSET) > 0:
         one = py_bigint_from_i64(1)
         if ptr_is_null(one):
             free(q)

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 from functools import lru_cache, wraps
+import json
 import os
 from pathlib import Path
 import shutil
@@ -20,6 +21,12 @@ from typing import Callable, ParamSpec, TypeVar
 
 from pcc.backend.self_backend_cache_identity import (
     self_backend_emitter_source_identity,
+)
+from pcc.tools.runtime_archive_provenance import (
+    ProvenanceError,
+    capi_inventory_path_for_archive,
+    manifest_path_for_archive,
+    verify_runtime_archive_manifest,
 )
 
 P = ParamSpec("P")
@@ -48,6 +55,71 @@ _PCC_PY_ARCHIVE_ENV_KEYS = (
 
 _REPO_ROOT = Path(__file__).absolute().parents[1]
 _RUNTIME_DIR = _REPO_ROOT / "pcc" / "py_runtime"
+_PCC_RUNTIME_CACHE_MARKER_SCHEMA = "pcc.runtime-build-cache.v2"
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while chunk := stream.read(1024 * 1024):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _pcc_runtime_cache_marker_value(*, key: str, archive: Path) -> dict[str, str]:
+    manifest = manifest_path_for_archive(archive)
+    capi_inventory = capi_inventory_path_for_archive(archive)
+    return {
+        "schema": _PCC_RUNTIME_CACHE_MARKER_SCHEMA,
+        "key": key,
+        "archive_sha256": _sha256_file(archive),
+        "manifest_sha256": _sha256_file(manifest),
+        "capi_inventory_sha256": _sha256_file(capi_inventory),
+    }
+
+
+def _pcc_runtime_cache_is_complete(
+    *,
+    runtime: Path,
+    archive: Path,
+    marker: Path,
+    key: str,
+) -> bool:
+    manifest = manifest_path_for_archive(archive)
+    capi_inventory = capi_inventory_path_for_archive(archive)
+    if (
+        not archive.is_file()
+        or not manifest.is_file()
+        or not capi_inventory.is_file()
+        or not marker.is_file()
+    ):
+        return False
+    try:
+        marker_value = json.loads(marker.read_text(encoding="utf-8"))
+        expected = _pcc_runtime_cache_marker_value(key=key, archive=archive)
+        if marker_value != expected:
+            return False
+        verify_runtime_archive_manifest(archive, runtime_root=runtime)
+    except (OSError, UnicodeError, json.JSONDecodeError, ProvenanceError):
+        return False
+    return True
+
+
+def _write_pcc_runtime_cache_marker(
+    marker: Path,
+    *,
+    key: str,
+    archive: Path,
+) -> None:
+    marker.write_text(
+        json.dumps(
+            _pcc_runtime_cache_marker_value(key=key, archive=archive),
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
 
 
 @lru_cache(maxsize=1)
@@ -55,7 +127,7 @@ def self_host_source_key() -> str:
     """Fingerprint inputs that can change the self-host compiler stages."""
 
     digest = hashlib.sha256()
-    digest.update(b"pcc.self-host-test-artifact.v1\0")
+    digest.update(b"pcc.self-host-test-artifact.v2\0")
     digest.update(str(_REPO_ROOT.resolve()).encode("utf-8"))
     digest.update(b"\0")
     digest.update(sys.version.encode("utf-8"))
@@ -66,6 +138,13 @@ def self_host_source_key() -> str:
         "CPPFLAGS",
         "LDFLAGS",
         "MACOSX_DEPLOYMENT_TARGET",
+        "PCC_GC_BACKEND",
+        "PCC_HOST_PYTHON",
+        "PCC_PYTHON_CONFIG",
+        "PCC_REFCOUNT_KIND",
+        "PCC_RUNTIME_CC",
+        "PCC_RUNTIME_HIGH",
+        "PCC_WITH_THREADS",
         "PCC_SELF_TARGET_PASSES",
         "PCC_SELF_TARGET_PASS_TRANSPORT",
     ):
@@ -73,6 +152,24 @@ def self_host_source_key() -> str:
         digest.update(b"=")
         digest.update(str(os.environ.get(name, "")).encode("utf-8"))
         digest.update(b"\0")
+    explicit_runtime = str(os.environ.get("PCC_RUNTIME_ARCHIVE", "")).strip()
+    digest.update(b"PCC_RUNTIME_ARCHIVE\0")
+    digest.update(explicit_runtime.encode("utf-8"))
+    digest.update(b"\0")
+    if explicit_runtime:
+        archive = Path(explicit_runtime).expanduser().resolve()
+        for label, artifact in (
+            ("archive", archive),
+            ("manifest", manifest_path_for_archive(archive)),
+            ("capi_inventory", capi_inventory_path_for_archive(archive)),
+        ):
+            digest.update(label.encode("utf-8"))
+            digest.update(b"\0")
+            try:
+                digest.update(artifact.read_bytes())
+            except OSError:
+                digest.update(b"<missing>")
+            digest.update(b"\0")
     cc = os.environ.get("CC", "cc")
     try:
         toolchain = subprocess.check_output(
@@ -313,10 +410,15 @@ def _cached_pcc_python_runtime(*, threaded: bool) -> Path:
             fcntl = None
         if fcntl is not None:
             fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        staging_root: Path | None = None
         try:
-            if archive.is_file() and marker.is_file():
-                if marker.read_text(encoding="utf-8") == key:
-                    return runtime
+            if _pcc_runtime_cache_is_complete(
+                runtime=runtime,
+                archive=archive,
+                marker=marker,
+                key=key,
+            ):
+                return runtime
             if runtime.exists():
                 shutil.rmtree(runtime)
             staging_root = Path(tempfile.mkdtemp(prefix=key + ".", dir=str(cache_root)))
@@ -325,7 +427,14 @@ def _cached_pcc_python_runtime(*, threaded: bool) -> Path:
                 _RUNTIME_DIR,
                 work_runtime,
                 ignore=shutil.ignore_patterns(
-                    "_native", "__pycache__", "build", "build_*", "*.a", "*.a.target"
+                    "_native",
+                    "__pycache__",
+                    "build",
+                    "build_*",
+                    "*.a",
+                    "*.a.target",
+                    "*.a.provenance.json",
+                    "*.a.capi_syms",
                 ),
             )
             command = [
@@ -346,11 +455,21 @@ def _cached_pcc_python_runtime(*, threaded: bool) -> Path:
                 timeout=900,
             )
             assert result.returncode == 0, result.stdout + result.stderr
-            (work_runtime / marker.name).write_text(key, encoding="utf-8")
+            work_archive = work_runtime / archive.name
+            verify_runtime_archive_manifest(
+                work_archive,
+                runtime_root=work_runtime,
+            )
+            _write_pcc_runtime_cache_marker(
+                work_runtime / marker.name,
+                key=key,
+                archive=work_archive,
+            )
             os.replace(work_runtime, runtime)
-            shutil.rmtree(staging_root, ignore_errors=True)
             return runtime
         finally:
+            if staging_root is not None:
+                shutil.rmtree(staging_root, ignore_errors=True)
             if fcntl is not None:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 

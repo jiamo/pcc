@@ -178,7 +178,32 @@ def test_default_xdist_keeps_bounded_workers_for_compiler_heavy_suite():
     matrix = (ROOT / "tests/python/test_gc_backend_under_env.py").read_text(
         encoding="utf-8"
     )
-    assert 'xdist_group(name=f"gc_meta_{gc_backend}")' in matrix
+    assert 'name=f"pcc_heavy_{frontend_backend}"' in matrix
+
+
+def test_boc_speedup_proofs_share_one_measured_performance_lane():
+    from tests.python import test_boc_benchmarks as ring
+    from tests.python import test_boc_threading_proof as bank
+
+    assert ring.MIN_RING_SPEEDUP == 1.5
+    assert bank.MIN_SPEEDUP == 2.5
+    assert ring.pytestmark.mark.kwargs["name"] == "pcc_heavy_llvm"
+    assert bank.pytestmark.mark.kwargs["name"] == "pcc_heavy_llvm"
+    assert callable(ring.test_boc_ring_correctness)
+    assert callable(bank.test_pcc_threads_complete_all_workers)
+
+    ring_gate = next(
+        mark
+        for mark in ring.test_boc_ring_correctness_and_speedup.pytestmark
+        if mark.name == "pcc_gate"
+    )
+    bank_gate = next(
+        mark
+        for mark in bank.test_pcc_threads_give_real_parallel_speedup.pytestmark
+        if mark.name == "pcc_gate"
+    )
+    assert ring_gate.kwargs["env"] == "PCC_RUN_BOC_SPEEDUP"
+    assert bank_gate.kwargs["env"] == "PCC_RUN_BOC_SPEEDUP"
 
 
 def test_lock_owned_self_host_warmer_has_independent_inner_budget(monkeypatch):
@@ -194,6 +219,8 @@ def test_lock_owned_self_host_warmer_has_independent_inner_budget(monkeypatch):
 
 def test_gc_meta_matrix_retains_required_modes_without_accidental_duplicates():
     from tests.python import test_gc_backend_under_env as matrix
+    from tests.python import test_runtime_oracle_diff as runtime_oracle
+    from tests.python import test_self_host_oracle_diff as self_host_oracle
 
     for target in matrix._FRONTEND_INDEPENDENT_TARGETS:
         assert matrix._self_frontend_target(target) is None
@@ -213,9 +240,28 @@ def test_gc_meta_matrix_retains_required_modes_without_accidental_duplicates():
         for parameter in matrix._iter_cases()
         for frontend, gc_backend, targets in (parameter.values,)
     }
+    heavy_groups = {
+        (frontend, gc_backend): next(
+            mark.kwargs["name"]
+            for mark in parameter.marks
+            if mark.name == "xdist_group"
+        )
+        for parameter in matrix._iter_cases()
+        for frontend, gc_backend, _targets in (parameter.values,)
+    }
     gc4_contract = "tests/python/test_gc_backend4_production.py"
     assert gc4_contract in cases[("llvm", "4")]
     assert gc4_contract in cases[("self", "4")]
+    assert set(heavy_groups.values()) == {
+        "pcc_heavy_llvm",
+        "pcc_heavy_self",
+    }
+    assert all(
+        group == f"pcc_heavy_{frontend}"
+        for (frontend, _gc_backend), group in heavy_groups.items()
+    )
+    assert runtime_oracle.pytestmark.mark.kwargs["name"] == "pcc_heavy_self"
+    assert self_host_oracle.pytestmark.mark.kwargs["name"] == "pcc_heavy_self"
 
 
 def test_stateless_gc_compile_suites_are_not_forced_onto_one_worker():
@@ -321,3 +367,12 @@ def test_self_host_oracle_stages_are_shared_across_xdist_workers():
     assert "pcc.self-host-test-artifact.v1" in cache
     assert "self-host-oracle" in cache
     assert "test_000_self_host_oracle_stage_cache_warmup" in conftest
+
+
+def test_uv_locked_wheel_bundles_a_current_source_pcc1():
+    source = (ROOT / "tests/integration/test_uv_locked_pcc_sync.py").read_text(
+        encoding="utf-8"
+    )
+
+    assert "find_current_pcc1(REPO)" in source
+    assert 'REPO / "build" / "bootstrap" / "pcc1"' not in source

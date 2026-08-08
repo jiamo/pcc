@@ -1,0 +1,509 @@
+{
+  "schema_version": "pcc.cpython-replacement.contract.v1",
+  "product": {
+    "name": "pcc1-cpython-replacement",
+    "execution_root": "pcc1",
+    "claim_mode": "pcc-native",
+    "final_level": 3,
+    "current_implementation_status": "unverified",
+    "workload_catalog": "docs/compat/pcc1-cpython-replacement-workloads.json",
+    "evidence_schema": "pcc.cpython-replacement.evidence.v1"
+  },
+  "baseline": {
+    "language_version": "3.13",
+    "oracle_implementation": "CPython",
+    "oracle_version": "3.13.2",
+    "oracle_build": "standard-gil",
+    "version_policy": "exact-oracle-version"
+  },
+  "levels": [
+    {
+      "level": 1,
+      "id": "pcc-native-pure-python-service",
+      "inherits": [],
+      "final_goal": false,
+      "description": "pcc1 is the sole Python execution root for the frozen pure-Python service workload."
+    },
+    {
+      "level": 2,
+      "id": "scientific-build-ecosystem",
+      "inherits": [
+        1
+      ],
+      "final_goal": false,
+      "description": "Level 1 plus the frozen scientific, native-extension and build-tool workload corpus."
+    },
+    {
+      "level": 3,
+      "id": "python3-drop-in",
+      "inherits": [
+        1,
+        2
+      ],
+      "final_goal": true,
+      "description": "Final product goal: pcc1 occupies the supported python3 role for the entire frozen version and platform matrix."
+    }
+  ],
+  "targets": [
+    {
+      "id": "darwin-arm64",
+      "target_triple": "arm64-apple-darwin",
+      "minimum_level": 1,
+      "runtime_boundary": "named-libSystem",
+      "zero_libc": false,
+      "gate": "tests/integration/test_pcc1_cpython_replacement_darwin_arm64.py",
+      "verdict": "supported",
+      "implementation_status": "unverified",
+      "diagnostic": "PCC-CPY-TARGET-DARWIN-ARM64-UNPROVEN"
+    },
+    {
+      "id": "linux-x86_64",
+      "target_triple": "x86_64-unknown-linux-gnu",
+      "minimum_level": 1,
+      "runtime_boundary": "static-zero-libc",
+      "zero_libc": true,
+      "gate": "tests/integration/test_pcc1_cpython_replacement_linux_x86_64.py",
+      "verdict": "supported",
+      "implementation_status": "unverified",
+      "diagnostic": "PCC-CPY-TARGET-LINUX-X86-64-UNPROVEN"
+    }
+  ],
+  "evidence_policy": {
+    "claimable_profile": "replacement-release",
+    "required_modes": {
+      "execution_root": "pcc1",
+      "execution_mode": "pcc-native",
+      "backend": "self",
+      "python_libpython": "off",
+      "runtime_owner": "pcc-python",
+      "fallback": "forbidden"
+    },
+    "required_gc_backends": [
+      0,
+      1,
+      2,
+      3,
+      4
+    ],
+    "required_fixed_point_stages": [
+      "pcc1",
+      "pcc2",
+      "pcc3"
+    ],
+    "required_clean_source_levels": [
+      1,
+      2,
+      3
+    ],
+    "required_targets": [
+      "arm64-apple-darwin",
+      "x86_64-unknown-linux-gnu"
+    ],
+    "forbidden_execution_owners": [
+      "host-python",
+      "host-pcc",
+      "cpython",
+      "libpython"
+    ],
+    "forbidden_linkage": [
+      "libpython",
+      "llvm-runtime-fallback",
+      "cpython-extension-abi"
+    ],
+    "required_provenance": [
+      "source",
+      "compiler-artifacts",
+      "application-artifacts",
+      "process-tree",
+      "binary-linkage",
+      "runtime-archive",
+      "gc",
+      "packages",
+      "oracle",
+      "performance"
+    ]
+  },
+  "unsupported_policy": {
+    "unknown_surface": "reject",
+    "publication_behavior": "fail-closed",
+    "execution_behavior": "stable-diagnostic-before-fallback",
+    "diagnostic_prefix": "PCC-CPY-UNSUPPORTED-",
+    "host_assistance_counts_as_replacement": false,
+    "cpython_compat_counts_as_replacement": false,
+    "supported_verdict_is_current_proof": false
+  },
+  "surfaces": [
+    {
+      "id": "language.core-values-control-flow",
+      "category": "language",
+      "title": "Core expressions, values, calls and control flow",
+      "owner": "CPY-P0-LANGUAGE-SEMANTIC-COMPATIBILITY",
+      "oracle": "CPython 3.13.2 differential corpus",
+      "minimum_level": 1,
+      "gate": "tests/python/test_pcc1_cpython_language_matrix.py",
+      "verdict": "supported",
+      "implementation_status": "unverified",
+      "diagnostic": "PCC-CPY-LANGUAGE-CORE-UNPROVEN"
+    },
+    {
+      "id": "language.arbitrary-precision-numerics",
+      "category": "language",
+      "title": "Arbitrary-precision int and Python numeric semantics",
+      "owner": "PY-P0-EXACT-INT-BRANCH-REPRESENTATION",
+      "oracle": "CPython 3.13.2 numeric behavior",
+      "minimum_level": 1,
+      "gate": "tests/python/test_pcc1_cpython_language_matrix.py",
+      "verdict": "supported",
+      "implementation_status": "unverified",
+      "diagnostic": "PCC-CPY-LANGUAGE-NUMERIC-UNPROVEN"
+    },
+    {
+      "id": "language.object-model",
+      "category": "language",
+      "title": "Classes, identity, descriptors, attributes and methods",
+      "owner": "CPY-P0-LANGUAGE-SEMANTIC-COMPATIBILITY",
+      "oracle": "CPython 3.13.2 object model",
+      "minimum_level": 1,
+      "gate": "tests/python/test_self_host_oracle_diff.py",
+      "verdict": "supported",
+      "implementation_status": "unverified",
+      "diagnostic": "PCC-CPY-LANGUAGE-OBJECT-MODEL-UNPROVEN"
+    },
+    {
+      "id": "language.exceptions-finalization",
+      "category": "language",
+      "title": "Exceptions, generators, coroutines, suspended frames and object lifetime",
+      "owner": "CPY-P0-LANGUAGE-SEMANTIC-COMPATIBILITY",
+      "oracle": "CPython 3.13.2 lifetime and exception behavior",
+      "minimum_level": 1,
+      "gate": "tests/python/test_pcc1_cpython_language_matrix.py",
+      "verdict": "supported",
+      "implementation_status": "unverified",
+      "diagnostic": "PCC-CPY-LANGUAGE-LIFETIME-UNPROVEN"
+    },
+    {
+      "id": "language.dynamic-reflection",
+      "category": "language",
+      "title": "Dynamic code, reflection and inspectable runtime objects",
+      "owner": "CPY-P0-LANGUAGE-SEMANTIC-COMPATIBILITY",
+      "oracle": "CPython 3.13.2 reflection behavior",
+      "minimum_level": 3,
+      "gate": "tests/python/test_pcc1_cpython_language_matrix.py",
+      "verdict": "supported",
+      "implementation_status": "unverified",
+      "diagnostic": "PCC-CPY-LANGUAGE-DYNAMIC-REFLECTION-UNPROVEN"
+    },
+    {
+      "id": "stdlib.service-core",
+      "category": "stdlib",
+      "title": "Frozen service, network and concurrency stdlib closure",
+      "owner": "CPY-P0-TIER1-PURE-PYTHON-SERVICE-REPLACEMENT",
+      "oracle": "CPython 3.13.2 service stdlib behavior",
+      "minimum_level": 1,
+      "gate": "tests/integration/test_pcc1_pure_python_service_replacement.py",
+      "verdict": "supported",
+      "implementation_status": "unverified",
+      "diagnostic": "PCC-CPY-STDLIB-SERVICE-CORE-UNPROVEN"
+    },
+    {
+      "id": "stdlib.build-tool-closure",
+      "category": "stdlib",
+      "title": "Build, metadata, compression, archive and source distribution modules",
+      "owner": "STDLIB-P1-BUILD-TOOL-CLOSURE",
+      "oracle": "CPython 3.13.2 build-tool behavior",
+      "minimum_level": 2,
+      "gate": "tests/python/test_py_stdlib_build_tool_closure.py",
+      "verdict": "supported",
+      "implementation_status": "unverified",
+      "diagnostic": "PCC-CPY-STDLIB-BUILD-TOOL-UNPROVEN"
+    },
+    {
+      "id": "stdlib.frozen-313-inventory",
+      "category": "stdlib",
+      "title": "Published Python 3.13 standard-library support inventory",
+      "owner": "CPY-P0-PYTHON-USER-TOOLING",
+      "oracle": "CPython 3.13.2 standard library",
+      "minimum_level": 3,
+      "gate": "tests/python/test_pcc1_python3_stdlib_matrix.py",
+      "verdict": "supported",
+      "implementation_status": "unverified",
+      "diagnostic": "PCC-CPY-STDLIB-FROZEN-INVENTORY-UNPROVEN"
+    },
+    {
+      "id": "stdlib.platform-specific-outside-targets",
+      "category": "stdlib",
+      "title": "Modules tied to operating systems outside the supported targets",
+      "owner": "CPY-P0-REPLACEMENT-CONTRACT",
+      "oracle": "CPython 3.13.2 platform availability table",
+      "minimum_level": 3,
+      "gate": "tests/python/test_pcc1_cpython_replacement_contract.py",
+      "verdict": "unsupported",
+      "implementation_status": "excluded",
+      "diagnostic": "PCC-CPY-UNSUPPORTED-STDLIB-OUTSIDE-TARGETS"
+    },
+    {
+      "id": "cli.script-module",
+      "category": "cli",
+      "title": "Script, -m, argv, import path, environment and exit semantics",
+      "owner": "CPY-P0-PYTHON-USER-TOOLING",
+      "oracle": "CPython 3.13.2 python3 CLI",
+      "minimum_level": 1,
+      "gate": "tests/python/test_pcc1_python3_cli_matrix.py",
+      "verdict": "supported",
+      "implementation_status": "unverified",
+      "diagnostic": "PCC-CPY-CLI-SCRIPT-MODULE-UNPROVEN"
+    },
+    {
+      "id": "cli.command-stdin-repl",
+      "category": "cli",
+      "title": "-c, stdin, interactive REPL and terminal behavior",
+      "owner": "CPY-P0-PYTHON-USER-TOOLING",
+      "oracle": "CPython 3.13.2 interactive CLI",
+      "minimum_level": 3,
+      "gate": "tests/integration/test_installed_pcc1_repl_debug_profile.py",
+      "verdict": "supported",
+      "implementation_status": "unverified",
+      "diagnostic": "PCC-CPY-CLI-INTERACTIVE-UNPROVEN"
+    },
+    {
+      "id": "cli.python3-role",
+      "category": "cli",
+      "title": "Installed pcc1 artifact occupies the supported python3 command role",
+      "owner": "CPY-P0-TIER3-PYTHON3-DROPIN-REPLACEMENT",
+      "oracle": "CPython 3.13.2 installed python3 executable",
+      "minimum_level": 3,
+      "gate": "tests/integration/test_pcc1_python3_dropin_replacement.py",
+      "verdict": "supported",
+      "implementation_status": "unverified",
+      "diagnostic": "PCC-CPY-CLI-PYTHON3-ROLE-UNPROVEN"
+    },
+    {
+      "id": "import.packages-relative",
+      "category": "import",
+      "title": "Modules, packages, relative imports and deterministic search paths",
+      "owner": "CPY-P0-LANGUAGE-SEMANTIC-COMPATIBILITY",
+      "oracle": "CPython 3.13.2 import behavior",
+      "minimum_level": 1,
+      "gate": "tests/python/test_pcc1_cpython_language_matrix.py",
+      "verdict": "supported",
+      "implementation_status": "unverified",
+      "diagnostic": "PCC-CPY-IMPORT-PACKAGE-RELATIVE-UNPROVEN"
+    },
+    {
+      "id": "import.extension-loader",
+      "category": "import",
+      "title": "Mode-labeled pcc-native extension discovery and loading",
+      "owner": "CPY-P0-GENERIC-PACKAGE-ABI",
+      "oracle": "pcc-native ABI manifest and CPython behavior oracle",
+      "minimum_level": 2,
+      "gate": "tests/python/test_pcc_native_extension_loader.py",
+      "verdict": "supported",
+      "implementation_status": "unverified",
+      "diagnostic": "PCC-CPY-IMPORT-PCC-NATIVE-EXTENSION-UNPROVEN"
+    },
+    {
+      "id": "import.hooks-resources-namespace",
+      "category": "import",
+      "title": "Import hooks, namespace packages and package resources",
+      "owner": "CPY-P0-PYTHON-USER-TOOLING",
+      "oracle": "CPython 3.13.2 importlib behavior",
+      "minimum_level": 3,
+      "gate": "tests/python/test_pcc1_python3_import_matrix.py",
+      "verdict": "supported",
+      "implementation_status": "unverified",
+      "diagnostic": "PCC-CPY-IMPORT-HOOKS-RESOURCES-UNPROVEN"
+    },
+    {
+      "id": "package.pure-python-install-build",
+      "category": "package",
+      "title": "Hostless pure-Python environment, acquisition, build, install and metadata",
+      "owner": "CPY-P0-HOSTLESS-RUNTIME-BUILD",
+      "oracle": "Pinned package artifacts and CPython 3.13.2 behavior",
+      "minimum_level": 1,
+      "gate": "tests/integration/test_pcc1_hostless_distribution.py",
+      "verdict": "supported",
+      "implementation_status": "unverified",
+      "diagnostic": "PCC-CPY-PACKAGE-PURE-PYTHON-UNPROVEN"
+    },
+    {
+      "id": "package.generic-native-source-build",
+      "category": "package",
+      "title": "Generic pcc-native extension source build and ABI",
+      "owner": "CPY-P0-GENERIC-PACKAGE-ABI",
+      "oracle": "pcc-native ABI specification plus CPython behavior oracle",
+      "minimum_level": 2,
+      "gate": "tests/integration/test_pcc1_generic_package_abi_matrix.py",
+      "verdict": "supported",
+      "implementation_status": "unverified",
+      "diagnostic": "PCC-CPY-PACKAGE-NATIVE-SOURCE-BUILD-UNPROVEN"
+    },
+    {
+      "id": "package.scientific-build-corpus",
+      "category": "package",
+      "title": "NumPy and a second unrelated native-extension family",
+      "owner": "CPY-P0-TIER2-SCIENTIFIC-BUILD-ECOSYSTEM-REPLACEMENT",
+      "oracle": "Version-pinned CPython 3.13.2 package corpus",
+      "minimum_level": 2,
+      "gate": "tests/integration/test_pcc1_scientific_build_replacement.py",
+      "verdict": "supported",
+      "implementation_status": "unverified",
+      "diagnostic": "PCC-CPY-PACKAGE-SCIENTIFIC-CORPUS-UNPROVEN"
+    },
+    {
+      "id": "package.cpython-binary-artifacts",
+      "category": "package",
+      "title": "CPython-tagged binary wheels and cpython-compat artifacts in pcc-native claims",
+      "owner": "CPY-P0-GENERIC-PACKAGE-ABI",
+      "oracle": "Python wheel and extension tag specifications",
+      "minimum_level": 2,
+      "gate": "tests/python/test_package_abi_mode_labels.py",
+      "verdict": "unsupported",
+      "implementation_status": "excluded",
+      "diagnostic": "PCC-CPY-UNSUPPORTED-CPYTHON-BINARY-ARTIFACT"
+    },
+    {
+      "id": "tooling.traceback-warnings",
+      "category": "tooling",
+      "title": "Tracebacks, source locations, warnings and stable diagnostics",
+      "owner": "CPY-P0-PYTHON-USER-TOOLING",
+      "oracle": "CPython 3.13.2 observable diagnostics",
+      "minimum_level": 1,
+      "gate": "tests/python/test_pcc1_traceback_tooling.py",
+      "verdict": "supported",
+      "implementation_status": "unverified",
+      "diagnostic": "PCC-CPY-TOOLING-DIAGNOSTICS-UNPROVEN"
+    },
+    {
+      "id": "tooling.debug-profile-coverage",
+      "category": "tooling",
+      "title": "Inspection, source maps, debugger, profiler and coverage hooks",
+      "owner": "CPY-P0-PYTHON-USER-TOOLING",
+      "oracle": "CPython 3.13.2 debugger, profiler and coverage events",
+      "minimum_level": 3,
+      "gate": "tests/integration/test_installed_pcc1_repl_debug_profile.py",
+      "verdict": "supported",
+      "implementation_status": "unverified",
+      "diagnostic": "PCC-CPY-TOOLING-OBSERVATION-HOOKS-UNPROVEN"
+    },
+    {
+      "id": "tooling.cpython-bytecode-tools",
+      "category": "tooling",
+      "title": "Tools that require CPython bytecode identity or private code-object layout",
+      "owner": "CPY-P0-REPLACEMENT-CONTRACT",
+      "oracle": "CPython 3.13.2 private implementation details",
+      "minimum_level": 3,
+      "gate": "tests/python/test_pcc1_cpython_replacement_contract.py",
+      "verdict": "unsupported",
+      "implementation_status": "excluded",
+      "diagnostic": "PCC-CPY-UNSUPPORTED-CPYTHON-BYTECODE-TOOL"
+    },
+    {
+      "id": "runtime.self-owned-fixed-point",
+      "category": "runtime",
+      "title": "Current-source pcc1 self backend and pcc2/pcc3 fixed point",
+      "owner": "CPY-P0-CURRENT-HEAD-RELEASE-FIXED-POINT",
+      "oracle": "Normalized pcc2/pcc3 identity and linkage audit",
+      "minimum_level": 1,
+      "gate": "tests/python/gc/test_pcc_bootstrap_full_gc0.py",
+      "verdict": "supported",
+      "implementation_status": "unverified",
+      "diagnostic": "PCC-CPY-RUNTIME-FIXED-POINT-UNPROVEN"
+    },
+    {
+      "id": "runtime.five-gc-equality",
+      "category": "runtime",
+      "title": "One object/root/frame/native-handle contract under GC0 through GC4",
+      "owner": "CPY-P0-CURRENT-HEAD-RELEASE-FIXED-POINT",
+      "oracle": "Five-GC differential and fixed-point matrix",
+      "minimum_level": 1,
+      "gate": "tests/python/gc/test_pcc_bootstrap_full_gc0.py..test_pcc_bootstrap_full_gc4.py",
+      "verdict": "supported",
+      "implementation_status": "unverified",
+      "diagnostic": "PCC-CPY-RUNTIME-FIVE-GC-UNPROVEN"
+    },
+    {
+      "id": "runtime.hostless-build-run",
+      "category": "runtime",
+      "title": "Install, build and execute with host Python and host pcc unavailable",
+      "owner": "CPY-P0-HOSTLESS-RUNTIME-BUILD",
+      "oracle": "Process-tree, linkage and provenance audit",
+      "minimum_level": 1,
+      "gate": "tests/integration/test_pcc1_hostless_distribution.py",
+      "verdict": "supported",
+      "implementation_status": "unverified",
+      "diagnostic": "PCC-CPY-RUNTIME-HOSTLESS-UNPROVEN"
+    },
+    {
+      "id": "runtime.long-running-efficiency",
+      "category": "runtime",
+      "title": "Bounded long-running RSS, pause, throughput and fragmentation",
+      "owner": "CPY-P0-TIER1-PURE-PYTHON-SERVICE-REPLACEMENT",
+      "oracle": "Mode- and machine-labeled CPython 3.13.2 comparison",
+      "minimum_level": 1,
+      "gate": "tests/integration/test_pcc1_pure_python_service_replacement.py",
+      "verdict": "supported",
+      "implementation_status": "unverified",
+      "diagnostic": "PCC-CPY-RUNTIME-LONGRUN-UNPROVEN"
+    },
+    {
+      "id": "runtime.native-extension-lifetime",
+      "category": "runtime",
+      "title": "Extension slots, buffers, capsules and external-resource lifetime",
+      "owner": "CPY-P0-GENERIC-PACKAGE-ABI",
+      "oracle": "CPython 3.13.2 behavior plus pcc five-GC ownership contract",
+      "minimum_level": 2,
+      "gate": "tests/integration/test_pcc1_generic_package_abi_matrix.py",
+      "verdict": "supported",
+      "implementation_status": "unverified",
+      "diagnostic": "PCC-CPY-RUNTIME-EXTENSION-LIFETIME-UNPROVEN"
+    },
+    {
+      "id": "runtime.cpython-embedding",
+      "category": "runtime",
+      "title": "Embedding or initializing CPython/libpython inside a pcc-native result",
+      "owner": "CPY-P0-REPLACEMENT-CONTRACT",
+      "oracle": "pcc pcc-native ownership contract",
+      "minimum_level": 1,
+      "gate": "tests/python/test_pcc1_cpython_replacement_contract.py",
+      "verdict": "unsupported",
+      "implementation_status": "excluded",
+      "diagnostic": "PCC-CPY-UNSUPPORTED-CPYTHON-EMBEDDING"
+    },
+    {
+      "id": "platform.darwin-named-libsystem",
+      "category": "platform",
+      "title": "Darwin arm64 enters the OS only through named libSystem ABI calls",
+      "owner": "CPY-P0-CURRENT-HEAD-RELEASE-FIXED-POINT",
+      "oracle": "Mach-O linkage and runtime archive provenance",
+      "minimum_level": 1,
+      "gate": "tests/darwin_python_runtime_libsystem_boundary.json",
+      "verdict": "supported",
+      "implementation_status": "unverified",
+      "diagnostic": "PCC-CPY-PLATFORM-DARWIN-LIBSYSTEM-UNPROVEN"
+    },
+    {
+      "id": "platform.linux-static-zero-libc",
+      "category": "platform",
+      "title": "Linux x86_64 final artifact has a static zero-C/libc production boundary",
+      "owner": "CPY-P0-CURRENT-HEAD-RELEASE-FIXED-POINT",
+      "oracle": "ELF linkage, undefined-symbol and archive provenance audit",
+      "minimum_level": 1,
+      "gate": "tests/integration/test_self_backend_x86_64_linux.py",
+      "verdict": "supported",
+      "implementation_status": "unverified",
+      "diagnostic": "PCC-CPY-PLATFORM-LINUX-ZERO-LIBC-UNPROVEN"
+    },
+    {
+      "id": "platform.outside-frozen-matrix",
+      "category": "platform",
+      "title": "Architectures and operating systems outside Darwin arm64 and Linux x86_64",
+      "owner": "CPY-P0-REPLACEMENT-CONTRACT",
+      "oracle": "Frozen replacement target matrix",
+      "minimum_level": 1,
+      "gate": "tests/python/test_pcc1_cpython_replacement_contract.py",
+      "verdict": "unsupported",
+      "implementation_status": "excluded",
+      "diagnostic": "PCC-CPY-UNSUPPORTED-TARGET"
+    }
+  ]
+}

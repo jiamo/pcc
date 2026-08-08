@@ -8,7 +8,10 @@ class Error(Exception):
 
 
 def crc32(data, value: int = 0) -> int:
-    crc = value ^ 0xFFFFFFFF
+    # CPython accepts an arbitrary Python int seed but the CRC state is a
+    # 32-bit register.  Mask before the first shift so high seed bits cannot
+    # bleed into the checksum over the next bytes.
+    crc = (value & 0xFFFFFFFF) ^ 0xFFFFFFFF
     for b in data:
         cur = b if isinstance(b, int) else ord(b)
         crc = crc ^ (cur & 0xFF)

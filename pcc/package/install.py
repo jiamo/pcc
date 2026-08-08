@@ -8,6 +8,7 @@ directory and writes a manifest that future import/build steps can consume.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -42,6 +43,7 @@ _ARTIFACT_SUFFIXES = (".whl", ".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".zip")
 _IMPORTABLE_SOURCE_SUFFIXES = (".py", ".pyi")
 _IMPORTABLE_NATIVE_SUFFIXES = (".so", ".pyd", ".dll", ".dylib")
 _PACKAGE_METADATA_DIR_SUFFIXES = (".dist-info", ".egg-info")
+BUILD_MODES = ("owned", "host")
 
 
 def _repo_root() -> Path:
@@ -821,10 +823,56 @@ def _meson_setup_command(
 
 
 def _ensure_meson_build_outputs(
-    source: Path, requires: tuple[str, ...]
+    source: Path,
+    requires: tuple[str, ...],
+    *,
+    build_mode: str = "owned",
 ) -> dict[str, object]:
     if not (source / "meson.build").is_file():
-        return {"ok": True, "skipped": True, "reason": "no_meson_build", "actions": []}
+        return {
+            "ok": True,
+            "skipped": True,
+            "reason": "no_meson_build",
+            "actions": [],
+            "build_mode_requested": build_mode,
+            "build_ownership": "not-required",
+            "host_assisted": False,
+            "host_python": None,
+            "host_free_build_claim": True,
+        }
+    if build_mode not in BUILD_MODES:
+        return {
+            "ok": False,
+            "skipped": False,
+            "reason": "build_mode_invalid",
+            "actions": [],
+            "build_mode_requested": build_mode,
+            "build_ownership": "unresolved",
+            "host_assisted": False,
+            "host_python": None,
+            "host_free_build_claim": False,
+            "diagnostics": ["PCC-PKG-BUILD-MODE-INVALID"],
+        }
+    if build_mode == "owned":
+        # A Meson source build is a Python-program execution boundary.  The
+        # host implementation cannot make that boundary pcc-owned merely by
+        # hiding python3 from PATH or pointing PCC_HOST_PYTHON at a failing
+        # executable.  Until a pcc-compiled Meson/build-exec artifact is
+        # supplied, owned mode must stop before creating wrappers, configuring
+        # Meson, or starting Ninja.
+        return {
+            "ok": False,
+            "skipped": False,
+            "reason": "owned_build_tool_required",
+            "actions": [],
+            "build_backend": "meson",
+            "build_mode_requested": build_mode,
+            "build_ownership": "owned-unavailable",
+            "host_assisted": False,
+            "host_python": None,
+            "host_free_build_claim": False,
+            "diagnostics": ["PCC-PKG-OWNED-BUILD-TOOL-REQUIRED"],
+        }
     build_dir = source / "build" / "pcc-package" / "meson-build"
     timeout = int(os.environ.get("PCC_PACKAGE_BUILD_TIMEOUT", "600"))
     wrappers = _build_requirement_tool_wrappers(requires)
@@ -839,10 +887,17 @@ def _ensure_meson_build_outputs(
             setup_command = _meson_setup_command(source, build_dir, path_env)
             if setup_command is None:
                 return {
-                    "ok": True,
-                    "skipped": True,
+                    "ok": False,
+                    "skipped": False,
                     "reason": "meson_not_available",
                     "actions": [],
+                    "build_backend": "meson",
+                    "build_mode_requested": build_mode,
+                    "build_ownership": "host",
+                    "host_assisted": True,
+                    "host_python": sys.executable,
+                    "host_free_build_claim": False,
+                    "diagnostics": ["PCC-PKG-HOST-BUILD-TOOL-MISSING"],
                 }
             build_dir.mkdir(parents=True, exist_ok=True)
             setup = subprocess.run(
@@ -864,7 +919,17 @@ def _ensure_meson_build_outputs(
                 }
             )
             if setup.returncode != 0:
-                return {"ok": False, "skipped": False, "actions": actions}
+                return {
+                    "ok": False,
+                    "skipped": False,
+                    "actions": actions,
+                    "build_backend": "meson",
+                    "build_mode_requested": build_mode,
+                    "build_ownership": "host",
+                    "host_assisted": True,
+                    "host_python": sys.executable,
+                    "host_free_build_claim": False,
+                }
         ninja = shutil.which("ninja", path=path_env) or "ninja"
         try:
             build_jobs = max(1, int(os.environ.get("PCC_PACKAGE_BUILD_JOBS", "2")))
@@ -889,7 +954,17 @@ def _ensure_meson_build_outputs(
                 "stderr": build.stderr[-4000:],
             }
         )
-        return {"ok": build.returncode == 0, "skipped": False, "actions": actions}
+        return {
+            "ok": build.returncode == 0,
+            "skipped": False,
+            "actions": actions,
+            "build_backend": "meson",
+            "build_mode_requested": build_mode,
+            "build_ownership": "host",
+            "host_assisted": True,
+            "host_python": sys.executable,
+            "host_free_build_claim": False,
+        }
     except (OSError, subprocess.TimeoutExpired) as exc:
         actions.append(
             {
@@ -901,10 +976,78 @@ def _ensure_meson_build_outputs(
                 "stderr": str(exc),
             }
         )
-        return {"ok": False, "skipped": False, "actions": actions}
+        return {
+            "ok": False,
+            "skipped": False,
+            "actions": actions,
+            "build_backend": "meson",
+            "build_mode_requested": build_mode,
+            "build_ownership": "host",
+            "host_assisted": True,
+            "host_python": sys.executable,
+            "host_free_build_claim": False,
+        }
     finally:
         if wrappers is not None:
             wrappers.cleanup()
+
+
+def _existing_payload_build_report(
+    source: Path, *, build_mode: str
+) -> dict[str, object] | None:
+    """Recover persisted host provenance without trusting source self-claims.
+
+    A source tree is an input, not a trust root.  The host installer cannot
+    prove that a JSON file claiming ``build_ownership=owned`` was emitted by a
+    pcc-native build, so owned mode always rejects this reuse boundary.  The
+    pcc1 path owns its separate compiler/tool/source receipt and may rebuild
+    from that closed input set.
+    """
+    manifest_path = source / "pcc-package.json"
+    if not manifest_path.is_file():
+        return None
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(manifest, dict):
+        return None
+    persisted = manifest.get("build_report")
+    if not isinstance(persisted, dict) or not persisted.get("ok"):
+        return None
+    if build_mode == "owned":
+        return {
+            "ok": False,
+            "skipped": False,
+            "reason": "existing_build_provenance_unverified",
+            "actions": [],
+            "build_backend": "existing",
+            "build_mode_requested": build_mode,
+            "build_ownership": "prebuilt-unverified",
+            "host_assisted": persisted.get("host_assisted"),
+            "host_python": persisted.get("host_python"),
+            "host_free_build_claim": False,
+            "diagnostics": ["PCC-PKG-BUILD-PROVENANCE-UNVERIFIED"],
+        }
+    persisted_host = (
+        persisted.get("build_ownership") == "host"
+        and persisted.get("host_assisted") is True
+        and isinstance(persisted.get("host_python"), str)
+        and bool(str(persisted.get("host_python")).strip())
+        and persisted.get("host_free_build_claim") is False
+    )
+    report = dict(persisted)
+    if not persisted_host:
+        report["build_ownership"] = "prebuilt-unverified"
+        report["host_assisted"] = None
+        report["host_python"] = None
+        report["host_free_build_claim"] = False
+    report["build_backend"] = "existing"
+    report["build_mode_requested"] = build_mode
+    report["reason"] = "existing_build_outputs"
+    report["skipped"] = True
+    report["actions"] = []
+    return report
 
 
 def _populate_cache_payload(cache_record: Path, installed_payloads: list[str]) -> None:
@@ -940,9 +1083,71 @@ def _populate_cache_payload(cache_record: Path, installed_payloads: list[str]) -
             shutil.copy2(payload, dest)
 
 
+def _artifact_sha256(source: Path) -> str | None:
+    """Content digest of a wheel/sdist artifact.
+
+    Directory sources deliberately return None: hashing a source tree either
+    costs as much as the reinstall it would save, or degrades to a
+    size/mtime approximation that can report "already satisfied" for changed
+    content. A wheel is one immutable file, so its digest is both cheap and
+    exact — that is the only case the reinstall fast path claims.
+    """
+    if not source.is_file():
+        return None
+    digest = hashlib.sha256()
+    with open(source, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _installed_manifests(site: Path) -> Iterable[dict]:
+    if not site.is_dir():
+        return
+    for child in sorted(site.iterdir()):
+        manifest_path = child / "pcc-package.json"
+        if not manifest_path.is_file():
+            continue
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(manifest, dict):
+            manifest["manifest_path"] = str(manifest_path)
+            yield manifest
+
+
+def _already_satisfied(site: Path, name: str, digest: str | None, abi: str):
+    """The installed manifest that makes this install a no-op, or None.
+
+    Matching on (name, artifact sha256, abi mode) plus a liveness check on the
+    recorded payloads. The payload check is what keeps this from reporting
+    success for a manifest whose files someone deleted.
+    """
+    if not digest:
+        return None
+    for manifest in _installed_manifests(site):
+        if manifest.get("name") != name:
+            continue
+        if manifest.get("artifact_sha256") != digest:
+            continue
+        if manifest.get("abi_mode") != abi:
+            continue
+        if not manifest.get("install_success"):
+            continue
+        payloads = manifest.get("installed_payloads") or []
+        if payloads and not all(os.path.exists(p) for p in payloads):
+            continue
+        if not os.path.isdir(str(manifest.get("installed_path") or "")):
+            continue
+        return manifest
+    return None
+
+
 def install_package(
     spec: str,
     *,
+    force: bool = False,
     target_dir: str | Path | None = None,
     cache_dir: str | Path | None = None,
     find_links: list[str] | tuple[str, ...] = (),
@@ -950,6 +1155,7 @@ def install_package(
     abi: str = "pcc-native",
     use_cache: bool = True,
     build_source: bool = False,
+    build_mode: str = "owned",
     resolved_from_override: str | None = None,
 ) -> dict[str, object]:
     cache = (
@@ -973,6 +1179,25 @@ def install_package(
 
     metadata_name = "" if Path(spec).expanduser().exists() else spec
     metadata = inspect_artifact(metadata_name, source)
+    site = (
+        Path(target_dir).expanduser().resolve() if target_dir else _default_site_dir()
+    )
+    artifact_sha256 = _artifact_sha256(source)
+
+    # Reinstalling the identical artifact used to redo everything — extract,
+    # copy, rescan every binary, rebuild native sources — because nothing
+    # compared the resolved artifact against what was already installed
+    # (PKG-P2-REINSTALL-FASTPATH; measured at 168s for numpy). Everything
+    # below this point is that work, so the match happens here.
+    # `force` keeps upgrade/reinstall semantics able to redo it.
+    if not force:
+        satisfied = _already_satisfied(site, metadata.name, artifact_sha256, abi)
+        if satisfied is not None:
+            satisfied["install_action"] = "already-satisfied"
+            satisfied["spec"] = spec
+            satisfied["resolved_from"] = resolved_from or "unresolved"
+            return satisfied
+
     inspection = inspect_package(
         metadata.name, str(source) if source.is_dir() else None
     )
@@ -981,12 +1206,46 @@ def install_package(
         "skipped": True,
         "reason": "build_source_disabled",
         "actions": [],
+        "build_mode_requested": build_mode,
+        "build_ownership": "not-attempted",
+        "host_assisted": None,
+        "host_python": None,
+        "host_free_build_claim": False,
     }
     if build_source and source.is_dir():
-        build_report = _ensure_meson_build_outputs(source, metadata.pyproject_requires)
-    site = (
-        Path(target_dir).expanduser().resolve() if target_dir else _default_site_dir()
-    )
+        persisted_report = _existing_payload_build_report(
+            source, build_mode=build_mode
+        )
+        if persisted_report is not None:
+            build_report = persisted_report
+        else:
+            build_report = _ensure_meson_build_outputs(
+                source,
+                metadata.pyproject_requires,
+                build_mode=build_mode,
+            )
+    if not bool(build_report.get("ok", True)):
+        # A failed source build is not an installable payload.  In particular,
+        # owned mode deliberately stops before invoking a host Meson process;
+        # copying that unbuilt tree into site-packages would turn the honest
+        # failure into a partially published import shadow.  Return the build
+        # provenance without mutating either the install target or cache.
+        return {
+            "ok": False,
+            "install_success": False,
+            "import_attempted": False,
+            "import_success": None,
+            "install_native_package_claim": False,
+            "native_package_claim": False,
+            "name": metadata.name,
+            "spec": spec,
+            "abi_mode": abi,
+            "build_mode_requested": build_mode,
+            "source_path": str(source),
+            "resolved_from": resolved_from or "unresolved",
+            "build_report": build_report,
+            "diagnostics": list(build_report.get("diagnostics", [])),
+        }
     install_root, installed_payloads = _copy_or_extract(source, site, metadata.name)
 
     cache_record = cache / metadata.name
@@ -1040,6 +1299,11 @@ def install_package(
         "name": metadata.name,
         "spec": spec,
         "abi_mode": abi,
+        "build_mode_requested": build_mode,
+        # None for directory sources — see _artifact_sha256. A manifest
+        # without it simply never matches the reinstall fast path.
+        "artifact_sha256": artifact_sha256,
+        "install_action": "installed",
         "source_path": str(source),
         "resolved_from": resolved_from or "unresolved",
         "installed_path": str(install_root),
@@ -1089,10 +1353,17 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--abi", default="pcc-native")
     parser.add_argument("--no-cache", action="store_true")
     parser.add_argument("--build-source", action="store_true")
+    parser.add_argument("--build", choices=BUILD_MODES, default="owned")
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="reinstall even when the identical artifact is already installed",
+    )
     parser.add_argument("--json", action="store_true")
     ns = parser.parse_args(argv)
     result = install_package(
         ns.spec,
+        force=ns.force,
         target_dir=ns.target_dir,
         cache_dir=ns.cache_dir,
         find_links=ns.find_links,
@@ -1100,6 +1371,7 @@ def main(argv: list[str] | None = None) -> int:
         abi=ns.abi,
         use_cache=not ns.no_cache,
         build_source=ns.build_source,
+        build_mode=ns.build,
     )
     if ns.json or True:
         print(json.dumps(result, indent=2, sort_keys=True))

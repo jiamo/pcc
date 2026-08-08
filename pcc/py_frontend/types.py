@@ -56,6 +56,8 @@ from .py_ast import (
 # ---------------------------------------------------------------------------
 
 TYPE_INT: IntType = IntType(name="int", width=64, signed=True)
+TYPE_I64: IntType = IntType(name="pcc.i64", width=64, signed=True)
+TYPE_U64: IntType = IntType(name="pcc.u64", width=64, signed=False)
 TYPE_FLOAT: FloatType = FloatType(name="float", width=64)
 TYPE_COMPLEX: ComplexType = ComplexType(name="complex")
 TYPE_BOOL: BoolType = BoolType(name="bool")
@@ -114,6 +116,10 @@ class PyFrontendError(Exception):
 # Map of plain Python builtin-name annotations to their Phase 1 types.
 _BUILTIN_NAMED_TYPES: dict[str, Type] = {
     "int": TYPE_INT,
+    "i64": TYPE_I64,
+    "u64": TYPE_U64,
+    "pcc.i64": TYPE_I64,
+    "pcc.u64": TYPE_U64,
     "float": TYPE_FLOAT,
     "complex": TYPE_COMPLEX,
     "bool": TYPE_BOOL,
@@ -247,6 +253,32 @@ def parse_annotation(expr: Expr) -> Type:
                 elem=parse_annotation(idx_exprs[0]),
                 length=length,
             )
+
+        if head in ("pcc.i64_buffer", "i64_buffer"):
+            if len(idx_exprs) != 1:
+                raise PyFrontendError(
+                    expr.span,
+                    "pcc.i64_buffer needs one literal length",
+                    "use pcc.i64_buffer[N] with N between 1 and 1048576",
+                )
+            length_expr = idx_exprs[0]
+            if not isinstance(length_expr, IntLit):
+                raise PyFrontendError(
+                    length_expr.span,
+                    "pcc.i64_buffer length must be an integer literal",
+                    "write a literal length between 1 and 1048576",
+                )
+            length = int(length_expr.value)
+            if length < 1 or length > 1_048_576:
+                raise PyFrontendError(
+                    length_expr.span,
+                    "pcc.i64_buffer length must be between 1 and 1048576",
+                    "choose a bounded fixed-length specialization candidate",
+                )
+            # The runtime representation deliberately remains exact immutable
+            # bytes.  Encoding the fixed element count in the semantic type
+            # name lets ordinary BytesType ABI/ownership paths stay valid.
+            return BytesType(name="pcc.i64_buffer[" + str(length) + "]")
 
         if head == "dict" or head == "Dict":
             if len(idx_exprs) == 2:
@@ -515,6 +547,16 @@ def common_type(a: Type, b: Type) -> Type:
 
     # Two int-likes.
     if _is_int_like(a) and _is_int_like(b):
+        a_raw = isinstance(a, IntType) and a.name in ("pcc.i64", "pcc.u64")
+        b_raw = isinstance(b, IntType) and b.name in ("pcc.i64", "pcc.u64")
+        if a_raw or b_raw:
+            # Raw machine lanes never arise from implicit promotion.  The
+            # inference pass contextually types integer *literals* before it
+            # calls ``common_type``; any remaining raw/Python-int or signed/
+            # unsigned mixture requires an explicit conversion.
+            if not (a_raw and b_raw) or a.name != b.name:
+                return TYPE_DYN
+            return a
         aw = getattr(a, "width", 64)
         bw = getattr(b, "width", 64)
         asg = getattr(a, "signed", True)
@@ -538,6 +580,8 @@ def common_type(a: Type, b: Type) -> Type:
 
 __all__ = [
     "TYPE_INT",
+    "TYPE_I64",
+    "TYPE_U64",
     "TYPE_FLOAT",
     "TYPE_COMPLEX",
     "TYPE_BOOL",

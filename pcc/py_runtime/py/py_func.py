@@ -8,6 +8,13 @@ Function object layout:
     offset 40   bound self object, nullable
     total size: 48 bytes
 """
+from pcc.py_runtime.py.py_abi_constants import (
+    PY_TYPE_DICT,
+    PY_TYPE_FUNC,
+    PY_TYPE_NONE,
+    PY_TYPE_STR,
+    PY_TYPE_TUPLE,
+)
 
 from pcc.extern import extern, c_abi_export, c_int32, c_int64, c_ptr, c_void
 from pcc.unsafe import (
@@ -50,6 +57,10 @@ py_str_new = extern("py_str_new", (c_ptr, c_int64), c_ptr)
 py_str_eq = extern("py_str_eq", (c_ptr, c_ptr), c_int64)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+py_err_occurred = extern("py_err_occurred", (), c_int64)
+py_runtime_error_if_unset = extern(
+    "py_runtime_error_if_unset", (c_ptr, c_ptr), c_ptr
+)
 py_incref = extern("py_incref", (c_ptr,), c_void)
 py_decref = extern("py_decref", (c_ptr,), c_void)
 py_gc_track = extern("py_gc_track", (c_ptr,), c_void)
@@ -76,7 +87,7 @@ def _checked_func(obj):
         return null()
     if is_tagged_int(obj):
         return null()
-    if load_i32(obj, 8) != 9:
+    if load_i32(obj, 8) != PY_TYPE_FUNC:
         return null()
     return obj
 
@@ -86,7 +97,7 @@ def _is_none_or_null(obj) -> int:
         return 1
     if is_tagged_int(obj):
         return 0
-    if load_i32(obj, 8) == 0:
+    if load_i32(obj, 8) == PY_TYPE_NONE:
         return 1
     return 0
 
@@ -96,7 +107,7 @@ def _is_tuple(obj) -> int:
         return 0
     if is_tagged_int(obj):
         return 0
-    if load_i32(obj, 8) == 7:
+    if load_i32(obj, 8) == PY_TYPE_TUPLE:
         return 1
     return 0
 
@@ -106,7 +117,7 @@ def _is_dict(obj) -> int:
         return 0
     if is_tagged_int(obj):
         return 0
-    if load_i32(obj, 8) == 6:
+    if load_i32(obj, 8) == PY_TYPE_DICT:
         return 1
     return 0
 
@@ -117,6 +128,12 @@ def _func_type_error(message):
     if ptr_is_null(exc) == 0:
         py_decref(exc)
     return null()
+
+
+def _func_runtime_error_if_unset(helper_name, message):
+    if py_err_occurred() != 0:
+        return null()
+    return py_runtime_error_if_unset(helper_name, message)
 
 
 def _kwargs_empty(kwargs) -> int:
@@ -143,7 +160,7 @@ def _signature_valid(sig) -> int:
     if is_tagged_int(magic) != 0:
         py_decref(magic)
         return 0
-    if load_i32(magic, 8) != 4:
+    if load_i32(magic, 8) != PY_TYPE_STR:
         py_decref(magic)
         return 0
     magic_len: int = load_i64(magic, 16)
@@ -241,7 +258,7 @@ def _code_set_owned_attr(code, name, value) -> int:
 def py_func_attach_code_metadata(func, signature, name) -> int:
     if ptr_is_null(func) or is_tagged_int(func):
         return -1
-    if load_i32(func, 8) != 9 or _signature_valid(signature) == 0:
+    if load_i32(func, 8) != PY_TYPE_FUNC or _signature_valid(signature) == 0:
         return -1
 
     names = py_tuple_get(signature, 1)
@@ -416,7 +433,7 @@ def _signature_from_captures(captures, out_actual_slot):
 def py_func_get_code_metadata(func):
     if ptr_is_null(func) or is_tagged_int(func):
         return null()
-    if load_i32(func, 8) != 9:
+    if load_i32(func, 8) != PY_TYPE_FUNC:
         return null()
     captures = pcc_gc_load_ptr(func, ptr_add(func, 64))
     if _is_tuple(captures) == 0 or py_tuple_len(captures) != 2:
@@ -446,7 +463,7 @@ def py_func_get_code_metadata(func):
 def py_func_get_defaults_metadata(func):
     if ptr_is_null(func) or is_tagged_int(func):
         return null()
-    if load_i32(func, 8) != 9:
+    if load_i32(func, 8) != PY_TYPE_FUNC:
         return null()
     captures = pcc_gc_load_ptr(func, ptr_add(func, 64))
     if _is_tuple(captures) == 0 or py_tuple_len(captures) != 2:
@@ -978,7 +995,7 @@ def _bind_signature_no_kwargs(sig, args_tuple):
 def py_func_new_bound(entry, captures_tuple, name, self_obj):
     if ptr_is_null(entry):
         return null()
-    fn = pcc_gc_alloc(96, 9, 0)
+    fn = pcc_gc_alloc(96, PY_TYPE_FUNC, 0)
     if ptr_is_null(fn):
         return null()
     store_ptr(fn, 16, null())
@@ -1019,15 +1036,29 @@ def py_func_new(entry, captures_tuple):
 def py_func_call_kwargs(callable_obj, args_tuple, kwargs):
     fn = _checked_func(callable_obj)
     if ptr_is_null(fn):
-        return null()
+        if ptr_is_null(callable_obj):
+            return _func_type_error(
+                cstr("native function call received NULL callable")
+            )
+        return _func_type_error(
+            cstr("native function call requires a function object")
+        )
     entry = load_ptr(fn, 56)
     if ptr_is_null(entry):
-        return null()
+        return _func_runtime_error_if_unset(
+            cstr("py_func_call_kwargs"),
+            cstr("native function object has no entry point")
+        )
     args = args_tuple
     made_args: int = 0
     if _is_none_or_null(args) != 0:
         args = py_tuple_new(0)
         made_args = 1
+        if ptr_is_null(args):
+            return _func_runtime_error_if_unset(
+                cstr("py_tuple_new"),
+                cstr("native function could not create its argument tuple")
+            )
     captures = pcc_gc_load_ptr(fn, ptr_add(fn, 64))
     actual_captures = captures
     sig = null()
@@ -1044,7 +1075,10 @@ def py_func_call_kwargs(callable_obj, args_tuple, kwargs):
                 py_decref(candidate)
                 if made_args != 0:
                     py_decref(args)
-                return null()
+                return _func_runtime_error_if_unset(
+                    cstr("py_func_signature_from_captures"),
+                    cstr("native function signature has no captures tuple")
+                )
             sig = candidate
             actual_captures = inner
             owns_actual_captures = 1
@@ -1066,6 +1100,14 @@ def py_func_call_kwargs(callable_obj, args_tuple, kwargs):
         else:
             call_args = _bind_signature(sig, args, kwargs)
         if ptr_is_null(call_args):
+            # Validate the binder's return before cleanup can run deallocators
+            # and accidentally provide an unrelated pending exception.
+            _func_runtime_error_if_unset(
+                cstr("py_func_bind_signature"),
+                cstr(
+                    "native function argument binding returned NULL without exception"
+                )
+            )
             py_decref(sig)
             if owns_actual_captures != 0:
                 py_decref(actual_captures)
@@ -1075,6 +1117,16 @@ def py_func_call_kwargs(callable_obj, args_tuple, kwargs):
         owns_call_args = 1
 
     result = call_ptr2(entry, actual_captures, call_args)
+    # The compiled entry owns its exception contract.  Check it before
+    # releasing call temporaries so cleanup cannot mask a silent NULL return.
+    if ptr_is_null(result):
+        entry_name = load_ptr(fn, 72)
+        if ptr_is_null(entry_name):
+            entry_name = cstr("<compiled native function>")
+        _func_runtime_error_if_unset(
+            entry_name,
+            cstr("compiled native function returned NULL without exception")
+        )
     if owns_call_args != 0:
         py_decref(call_args)
     if ptr_is_null(sig) == 0:

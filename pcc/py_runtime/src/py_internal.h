@@ -10,6 +10,74 @@
 #include <stdint.h>
 #include <stddef.h>
 
+/* Transitional C helpers that remain in the pcc-Python archive must observe
+ * the same owned environment table as pcc-Python semantics.  The C-oracle
+ * archive deliberately leaves this macro unset and continues to call host
+ * libc, so this bridge does not make the oracle depend on the production
+ * freestanding module. */
+#ifdef PCC_USE_FREESTANDING_PLATFORM_ENV
+char *pcc_platform_getenv(const char *name);
+char **pcc_platform_env_snapshot(void);
+void pcc_platform_env_snapshot_free(char **snapshot);
+#define pcc_runtime_getenv pcc_platform_getenv
+#else
+#define pcc_runtime_getenv getenv
+#endif
+
+#ifdef PCC_USE_FREESTANDING_PLATFORM_TIME
+int64_t pcc_platform_wall_time_us(void);
+int64_t pcc_platform_monotonic_us(void);
+int64_t pcc_platform_sleep_ns(int64_t delay_ns);
+#endif
+
+#ifdef PCC_USE_FREESTANDING_PLATFORM_PROCESS
+int64_t pcc_platform_waitpid(int64_t pid, int32_t *status, int64_t options);
+int64_t pcc_platform_kill(int64_t pid, int64_t signal_number);
+void pcc_platform_exit(int64_t status);
+void pcc_platform_abort(void);
+#endif
+
+#ifdef PCC_USE_FREESTANDING_PLATFORM_IO
+int64_t pcc_platform_read(int64_t fd, void *buffer, int64_t size);
+int64_t pcc_platform_write(int64_t fd, const void *buffer, int64_t size);
+int64_t pcc_platform_close(int64_t fd);
+#endif
+
+#ifdef PCC_USE_FREESTANDING_PLATFORM_SOCKET
+int64_t pcc_platform_tcp_connect(const char *host, const char *port);
+int64_t pcc_platform_tcp_listen(
+    const char *host, const char *port, int64_t reuse_port
+);
+int64_t pcc_platform_tcp_listen_with_backlog(
+    const char *host, const char *port, int64_t reuse_port, int64_t backlog
+);
+int64_t pcc_platform_tcp_accept_observe(int64_t fd, int64_t *output_fd);
+int64_t pcc_platform_tcp_connect_start(
+    const char *host, const char *port, int64_t *output_fd
+);
+int64_t pcc_platform_socket_connect_observe(int64_t fd, int64_t timeout_ms);
+int64_t pcc_platform_socket_read_observe(
+    int64_t fd, void *buffer, int64_t size, int64_t flags,
+    int64_t *output_count
+);
+int64_t pcc_platform_socket_write_observe(
+    int64_t fd, const void *buffer, int64_t size, int64_t flags,
+    int64_t *output_count
+);
+int64_t pcc_platform_socket_send(
+    int64_t fd, const void *buffer, int64_t size, int64_t flags
+);
+int64_t pcc_platform_socket_recv(
+    int64_t fd, void *buffer, int64_t size, int64_t flags
+);
+int64_t pcc_platform_socket_format_numeric_address(
+    const void *address, int64_t length, char *output, int64_t capacity
+);
+int64_t pcc_platform_socket_peer_text(
+    int64_t fd, char *output, int64_t capacity
+);
+#endif
+
 /* ---- Flags ------------------------------------------------------------- */
 #define PY_FLAG_IMMORTAL    0x1
 #define PY_FLAG_GC_TRACKED  0x2
@@ -34,6 +102,10 @@
 #define PY_FLAG_GC_FORWARD_RETIRING 0x20000
 #define PY_FLAG_GC_MALLOC_ALLOC 0x40000
 #define PY_FLAG_GC_DEALLOCATING 0x80000
+/* Generator-only semantic bit: this generator is a compiler-proven
+ * ``may_park`` continuation and may be transparently delegated by
+ * pcc.virtual_thread.call.  Ordinary Python generators never carry it. */
+#define PY_FLAG_GEN_MAY_PARK 0x100000
 #define PY_FLAG_GC_COLOR_MASK \
     (PY_FLAG_GC_WHITE | PY_FLAG_GC_GRAY | PY_FLAG_GC_BLACK)
 
@@ -98,6 +170,7 @@ void py_dealloc_thread_condition(PyObject *o);
 void py_dealloc_thread_semaphore(PyObject *o);
 void py_dealloc_thread_thread(PyObject *o);
 void py_dealloc_virtual_thread(PyObject *o);
+void py_dealloc_vthread_channel(PyObject *o);
 void py_dealloc_generic(PyObject *o);
 void pcc_vthread_waiter_pool_note_allocation(void);
 void pcc_vthread_waiter_pool_note_reuse(void);
@@ -126,6 +199,11 @@ PyObject *pcc_capi_cext_binary_number(
     PyObject *right,
     int64_t op
 );
+PyObject *pcc_capi_cext_inplace_number(
+    PyObject *left,
+    PyObject *right,
+    int64_t op
+);
 PyObject *pcc_capi_cext_absolute(PyObject *value);
 int64_t pcc_capi_cext_truthy(PyObject *value);
 int64_t pcc_capi_cext_richcompare_bool(
@@ -138,6 +216,15 @@ PyObject *pcc_capi_cext_object_iter(PyObject *o);
 PyObject *pcc_capi_cext_object_next(PyObject *o);
 int64_t pcc_capi_cext_object_is_iterator(PyObject *o);
 PyObject *pcc_capi_cext_object_getitem(PyObject *o, PyObject *key);
+int64_t pcc_capi_cext_object_setitem(
+    PyObject *o,
+    PyObject *key,
+    PyObject *value
+);
+/* len() for a cext object; -1 when the type exposes no length slot. */
+int64_t pcc_capi_cext_object_length(PyObject *o);
+/* tp_repr text for a cext object; NULL when the type has no repr slot. */
+PyObject *pcc_capi_cext_object_repr(PyObject *o);
 PyObject *pcc_capi_cext_object_getattr(PyObject *o, const char *name);
 int64_t pcc_capi_cext_object_setattr(
     PyObject *o,
@@ -168,6 +255,8 @@ void pcc_gc_note_slot_write_barrier(
     PyObject *value
 );
 void pcc_gc_thread_unregister_buffers(void);
+int64_t pcc_gc_frame_node_tls_pool_cached_count(void);
+void pcc_gc_frame_node_tls_pool_drain(void);
 int64_t pcc_gc_has_tracing_sweep(void);
 int64_t pcc_gc_collect_tracing(void);
 void pcc_gc_begin_explicit_tracing_collect(void);
@@ -272,6 +361,9 @@ void *pcc_gc_object_index_find(PyObject *obj);
 int64_t pcc_gc_object_index_insert(PyObject *obj, void *node);
 void *pcc_gc_object_index_remove(PyObject *obj);
 void pcc_gc_object_index_clear(void);
+int64_t pcc_gc_managed_pointer_index_contains(PyObject *obj);
+int64_t pcc_gc_managed_pointer_index_insert(PyObject *obj);
+int64_t pcc_gc_managed_pointer_index_remove(PyObject *obj);
 void pcc_gc_ptr_index_tls_pool_drain(void);
 typedef enum {
     PY_OBJ_SLOT_OWNED = 1,
@@ -335,6 +427,7 @@ void *pcc_gc_zpage_page_index_remove(void *page);
 void pcc_gc_zpage_page_index_clear(void);
 int64_t pcc_gc_object_is_known(PyObject *obj);
 int64_t pcc_gc_object_is_known_no_lock(PyObject *obj);
+int64_t pcc_gc_pointer_is_managed_no_lock(PyObject *obj);
 int64_t pcc_gc_backend4_slot_needs_resolve(PyObject *value);
 int64_t pcc_gc_forwarding_population_load(void);
 int64_t pcc_gc_relocation_set_active_load(void);
@@ -556,9 +649,12 @@ typedef struct PyClassMethod {
  *   instance_size     : total bytes of a PyInstanceObject carrying
  *                       n_fields slots.
  *   type_tag_alloc    : the type tag allocated for this class
- *                       (PY_TYPE_USER + n). Instances carry this tag in
- *                       their header so isinstance and dispatch stay O(1)
- *                       for pointer identity checks.
+ *                       (PY_TYPE_USER_CLASS_START + n). Tags immediately
+ *                       above PY_TYPE_USER are reserved for descriptors and
+ *                       must never enter instance-layout dispatch. Instances
+ *                       carry this allocated tag in their header so
+ *                       isinstance and dispatch stay O(1) for pointer
+ *                       identity checks.
  */
 typedef struct PyClassObject {
     PyObjectHeader           h;
@@ -682,6 +778,59 @@ typedef struct {
     int64_t done;
 } PyTaskObject;
 
+/* All PY_TYPE_VTHREAD_CHANNEL variants share this prefix. */
+typedef struct {
+    PyObjectHeader h;
+    int64_t kind;
+} PyVThreadChannelObject;
+
+/* Sender/receiver endpoint layout (40 bytes). */
+typedef struct {
+    PyObjectHeader h;
+    int64_t kind;
+    PyObject *core;
+    int64_t closed;
+} PyVThreadChannelEndpointObject;
+
+/* Shared bounded-channel layout.  The capacity slots are part of the GC
+ * allocation itself, not a separately owned payload, so relocation can use
+ * the ordinary object copy plus slot-pair remapping contract. */
+typedef struct {
+    PyObjectHeader h;
+    int64_t kind;
+    int64_t capacity;
+    int64_t length;
+    int64_t head;
+    int64_t tail;
+    int64_t sender_count;
+    int64_t receiver_closed;
+    int64_t oneshot;
+    int64_t oneshot_sent;
+    void *send_head;
+    void *send_tail;
+    void *recv_head;
+    void *recv_tail;
+    int64_t flags;
+    PyObject *items[];
+} PyVThreadChannelCoreObject;
+
+_Static_assert(
+    sizeof(PyVThreadChannelEndpointObject) == 40,
+    "PyVThreadChannelEndpointObject ABI"
+);
+_Static_assert(
+    offsetof(PyVThreadChannelEndpointObject, core) == 24,
+    "PyVThreadChannelEndpointObject.core ABI"
+);
+_Static_assert(
+    sizeof(PyVThreadChannelCoreObject) == 128,
+    "PyVThreadChannelCoreObject ABI"
+);
+_Static_assert(
+    offsetof(PyVThreadChannelCoreObject, items) == 128,
+    "PyVThreadChannelCoreObject.items ABI"
+);
+
 struct PyContinuationStackChunk {
     int32_t root_map_slot_count;
     int32_t reserved;
@@ -704,7 +853,43 @@ typedef struct {
      * timer backpointer, the node owns the registered GC root and this field
      * must be NULL whenever the virtual thread is not IO-queued. */
     void *io_entry;
+    /* Task-local terminal payload.  An uncaught worker exception is moved
+     * out of carrier TLS into this traced slot before the scheduler continues
+     * with unrelated ready work. */
+    PyObject *exception;
+    /* PCC_VTHREAD_OUTCOME_*; execution state remains DONE for every terminal
+     * outcome so the existing state ABI stays backward compatible. */
+    int64_t outcome;
+    /* Raw, stable scheduler nodes. Each node owns an updateable root for its
+     * joining virtual thread; these pointers themselves are not GC slots. */
+    void *join_waiters;
+    void *join_wait_tail;
+    void *join_entry;
+    /* Target retained while this task is parked in join and until join_result
+     * consumes the terminal payload. */
+    PyObject *join_target;
+    int64_t wait_kind;
+    int64_t cancel_requested;
+    /* Channel/select wait state.  Owner and value fields are traced; arm
+     * entries are raw scheduler backpointers and must be NULL whenever the
+     * virtual thread is not actively parked on a channel operation. */
+    PyObject *channel_owner_a;
+    PyObject *channel_owner_b;
+    void *channel_arm_a;
+    void *channel_arm_b;
+    PyObject *channel_value;
+    int64_t channel_status;
+    int64_t channel_index;
 } PyVirtualThreadObject;
+
+_Static_assert(sizeof(PyVirtualThreadObject) == 192,
+               "PyVirtualThreadObject ABI");
+_Static_assert(offsetof(PyVirtualThreadObject, channel_owner_a) == 136,
+               "PyVirtualThreadObject.channel_owner_a ABI");
+_Static_assert(offsetof(PyVirtualThreadObject, channel_owner_b) == 144,
+               "PyVirtualThreadObject.channel_owner_b ABI");
+_Static_assert(offsetof(PyVirtualThreadObject, channel_value) == 168,
+               "PyVirtualThreadObject.channel_value ABI");
 
 /* ---- Class / Instance API (py_class.c) -------------------------------- */
 
@@ -771,7 +956,8 @@ PyObject *py_valuebox_new(PyClassObject *cls);
 PyObject *py_valuebox_get_field(PyValueBoxObject *box, int32_t idx);
 void      py_valuebox_set_field(PyValueBoxObject *box, int32_t idx, PyObject *value);
 
-/* Generic attribute dispatch for PY_TYPE_INSTANCE / PY_TYPE_USER tags.
+/* Generic attribute dispatch for PY_TYPE_INSTANCE and allocated user-class
+ * tags (PY_TYPE_USER_CLASS_START and above).
  * Tries `inst->cls->field_names` first, then MRO method lookup. Returns
  * a borrowed reference (caller may py_incref if keeping). */
 PyObject *py_instance_getattr(PyInstanceObject *inst, const char *name);
@@ -817,19 +1003,15 @@ int c3_linearize(PyClassObject **bases, int32_t n_bases,
 /* Destructor helper used by py_decref when a class's refcount drops. */
 void py_class_dealloc(PyObject *o);
 void py_instance_dealloc(PyObject *o);
+void py_descriptor_dealloc(PyObject *o);
 
 /* ---- Descriptors (Phase 3 — property / classmethod / staticmethod) ----
  *
  * The three descriptor wrappers wear their own user-type tags so the
  * descriptor protocol in py_obj_getattr can recognise them without a
- * string match on the function's name. Tags sit just above PY_TYPE_USER
- * and must stay stable — codegen (layer1.py) and the runtime both test
- * against these constants. */
-#define PY_TYPE_PROPERTY      (PY_TYPE_USER + 1)
-#define PY_TYPE_CLASSMETHOD   (PY_TYPE_USER + 2)
-#define PY_TYPE_STATICMETHOD  (PY_TYPE_USER + 3)
-#define PY_TYPE_USER_CLASS_START (PY_TYPE_USER + 4)
-
+ * string match on the function's name. Tags 101..103 are reserved between
+ * PY_TYPE_USER and PY_TYPE_USER_CLASS_START and must stay stable — codegen
+ * and the runtime both test against these constants. */
 typedef struct {
     PyObjectHeader h;       /* type_tag = PY_TYPE_PROPERTY */
     PyObject *fget;         /* function or NULL */
@@ -853,10 +1035,12 @@ typedef struct {
     int64_t index;          /* next index to return */
 } PyIterObject;
 
-/* Constructors (implemented in py_descr.c). All return new references. */
+/* Constructors implemented by py_class_attrs.c. All return new references.
+ * Static methods currently lower directly to their wrapped callable, so tag
+ * PY_TYPE_STATICMETHOD remains part of the runtime layout/GC contract but has
+ * no public constructor. */
 PyObject *py_property_new(PyObject *fget, PyObject *fset, PyObject *fdel);
 PyObject *py_classmethod_new(PyObject *func);
-PyObject *py_staticmethod_new(PyObject *func);
 PyObject *py_instance_bind_method(PyObject *method, PyObject *self, const char *name);
 
 /* In-place setter/deleter replacement — used by the @name.setter /
@@ -901,17 +1085,18 @@ int64_t py_obj_ge(PyObject *a, PyObject *b);
 /* Traceback frame record.
  *
  * Each entry captures a single activation: the function name, source
- * filename, and line number of the call site or throw point. Stored by
+ * filename, source-line text, and line number of the call site or throw point. Stored by
  * value inside a traceback array owned by the PyExceptionObject.
  *
- * Borrowed-pointer semantics: `func_name` and `filename` reference
+ * Borrowed-pointer semantics: `func_name`, `filename`, and `source_line` reference
  * static rodata globals emitted by the frontend. The exception object
  * never frees them. */
 typedef struct PyFrameRecord {
     const char *func_name;
     const char *filename;
+    const char *source_line;
     int32_t     line;
-    int32_t     _pad;       /* keep 16-byte alignment */
+    int32_t     _pad;       /* keep pointer alignment */
 } PyFrameRecord;
 
 /* Exception object layout.

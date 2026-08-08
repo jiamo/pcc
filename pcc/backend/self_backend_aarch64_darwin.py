@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import sys
 
 """Asm-first self backend bootstrap for AArch64 Darwin.
 
@@ -19,6 +20,7 @@ Supported slice today:
 Unsupported shapes still raise ``BackendUnavailable`` instead of guessing.
 """
 from . import BackendUnavailable
+from .code_profile import apply_function_order_profile
 from .self_backend_aarch64_darwin_abi import (
     aggregate_returned_indirect as _aggregate_returned_indirect,
 )
@@ -26,10 +28,14 @@ from .self_backend_aarch64_darwin_compute import (
     emit_compute_instruction as _compute_emit_instruction,
 )
 from .self_backend_aarch64_darwin_data import emit_globals as _emit_globals
+from .self_backend_aarch64_darwin_flow import (
+    plan_aarch64_canonical_error_fallthroughs,
+)
 from .self_backend_aarch64_darwin_memory import (
     emit_memory_instruction as _memory_emit_instruction,
 )
 from .self_backend_aarch64_darwin_symbols import (
+    asm_symbol as _asm_symbol,
     block_label as _block_label,
 )
 from .self_backend_aarch64_darwin_prologue import (
@@ -53,7 +59,18 @@ from .self_backend_ir import (
 )
 from .self_backend_module_symbols import PreparedModuleSymbols
 from .self_backend_prepare import PreparedSelfBackendModule, prepare_module_for_target
-from .self_backend_target_passes import run_self_target_memory_pass_pipeline
+from .self_backend_precise_stackmaps import (
+    FunctionStackMapPlan,
+    build_stack_map_plans,
+    render_aarch64_stack_map_section,
+)
+from .self_backend_target_passes import (
+    AARCH64_MEMORY_PAIR_BARRIER_BEGIN,
+    AARCH64_MEMORY_PAIR_BARRIER_END,
+    pair_adjacent_aarch64_64bit_memory_ops,
+    plan_aarch64_madd_fusions,
+    run_self_target_memory_pass_pipeline,
+)
 from .self_backend_target_match import is_aarch64_darwin_triple
 from .self_backend_terminator_dispatch import emit_terminator_dispatch
 
@@ -64,22 +81,125 @@ _MODULE_SYMBOLS = PreparedModuleSymbols(
 )
 
 
+def _function_symbol(name: str) -> str:
+    """Resolve one function symbol without a non-self-hostable lambda."""
+    return _asm_symbol(name, _MODULE_SYMBOLS)
+
+# SDK mach-o/compact_unwind_encoding.h: standard FP/LR frame, no saved pairs.
+_UNWIND_ARM64_MODE_FRAME = 0x04000000
+
+_MEMORY_PAIR_BARRIER_KINDS = (
+    "load_atomic",
+    "store_atomic",
+    "atomicrmw",
+    "cmpxchg",
+    "fence",
+)
+
+
+def _append_compact_unwind(
+    lines: list[str],
+    functions: list[ParsedFunction],
+    module_symbols: PreparedModuleSymbols,
+) -> list[str]:
+    """Append one exact frame-mode compact-unwind row per function.
+
+    Every function emitted by this backend immediately saves FP/LR and makes
+    x29 the frame pointer.  Function sizes are measured from the final text,
+    after the peephole passes, so removed instructions cannot leave stale
+    unwind ranges.
+    """
+    if not functions:
+        return lines
+
+    symbols = [_asm_symbol(func.name, module_symbols) for func in functions]
+    wanted = set(symbols)
+    offsets: dict[str, int] = {}
+    text_offset = 0
+    in_text = False
+    for raw in lines:
+        line = raw.strip()
+        if line.startswith(".section "):
+            section = line[len(".section ") :].strip()
+            in_text = section.startswith("__TEXT,__text,")
+            continue
+        if not in_text or not line:
+            continue
+        if line.endswith(":"):
+            label = line[:-1].strip()
+            if label in wanted:
+                if label in offsets:
+                    raise BackendUnavailable(
+                        f"duplicate self-backend function label {label!r}"
+                    )
+                offsets[label] = text_offset
+            continue
+        if line.startswith("."):
+            continue
+        text_offset += 4
+
+    missing = [symbol for symbol in symbols if symbol not in offsets]
+    if missing:
+        raise BackendUnavailable(
+            "self backend could not locate function labels for compact "
+            f"unwind: {missing!r}"
+        )
+
+    starts = sorted((offsets[symbol], symbol) for symbol in symbols)
+    result = list(lines)
+    result.append(".section __LD,__compact_unwind,regular,debug")
+    result.append(".p2align 3")
+    for index, (start, symbol) in enumerate(starts):
+        end = starts[index + 1][0] if index + 1 < len(starts) else text_offset
+        length = end - start
+        if length <= 0 or length % 4 != 0 or length > 0xFFFFFFFF:
+            raise BackendUnavailable(
+                f"bad compact-unwind range for {symbol!r}: {start}..{end}"
+            )
+        result.append(f"  .quad {symbol}")
+        result.append(f"  .long {length}")
+        result.append(f"  .long {_UNWIND_ARM64_MODE_FRAME}")
+        result.append("  .quad 0")
+        result.append("  .quad 0")
+    return result
+
+
+def _emit_trace(message: str) -> None:
+    """Coarse phase marker for diagnosing self-compiled backend failures.
+
+    pcc1 raises runtime-generated exceptions with no message, so a failing
+    stage inside the emitter is otherwise invisible: the only surface is
+    `PCC-PY-COMPILE-001 ... exception_type=Exception`.  Gated on
+    PCC_DEBUG_SELF_BACKEND_TRACE so it costs one env probe otherwise.
+    """
+    if os.environ.get("PCC_DEBUG_SELF_BACKEND_TRACE"):
+        sys.stderr.write("[self.emit] " + message + "\n")
+
+
 def emit_aarch64_darwin_asm(ir_text: str, optimize: bool = True) -> str:
     # ``ir_text`` is a borrowed function parameter.  The self-compiled path
     # forwards it through the prepare/parser stack.  Keep this wrapper short:
     # the prepared module crosses the next call as an owned return value, while
     # the large source string no longer shares a frame with every emit pass.
     owned_ir_text = ir_text + ""
+    _emit_trace("prepare begin bytes=" + str(len(owned_ir_text)))
     prepared = prepare_module_for_target(
         owned_ir_text,
         aggregate_returned_indirect=_aggregate_returned_indirect,
     )
-    return _emit_prepared_aarch64_darwin_module(prepared, optimize)
+    _emit_trace("prepare end")
+    return _emit_prepared_aarch64_darwin_module(
+        prepared,
+        optimize,
+        profile_ir_text=owned_ir_text,
+    )
 
 
 def _emit_prepared_aarch64_darwin_module(
     prepared: PreparedSelfBackendModule,
     optimize: bool = True,
+    *,
+    profile_ir_text: str = "",
 ) -> str:
     global _MODULE_SYMBOLS
     triple = prepared.triple
@@ -99,14 +219,51 @@ def _emit_prepared_aarch64_darwin_module(
         )
 
     globals_ = prepared.globals_
-    functions = prepared.functions
+    _emit_trace("order profile begin")
+    functions, _profile_decision = apply_function_order_profile(
+        prepared.functions,
+        ir_text=profile_ir_text,
+        target=triple,
+    )
     _MODULE_SYMBOLS = prepared.module_symbols
+    _emit_trace("stack map plans begin funcs=" + str(len(functions)))
+    stack_map_plans = {
+        plan.function_name: plan
+        for plan in build_stack_map_plans(
+            functions,
+            globals_,
+            target="aarch64-darwin",
+            function_symbol=_function_symbol,
+        )
+    }
 
+    _emit_trace("stack map plans end")
     lines = _emit_globals(globals_, _MODULE_SYMBOLS)
+    _emit_trace("globals end")
+    cold_fallthrough_edges: list[tuple[str, str, str]] = []
     if functions:
         lines.append(".section __TEXT,__text,regular,pure_instructions")
         for func in functions:
-            lines.extend(_emit_function(func))
+            # Plan before the prologue invokes block-local allocation.  The
+            # allocator extends the delayed multiply operands through the
+            # consumer and discards any plan whose stack fallback was reused.
+            _emit_trace("func begin " + str(func.name))
+            plan_aarch64_madd_fusions(func, enabled=optimize)
+            plan_aarch64_canonical_error_fallthroughs(
+                func,
+                enabled=optimize,
+            )
+            for source_block, error_block, success_block in (
+                func.aarch64_cold_fallthrough_edges
+            ):
+                cold_fallthrough_edges.append(
+                    (
+                        _block_label(func.name, source_block),
+                        _block_label(func.name, error_block),
+                        _block_label(func.name, success_block),
+                    )
+                )
+            lines.extend(_emit_function(func, stack_map_plans[func.name]))
     if optimize:
         lines = _forward_adjacent_stack_store_load(lines)
         lines = _forward_one_intervening_stack_store_load(lines)
@@ -122,9 +279,24 @@ def _emit_prepared_aarch64_darwin_module(
         lines = _fold_cset_zero_branch(lines)
         lines = _drop_dead_cset_branch_stores(lines)
         lines = _thread_trampoline_branches(lines)
-        lines = _fold_cond_branch_to_fallthrough(lines)
+        lines = _fold_cond_branch_to_fallthrough(
+            lines,
+            cold_fallthrough_edges,
+        )
         lines = _drop_fallthrough_uncond_branches(lines)
         lines = _drop_unreferenced_empty_local_labels(lines)
+    # Run after register allocation and every instruction-deleting peephole,
+    # but before compact-unwind sizing.  Even with optimization disabled this
+    # finalizer removes the source-semantics barrier pseudo-directives.
+    lines = pair_adjacent_aarch64_64bit_memory_ops(lines, enabled=optimize)
+    if functions:
+        lines.extend(render_aarch64_stack_map_section(
+            lines,
+            tuple(stack_map_plans[func.name] for func in functions),
+            function_symbol=_function_symbol,
+            block_label=_block_label,
+        ))
+    lines = _append_compact_unwind(lines, functions, _MODULE_SYMBOLS)
     if lines:
         lines.append(".subsections_via_symbols")
     return "\n".join(lines) + "\n"
@@ -427,10 +599,17 @@ def _line_defines_reg(line: str, reg: str) -> bool:
         "ret",
         "stur",
         "str",
+        # Release stores consume their first register operand just like the
+        # ordinary store forms above.  Treating ``stlr w10, [x9]`` as a
+        # definition of w10 lets the move/store peepholes delete the move
+        # which produced w10, leaving the atomic store with a stale value.
+        "stlr",
         "sturb",
         "strb",
+        "stlrb",
         "sturh",
         "strh",
+        "stlrh",
         "stp",
     ):
         return False
@@ -922,6 +1101,12 @@ def _trampoline_targets(lines: list[str]) -> dict[str, str]:
         if label is None:
             index += 1
             continue
+        # Target-final stack-map anchors can legitimately be followed by a
+        # single branch, but they describe a safepoint PC rather than an IR
+        # trampoline block.  Threading/removing them loses the metadata record.
+        if label.startswith("L_pcc_smap"):
+            index += 1
+            continue
         body: list[str] = []
         j = index + 1
         while j < len(lines):
@@ -1040,7 +1225,17 @@ def _drop_fallthrough_uncond_branches(lines: list[str]) -> list[str]:
     return out
 
 
-def _fold_cond_branch_to_fallthrough(lines: list[str]) -> list[str]:
+def _fold_cond_branch_to_fallthrough(
+    lines: list[str],
+    eligible_edges: list[tuple[str, str, str]],
+) -> list[str]:
+    """Invert only IR-proven canonical error checks around a next block.
+
+    ``eligible_edges`` comes from
+    ``plan_aarch64_canonical_error_fallthroughs``.  Keeping that proof input
+    mandatory prevents this textual peephole from changing ordinary branches
+    that happen to have the same two-instruction assembly shape.
+    """
     label_index: dict[str, int] = {}
     for idx, line in enumerate(lines):
         label = _local_label_name(line)
@@ -1048,32 +1243,70 @@ def _fold_cond_branch_to_fallthrough(lines: list[str]) -> list[str]:
             label_index[label] = idx
     out: list[str] = []
     index = 0
+    current_error_target = ""
+    current_success_target = ""
     while index < len(lines):
-        if index + 1 < len(lines):
-            cond_branch = _parse_direct_cond_branch(lines[index])
+        local_label = _local_label_name(lines[index])
+        if local_label is not None:
+            # Stack-map anchors identify safepoint PCs inside an IR block;
+            # they do not begin a new control-flow block and therefore must
+            # not discard the proof attached to the containing block.
+            if not local_label.startswith("L_pcc_smap"):
+                current_error_target = ""
+                current_success_target = ""
+                for source_label, error_target, success_target in eligible_edges:
+                    if local_label == source_label:
+                        current_error_target = error_target
+                        current_success_target = success_target
+                        break
+        elif _is_function_label(lines[index]):
+            current_error_target = ""
+            current_success_target = ""
+        if current_success_target and index + 1 < len(lines):
             else_target = _parse_uncond_branch(lines[index + 1])
-            if cond_branch is not None and else_target is not None:
-                cond, then_target = cond_branch
-                inverse = _invert_aarch64_cc(cond)
+            direct_branch = _parse_direct_cond_branch(lines[index])
+            zero_branch = _parse_cond_zero_branch(lines[index])
+            if (
+                else_target is not None
+                and (direct_branch is not None or zero_branch is not None)
+            ):
+                then_target = ""
+                replacement = ""
+                range_limit = 0
+                if direct_branch is not None:
+                    cond, then_target = direct_branch
+                    inverse = _invert_aarch64_cc(cond)
+                    if inverse is not None:
+                        replacement = f"  b.{inverse} {else_target}"
+                        range_limit = 200000
+                elif zero_branch is not None:
+                    opcode, reg, then_target = zero_branch
+                    inverse_opcode = "cbnz" if opcode == "cbz" else "cbz"
+                    replacement = f"  {inverse_opcode} {reg}, {else_target}"
+                    range_limit = 200000
                 j = index + 2
                 while j < len(lines) and not lines[j]:
                     j += 1
-                # Range guard: this rewrites a +/-128MB `b` into a +/-1MB
-                # b.cond; skip when the else target is too far (line
-                # distance conservatively over-approximates instructions).
+                # Range guard: this rewrites a +/-128MB `b` into an imm19
+                # b.cond or cbz/cbnz (both +/-1MB).  Line distance
+                # conservatively over-approximates instruction distance.
                 else_index = label_index.get(else_target)
                 else_in_range = (
-                    else_index is not None and abs(else_index - index) <= 200000
+                    else_index is not None
+                    and range_limit > 0
+                    and abs(else_index - index) <= range_limit
                 )
                 if (
-                    inverse is not None
+                    replacement
                     and then_target.startswith("L_")
                     and else_target.startswith("L_")
+                    and then_target == current_success_target
+                    and else_target == current_error_target
                     and else_in_range
                     and j < len(lines)
                     and _local_label_name(lines[j]) == then_target
                 ):
-                    out.append(f"  b.{inverse} {else_target}")
+                    out.append(replacement)
                     index += 2
                     continue
         out.append(lines[index])
@@ -1092,7 +1325,18 @@ def _drop_unreferenced_empty_local_labels(lines: list[str]) -> list[str]:
     index = 0
     while index < len(lines):
         label = _local_label_name(lines[index])
-        if label is not None and label not in referenced:
+        # Precise-stackmap labels are consumed after all peepholes when final
+        # PCs are calculated; they intentionally have no branch reference.
+        # Treat them as externally referenced metadata anchors even when two
+        # safepoints collapse to the same target-final instruction boundary.
+        is_stack_map_anchor = label is not None and label.startswith(
+            "L_pcc_smap"
+        )
+        if (
+            label is not None
+            and label not in referenced
+            and not is_stack_map_anchor
+        ):
             j = index + 1
             while j < len(lines) and not lines[j]:
                 j += 1
@@ -1106,29 +1350,43 @@ def _drop_unreferenced_empty_local_labels(lines: list[str]) -> list[str]:
     return out
 
 
-def _emit_function(func: ParsedFunction) -> list[str]:
+def _emit_function(
+    func: ParsedFunction,
+    stack_map_plan: FunctionStackMapPlan,
+) -> list[str]:
     lines = _prologue_emit_function_prologue(func, _MODULE_SYMBOLS)
+    blocks = func.aarch64_block_layout or func.blocks
     lines.extend(
         emit_function_blocks(
             func,
             block_label=_block_label,
             emit_instruction=_emit_instruction,
             emit_terminator=_emit_terminator,
+            blocks=blocks,
+            stack_map_plan=stack_map_plan,
         )
     )
+    lines.append(stack_map_plan.end_label + ":")
     return lines
 
 
 def _emit_instruction(
     func: ParsedFunction, block: ParsedBlock, instr: ParsedInstr
 ) -> list[str]:
-    return emit_instruction_dispatch(
+    lines = emit_instruction_dispatch(
         func,
         block,
         instr,
         emit_memory=_emit_memory_with_symbols,
         emit_compute=_emit_compute_with_symbols,
     )
+    if instr.is_volatile or instr.kind in _MEMORY_PAIR_BARRIER_KINDS:
+        return [
+            AARCH64_MEMORY_PAIR_BARRIER_BEGIN,
+            *lines,
+            AARCH64_MEMORY_PAIR_BARRIER_END,
+        ]
+    return lines
 
 
 def _emit_memory_with_symbols(func: ParsedFunction, kind: str, data) -> list[str]:

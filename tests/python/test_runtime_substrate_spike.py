@@ -36,11 +36,7 @@ def _pcc_binary() -> str:
 
 
 def _active_python_runtime_modules() -> list[str]:
-    makefile = PY_RUNTIME_DIR / "Makefile"
-    for line in makefile.read_text(encoding="utf-8").splitlines():
-        if line.startswith("PY_MODULES ="):
-            return line.split("=", 1)[1].split()
-    raise AssertionError("PY_MODULES line not found in py_runtime Makefile")
+    return _make_var_words("PY_MODULES")
 
 
 def _make_var_words(name: str) -> list[str]:
@@ -74,36 +70,6 @@ def _make_var_words(name: str) -> list[str]:
     if not out:
         raise AssertionError(f"{name} line not found in py_runtime Makefile")
     return out
-
-
-def _runtime_c_source_modules() -> set[str]:
-    srcs: set[str] = set()
-    for word in _make_var_words("SRCS"):
-        marker = "$(SRCDIR)/"
-        if not word.startswith(marker) or not word.endswith(".c"):
-            continue
-        srcs.add(word[len(marker):-2])
-    return srcs
-
-
-def _replaced_c_modules() -> set[str]:
-    py_modules = set(_active_python_runtime_modules())
-    replaced: set[str] = set()
-    for word in _make_var_words("PY_REPLACED_C_MODULES"):
-        if word == "$(PY_MODULES)":
-            replaced.update(py_modules)
-        else:
-            replaced.add(word)
-    return replaced
-
-
-def _pcc_py_c_helper_modules() -> set[str]:
-    helpers: set[str] = set()
-    for word in _make_var_words("OBJ_PY_CC_HELPERS"):
-        marker = "$(OBJDIR_PY)/"
-        if word.startswith(marker) and word.endswith(".o"):
-            helpers.add(word[len(marker):-2])
-    return helpers
 
 
 def test_no_libpython_runtime_selector_defaults_to_pcc_python_archive():
@@ -219,12 +185,16 @@ def test_active_python_runtime_modules_do_not_call_substrate_helpers():
     assert offenders == []
 
 
-def test_python_runtime_replacement_list_has_only_declared_c_islands():
-    srcs = _runtime_c_source_modules()
-    replaced = _replaced_c_modules()
-    remaining = srcs - replaced
-    allowed_c_islands = _pcc_py_c_helper_modules() & srcs
-    assert remaining == allowed_c_islands
+def test_python_runtime_archive_requires_provenance_for_exact_python_objects():
+    makefile = (PY_RUNTIME_DIR / "Makefile").read_text(encoding="utf-8")
+    target = makefile.split("$(LIB_PCC_PY):", 1)[1].split("\n\n", 1)[0]
+
+    assert "PCC_PY_OBJECTS = $(OBJS_PY) $(FREESTANDING_OBJS_PY)" in makefile
+    assert "PCC_PY_RECEIPTS = $(addsuffix .provenance.json,$(PCC_PY_OBJECTS))" in makefile
+    assert target.startswith(" $(PCC_PY_OBJECTS) $(PCC_PY_RECEIPTS)\n")
+    assert "$(AR) rcs $@.tmp $(PCC_PY_OBJECTS)" in target
+    assert "runtime_archive_provenance assemble" in target
+    assert "$(OBJ_PY_CC_HELPERS)" not in target
 
 
 def test_pcc_python_archive_has_no_libpython_object():
@@ -264,6 +234,7 @@ def test_no_libpython_pcc_python_archive_staleness_ignores_libpython_bridge(tmp_
 
     archive = runtime_dir / "libpy_runtime_pcc_py.a"
     archive.write_text("archive", encoding="utf-8")
+    Path(str(archive) + ".provenance.json").write_text("{}\n", encoding="utf-8")
     (runtime_dir / "Makefile").write_text("all:\n", encoding="utf-8")
     (include_dir / "py_runtime.h").write_text("/* header */\n", encoding="utf-8")
     (src_dir / "py_obj.c").write_text("/* normal no-lib source */\n", encoding="utf-8")
@@ -296,7 +267,12 @@ def test_no_libpython_pcc_python_archive_staleness_ignores_libpython_bridge(tmp_
             "_runtime_archive_compiler_sources_newer_than",
             return_value=False,
         ):
-            assert pipeline._runtime_archive_stale(str(archive)) is False
+            with mock.patch.object(
+                pipeline,
+                "_runtime_archive_provenance_valid",
+                return_value=True,
+            ):
+                assert pipeline._runtime_archive_stale(str(archive)) is False
 
 
 def test_pcc_python_archive_staleness_ignores_replaced_c_source(tmp_path):
@@ -312,6 +288,7 @@ def test_pcc_python_archive_staleness_ignores_replaced_c_source(tmp_path):
 
     archive = runtime_dir / "libpy_runtime_pcc_py.a"
     archive.write_text("archive", encoding="utf-8")
+    Path(str(archive) + ".provenance.json").write_text("{}\n", encoding="utf-8")
     (runtime_dir / "Makefile").write_text(
         "PY_MODULES = py_obj_gc\n"
         "PY_REPLACED_C_MODULES = $(PY_MODULES) py_bytes\n",
@@ -348,9 +325,37 @@ def test_pcc_python_archive_staleness_ignores_replaced_c_source(tmp_path):
             "_runtime_archive_compiler_sources_newer_than",
             return_value=False,
         ):
-            assert pipeline._runtime_archive_stale(str(archive)) is False
-            os.utime(active_c, (newer, newer))
-            assert pipeline._runtime_archive_stale(str(archive)) is True
+            with mock.patch.object(
+                pipeline,
+                "_runtime_archive_provenance_valid",
+                return_value=True,
+            ):
+                assert pipeline._runtime_archive_stale(str(archive)) is False
+                os.utime(active_c, (newer, newer))
+                assert pipeline._runtime_archive_stale(str(archive)) is True
+
+
+def test_pcc_python_archive_requires_valid_provenance_before_wheel_shortcut(tmp_path):
+    from pcc.py_frontend import pipeline
+
+    archive = tmp_path / "libpy_runtime_pcc_py.a"
+    archive.write_bytes(b"archive")
+    Path(pipeline._runtime_archive_target_stamp(str(archive))).write_text(
+        pipeline._runtime_archive_target_id() + "\n",
+        encoding="utf-8",
+    )
+    Path(str(archive) + ".wheel").write_text(
+        "pcc.runtime-wheel-artifact.v1\n"
+        + pipeline._runtime_archive_target_id()
+        + "\nsha256:"
+        + ("a" * 64)
+        + "\n",
+        encoding="utf-8",
+    )
+
+    assert pipeline._runtime_archive_stale(str(archive)) is True
+    Path(str(archive) + ".provenance.json").write_text("{}\n", encoding="utf-8")
+    assert pipeline._runtime_archive_stale(str(archive)) is True
 
 
 def test_pcc_c_archive_staleness_tracks_runtime_c_sources(tmp_path):
@@ -365,7 +370,11 @@ def test_pcc_c_archive_staleness_tracks_runtime_c_sources(tmp_path):
     py_dir.mkdir()
 
     archive = runtime_dir / "libpy_runtime_pcc.a"
-    archive.write_text("archive", encoding="utf-8")
+    archive.write_bytes(b"!<arch>\n")
+    Path(str(archive) + ".capi_syms").write_text(
+        "PyRuntime_SubstrateAnchor\n",
+        encoding="ascii",
+    )
     (runtime_dir / "Makefile").write_text("all:\n", encoding="utf-8")
     (include_dir / "py_runtime.h").write_text("/* header */\n", encoding="utf-8")
     (src_dir / "py_class.c").write_text("/* c runtime source */\n", encoding="utf-8")
@@ -389,8 +398,13 @@ def test_pcc_c_archive_staleness_tracks_runtime_c_sources(tmp_path):
     os.utime(archive, (current, current))
     os.utime(src_dir / "py_class.c", (newer, newer))
 
+    # This unit isolates source mtimes; archive/member/inventory binding has a
+    # dedicated real-ar regression in test_runtime_archive_isolation.py.
     with mock.patch.object(pipeline, "_PY_RUNTIME_DIR", str(runtime_dir)):
-        assert pipeline._runtime_archive_stale(str(archive)) is True
+        with mock.patch.object(
+            pipeline, "_runtime_archive_c_bundle_valid", return_value=True
+        ):
+            assert pipeline._runtime_archive_stale(str(archive)) is True
 
 
 def test_pcc_emitted_archive_staleness_tracks_compiler_sources(tmp_path):
@@ -449,7 +463,11 @@ def test_pcc_c_source_staleness_uses_incremental_runtime_rebuild(tmp_path):
     include_dir.mkdir()
 
     archive = runtime_dir / "libpy_runtime_pcc.a"
-    archive.write_text("archive", encoding="utf-8")
+    archive.write_bytes(b"!<arch>\n")
+    Path(str(archive) + ".capi_syms").write_text(
+        "PyRuntime_SubstrateAnchor\n",
+        encoding="ascii",
+    )
     (runtime_dir / "Makefile").write_text("all:\n", encoding="utf-8")
     (include_dir / "py_runtime.h").write_text("/* header */\n", encoding="utf-8")
     source = src_dir / "py_class.c"
@@ -487,12 +505,54 @@ def test_pcc_c_source_staleness_uses_incremental_runtime_rebuild(tmp_path):
                     with mock.patch.object(
                         pipeline, "_run_runtime_make", side_effect=fake_runtime_make
                     ):
-                        selected = pipeline._ensure_runtime(False, needs_libpython=False)
+                        with mock.patch.object(
+                            pipeline,
+                            "_runtime_archive_c_bundle_valid",
+                            return_value=True,
+                        ):
+                            selected = pipeline._ensure_runtime(
+                                False, needs_libpython=False
+                            )
 
     assert selected == str(archive)
     assert calls, "stale libpy_runtime_pcc.a should trigger a runtime rebuild"
     assert "-B" not in calls[0]
     assert calls[0][-1] == "libpy_runtime_pcc.a"
+
+
+def test_pcc_python_runtime_build_rejects_missing_provenance(tmp_path):
+    from pcc.py_frontend import pipeline
+
+    runtime_dir = tmp_path / "py_runtime"
+    runtime_dir.mkdir()
+    archive = runtime_dir / "libpy_runtime_pcc_py.a"
+    archive.write_bytes(b"archive")
+    (runtime_dir / "Makefile").write_text("all:\n", encoding="utf-8")
+    Path(pipeline._runtime_archive_target_stamp(str(archive))).write_text(
+        pipeline._runtime_archive_target_id() + "\n",
+        encoding="utf-8",
+    )
+
+    with mock.patch.dict(
+        os.environ,
+        {"PCC_RUNTIME_CC": "pcc", "PCC_RUNTIME_HIGH": "py"},
+        clear=True,
+    ):
+        with mock.patch.object(pipeline, "_PY_RUNTIME_DIR", str(runtime_dir)):
+            with mock.patch.object(
+                pipeline, "_PY_RUNTIME_ARCHIVE_PCC_PY", str(archive)
+            ):
+                with mock.patch.object(
+                    pipeline,
+                    "_runtime_archive_compiler_sources_newer_than",
+                    return_value=False,
+                ):
+                    with mock.patch.object(pipeline, "_run_runtime_make"):
+                        with pytest.raises(
+                            pipeline.PyPipelineError,
+                            match="missing provenance manifest",
+                        ):
+                            pipeline._ensure_runtime(False, needs_libpython=False)
 
 
 def test_libpython_pcc_python_archive_staleness_tracks_libpython_bridge(tmp_path):
@@ -602,6 +662,41 @@ def test_python_library_mode_emits_module_without_program_main(tmp_path):
     )
 
 
+def test_python_library_mode_statically_initializes_scalar_literals(tmp_path):
+    from pcc.py_frontend.pipeline import compile_python
+
+    src = tmp_path / "library_constants.py"
+    out_ll = tmp_path / "library_constants.ll"
+    src.write_text(
+        "from pcc.extern import c_abi_typed_export\n"
+        "\n"
+        "POSITIVE = 48\n"
+        "NEGATIVE = -103\n"
+        "ENABLED = True\n"
+        "\n"
+        "@c_abi_typed_export('read_positive', 'i64', ())\n"
+        "def read_positive() -> int:\n"
+        "    return POSITIVE\n",
+        encoding="utf-8",
+    )
+
+    compile_python(
+        str(src),
+        str(out_ll),
+        emit_llvm_only=True,
+        python_library=True,
+    )
+
+    ir_text = out_ll.read_text(encoding="utf-8")
+    assert "@.modvar.library_constants.POSITIVE = global i64 48" in ir_text
+    assert "@.modvar.library_constants.NEGATIVE = global i64 -103" in ir_text
+    assert "@.modvar.library_constants.ENABLED = global i1 true" in ir_text
+    assert (
+        "@.modvar.library_constants.POSITIVE_initialized = global i1 false"
+        in ir_text
+    )
+
+
 def test_python_library_copied_runtime_source_suppresses_implicit_frame_roots(
     tmp_path,
 ):
@@ -638,8 +733,9 @@ def test_python_library_copied_runtime_source_suppresses_implicit_frame_roots(
     assert "call void @pcc_gc_frame_enter" not in ir_text
 
 
-def test_pcc_python_libpython_archive_adds_only_bridge_object():
+def test_pcc_python_libpython_archive_adds_only_bridge_object(tmp_path):
     archive = PY_RUNTIME_DIR / "libpy_runtime_pcc_py_libpython.a"
+    base_archive = PY_RUNTIME_DIR / "libpy_runtime_pcc_py.a"
     if not archive.exists():
         pytest.fail(f"runtime archive missing: {archive}")
 
@@ -652,40 +748,67 @@ def test_pcc_python_libpython_archive_adds_only_bridge_object():
     )
     assert result.returncode == 0, result.stderr
     members = set(result.stdout.splitlines())
-    assert "py_substrate.o" in members
-    assert "py_int.o" in members
-    assert "py_libpython.o" in members
-    assert "py_capi_shim.o" not in members
-
-    # Removing the no-libpython shim must not leave pcc runtime objects with
-    # unresolved references to its internal (non-Py*) protocol helpers.  The
-    # libpython bridge owns fail-closed definitions because this archive has no
-    # pcc C-extension object tags.
-    symbols = subprocess.run(
-        ["nm", "-g", str(archive)],
+    base_result = subprocess.run(
+        ["ar", "t", str(base_archive)],
         capture_output=True,
         text=True,
         timeout=30,
         cwd=str(REPO_ROOT),
         check=True,
-    ).stdout.splitlines()
-    defined = set()
-    for line in symbols:
-        fields = line.split()
-        if len(fields) >= 2 and fields[-2].upper() == "T":
-            defined.add(fields[-1].lstrip("_"))
-    assert {
-        "pcc_capi_cext_absolute",
-        "pcc_capi_cext_binary_number",
-        "pcc_capi_cext_object_getitem",
-        "pcc_capi_cext_object_iter",
-        "pcc_capi_cext_object_next",
-        "pcc_capi_cext_object_repr",
-        "pcc_capi_cext_richcompare_bool",
-        "pcc_capi_cext_subtract",
-        "pcc_capi_cext_truthy",
-        "py_cext_number_to_i64",
-    } <= defined
+    )
+    base_members = set(base_result.stdout.splitlines())
+    assert "py_substrate.o" in members
+    assert "py_int.o" in members
+    assert "py_libpython.o" in members
+    assert "py_capi_shim.o" not in members
+    assert "py_extension_loader_runtime.o" not in members
+    assert members == (
+        base_members - {"py_extension_loader_runtime.o"}
+    ) | {"py_libpython.o"}
+    assert {member for member in members if member.startswith("py_capi_")}
+
+    subprocess.run(
+        ["ar", "x", str(archive), "py_libpython.o"],
+        check=True,
+        timeout=30,
+        cwd=str(tmp_path),
+    )
+    undefined_result = subprocess.run(
+        ["nm", "-u", "py_libpython.o"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+        cwd=str(tmp_path),
+    )
+    undefined = {
+        fields[-1][1:] if fields[-1].startswith("_") else fields[-1]
+        for line in undefined_result.stdout.splitlines()
+        if (fields := line.split())
+    }
+    assert not {
+        symbol
+        for symbol in undefined
+        if symbol.startswith("Py") or symbol.startswith("_Py")
+    }, "the bridge must resolve every CPython symbol from its named handle"
+    assert undefined.isdisjoint(
+        {
+            "Py_Initialize",
+            "Py_Finalize",
+            "Py_IsInitialized",
+            "_Py_NoneStruct",
+            "PyBool_Type",
+            "PyLong_Type",
+            "PyFloat_Type",
+            "PyUnicode_Type",
+            "PyList_Type",
+            "PyTuple_Type",
+            "PyDict_Type",
+            "PySet_Type",
+            "PyExc_SystemExit",
+            "PyExc_RuntimeError",
+        }
+    )
 
 
 def test_pcc_python_archive_uses_python_py_substrate_object(tmp_path):
@@ -1475,9 +1598,11 @@ def test_runtime_mirror_probe_and_backend0_latch_source_parity():
 
     c_gc = (REPO_ROOT / "pcc/py_runtime/src/py_gc_backend.c").read_text(encoding="utf-8")
     py_gc = (REPO_ROOT / "pcc/py_runtime/py/py_gc_backend.py").read_text(encoding="utf-8")
-    substrate = (REPO_ROOT / "pcc/py_runtime/py/py_substrate.py").read_text(encoding="utf-8")
+    gc_state = (
+        REPO_ROOT / "pcc/py_runtime/py/freestanding_gc_state.py"
+    ).read_text(encoding="utf-8")
     assert "pcc_gc_backend0_frame_roots_enabled = 0" in c_gc
-    assert 'define_global_i32("pcc_gc_backend0_frame_roots_enabled", 0)' in substrate
+    assert 'define_global_i32("pcc_gc_backend0_frame_roots_enabled", 0)' in gc_state
     assert "pcc_gc_backend0_frame_roots_enabled = 1;" in c_gc
     assert 'store_i32(global_addr("pcc_gc_backend0_frame_roots_enabled"), 0, 1)' in py_gc
     assert "pcc_gc_backend0_frame_roots_enabled != 0" in c_gc

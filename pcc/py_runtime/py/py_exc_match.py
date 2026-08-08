@@ -4,24 +4,20 @@ Ports py_exc_matches — the hot MRO-aware class matcher used by every
 try/except handler dispatch. Traceback frame growth and unhandled
 stderr formatting live in sibling py_exc_traceback.py.
 
-PyClassObject layout (from py_internal.h, LP64 with natural alignment):
-    offset   0   PyObjectHeader          (16 bytes)
-    offset  16   name                    (ptr)
-    offset  24   n_bases                 (i32 + 4 pad)
-    offset  32   bases                   (ptr)
-    offset  40   n_mro                   (i32 + 4 pad)
-    offset  48   mro                     (ptr to PyClassObject* array)
-    offset  56   n_methods               (i32 + 4 pad)
-    offset  64   methods                 (ptr)
-    offset  72   n_fields                (i32 + 4 pad)
-    offset  80   field_names             (ptr)
-    offset  88   instance_size           (i32)
-    offset  92   type_tag_alloc          (i32)
-
 PyExceptionObject layout (offset 16 -> exc_class).
 
-Constants: PY_TYPE_CLASS = 10, PY_TYPE_EXC = 12.
+Public object type tags and class/instance layout offsets come from the
+generated ``py_abi_constants`` module.
 """
+from pcc.py_runtime.py.py_abi_constants import (
+    PYCLASSOBJECT_MRO_OFFSET,
+    PYINSTANCEOBJECT_CLS_OFFSET,
+    PY_TYPE_CLASS,
+    PY_TYPE_EXC,
+    PY_TYPE_INSTANCE,
+    PY_TYPE_INT,
+    PY_TYPE_USER_CLASS_START,
+)
 from pcc.extern import c_abi_export, c_ptr, extern
 from pcc.unsafe import (
     is_tagged_int,
@@ -39,7 +35,7 @@ pcc_gc_note_relocation_read = extern("pcc_gc_note_relocation_read", (c_ptr,), c_
 
 def _type_of(obj) -> int:
     if is_tagged_int(obj):
-        return 2
+        return PY_TYPE_INT
     return load_i32(obj, 8)
 
 
@@ -52,16 +48,18 @@ def _to_class(obj):
         return null()
     obj = pcc_gc_note_relocation_read(obj)
     tag: int = load_i32(obj, 8)
-    if tag == 10:                         # PY_TYPE_CLASS
+    if tag == PY_TYPE_CLASS:                         # PY_TYPE_CLASS
         return obj
-    if tag == 12:                         # PY_TYPE_EXC
+    if tag == PY_TYPE_EXC:                         # PY_TYPE_EXC
         return pcc_gc_load_ptr(obj, ptr_add(obj, 16))   # ->exc_class
-    if tag == 11 or tag >= 100:           # PY_TYPE_INSTANCE / user classes
+    if tag == PY_TYPE_INSTANCE or tag >= PY_TYPE_USER_CLASS_START:
         # A raised user exception subclass is a PyInstanceObject; its ``cls``
         # is at offset 16 (right after the 16-byte header), same slot as
         # PyExceptionObject->exc_class. Project to it so the MRO walk matches
         # ``except MyError`` / ``except Exception``.
-        return pcc_gc_load_ptr(obj, ptr_add(obj, 16))   # ->cls
+        return pcc_gc_load_ptr(
+            obj, ptr_add(obj, PYINSTANCEOBJECT_CLS_OFFSET)
+        )
     return null()
 
 
@@ -73,7 +71,7 @@ def py_exc_matches(exc, type_) -> int:
         return 0
     if ptr_is_null(tcls):
         return 0
-    mro = load_ptr(ecls, 48)     # PyClassObject->mro
+    mro = load_ptr(ecls, PYCLASSOBJECT_MRO_OFFSET)
     if ptr_is_null(mro):
         if ptr_eq(ecls, tcls):
             return 1

@@ -12,15 +12,20 @@ from ..py_ast import (
     Assign,
     Attr,
     AugAssign,
+    BinOp,
+    BoolType,
     Call,
     ClassDef,
+    Compare,
     DynType,
     Expr,
     ExprStmt,
     For,
     FuncDef,
     If,
+    IntType,
     Name,
+    NoneType,
     Return,
     Stmt,
     Try,
@@ -31,6 +36,14 @@ from ..py_ast import (
 from . import marshal
 from .errors import L1CodegenError
 from .runtime_abi import declare_runtime_global
+from .vthread_effect_analysis import (
+    vthread_delegate_frame_name,
+    vthread_method_owner_for_funcdef,
+    vthread_proven_direct_name_call,
+    vthread_proven_export_method_call_key,
+    vthread_proven_method_call_key,
+    vthread_proven_suspension_call_key,
+)
 
 _I1 = ir.IntType(1)
 _I8 = ir.IntType(8)
@@ -39,6 +52,358 @@ _I64 = ir.IntType(64)
 _VOID = ir.VoidType()
 _CSTR = _I8.as_pointer()
 _STOP_ITERATION_TAG = 8
+
+
+def emit_generator_may_park_call(
+    host,
+    expr: Call,
+    callee_name: str,
+    *,
+    fn=None,
+    ast_func_def: Optional[FuncDef] = None,
+    effect_proven: bool = False,
+) -> Optional[ir.Value]:
+    """Delegate one ordinary call to a transitive ``may_park`` generator.
+
+    Effect analysis has already changed both caller and callee to the existing
+    native generator ABI.  This routine supplies the missing transparent-call
+    bridge: it drives the child until it yields or completes, forwards each
+    suspension through the parent, and returns ``StopIteration.value`` in the
+    source expression's semantic representation.
+
+    The child generator lives in a hidden managed frame slot.  Consequently a
+    parent suspension never leaves the only live child reference in an SSA
+    temporary or raw stack address, and relocating collectors can update it
+    through the normal generator-frame/root contract.
+    """
+    if len(getattr(host, "_generator_ctx_stack", ())) == 0:
+        return None
+    if not effect_proven:
+        may_park_names = getattr(host, "_vthread_may_park_func_names", set())
+        if callee_name not in may_park_names:
+            return None
+        current_fd = getattr(host, "current_func_def", None)
+        if (
+            current_fd is None
+            or vthread_proven_direct_name_call(
+                current_fd,
+                expr,
+                may_park_names,
+                getattr(host, "_vthread_binding_cache", None),
+            )
+            is None
+        ):
+            return None
+    elif callee_name == "pcc.virtual_thread.call":
+        current_fd = getattr(host, "current_func_def", None)
+        if (
+            current_fd is None
+            or vthread_proven_suspension_call_key(
+                host.ast_module,
+                current_fd,
+                expr,
+                getattr(host, "_vthread_binding_cache", None),
+            )
+            != "pcc.virtual_thread.call"
+        ):
+            return None
+    if fn is None:
+        fn = host.functions.get(callee_name)
+    if fn is None:
+        return None
+    if ast_func_def is None:
+        ast_func_def = host._find_user_funcdef(callee_name)
+    if ast_func_def is None:
+        return None
+    if ast_func_def.is_async:
+        raise L1CodegenError(
+            "may_park delegation does not accept async function "
+            + repr(callee_name)
+        )
+
+    child = host._emit_direct_user_function_call(
+        display_name=callee_name,
+        fn=fn,
+        ast_func_def=ast_func_def,
+        args=expr.args,
+        kwargs=expr.kwargs,
+    )
+    return emit_generator_may_park_child(
+        host,
+        expr,
+        callee_name,
+        child,
+    )
+
+
+def emit_generator_may_park_child(
+    host,
+    expr: Call,
+    callee_name: str,
+    child: ir.Value,
+    pinned_arg_provenance=(),
+    child_already_rooted: bool = False,
+) -> ir.Value:
+    """Drive an already-created child continuation through its parent."""
+    if len(getattr(host, "_generator_ctx_stack", ())) == 0:
+        raise L1CodegenError(
+            "may_park child delegation requires a generator parent: "
+            + callee_name
+        )
+    child_slot, initial_child_root_ptr = generator_may_park_child_slot(
+        host, expr, callee_name
+    )
+    if not child_already_rooted:
+        host.builder.call(host.runtime["pcc_gc_pin"], [child])
+        host.builder.call(
+            host.runtime["pcc_gc_store_root"],
+            [initial_child_root_ptr, child],
+        )
+        host.builder.call(host.runtime["pcc_gc_unpin"], [child])
+        # The root store retained the replacement and released the slot's prior
+        # owner. Consume the direct call's owned temporary so the hidden slot
+        # is the single local owner.
+        host._gc_release(child)
+    # Direct method calls pin receiver/argument temporaries across the call.
+    # Keep those pins until the returned child has entered its traced frame
+    # slot; releasing them earlier would put the only child reference in SSA
+    # across collector-visible cleanup calls.
+    for value, managed, raw, owned in pinned_arg_provenance:
+        if managed:
+            host.builder.call(host.runtime["pcc_gc_unpin"], [value])
+            if owned:
+                host._gc_release(
+                    value,
+                    host._release_context_label("method_call_arg"),
+                )
+        elif raw and owned:
+            raise L1CodegenError(
+                "raw method argument cannot carry pcc ownership"
+            )
+
+    parent_fn = host.current_function
+    next_bb = parent_fn.append_basic_block(
+        name=host._fresh("vthread.delegate.next")
+    )
+    yielded_bb = parent_fn.append_basic_block(
+        name=host._fresh("vthread.delegate.yielded")
+    )
+    stopped_bb = parent_fn.append_basic_block(
+        name=host._fresh("vthread.delegate.stopped")
+    )
+    completed_bb = parent_fn.append_basic_block(
+        name=host._fresh("vthread.delegate.completed")
+    )
+    propagate_bb = parent_fn.append_basic_block(
+        name=host._fresh("vthread.delegate.propagate")
+    )
+
+    host.builder.branch(next_bb)
+    host.builder.position_at_end(next_bb)
+    current_child = host.builder.load(
+        child_slot,
+        name=host._fresh("vthread.delegate.child"),
+    )
+    yielded = host.builder.call(
+        host.runtime["py_gen_next"],
+        [current_child],
+        name=host._fresh("vthread.delegate.value"),
+    )
+    is_stopped = host.builder.icmp_unsigned(
+        "==",
+        yielded,
+        ir.Constant(_CSTR, None),
+        name=host._fresh("vthread.delegate.is_stopped"),
+    )
+    host.builder.cbranch(is_stopped, stopped_bb, yielded_bb)
+
+    host.builder.position_at_end(yielded_bb)
+    outer_err_target = getattr(host, "_try_err_block", None)
+    if outer_err_target is None:
+        outer_err_target = host._ensure_fn_err_exit()
+    child_unwind_bb = parent_fn.append_basic_block(
+        name=host._fresh("vthread.delegate.child.unwind")
+    )
+    host._emit_generator_yield_value(
+        yielded,
+        resume_err_target=child_unwind_bb,
+    )
+    resume_ok_bb = host.builder._block
+    host.builder.position_at_end(child_unwind_bb)
+    unwind_child = host.builder.load(
+        child_slot,
+        name=host._fresh("vthread.delegate.child.unwind.value"),
+    )
+    host.builder.call(
+        host.runtime["py_gen_close_preserving_exception"],
+        [unwind_child],
+        name=host._fresh("vthread.delegate.child.close.rc"),
+    )
+    unwind_root_ptr = host._as_gc_ptr(
+        child_slot,
+        name=host._fresh("vthread.delegate.child.unwind.root"),
+    )
+    host.builder.call(
+        host.runtime["pcc_gc_store_root"],
+        [unwind_root_ptr, host._emit_none_literal()],
+    )
+    host.builder.branch(outer_err_target)
+    host.builder.position_at_end(resume_ok_bb)
+    if not host._builder_block_is_terminated():
+        host.builder.branch(next_bb)
+
+    host.builder.position_at_end(stopped_bb)
+    current_exc = host.builder.call(
+        host.runtime["py_current_exception"],
+        [],
+        name=host._fresh("vthread.delegate.exc"),
+    )
+    stop_cls = host.builder.call(
+        host.runtime["py_exc_builtin_class"],
+        [ir.Constant(_I64, _STOP_ITERATION_TAG)],
+        name=host._fresh("vthread.delegate.stop_cls"),
+    )
+    stop_match = host.builder.call(
+        host.runtime["py_exc_matches"],
+        [current_exc, stop_cls],
+        name=host._fresh("vthread.delegate.stop_match"),
+    )
+    is_stop_iteration = host.builder.icmp_signed(
+        "!=",
+        stop_match,
+        ir.Constant(_I64, 0),
+        name=host._fresh("vthread.delegate.is_stop_iteration"),
+    )
+    host.builder.cbranch(is_stop_iteration, completed_bb, propagate_bb)
+
+    host.builder.position_at_end(propagate_bb)
+    err_target = getattr(host, "_try_err_block", None)
+    if err_target is None:
+        err_target = host._ensure_fn_err_exit()
+    host.builder.branch(err_target)
+
+    host.builder.position_at_end(completed_bb)
+    result_obj = host.builder.call(
+        host.runtime["py_exc_get_message"],
+        [current_exc],
+        name=host._fresh("vthread.delegate.result.borrowed"),
+    )
+    result_is_null = host.builder.icmp_unsigned(
+        "==",
+        result_obj,
+        ir.Constant(_CSTR, None),
+        name=host._fresh("vthread.delegate.result.is_null"),
+    )
+    result_or_none = host.builder.select(
+        result_is_null,
+        host._emit_none_literal(),
+        result_obj,
+        name=host._fresh("vthread.delegate.result"),
+    )
+    result_root_ptr = host._as_gc_ptr(
+        child_slot,
+        name=host._fresh("vthread.delegate.result.root"),
+    )
+    # Move the StopIteration value into the same traced frame slot before
+    # clearing the exception that currently owns it.  The slot store also
+    # releases the completed child generator.
+    host.builder.call(
+        host.runtime["pcc_gc_store_root"],
+        [result_root_ptr, result_or_none],
+    )
+    host.builder.call(host.runtime["py_clear_exception"], [])
+    rooted_result = host.builder.call(
+        host.runtime["pcc_gc_load_ptr"],
+        [ir.Constant(_CSTR, None), result_root_ptr],
+        name=host._fresh("vthread.delegate.result.rooted"),
+    )
+
+    result_ty = getattr(expr, "ty", None)
+    if result_ty is None or isinstance(result_ty, NoneType):
+        host.builder.call(
+            host.runtime["pcc_gc_store_root"],
+            [result_root_ptr, host._emit_none_literal()],
+        )
+        return host._emit_none_literal()
+    if host._is_valueclass_payload_type(result_ty):
+        payload = host._emit_object_to_valueclass_payload(
+            rooted_result,
+            result_ty,
+        )
+        if payload is None:
+            raise L1CodegenError(
+                "may_park call cannot restore value payload from "
+                + repr(callee_name)
+            )
+        host._emit_post_call_err_check(expr.span)
+        host.builder.call(
+            host.runtime["pcc_gc_store_root"],
+            [result_root_ptr, host._emit_none_literal()],
+        )
+        return payload
+    if host._is_object(result_ty):
+        owned_result = host._gc_retain(
+            rooted_result,
+            name=host._fresh("vthread.delegate.result.retain"),
+        )
+        host.builder.call(
+            host.runtime["pcc_gc_store_root"],
+            [result_root_ptr, host._emit_none_literal()],
+        )
+        return owned_result
+    native_result = marshal.marshal_from_object(
+        host.builder,
+        host.module,
+        host.runtime,
+        rooted_result,
+        result_ty,
+    )
+    host._emit_post_call_err_check(expr.span)
+    host.builder.call(
+        host.runtime["pcc_gc_store_root"],
+        [result_root_ptr, host._emit_none_literal()],
+    )
+    return native_result
+
+
+def generator_may_park_child_slot(host, expr: Call, callee_name: str):
+    """Return the compiler-managed frame slot for one delegation call site."""
+    if len(getattr(host, "_generator_ctx_stack", ())) == 0:
+        raise L1CodegenError(
+            "may_park child delegation requires a generator parent: "
+            + callee_name
+        )
+    ctx = host._generator_ctx_stack[-1]
+    hidden_name = vthread_delegate_frame_name(expr, callee_name)
+    frame_entry = ctx["frame_slots"].get(hidden_name)
+    if frame_entry is None:
+        raise L1CodegenError(
+            "may_park call missing managed child frame slot: " + callee_name
+        )
+    child_slot = frame_entry[1]
+    # This address is reused by sibling retry, cleanup and resume blocks.  A
+    # cast emitted at the current insertion point does not necessarily
+    # dominate those blocks (the TCP observe/park/retry lowering exposed that
+    # with the cast in one retry arm and uses in another).  Materialize the
+    # stable frame-slot address in the function entry, before its terminator,
+    # just like the entry GC-frame registration helpers do.
+    entry = host.current_function.blocks[0]
+    saved_block = host.builder._block
+    terminator = None
+    for instr in reversed(entry._instrs):
+        if host._instruction_is_terminator(instr):
+            terminator = instr
+            break
+    if terminator is not None:
+        host.builder.position_before(terminator)
+    else:
+        host.builder.position_at_end(entry)
+    root_ptr = host._as_gc_ptr(
+        child_slot,
+        name=host._fresh("vthread.delegate.child.root"),
+    )
+    host.builder.position_at_end(saved_block)
+    return child_slot, root_ptr
 
 
 def _dataclass_field_value(obj, field_name: str, default=None):
@@ -98,30 +463,45 @@ def _dataclass_field_names(obj):
 
 
 class GeneratorLoweringMixin:
-    def _vthread_suspension_call(self, expr: Expr) -> bool:
+    def _vthread_suspension_call(
+        self,
+        expr: Expr,
+        fd: Optional[FuncDef] = None,
+    ) -> bool:
         if not isinstance(expr, Call):
             return False
-        names = ("yield_now", "sleep_current", "block_current_on_fd")
-        if isinstance(expr.func, Name):
-            try:
-                kind = self._native_builtin_value_for_name(expr.func.ident)
-            except AttributeError:
-                kind = None
-            return (
-                kind == "pcc.virtual_thread.yield_now"
-                or kind == "pcc.virtual_thread.sleep_current"
-                or kind == "pcc.virtual_thread.block_current_on_fd"
+        if fd is None:
+            fd = getattr(self, "current_func_def", None)
+        if fd is None:
+            return False
+        return (
+            vthread_proven_suspension_call_key(
+                self.ast_module,
+                fd,
+                expr,
+                self._vthread_binding_cache,
             )
-        func = expr.func
-        if not isinstance(func, Attr) or not isinstance(func.obj, Name):
+            is not None
+        )
+
+    def _vthread_dynamic_callback_call(
+        self,
+        expr: Expr,
+        fd: Optional[FuncDef] = None,
+    ) -> bool:
+        if fd is None:
+            fd = getattr(self, "current_func_def", None)
+        if fd is None:
             return False
-        if func.name not in names:
-            return False
-        try:
-            module = self._native_builtin_module_for_name(func.obj.ident)
-        except AttributeError:
-            module = None
-        return module == "pcc.virtual_thread"
+        return (
+            vthread_proven_suspension_call_key(
+                self.ast_module,
+                fd,
+                expr,
+                self._vthread_binding_cache,
+            )
+            == "pcc.virtual_thread.call"
+        )
 
     def _funcdef_has_yield_sentinel(self, fd: FuncDef) -> bool:
         """Return True when ``fd`` contains a parser-lifted yield call.
@@ -133,6 +513,16 @@ class GeneratorLoweringMixin:
         cache_key = id(fd)
         if cache_key in self._funcdef_yield_sentinel_cache:
             return self._funcdef_yield_sentinel_cache[cache_key]
+        if (
+            cache_key in getattr(self, "_vthread_may_park_func_ids", set())
+            or cache_key
+            in getattr(self, "_vthread_may_park_method_ids", set())
+        ):
+            # ``may_park`` functions use the same heap-owned state-machine
+            # shape as source generators, but calls between them are
+            # transparently delegated by ``emit_generator_may_park_call``.
+            self._funcdef_yield_sentinel_cache[cache_key] = True
+            return True
         stack = []
         for stmt in fd.body:
             stack.append(stmt)
@@ -155,7 +545,7 @@ class GeneratorLoweringMixin:
             ):
                 self._funcdef_yield_sentinel_cache[cache_key] = True
                 return True
-            if self._vthread_suspension_call(node):
+            if self._vthread_suspension_call(node, fd):
                 self._funcdef_yield_sentinel_cache[cache_key] = True
                 return True
             for slot in _dataclass_field_names(node):
@@ -205,6 +595,27 @@ class GeneratorLoweringMixin:
         span = stmt.span
         return f"__pcc_enum_cnt_{span.line}_{span.col}"
 
+    def _generator_return_value_name(self, stmt: Return) -> str:
+        span = stmt.span
+        return f"__pcc_return_value_{span.line}_{span.col}"
+
+    def _generator_print_args_name(self, call: Call) -> str:
+        """Name the persisted tuple used by a multi-argument ``print``.
+
+        A print argument may suspend after earlier arguments have already
+        populated the tuple.  Generator resume dispatch enters after that
+        suspension, so an SSA-only tuple created in ``gen.start`` would not
+        dominate the remaining tuple writes.  A deterministic hidden frame
+        name lets print lowering keep the partially populated tuple in the
+        same heap-owned state as ordinary generator locals.
+        """
+        span = call.span
+        return f"__pcc_print_args_{span.line}_{span.col}"
+
+    def _generator_finally_exception_name(self, stmt: Try) -> str:
+        span = stmt.span
+        return f"__pcc_finally_exception_{span.line}_{span.col}"
+
     def _collect_generator_target_names(
         self,
         names: list[str],
@@ -223,7 +634,68 @@ class GeneratorLoweringMixin:
                 for item in cur.elems:
                     stack.append(item)
 
-    def _collect_generator_frame_names(self, fd: FuncDef) -> list[str]:
+    def _collect_generator_exact_int_frame_names(
+        self,
+        names: list[str],
+        body,
+    ) -> None:
+        """Reserve managed operand roots independently of parking effects.
+
+        Exact-int binary/comparison lowering evaluates the lhs before the rhs.
+        In a generator that lhs must live in the heap frame while the rhs may
+        allocate or trigger a relocating collection, even when the function
+        has no virtual-thread ``may_park`` calls.  Keeping this inventory under
+        the parking-effect guard made ordinary generators such as ``yield i*i``
+        request a frame slot that had never been allocated.
+        """
+        work = list(body)
+        idx = 0
+        while idx < len(work):
+            node = work[idx]
+            idx += 1
+            if node is None:
+                continue
+            if isinstance(node, tuple):
+                work.extend(node)
+                continue
+            if isinstance(node, (FuncDef, ClassDef)):
+                continue
+            if (
+                isinstance(node, BinOp)
+                and isinstance(node.lhs.ty, (IntType, BoolType))
+                and isinstance(node.rhs.ty, (IntType, BoolType))
+            ):
+                hidden = vthread_delegate_frame_name(
+                    node,
+                    "pcc.exact_int.lhs",
+                )
+                if hidden not in names:
+                    names.append(hidden)
+            if (
+                isinstance(node, Compare)
+                and isinstance(node.lhs.ty, (IntType, BoolType))
+                and isinstance(node.rhs.ty, (IntType, BoolType))
+            ):
+                hidden = vthread_delegate_frame_name(
+                    node,
+                    "pcc.exact_int.compare.lhs",
+                )
+                if hidden not in names:
+                    names.append(hidden)
+            for slot_name in _dataclass_field_names(node):
+                if slot_name == "span":
+                    continue
+                value = _dataclass_field_value(node, slot_name, None)
+                if isinstance(value, tuple):
+                    work.extend(value)
+                else:
+                    work.append(value)
+
+    def _collect_generator_frame_names(
+        self,
+        fd: FuncDef,
+        owner_class_name: Optional[str] = None,
+    ) -> list[str]:
         names: list[str] = []
 
         for a in fd.args:
@@ -246,6 +718,15 @@ class GeneratorLoweringMixin:
                     hidden = self._generator_yield_from_iter_name(s.expr)
                     if hidden not in names:
                         names.append(hidden)
+                if (
+                    isinstance(s.expr, Call)
+                    and isinstance(s.expr.func, Name)
+                    and s.expr.func.ident == "print"
+                    and len(s.expr.args) > 1
+                ):
+                    hidden = self._generator_print_args_name(s.expr)
+                    if hidden not in names:
+                        names.append(hidden)
                 continue
             if isinstance(s, Assign):
                 for t in s.targets:
@@ -253,6 +734,12 @@ class GeneratorLoweringMixin:
                 continue
             if isinstance(s, AugAssign):
                 self._collect_generator_target_names(names, s.target)
+                continue
+            if isinstance(s, Return):
+                if s.value is not None:
+                    hidden = self._generator_return_value_name(s)
+                    if hidden not in names:
+                        names.append(hidden)
                 continue
             if isinstance(s, For):
                 hidden = self._generator_for_iter_name(s)
@@ -293,6 +780,10 @@ class GeneratorLoweringMixin:
                     work.append(item)
                 continue
             if isinstance(s, Try):
+                if s.finally_body:
+                    hidden = self._generator_finally_exception_name(s)
+                    if hidden not in names:
+                        names.append(hidden)
                 for item in s.body:
                     work.append(item)
                 for h in s.handlers:
@@ -305,6 +796,157 @@ class GeneratorLoweringMixin:
                     work.append(item)
                 for item in s.finally_body:
                     work.append(item)
+
+        self._collect_generator_exact_int_frame_names(names, fd.body)
+
+        # A transitive parking call is an expression, not a source ``yield``.
+        # Reserve one managed child-generator slot for every such call site,
+        # including calls nested inside larger expressions.  This second walk
+        # is intentionally generic so future expression forms do not silently
+        # leave a child continuation in an SSA-only temporary across a park.
+        may_park_names = getattr(self, "_vthread_may_park_func_names", set())
+        may_park_method_keys = getattr(
+            self,
+            "_vthread_may_park_method_keys",
+            set(),
+        )
+        if may_park_names or may_park_method_keys:
+            current_class_name = vthread_method_owner_for_funcdef(
+                self.ast_module,
+                fd,
+                self._vthread_binding_cache,
+            )
+            if current_class_name is None:
+                current_class_name = owner_class_name
+            work = []
+            for stmt in fd.body:
+                work.append(stmt)
+            idx = 0
+            while idx < len(work):
+                node = work[idx]
+                idx += 1
+                if node is None:
+                    continue
+                if isinstance(node, tuple):
+                    for item in node:
+                        work.append(item)
+                    continue
+                if isinstance(node, FuncDef) or isinstance(node, ClassDef):
+                    continue
+                primitive_key = vthread_proven_suspension_call_key(
+                    self.ast_module,
+                    fd,
+                    node,
+                    self._vthread_binding_cache,
+                )
+                if primitive_key in (
+                    "pcc.virtual_thread.tcp_accept",
+                    "pcc.virtual_thread.tcp_connect",
+                    "pcc.virtual_thread.tcp_recv",
+                    "pcc.virtual_thread.tcp_send_all",
+                ):
+                    # Sequential TCP evaluates its Python operands once, then
+                    # keeps them and operation progress in this traced hidden
+                    # frame slot while readiness parks the parent generator.
+                    hidden = vthread_delegate_frame_name(node, primitive_key)
+                    if hidden not in names:
+                        names.append(hidden)
+                elif self._vthread_dynamic_callback_call(node, fd):
+                    hidden = vthread_delegate_frame_name(
+                        node,
+                        "pcc.virtual_thread.call",
+                    )
+                    if hidden not in names:
+                        names.append(hidden)
+                elif (
+                    isinstance(node, Call)
+                    and isinstance(node.func, Name)
+                    and vthread_proven_direct_name_call(
+                        fd,
+                        node,
+                        may_park_names,
+                        self._vthread_binding_cache,
+                    )
+                    is not None
+                ):
+                    hidden = vthread_delegate_frame_name(node, node.func.ident)
+                    if hidden not in names:
+                        names.append(hidden)
+                elif isinstance(node, Call) and isinstance(node.func, Attr):
+                    method_key = vthread_proven_method_call_key(
+                        node,
+                        current_class_name,
+                        may_park_method_keys,
+                        self.ast_module,
+                        fd,
+                        proof_cache=self._vthread_binding_cache,
+                    )
+                    if method_key is not None:
+                        hidden = vthread_delegate_frame_name(
+                            node,
+                            method_key,
+                        )
+                        if hidden not in names:
+                            names.append(hidden)
+                        # A local method cannot simultaneously be a compiled
+                        # sibling module export, so skip that independent
+                        # resolution path.
+                        for slot_name in _dataclass_field_names(node):
+                            if slot_name == "span":
+                                continue
+                            value = _dataclass_field_value(node, slot_name, None)
+                            if isinstance(value, tuple):
+                                for item in value:
+                                    work.append(item)
+                            else:
+                                work.append(value)
+                        continue
+                    export_method_key = vthread_proven_export_method_call_key(
+                        node,
+                        getattr(self, "_native_module_exports", None),
+                        self.ast_module,
+                        self._vthread_binding_cache,
+                    )
+                    if export_method_key is not None:
+                        hidden = vthread_delegate_frame_name(
+                            node,
+                            export_method_key,
+                        )
+                        if hidden not in names:
+                            names.append(hidden)
+                        for slot_name in _dataclass_field_names(node):
+                            if slot_name == "span":
+                                continue
+                            value = _dataclass_field_value(node, slot_name, None)
+                            if isinstance(value, tuple):
+                                for item in value:
+                                    work.append(item)
+                            else:
+                                work.append(value)
+                        continue
+                    export = self._native_module_expr_export_info(
+                        node.func.obj,
+                        node.func.name,
+                    )
+                    if export is not None:
+                        export_module, export_info = export
+                        if bool(export_info.get("may_park", False)):
+                            effect_name = export_module + "." + node.func.name
+                            hidden = vthread_delegate_frame_name(
+                                node,
+                                effect_name,
+                            )
+                            if hidden not in names:
+                                names.append(hidden)
+                for slot_name in _dataclass_field_names(node):
+                    if slot_name == "span":
+                        continue
+                    value = _dataclass_field_value(node, slot_name, None)
+                    if isinstance(value, tuple):
+                        for item in value:
+                            work.append(item)
+                    else:
+                        work.append(value)
 
         return names
 
@@ -319,7 +961,13 @@ class GeneratorLoweringMixin:
         worker_timing = str(
             os.environ.get("PCC_PY_FRONTEND_WORKER_TIMING", "") or ""
         ).strip().lower() in ("1", "true", "yes", "on")
-        frame_names = self._collect_generator_frame_names(fd)
+        owner_class_name = None
+        if class_info is not None:
+            owner_class_name = class_info.name
+        frame_names = self._collect_generator_frame_names(
+            fd,
+            owner_class_name,
+        )
         if worker_timing:
             sys.stderr.write(
                 "pcc frontend generator frames function="
@@ -401,6 +1049,14 @@ class GeneratorLoweringMixin:
             [resume_ptr, frame],
             name=self._fresh(f"{fd.name}.gen"),
         )
+        if (
+            id(fd) in getattr(self, "_vthread_may_park_func_ids", set())
+            or id(fd) in getattr(self, "_vthread_may_park_method_ids", set())
+        ):
+            self.builder.call(
+                self.runtime["py_gen_set_may_park"],
+                [gen],
+            )
         self._gc_release(frame)
         self.builder.ret(gen)
 
@@ -527,6 +1183,7 @@ class GeneratorLoweringMixin:
                 "dispatch_bb": dispatch_bb,
                 "switch": switch_inst,
                 "next_state": 1,
+                "active_exception_unwind_roots": [],
             }
         )
 
@@ -625,18 +1282,69 @@ class GeneratorLoweringMixin:
         value: Optional[ir.Value] = None,
     ) -> None:
         ctx = self._generator_ctx_stack[-1]
-        self._emit_generator_save_frame()
+        if value is None:
+            value = self._emit_none_literal()
+        for root_ptr in ctx.get("active_exception_unwind_roots", ()):
+            self.builder.call(
+                self.runtime["pcc_gc_store_root"],
+                [root_ptr, self._emit_none_literal()],
+            )
+        # Construct StopIteration while every live local is still registered
+        # as an updateable root.  In particular, a return value preserved
+        # across a parking finally block must not survive only as an SSA value
+        # while py_gen_finish allocates the exception.
+        result = self.builder.call(
+            self.runtime["py_gen_finish"],
+            [ctx["gen"], value],
+            name=self._fresh("gen.finish"),
+        )
         self._emit_owned_local_cleanup()
-        self.builder.call(self.runtime["py_gen_set_done"], [ctx["gen"]])
-        self._emit_generator_stop_iteration(value)
+        self.builder.ret(result)
 
     def _emit_generator_return(self, stmt: Return) -> None:
-        value = None
-        if stmt.value is not None:
-            value = self._emit_as_object(stmt.value)
-        self._emit_generator_finish(value)
+        if stmt.value is None:
+            self._emit_pending_finally_blocks()
+            if not self._builder_block_is_terminated():
+                self._emit_generator_finish()
+            return
 
-    def _emit_generator_yield_value(self, value: ir.Value) -> None:
+        ctx = self._generator_ctx_stack[-1]
+        hidden = self._generator_return_value_name(stmt)
+        frame_entry = ctx["frame_slots"].get(hidden)
+        if frame_entry is None:
+            raise L1CodegenError("generator return missing managed value slot")
+        value_slot = frame_entry[1]
+        value = self._emit_as_object(stmt.value)
+        # Normalize the expression to one owned reference, then transfer that
+        # reference into the heap-frame slot.  The slot is saved by any park in
+        # a pending finally block and is rewritten by relocating collectors.
+        value = self._retain_borrowed_return_value(value, stmt)
+        value_root_ptr = self._as_gc_ptr(
+            value_slot,
+            name=self._fresh("gen.return.root"),
+        )
+        self.builder.call(
+            self.runtime["pcc_gc_store_root"],
+            [value_root_ptr, value],
+        )
+        self._gc_release(value)
+
+        self._emit_pending_finally_blocks()
+        if self._builder_block_is_terminated():
+            return
+        rooted_value = self.builder.call(
+            self.runtime["pcc_gc_load_ptr"],
+            [ir.Constant(_CSTR, None), value_root_ptr],
+            name=self._fresh("gen.return.value"),
+        )
+        self._emit_generator_finish(rooted_value)
+
+    def _emit_generator_yield_value(
+        self,
+        value: ir.Value,
+        *,
+        resume_err_target: Optional[ir.Block] = None,
+    ) -> None:
         ctx = self._generator_ctx_stack[-1]
         worker_timing = str(
             os.environ.get("PCC_PY_FRONTEND_WORKER_TIMING", "") or ""
@@ -680,9 +1388,11 @@ class GeneratorLoweringMixin:
         ok_bb = self.current_function.append_basic_block(
             name=self._fresh("gen.resume.ok"),
         )
-        err_target = getattr(self, "_try_err_block", None)
+        err_target = resume_err_target
         if err_target is None:
-            err_target = self._ensure_fn_err_exit()
+            err_target = getattr(self, "_try_err_block", None)
+            if err_target is None:
+                err_target = self._ensure_fn_err_exit()
         self.builder.cbranch(has_pending, err_target, ok_bb)
         self.builder.position_at_end(ok_bb)
 

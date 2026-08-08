@@ -1,11 +1,12 @@
-"""G-P3-LONGRUN slice 2: process-RSS sampling helper (Darwin gate).
+"""G-P3-LONGRUN slice 2: host-C oracle for process-RSS sampling.
 
 The long-run workloads poll `pcc_os_current_rss_bytes` /
 `pcc_os_peak_rss_bytes` for their CSV time series. Assertions stay
 loose (the OS owns the numbers): both calls succeed, report > 1 MB for
 a live process, peak >= a freshly-sampled current, and current grows
 (or at least does not report failure) after a deliberate multi-MB
-allocation burst. The Linux branch ships UNTESTED until S-P2-LINUX.
+allocation burst. Production pcc-Python ownership and both target lowering
+shapes are gated separately in ``test_freestanding_platform_rss.py``.
 """
 from __future__ import annotations
 

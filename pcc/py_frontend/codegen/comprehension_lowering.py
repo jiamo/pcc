@@ -57,21 +57,28 @@ class ComprehensionLoweringMixin:
             [self._ptr_to_cstr(mod_name_gv)],
             name=self._fresh("cpy.operator"),
         )
+        self._guard_cpy_value_not_null(mod_val)
         attr_gv = self._cstr_global(
             getter_name,
             f".cpy.operator.{getter_name}",
         )
-        fn_val = self.builder.call(
-            self.runtime["py_cpy_getattr"],
-            [mod_val, self._ptr_to_cstr(attr_gv)],
-            name=self._fresh(f"cpy.{getter_name}"),
+        fn_val = self._mark_owned_cpy_value(
+            self.builder.call(
+                self.runtime["py_cpy_getattr"],
+                [mod_val, self._ptr_to_cstr(attr_gv)],
+                name=self._fresh(f"cpy.{getter_name}"),
+            )
         )
+        self.builder.call(self.runtime["py_cpy_decref"], [mod_val])
+        self._guard_cpy_value_not_null(fn_val)
         # Marshal the key: str → CPython str, int → CPython int.
         if isinstance(key, int):
-            key_cpy = self.builder.call(
-                self.runtime["py_cpy_from_i64"],
-                [ir.Constant(_I64, key)],
-                name=self._fresh(f"{getter_name}.key.int"),
+            key_cpy = self._mark_owned_cpy_value(
+                self.builder.call(
+                    self.runtime["py_cpy_from_i64"],
+                    [ir.Constant(_I64, key)],
+                    name=self._fresh(f"{getter_name}.key.int"),
+                )
             )
         else:
             key_bytes = self._utf8_byte_values(key)
@@ -87,20 +94,26 @@ class ComprehensionLoweringMixin:
                 ],
                 name=self._fresh(f"{getter_name}.key.pccstr"),
             )
-            key_cpy = self.builder.call(
-                self.runtime["py_cpy_from_pccstr"],
-                [pcc_str],
-                name=self._fresh(f"{getter_name}.key.cpystr"),
+            key_cpy = self._mark_owned_cpy_value(
+                self.builder.call(
+                    self.runtime["py_cpy_from_pccstr"],
+                    [pcc_str],
+                    name=self._fresh(f"{getter_name}.key.cpystr"),
+                )
             )
+            self._gc_release(pcc_str)
+        self._guard_cpy_value_not_null(key_cpy, (fn_val,))
         result = self.builder.call(
             self.runtime["py_cpy_call1"],
             [fn_val, key_cpy],
             name=self._fresh(f"cpy.{getter_name}.call"),
         )
-        if not hasattr(self, "_cpy_values"):
-            self._cpy_values = set()
-        self._cpy_values.add(result)
-        return result
+        self.builder.call(self.runtime["py_cpy_decref"], [key_cpy])
+        self._forget_owned_cpy_value(key_cpy)
+        self.builder.call(self.runtime["py_cpy_decref"], [fn_val])
+        self._forget_owned_cpy_value(fn_val)
+        self._guard_cpy_value_not_null(result)
+        return self._mark_owned_cpy_value(result)
     def _emit_comprehension(self, expr: Call, kind: str) -> ir.Value:
         """Lower list/set/dict comprehension sentinels into explicit
         loops over a freshly-allocated runtime container.

@@ -138,3 +138,22 @@ def test_os_environ_membership_dispatches_to_native_contains_off_mode():
     assert "@py_os_environ_contains" in body, body
     assert "@py_err_occurred" in body, body
     assert "@py_cpy_" not in body, body
+
+
+def test_os_environ_delitem_checks_presence_then_unsets_natively():
+    program = textwrap.dedent("""
+        import os
+
+        def remove(name: str) -> None:
+            del os.environ[name]
+    """)
+    ir = _compile_to_ll(program, "environ_delitem", mode="on")
+    body = _function_body(ir, "remove")
+    assert body is not None
+    assert "@py_os_environ_getitem" in body, body
+    assert "@py_os_unsetenv" in body, body
+    getitem_key = re.search(r"@py_os_environ_getitem\(ptr ([^)]+)\)", body)
+    unsetenv_key = re.search(r"@py_os_unsetenv\(ptr ([^)]+)\)", body)
+    assert getitem_key is not None and unsetenv_key is not None, body
+    assert getitem_key.group(1) == unsetenv_key.group(1), body
+    assert "@py_cpy_" not in body, body

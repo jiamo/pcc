@@ -44,6 +44,7 @@ def _click_entry(
     separate_tus,
     jobs,
     system_link,
+    freestanding_libc,
     no_cache,
     cache_dir,
     sources_from_make,
@@ -81,6 +82,7 @@ def _click_entry(
             jobs=jobs,
             jobs_was_explicit=jobs_was_explicit,
             system_link=system_link,
+            freestanding_libc=freestanding_libc,
             no_cache=no_cache,
             cache_dir=cache_dir,
             sources_from_make=sources_from_make,
@@ -246,6 +248,12 @@ def _build_click_main():
         is_flag=True,
         default=False,
         help="Disable the translation-unit compile cache.",
+    )(cmd)
+    cmd = click_mod.option(
+        "--freestanding-libc",
+        is_flag=True,
+        default=False,
+        help="For C, link supported libc ABI to the shared pcc-Python archive (implies --system-link).",
     )(cmd)
     cmd = click_mod.option(
         "--system-link",

@@ -15,9 +15,29 @@ PY_OBJ_C = REPO_ROOT / "pcc" / "py_runtime" / "src" / "py_obj.c"
 PY_OBJ_PORT = REPO_ROOT / "pcc" / "py_runtime" / "py" / "py_obj.py"
 THREADS_C = REPO_ROOT / "pcc" / "py_runtime" / "src" / "pcc_threads.c"
 PY_OBJ_GC_C = REPO_ROOT / "pcc" / "py_runtime" / "src" / "py_obj_gc.c"
-PY_OBJ_GC_PORT = REPO_ROOT / "pcc" / "py_runtime" / "py" / "py_obj_gc.py"
+PY_OBJ_GC_PORT = (
+    REPO_ROOT
+    / "pcc"
+    / "py_runtime"
+    / "py"
+    / "freestanding_gc_backend0_collector.py"
+)
 PY_GC_BACKEND_C = REPO_ROOT / "pcc" / "py_runtime" / "src" / "py_gc_backend.c"
 PY_GC_BACKEND_PORT = REPO_ROOT / "pcc" / "py_runtime" / "py" / "py_gc_backend.py"
+PY_GC_BARRIER_DISPATCHER = (
+    REPO_ROOT
+    / "pcc"
+    / "py_runtime"
+    / "py"
+    / "freestanding_gc_barrier_dispatcher.py"
+)
+PY_GC_GENERATIONAL_SCHEDULER = (
+    REPO_ROOT
+    / "pcc"
+    / "py_runtime"
+    / "py"
+    / "freestanding_gc_generational_scheduler.py"
+)
 CORE_HELPERS = REPO_ROOT / "pcc" / "py_frontend" / "codegen" / "core_helpers.py"
 CONTROL_FLOW_LOWERING = (
     REPO_ROOT / "pcc" / "py_frontend" / "codegen" / "control_flow_lowering.py"
@@ -38,6 +58,7 @@ def _build_threaded_runtime(tmp_path: Path) -> Path:
 THREADING_SURFACE = [
     "pcc_threads_enabled",
     "pcc_current_thread_id",
+    "pcc_current_native_thread_token",
     "pcc_refcount_strategy",
     "pcc_thread_safepoint",
     "pcc_stop_the_world",
@@ -59,10 +80,12 @@ def test_threading_substrate_public_surface_is_in_header_and_runtime_abi():
         assert name in header
 
 
-def test_threading_substrate_is_built_into_c_and_pcc_python_archives():
+def test_threading_c_oracle_is_not_linked_into_pcc_python_archive():
     makefile = RUNTIME_MAKEFILE.read_text(encoding="utf-8")
     assert "$(SRCDIR)/pcc_threads.c" in makefile
-    assert "$(OBJDIR_PY)/pcc_threads.o" in makefile
+    assert "OBJ_PY_CC_HELPERS" not in makefile
+    assert "freestanding_thread_kernel_pthread" in makefile
+    assert "freestanding_thread_kernel" in makefile
     assert "PCC_WITH_THREADS" in makefile
     assert "PCC_REFCOUNT_KIND" in makefile
 
@@ -186,6 +209,36 @@ def test_python_codegen_ir_contains_loop_and_entry_thread_safepoints(
     assert "for.step" in ir_text
 
 
+def test_python_codegen_zero_thread_env_disables_implicit_safepoints(
+    tmp_path,
+    monkeypatch,
+):
+    """A conventional ``PCC_WITH_THREADS=0`` must mean disabled."""
+    from pcc.py_frontend.pipeline import compile_python
+
+    monkeypatch.setenv("PCC_WITH_THREADS", "0")
+    src = tmp_path / "no_implicit_safepoints.py"
+    out_ll = tmp_path / "no_implicit_safepoints.ll"
+    src.write_text(
+        "def identity(value: int) -> int:\n"
+        "    return value\n",
+        encoding="utf-8",
+    )
+
+    compile_python(
+        str(src),
+        str(out_ll),
+        ir_scaffold_mode="on",
+        libpython_mode="off",
+        emit_llvm_only=True,
+    )
+
+    assert (
+        "call void @pcc_thread_safepoint()"
+        not in out_ll.read_text(encoding="utf-8")
+    )
+
+
 def test_biased_and_deferred_refcount_are_recognized_strategies():
     """All four refcount strategies must be wired in pcc_threads.c.
 
@@ -213,11 +266,20 @@ def test_refcount_cycle_gc_collect_wraps_stw_gate_in_c_and_pcc_python_runtime():
 
     py_src = PY_OBJ_GC_PORT.read_text(encoding="utf-8")
     py_body = py_src.split('@c_abi_export("py_gc_collect")', 1)[1]
-    py_body = py_body.split('@c_abi_export("py_gc_track")', 1)[0]
     assert 'extern("pcc_stop_the_world"' in py_src
     assert 'extern("pcc_resume_world"' in py_src
     assert "pcc_stop_the_world()" in py_body
+    assert "while stw != 0:" in py_body
+    assert "pcc_thread_safepoint()" in py_body
+    assert "pcc_gc_default_table_lock()" in py_body
+    assert "pcc_gc_default_table_unlock()" in py_body
     assert "pcc_resume_world()" in py_body
+    assert py_body.index("pcc_gc_default_table_lock()") < py_body.index(
+        'store_i32(collecting_slot, 0, 1)'
+    )
+    assert py_body.rindex("pcc_gc_default_table_unlock()") < py_body.rindex(
+        "pcc_resume_world()"
+    )
 
 
 def test_generational_backend_step_polls_thread_safepoint_in_c_and_pcc_python_runtime():
@@ -232,13 +294,14 @@ def test_generational_backend_step_polls_thread_safepoint_in_c_and_pcc_python_ru
     assert "pcc_gc_step_generational_promotion(budget, 1)" in c_body
     assert "pcc_thread_safepoint()" in c_helper
 
-    py_src = PY_GC_BACKEND_PORT.read_text(encoding="utf-8")
-    py_body = py_src.split("elif backend == 3:", 1)[1]
+    py_src = PY_GC_BARRIER_DISPATCHER.read_text(encoding="utf-8")
+    py_body = py_src.split("def pcc_gc_step(budget: int) -> int:", 1)[1]
+    py_body = py_body.split("def pcc_gc_note_alloc", 1)[0]
+    py_body = py_body.split("if backend == 3:", 1)[1]
     py_body = py_body.split("elif backend == 4:", 1)[0]
-    py_helper = py_src.split("def _step_generational_promotion", 1)[1]
-    py_helper = py_helper.split('@c_abi_export("pcc_gc_step")', 1)[0]
-    assert 'extern("pcc_thread_safepoint"' in py_src
-    assert "_step_generational_promotion(budget, 1)" in py_body
+    py_helper = PY_GC_GENERATIONAL_SCHEDULER.read_text(encoding="utf-8")
+    assert 'extern("pcc_thread_safepoint"' in py_helper
+    assert "pcc_gc_generational_step(budget, 1)" in py_body
     assert "pcc_thread_safepoint()" in py_helper
 
 
@@ -271,9 +334,14 @@ def test_tracing_gc_finalizer_handles_thread_objects_and_refcount_side_table():
     )
     for name in ["c_abi_export", "c_int64", "c_ptr", "c_void", "extern"]:
         assert name in extern_import
-    assert "pcc_refcount_forget(o)" in py_src
-    assert "tag == 27" in py_src
-    assert "py_dealloc_thread_thread(o)" in py_src
+    # The thread-object finalizer path moved to the freestanding tracing-sweep
+    # collector as the refcount-cycle collector policy migrated.
+    sweep_collector = (
+        RUNTIME_DIR / "py" / "freestanding_gc_tracing_sweep_collector.py"
+    ).read_text(encoding="utf-8")
+    assert "pcc_refcount_forget(obj)" in sweep_collector
+    assert "tag == 27" in sweep_collector
+    assert "py_dealloc_thread_thread(obj)" in sweep_collector
 
     thread_port = (REPO_ROOT / "pcc" / "py_runtime" / "py" / "py_threading.py").read_text(
         encoding="utf-8"

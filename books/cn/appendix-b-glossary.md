@@ -79,6 +79,20 @@
 | case study | 案例研究 | 本书"历史与教训"小节的体例,取材 docs/investigations |
 | reproducer | 重现程序 | 最小化的失败用例 |
 | regression | 回归 | |
-| no-libpython | no-libpython | 不译;不依赖 CPython 运行时 |
-| C kernel | C 内核 | 四层模型最底层 |
-| C-API shim | C-API 垫片(shim) | 扩展所见的 ABI 面 |
+| no-libpython | no-libpython | 不译;不依赖 CPython 运行时,不自动推出 zero-libc |
+| zero-libc | zero-libc | Linux 模式声明:无生产 C/libc 对象、动态解释器/依赖和未定义符号;Darwin 不使用此标签 |
+| compiler intrinsic | 编译器内建 | raw memory、原子、syscall、host ABI 等机器操作;不得承载 Python 语义政策 |
+| freestanding pcc-Python | freestanding pcc-Python | 实现分配器、线程、安全点、GC 与 libc-like substrate 的严格无托管依赖子集 |
+| C-API shim | C-API 垫片(shim) | 扩展所见的 ABI 面;生产 owner 正迁入 `py_capi_*_runtime.py` |
+
+## GUI
+
+| English | 中文 | 注 |
+|---|---|---|
+| declarative UI | 声明式 UI | 组件从 props/state 产生描述符,不直接逐帧修改 committed tree |
+| keyed reconciliation | keyed 对账(reconciliation) | 以 parent/key/type 判定 reuse、move、replace、remove |
+| atomic commit | 原子提交 | 只有完整 work-in-progress 结果可修改 committed kernel tree |
+| scheduling lane | 调度 lane | discrete/animation/default/background 优先级与 aging/replay 契约 |
+| effect phase | effect 阶段 | before-mutation、mutation/layout cleanup、layout create、passive cleanup/create |
+| managed state | 托管状态 | command owner 中具有明确 slot kind 与 ownership 的应用状态,不是任意 Python object |
+| native bridge | 原生桥 | CoreGraphics/Metal/AppKit 的具名 ABI 边界;reachability acknowledgement 不等于像素正确性 |

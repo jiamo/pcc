@@ -4,7 +4,7 @@ Upstream reference:
 - /tmp/llvm-src/llvm-20.1.8.src/lib/IR/Dominators.cpp
 """
 
-import shutil
+import pytest
 import subprocess
 import unittest
 
@@ -21,7 +21,9 @@ from pcc.ir_passes.dominator_tree import (
 )
 
 
-_OPT = shutil.which("opt")
+from pcc.passes.llvm_text_pipeline import find_opt_binary
+
+_OPT = find_opt_binary()
 
 
 def _parse_fn(ir_text: str, name: str = "f") -> llvm.ValueRef:
@@ -160,7 +162,7 @@ class AnalysisManagerTests(unittest.TestCase):
         self.assertTrue(post.dominates("join", "then"))
 
 
-@unittest.skipUnless(_OPT, "requires LLVM 'opt' on PATH")
+@pytest.mark.pcc_gate(unavailable=None if _OPT else "matching LLVM opt not installed")
 class UpstreamParityTests(unittest.TestCase):
     """Diff our idom map against ``opt -passes=print<domtree>``.
 

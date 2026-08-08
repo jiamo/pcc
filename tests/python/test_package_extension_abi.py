@@ -3281,3 +3281,27 @@ def test_pcc1_ext_abi_no_host_reports_numpy_capi_provider_subset_ok():
     assert status["PyArray_FromObject"]["failure_mode"] == "implemented_header_macro"
     assert status["PyArray_CopyFromObject"]["implemented"] is True
     assert status["PyArray_CopyFromObject"]["failure_mode"] == "implemented_header_macro"
+
+
+def test_cached_built_source_tree_counts_as_installable_meson_payload(tmp_path):
+    """A cache hit hands the installer an already-built package tree: the
+    package ``__init__.py`` plus built native artifacts, and no
+    ``build/pcc-package/meson-build`` directory (that only exists in a tree the
+    fresh-acquire path just configured). While only the build directory was
+    inspected, a cache hit re-entered the meson configure path on a tree that
+    carries no build system, so installing the same spec twice reported
+    ``install_success`` true and then false on the identical machine.
+    """
+    from pcc.cli_bootstrap import _native_has_installable_meson_payload
+
+    source = tmp_path / "numpy"
+    (source / "_core").mkdir(parents=True)
+    (source / "__init__.py").write_text("", encoding="utf-8")
+    (source / "meson.build").write_text("", encoding="utf-8")
+
+    # An unbuilt tree must still be built, not silently skipped.
+    assert not _native_has_installable_meson_payload("numpy", str(source))
+
+    artifact = source / "_core" / "_multiarray_umath.pcc3-pcc_native-macosx_14_0_arm64.so"
+    artifact.write_bytes(b"\x00")
+    assert _native_has_installable_meson_payload("numpy", str(source))

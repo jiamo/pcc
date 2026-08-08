@@ -7,39 +7,36 @@ runtime archives. The immortal singletons live in py_substrate.py for
 the pcc-Python archive and in py_substrate.c for the C runtime archives.
 This port only owns the "dispatch layer".
 
-PyObjectHeader layout:
-    offset  0   refcount     (i64)
-    offset  8   type_tag     (i32)
-    offset 12   flags        (i32)
-
-PY_FLAG_IMMORTAL = 0x1. Tagged ints are low-bit=1 pointers.
-
-Type tags (from py_runtime.h):
-    PY_TYPE_NONE     = 0
-    PY_TYPE_BOOL     = 1
-    PY_TYPE_INT      = 2
-    PY_TYPE_FLOAT    = 3
-    PY_TYPE_STR      = 4
-    PY_TYPE_LIST     = 5
-    PY_TYPE_DICT     = 6
-    PY_TYPE_TUPLE    = 7
-    PY_TYPE_SET      = 8
-    PY_TYPE_FUNC     = 9
-    PY_TYPE_CLASS    = 10
-    PY_TYPE_INSTANCE = 11
-    PY_TYPE_EXC      = 12
-    PY_TYPE_FILE     = 13
-    PY_TYPE_ITER     = 14
-    PY_TYPE_GEN      = 15
-    PY_TYPE_MEMORYVIEW = 19
-    PY_TYPE_COROUTINE = 20
-    PY_TYPE_TASK     = 28
-    PY_TYPE_CONTINUATION = 29
-    PY_TYPE_VIRTUAL_THREAD = 30
-    PY_TYPE_USER     = 100
+The object-header layout, flags, and public type-tag values are consumed from
+the generated C-header-derived ``py_abi_constants`` module.  Numeric copies do
+not belong in this prose because the generator cannot update them.
 """
 
 from pcc.extern import extern, c_abi_export, c_int32, c_int64, c_ptr, c_void
+from pcc.py_runtime.py.py_abi_constants import (
+    PYLISTOBJECT_ITEMS_OFFSET,
+    PYLISTOBJECT_LENGTH_OFFSET,
+    PYOBJECTHEADER_FLAGS_OFFSET,
+    PYOBJECTHEADER_REFCOUNT_OFFSET,
+    PYOBJECTHEADER_TYPE_TAG_OFFSET,
+    PY_FLAG_GC_PINNED,
+    PY_FLAG_GC_TRACKED,
+    PY_FLAG_IMMORTAL,
+    PY_TYPE_BOOL,
+    PY_TYPE_BYTEARRAY,
+    PY_TYPE_BYTES,
+    PY_TYPE_COMPLEX,
+    PY_TYPE_CONTINUATION,
+    PY_TYPE_CPY_HANDLE,
+    PY_TYPE_FLOAT,
+    PY_TYPE_FUNC,
+    PY_TYPE_INT,
+    PY_TYPE_NONE,
+    PY_TYPE_STR,
+    PY_TYPE_USER,
+    PY_TYPE_VIRTUAL_THREAD,
+    PY_TYPE_VTHREAD_CHANNEL,
+)
 from pcc.unsafe import (
     cstr,
     global_addr,
@@ -93,7 +90,7 @@ pcc_dealloc_with_trash = extern(
     (c_ptr, c_int64),
     c_void,
 )
-pcc_runtime_monotonic_us = extern("pcc_runtime_monotonic_us", (), c_int64)
+pcc_runtime_monotonic_us = extern("pcc_platform_monotonic_us", (), c_int64)
 pcc_gc_record_explicit_pause = extern(
     "pcc_gc_record_explicit_pause", (c_int64, c_int64), c_void
 )
@@ -123,6 +120,11 @@ pcc_gc_note_object_allocated_sized = extern(
     "pcc_gc_note_object_allocated_sized",
     (c_ptr, c_int64),
     c_void,
+)
+pcc_gc_pointer_register = extern(
+    "pcc_gc_pointer_register",
+    (c_ptr,),
+    c_int64,
 )
 pcc_gc_try_minor_alloc = extern("pcc_gc_try_minor_alloc", (c_int64,), c_ptr)
 pcc_gc_backend4_try_zpage_alloc = extern(
@@ -227,27 +229,19 @@ def _gc_backend_fast() -> int:
     return load_i32(global_addr("pcc_gc_backend_selected"), 0)
 
 
+pcc_gc_pointer_is_managed = extern(
+    "pcc_gc_pointer_is_managed", (c_ptr,), c_int64
+)
+
+
 def _ptr_can_have_header(o) -> bool:
-    if ptr_is_null(o) != 0:
-        return False
-    if is_tagged_int(o) != 0:
-        return False
-    bits: int = ptr_diff(o, null())
-    if bits < 4096:
-        return False
-    if (bits & 7) != 0:
-        return False
-    if bits >= 17592186044416 and bits < 35184372088832:
-        return False
-    if bits >= 281474976710656:
-        return False
-    return True
+    return pcc_gc_pointer_is_managed(o) != 0
 
 
 def _gc_relocation_candidate(o) -> int:
     if not _ptr_can_have_header(o):
         return 0
-    return 1 if (load_i32(o, 12) & 2048) != 0 else 0
+    return 1 if (load_i32(o, PYOBJECTHEADER_FLAGS_OFFSET) & 2048) != 0 else 0
 
 
 def _gc_forwarding_population() -> int:
@@ -264,28 +258,10 @@ def _gc_backend4_should_check_slot(slot) -> int:
     return 1
 
 
-# NOTE: pcc-Python initializes module-level integers in the
-# auto-generated main(), which the Makefile strips for library .o
-# builds. So we inline the type-tag and flag literals at each use
-# site instead of declaring them as module constants.
-#
-#   PY_FLAG_IMMORTAL  = 1
-#   PY_TYPE_INT       = 2
-#   PY_TYPE_FLOAT     = 3
-#   PY_TYPE_STR       = 4
-#   PY_TYPE_LIST      = 5
-#   PY_TYPE_DICT      = 6
-#   PY_TYPE_TUPLE     = 7
-#   PY_TYPE_SET       = 8
-#   PY_TYPE_CLASS     = 10
-#   PY_TYPE_INSTANCE  = 11
-#   PY_TYPE_EXC       = 12
-#   PY_TYPE_FILE      = 13
-#   PY_TYPE_ITER      = 14
-#   PY_TYPE_GEN       = 15
-#   PY_TYPE_COROUTINE = 20
-#   PY_TYPE_TASK      = 28
-#   PY_TYPE_USER      = 100
+# Header layout, stable flags, and public type tags come from the generated
+# C-header-derived ABI module.  Collector-private state bits remain local to
+# their owning implementation because they are not part of PyObjectHeader's
+# public port ABI contract.
 
 
 @c_abi_export("py_bool_from_bit")
@@ -296,23 +272,23 @@ def py_bool_from_bit(b: int):
 
 
 def _gc_graph_leaf_tag(tag: int) -> int:
-    if tag == 0:
+    if tag == PY_TYPE_NONE:
         return 1
-    if tag == 1:
+    if tag == PY_TYPE_BOOL:
         return 1
-    if tag == 2:
+    if tag == PY_TYPE_INT:
         return 1
-    if tag == 3:
+    if tag == PY_TYPE_FLOAT:
         return 1
-    if tag == 4:
+    if tag == PY_TYPE_STR:
         return 1
-    if tag == 16:
+    if tag == PY_TYPE_COMPLEX:
         return 1
-    if tag == 17:
+    if tag == PY_TYPE_BYTES:
         return 1
-    if tag == 18:
+    if tag == PY_TYPE_BYTEARRAY:
         return 1
-    if tag == 32:
+    if tag == PY_TYPE_CPY_HANDLE:
         return 1
     return 0
 
@@ -350,10 +326,14 @@ def pcc_gc_alloc(size: int, type_tag: int, flags: int):
                 stored_flags = (stored_flags & ~4096) | 262144
     if ptr_is_null(obj):
         return obj
-    store_i64(obj, 0, 1)
-    store_i32(obj, 8, type_tag)
-    store_i32(obj, 12, stored_flags)
+    store_i64(obj, PYOBJECTHEADER_REFCOUNT_OFFSET, 1)
+    store_i32(obj, PYOBJECTHEADER_TYPE_TAG_OFFSET, type_tag)
+    store_i32(obj, PYOBJECTHEADER_FLAGS_OFFSET, stored_flags)
     pcc_debug_note_alloc_size(obj, size)
+    # Exact provenance is visible before the tracking layer can publish the
+    # object.  Backend-0 objects and graph leaves intentionally stay here.
+    if pcc_gc_pointer_register(obj) < 0:
+        return null()
     pcc_gc_note_object_allocated_sized(obj, size)
     if load_i32(global_addr("pcc_runtime_log_fast_state"), 0) != 0:
         pcc_runtime_log_event_code(1, 2, size, type_tag, obj)
@@ -384,8 +364,8 @@ def pcc_gc_release(o) -> None:
                 return
             o = resolved
     if backend == 3:
-        flags: int = load_i32(o, 12)
-        if (flags & 4096) != 0 and (flags & 256) != 0 and load_i64(o, 0) <= 0:
+        flags: int = load_i32(o, PYOBJECTHEADER_FLAGS_OFFSET)
+        if (flags & 4096) != 0 and (flags & 256) != 0 and load_i64(o, PYOBJECTHEADER_REFCOUNT_OFFSET) <= 0:
             return
     py_decref(o)
 
@@ -613,8 +593,8 @@ def _pcc_gc_callback_eq(a, b) -> int:
     b = pcc_gc_note_relocation_read(b)
     if ptr_eq(a, b) != 0:
         return 1
-    if load_i32(a, 8) == 9:
-        if load_i32(b, 8) == 9:
+    if load_i32(a, PYOBJECTHEADER_TYPE_TAG_OFFSET) == PY_TYPE_FUNC:
+        if load_i32(b, PYOBJECTHEADER_TYPE_TAG_OFFSET) == PY_TYPE_FUNC:
             if ptr_eq(load_ptr(a, 56), load_ptr(b, 56)) != 0:
                 a_captures = pcc_gc_load_ptr(a, ptr_add(a, 64))
                 b_captures = pcc_gc_load_ptr(b, ptr_add(b, 64))
@@ -627,8 +607,8 @@ def py_gc_callbacks_remove(callback) -> None:
     callbacks = _py_gc_callbacks_ensure()
     if ptr_is_null(callbacks) != 0:
         return
-    length: int = load_i64(callbacks, 16)
-    items = load_ptr(callbacks, 32)
+    length: int = load_i64(callbacks, PYLISTOBJECT_LENGTH_OFFSET)
+    items = load_ptr(callbacks, PYLISTOBJECT_ITEMS_OFFSET)
     i: int = 0
     while i < length:
         existing = pcc_gc_load_ptr(callbacks, ptr_add(items, i * 8))
@@ -637,7 +617,7 @@ def py_gc_callbacks_remove(callback) -> None:
                 src = ptr_add(items, (i + 1) * 8)
                 dst = ptr_add(items, i * 8)
                 memmove(dst, src, (length - i - 1) * 8)
-            store_i64(callbacks, 16, length - 1)
+            store_i64(callbacks, PYLISTOBJECT_LENGTH_OFFSET, length - 1)
             py_decref(existing)
             return
         i = i + 1
@@ -744,8 +724,8 @@ def pcc_gc_pin(o) -> None:
         return
     if is_tagged_int(o) != 0:
         return
-    flags: int = load_i32(o, 12)
-    store_i32(o, 12, flags | 64)
+    flags: int = load_i32(o, PYOBJECTHEADER_FLAGS_OFFSET)
+    store_i32(o, PYOBJECTHEADER_FLAGS_OFFSET, flags | PY_FLAG_GC_PINNED)
     pcc_gc_note_pin(1)
     return
 
@@ -756,9 +736,23 @@ def pcc_gc_unpin(o) -> None:
         return
     if is_tagged_int(o) != 0:
         return
-    flags: int = load_i32(o, 12)
-    store_i32(o, 12, flags & ~64)
+    flags: int = load_i32(o, PYOBJECTHEADER_FLAGS_OFFSET)
+    store_i32(o, PYOBJECTHEADER_FLAGS_OFFSET, flags & ~PY_FLAG_GC_PINNED)
     pcc_gc_note_pin(-1)
+    return
+
+
+@c_abi_export("pcc_gc_immortalize")
+def pcc_gc_immortalize(o) -> None:
+    # Mirror of C pcc_gc_immortalize: pin + set PY_FLAG_IMMORTAL (0x1) so
+    # py_incref/py_decref stop touching this object's refcount cache line.
+    if ptr_is_null(o) != 0:
+        return
+    if is_tagged_int(o) != 0:
+        return
+    pcc_gc_pin(o)
+    flags: int = load_i32(o, PYOBJECTHEADER_FLAGS_OFFSET)
+    store_i32(o, PYOBJECTHEADER_FLAGS_OFFSET, flags | PY_FLAG_IMMORTAL)
     return
 
 
@@ -778,11 +772,14 @@ def py_incref(o) -> None:
         backend = load_i32(global_addr("pcc_gc_backend_selected"), 0)
     if not _ptr_can_have_header(o):
         return
-    tag: int = load_i32(o, 8)
-    # validity window: 0..32 (32 == PY_TYPE_CPY_HANDLE) or user/class tags
-    if tag < 0 or (tag > 32 and tag < 100) or tag > 500:
+    tag: int = load_i32(o, PYOBJECTHEADER_TYPE_TAG_OFFSET)
+    if (
+        tag < PY_TYPE_NONE
+        or (tag > PY_TYPE_CPY_HANDLE and tag < PY_TYPE_USER)
+        or tag > 500
+    ):
         return
-    flags: int = load_i32(o, 12)
+    flags: int = load_i32(o, PYOBJECTHEADER_FLAGS_OFFSET)
     if (backend == 1 or backend == 2) and flags == 0:
         return
     if backend == 4 and _gc_forwarding_population() > 0 and (flags & 2048) != 0:
@@ -791,19 +788,25 @@ def py_incref(o) -> None:
         resolved = pcc_gc_note_relocation_read(o)
         if ptr_is_null(resolved) == 0 and ptr_eq(resolved, o) == 0:
             o = resolved
-            tag = load_i32(o, 8)
-            flags = load_i32(o, 12)
+            tag = load_i32(o, PYOBJECTHEADER_TYPE_TAG_OFFSET)
+            flags = load_i32(o, PYOBJECTHEADER_FLAGS_OFFSET)
     if (
-        (tag == 29 or tag == 30 or tag == 31)
-        and (flags & 2) == 0
+        (
+            tag == PY_TYPE_CONTINUATION
+            or tag == PY_TYPE_VIRTUAL_THREAD
+            or tag == PY_TYPE_VTHREAD_CHANNEL
+        )
+        and (flags & PY_FLAG_GC_TRACKED) == 0
         and pcc_gc_object_is_known(o) == 0
     ):
         return
-    if (flags & 1) != 0:  # PY_FLAG_IMMORTAL
+    if (flags & PY_FLAG_IMMORTAL) != 0:
         return
     if backend == 3 and (flags & 4096) != 0 and (flags & 256) != 0:
-        if load_i64(o, 0) <= 0:
+        if load_i64(o, PYOBJECTHEADER_REFCOUNT_OFFSET) <= 0:
             return
+    if load_i64(o, PYOBJECTHEADER_REFCOUNT_OFFSET) < 0:
+        return  # already freed (poisoned); stray reference, skip
     new_rc: int = pcc_refcount_incref(o)
     if load_i32(global_addr("pcc_runtime_log_fast_state"), 0) != 0:
         pcc_runtime_log_event_code(3, 1, new_rc, tag, o)
@@ -822,11 +825,14 @@ def py_decref(o) -> None:
         backend = load_i32(global_addr("pcc_gc_backend_selected"), 0)
     if not _ptr_can_have_header(o):
         return
-    tag_dbg: int = load_i32(o, 8)
-    # validity window: 0..32 (32 == PY_TYPE_CPY_HANDLE) or user/class tags
-    if tag_dbg < 0 or (tag_dbg > 32 and tag_dbg < 100) or tag_dbg > 500:
+    tag_dbg: int = load_i32(o, PYOBJECTHEADER_TYPE_TAG_OFFSET)
+    if (
+        tag_dbg < PY_TYPE_NONE
+        or (tag_dbg > PY_TYPE_CPY_HANDLE and tag_dbg < PY_TYPE_USER)
+        or tag_dbg > 500
+    ):
         return
-    flags: int = load_i32(o, 12)
+    flags: int = load_i32(o, PYOBJECTHEADER_FLAGS_OFFSET)
     if (backend == 1 or backend == 2) and flags == 0:
         return
     if backend == 4 and _gc_forwarding_population() > 0 and (flags & 2048) != 0:
@@ -836,18 +842,22 @@ def py_decref(o) -> None:
         resolved = pcc_gc_note_relocation_read(o)
         if ptr_is_null(resolved) == 0 and ptr_eq(resolved, o) == 0:
             o = resolved
-            tag_dbg = load_i32(o, 8)
-            flags = load_i32(o, 12)
+            tag_dbg = load_i32(o, PYOBJECTHEADER_TYPE_TAG_OFFSET)
+            flags = load_i32(o, PYOBJECTHEADER_FLAGS_OFFSET)
     if (
-        (tag_dbg == 29 or tag_dbg == 30 or tag_dbg == 31)
-        and (flags & 2) == 0
+        (
+            tag_dbg == PY_TYPE_CONTINUATION
+            or tag_dbg == PY_TYPE_VIRTUAL_THREAD
+            or tag_dbg == PY_TYPE_VTHREAD_CHANNEL
+        )
+        and (flags & PY_FLAG_GC_TRACKED) == 0
         and pcc_gc_object_is_known(o) == 0
     ):
         return
-    if (flags & 1) != 0:  # PY_FLAG_IMMORTAL
+    if (flags & PY_FLAG_IMMORTAL) != 0:
         return
     if backend == 3 and (flags & 4096) != 0 and (flags & 256) != 0:
-        if load_i64(o, 0) <= 0:
+        if load_i64(o, PYOBJECTHEADER_REFCOUNT_OFFSET) <= 0:
             return
     if (
         backend == 4
@@ -855,9 +865,17 @@ def py_decref(o) -> None:
         and pcc_gc_object_is_known(o) == 0
     ):
         return
+    # Guard against a stray second release of an already-freed object: the
+    # free path poisons the header (refcount = -1) but leaves the memory in
+    # place long enough for a stale pointer to reach this code.  A negative
+    # pre-decref refcount means the object is gone; skip instead of crashing.
+    pre_rc: int = load_i64(o, PYOBJECTHEADER_REFCOUNT_OFFSET)
+    if pre_rc < 0:
+        return
     new_rc: int = pcc_refcount_decref(o)
     if new_rc < 0:
-        _pcc_debug_bad_incref(o, tag_dbg)
+        if load_i32(global_addr("pcc_runtime_log_fast_state"), 0) != 0:
+            _pcc_debug_bad_incref(o, tag_dbg)
         return
     if new_rc > 0:
         if load_i32(global_addr("pcc_runtime_log_fast_state"), 0) != 0:
@@ -869,7 +887,7 @@ def py_decref(o) -> None:
     # Dedicated deallocation state.  Do not infer it from refcount zero because
     # backend-3 forwarding shells can legitimately carry a zero count.
     flags = flags | 524288
-    store_i32(o, 12, flags)
+    store_i32(o, PYOBJECTHEADER_FLAGS_OFFSET, flags)
     if load_i32(global_addr("pcc_runtime_log_fast_state"), 0) != 0:
         pcc_runtime_log_event_code(3, 2, new_rc, tag_dbg, o)
     pcc_refcount_forget(o)
@@ -880,7 +898,10 @@ def py_decref(o) -> None:
     if delay_zpage_freeing_note == 0:
         pcc_gc_note_object_freeing(o)
     py_gc_untrack(o)
-    tag: int = load_i32(o, 8)
+    tag: int = load_i32(o, PYOBJECTHEADER_TYPE_TAG_OFFSET)
     pcc_dealloc_with_trash(o, tag)
-    if delay_zpage_freeing_note != 0:
+    if (
+        delay_zpage_freeing_note != 0
+        and pcc_gc_pointer_is_managed(o) != 0
+    ):
         pcc_gc_note_object_freeing(o)

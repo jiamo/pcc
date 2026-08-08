@@ -144,7 +144,12 @@ def _one_sccp_round(ir_text: str) -> tuple[str, bool]:
             if bm and bm.group("op") in _BINOP_OPS:
                 lv = get(bm.group("lhs"), bm.group("ty"))
                 rv = get(bm.group("rhs"), bm.group("ty"))
-                new_val = evaluate_binary(bm.group("op"), lv, rv)
+                new_val = evaluate_binary(
+                    bm.group("op"),
+                    lv,
+                    rv,
+                    bm.group("flags").split(),
+                )
             else:
                 im = _ICMP_RE.match(rest)
                 if im:

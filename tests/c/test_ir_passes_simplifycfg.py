@@ -1,13 +1,15 @@
 """Parity tests for SimplifyCFGPass (subset)."""
 
-import shutil
+import pytest
 import unittest
 
 from pcc.ir_passes.parity import assert_ir_parity
 from pcc.ir_passes.simplifycfg import SimplifyCFGPass, simplify_cfg_text
 
 
-_OPT = shutil.which("opt")
+from pcc.passes.llvm_text_pipeline import find_opt_binary
+
+_OPT = find_opt_binary()
 
 
 _CORPUS_IR = """
@@ -901,7 +903,7 @@ class FoldingTests(unittest.TestCase):
         self.assertNotIn("else:", out)
 
 
-@unittest.skipUnless(_OPT, "requires opt")
+@pytest.mark.pcc_gate(unavailable=None if _OPT else "matching LLVM opt not installed")
 class UpstreamParityTests(unittest.TestCase):
     def _parity(self, ir: str):
         report = assert_ir_parity(ir, SimplifyCFGPass(), "simplifycfg")

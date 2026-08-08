@@ -32,12 +32,19 @@ static const char *pcc_log_file_path = NULL;
 int32_t pcc_runtime_log_fast_state = -1;
 
 int64_t pcc_runtime_now_us(void) {
+#ifdef PCC_USE_FREESTANDING_PLATFORM_TIME
+    return pcc_platform_wall_time_us();
+#else
     struct timeval tv;
     if (gettimeofday(&tv, NULL) != 0) return 0;
     return (int64_t)tv.tv_sec * 1000000LL + (int64_t)tv.tv_usec;
+#endif
 }
 
 int64_t pcc_runtime_monotonic_us(void) {
+#ifdef PCC_USE_FREESTANDING_PLATFORM_TIME
+    return pcc_platform_monotonic_us();
+#else
 #if defined(CLOCK_MONOTONIC)
     struct timespec ts;
     if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0) {
@@ -46,6 +53,19 @@ int64_t pcc_runtime_monotonic_us(void) {
     }
 #endif
     return pcc_runtime_now_us();
+#endif
+}
+
+int64_t pcc_runtime_sleep_ns(int64_t delay_ns) {
+#ifdef PCC_USE_FREESTANDING_PLATFORM_TIME
+    return pcc_platform_sleep_ns(delay_ns);
+#else
+    if (delay_ns <= 0) return 0;
+    struct timespec request;
+    request.tv_sec = (time_t)(delay_ns / 1000000000LL);
+    request.tv_nsec = (long)(delay_ns % 1000000000LL);
+    return nanosleep(&request, NULL) == 0 ? 0 : -1;
+#endif
 }
 
 static unsigned int pcc_log_category_mask(const char *category) {
@@ -106,10 +126,20 @@ static void pcc_runtime_log_init_once(void) {
             __ATOMIC_ACQ_REL,
             __ATOMIC_ACQUIRE
         )) {
-        pcc_log_mask = pcc_log_parse_tokens(getenv("PCC_LOG"));
-        const char *fmt = getenv("PCC_LOG_FORMAT");
+        /* The freestanding environment table is initialized lazily and may
+         * allocate while servicing the first getenv().  Allocation emits a
+         * log event, so suppress the fast path while this thread owns log
+         * initialization; otherwise the event re-enters this function and
+         * waits forever on state == 1.  Republish the configured state below. */
+        __atomic_store_n(
+            &pcc_runtime_log_fast_state,
+            0,
+            __ATOMIC_RELEASE
+        );
+        pcc_log_mask = pcc_log_parse_tokens(pcc_runtime_getenv("PCC_LOG"));
+        const char *fmt = pcc_runtime_getenv("PCC_LOG_FORMAT");
         pcc_log_json = fmt != NULL && strcmp(fmt, "json") == 0;
-        pcc_log_file_path = getenv("PCC_LOG_FILE");
+        pcc_log_file_path = pcc_runtime_getenv("PCC_LOG_FILE");
         __atomic_store_n(
             &pcc_runtime_log_fast_state,
             pcc_log_mask == 0 ? 0 : 1,
@@ -162,7 +192,7 @@ void pcc_runtime_log_event(const char *category,
                            int64_t value1,
                            const void *ptr) {
     if (!pcc_runtime_log_enabled(category)) return;
-    long long ts = (long long)time(NULL);
+    long long ts = (long long)(pcc_runtime_now_us() / 1000000LL);
     long long tid = (long long)pcc_current_thread_id();
     int should_close = 0;
     FILE *out = pcc_runtime_log_open_stream(&should_close);
@@ -258,6 +288,10 @@ static const char *pcc_runtime_log_event_from_code(int32_t category, int32_t eve
                 case 7: return "delattr";
                 case 8: return "call";
                 case 9: return "isinstance";
+                /* py_obj_call reached its fall-through: no dispatch branch
+                 * matched, so it returns NULL with no exception set and the
+                 * caller invents a message. value0 carries the type tag. */
+                case 10: return "call_unmatched";
                 default: return "dispatch_event";
             }
         default:
@@ -279,7 +313,11 @@ void pcc_runtime_tripwire_fail(const char *msg, const char *file, int32_t line) 
              (long)line,
              msg != NULL ? msg : "invariant violated");
     pcc_runtime_log_event("runtime", buf, (int64_t)line, 0, NULL);
+#ifdef PCC_USE_FREESTANDING_PLATFORM_PROCESS
+    pcc_platform_abort();
+#else
     abort();
+#endif
 }
 
 void pcc_runtime_log_event_code(int32_t category, int32_t event,

@@ -1,4 +1,4 @@
-"""Production vthread IO uses kqueue or the explicit live-poll fallback."""
+"""Production vthread IO uses kqueue/epoll with an interruptible wait owner."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.runtime_build_cache import cached_c_runtime
+from tests.runtime_build_cache import cached_threaded_c_runtime
 
 
 REPO_ROOT = Path(__file__).absolute().parents[3]
@@ -137,6 +137,112 @@ static int check_complete_cancels_wait(void) {
     return py_virtual_thread_poll_ready() == NULL;
 }
 
+typedef struct LiveWaitWorker {
+    int64_t result;
+} LiveWaitWorker;
+
+static void *live_wait_worker(void *opaque) {
+    LiveWaitWorker *worker = (LiveWaitWorker *)opaque;
+    worker->result = py_virtual_thread_poll_io(-1);
+    return NULL;
+}
+
+static int wait_until_live_wait_active(void) {
+    for (int i = 0; i < 500; i++) {
+        if (py_virtual_thread_io_wait_active() == 1) return 1;
+        (void)poll(NULL, 0, 1);
+    }
+    return 0;
+}
+
+static int check_live_wait_registration_and_cancel_interrupt(void) {
+    if (py_virtual_thread_io_backend() == PCC_VTHREAD_IO_BACKEND_POLL) return 1;
+    if (!pcc_threads_enabled()) return 1;
+    int first_pipe[2];
+    int second_pipe[2];
+    if (pipe(first_pipe) != 0 || pipe(second_pipe) != 0) return 0;
+    PyObject *first = new_vthread();
+    PyObject *second = new_vthread();
+    if (first == NULL || second == NULL) return 0;
+    if (py_virtual_thread_block_on_fd(
+        first, first_pipe[0], POLLIN, -1
+    ) != 0) return 0;
+
+    /* A concurrent registration must wake the single carrier that owns the
+     * infinite live wait, without waiting for its fd to become ready. */
+    LiveWaitWorker add_worker = {-99};
+    PccThreadHandle *thread = NULL;
+    if (pcc_thread_start(&thread, live_wait_worker, &add_worker) != 0) return 0;
+    if (!wait_until_live_wait_active()) return 0;
+    if (py_virtual_thread_block_on_fd(
+        second, second_pipe[0], POLLIN, -1
+    ) != 0) return 0;
+    if (pcc_thread_join(thread, NULL) != 0) return 0;
+    if (add_worker.result != 0 || py_virtual_thread_io_wait_active() != 0)
+        return 0;
+    if (py_virtual_thread_io_wait_count() != 2) return 0;
+
+    /* Cancellation exercises the same interrupt channel from a second
+     * scheduler mutation while another carrier is blocked indefinitely. */
+    LiveWaitWorker cancel_worker = {-99};
+    thread = NULL;
+    if (pcc_thread_start(&thread, live_wait_worker, &cancel_worker) != 0)
+        return 0;
+    if (!wait_until_live_wait_active()) return 0;
+    if (py_virtual_thread_complete(first, py_None) != 0) return 0;
+    if (pcc_thread_join(thread, NULL) != 0) return 0;
+    if (cancel_worker.result != 0 || py_virtual_thread_io_wait_active() != 0)
+        return 0;
+    if (py_virtual_thread_io_wait_count() != 1) return 0;
+    if (py_virtual_thread_complete(second, py_None) != 0) return 0;
+    if (py_virtual_thread_io_wait_count() != 0) return 0;
+
+    pcc_gc_release(first);
+    pcc_gc_release(second);
+    if (py_virtual_thread_poll_ready() != NULL) return 0;
+    close(first_pipe[0]);
+    close(first_pipe[1]);
+    close(second_pipe[0]);
+    close(second_pipe[1]);
+    return pcc_gc_scheduler_root_count() == 0;
+}
+
+static int check_pool_stop_restart_preserves_parked_io(void) {
+    if (!pcc_threads_enabled()) return 1;
+    int fds[2];
+    if (pipe(fds) != 0) return 0;
+    if (py_virtual_thread_carrier_pool_start(2) != 2) return 0;
+    PyObject *vt = new_vthread();
+    if (vt == NULL) return 0;
+    if (py_virtual_thread_block_on_fd(vt, fds[0], POLLIN, -1) != 0) return 0;
+    pcc_gc_release(vt);
+    (void)pcc_gc_collect(0);
+    if (py_virtual_thread_io_wait_count() != 1) return 0;
+    if (pcc_gc_scheduler_root_count() != 1) return 0;
+
+    /* Stop owns the initialized waitset lifetime, but the parked IO node and
+     * its scheduler root remain the durable registration source. */
+    if (py_virtual_thread_carrier_pool_stop() != 2) return 0;
+    if (py_virtual_thread_io_wait_active() != 0) return 0;
+    if (py_virtual_thread_io_wait_count() != 1) return 0;
+    if (pcc_gc_scheduler_root_count() != 1) return 0;
+
+    /* Starting a fresh pool must rebuild that parked fd before any carrier
+     * runs.  A second clean stop must preserve the same root exactly once. */
+    if (py_virtual_thread_carrier_pool_start(2) != 2) return 0;
+    if (py_virtual_thread_carrier_pool_stop() != 2) return 0;
+    if (py_virtual_thread_io_wait_count() != 1) return 0;
+    if (pcc_gc_scheduler_root_count() != 1) return 0;
+
+    if (write(fds[1], "r", 1) != 1) return 0;
+    if (py_virtual_thread_poll_io(0) != 1) return 0;
+    if (!finish_one_ready()) return 0;
+    close(fds[0]);
+    close(fds[1]);
+    return py_virtual_thread_io_wait_count() == 0
+        && pcc_gc_scheduler_root_count() == 0;
+}
+
 int main(int argc, char **argv) {
     if (argc != 3) return 2;
     int64_t backend = (int64_t)atoll(argv[1]);
@@ -145,15 +251,23 @@ int main(int argc, char **argv) {
     if (pcc_gc_set_backend(backend) != 0) return 4;
     int64_t expected = mode[0] == 'p'
         ? PCC_VTHREAD_IO_BACKEND_POLL
-        : (pcc_io_waitset_kqueue_available()
+        : (mode[0] == 'e'
+            ? (pcc_io_waitset_epoll_available()
+                ? PCC_VTHREAD_IO_BACKEND_EPOLL
+                : PCC_VTHREAD_IO_BACKEND_POLL)
+            : (pcc_io_waitset_kqueue_available()
             ? PCC_VTHREAD_IO_BACKEND_KQUEUE
-            : PCC_VTHREAD_IO_BACKEND_POLL);
+            : (pcc_io_waitset_epoll_available()
+                ? PCC_VTHREAD_IO_BACKEND_EPOLL
+                : PCC_VTHREAD_IO_BACKEND_POLL)));
     int ok = py_virtual_thread_io_backend() == expected
         && check_pipe_ready()
         && check_socket_ready()
         && check_timeout()
         && check_same_fd_waiters()
         && check_complete_cancels_wait()
+        && check_live_wait_registration_and_cancel_interrupt()
+        && check_pool_stop_restart_preserves_parked_io()
         && py_virtual_thread_io_backend() == expected
         && py_virtual_thread_ready_count() == 0
         && py_virtual_thread_io_wait_count() == 0
@@ -171,7 +285,7 @@ int main(int argc, char **argv) {
 @pytest.fixture(scope="module")
 def _io_waitset_runtime_exe(tmp_path_factory):
     tmp = tmp_path_factory.mktemp("gc_vthread_io_waitset_runtime")
-    work_runtime = cached_c_runtime()
+    work_runtime = cached_threaded_c_runtime()
     src = tmp / "vthread_io_waitset_runtime.c"
     src.write_text(textwrap.dedent(_SOURCE).lstrip(), encoding="utf-8")
     exe = tmp / "vthread_io_waitset_runtime_bin"
@@ -183,6 +297,7 @@ def _io_waitset_runtime_exe(tmp_path_factory):
             f"-I{work_runtime / 'src'}",
             str(src),
             str(work_runtime / "libpy_runtime.a"),
+            "-pthread",
             "-lm",
             "-o",
             str(exe),
@@ -196,7 +311,7 @@ def _io_waitset_runtime_exe(tmp_path_factory):
 
 
 @pytest.mark.parametrize("backend", ["0", "1", "2", "3", "4"])
-@pytest.mark.parametrize("mode", ["auto", "poll"])
+@pytest.mark.parametrize("mode", ["auto", "poll", "epoll"])
 def test_production_io_waitset_modes_preserve_roots(
     _io_waitset_runtime_exe, backend, mode
 ):
@@ -226,7 +341,102 @@ def test_scheduler_owns_waitset_instead_of_per_entry_poll() -> None:
         "int64_t py_virtual_thread_io_wait_count", 1
     )[0]
     assert "pcc_io_waitset_add" in source
-    assert "pcc_io_waitset_wait" in poll_io
+    assert "pcc_io_waitset_wait_prepare" in poll_io
+    assert "pcc_io_waitset_wait_block" in poll_io
+    assert "pcc_io_waitset_wait_finish" in poll_io
+    block_at = poll_io.index("pcc_io_waitset_wait_block")
+    assert poll_io.rfind("pcc_mutex_unlock", 0, block_at) >= 0
+    assert poll_io.find("pcc_mutex_lock", block_at) > block_at
+    assert "pcc_vthread_io_wait_active" in poll_io
+    assert "pcc_io_waitset_interrupt" in source
     assert "pcc_vthread_fd_ready(entry->fd" not in poll_io
     assert "py_virtual_thread_io_backend" in source
     assert "py_virtual_thread_io_backend" in header
+    assert "py_virtual_thread_io_wait_active" in header
+
+
+def test_current_pcc1_scheduler_releases_lock_around_live_wait() -> None:
+    source = (RUNTIME_DIR / "py" / "py_virtual_thread_runtime.py").read_text(
+        encoding="utf-8"
+    )
+    poll_io = source.split(
+        '@c_abi_export("py_virtual_thread_poll_io")', 1
+    )[1].split('@c_abi_export("py_virtual_thread_io_wait_count")', 1)[0]
+    block_at = poll_io.index("pcc_io_waitset_wait_block")
+    assert poll_io.rfind("_scheduler_unlock()", 0, block_at) >= 0
+    assert poll_io.find("_scheduler_lock()", block_at) > block_at
+    assert "pcc_io_waitset_wait_prepare" in poll_io
+    assert "pcc_io_waitset_wait_finish" in poll_io
+    refresh = source.split("def _io_refresh", 1)[1].split(
+        "def _io_cancel", 1
+    )[0]
+    assert "_io_interrupt_locked()" in refresh
+    assert '@c_abi_export("py_virtual_thread_io_wait_active")' in source
+
+
+def test_carrier_stop_disposes_after_join_and_restart_rehydrates_roots() -> None:
+    c_source = (RUNTIME_DIR / "src" / "pcc_threads.c").read_text(
+        encoding="utf-8"
+    )
+    py_source = (
+        RUNTIME_DIR / "py" / "py_virtual_thread_runtime.py"
+    ).read_text(encoding="utf-8")
+
+    c_stop = c_source.split(
+        "int64_t py_virtual_thread_carrier_pool_stop(void)", 1
+    )[1].split("PyObject *py_virtual_thread_current", 1)[0]
+    assert c_stop.index("pcc_thread_join") < c_stop.index(
+        "pcc_vthread_io_waitset_dispose_locked"
+    )
+    assert c_stop.count("pcc_vthread_io_waitset_dispose_locked") == 1
+    assert "if (join_failed)" in c_stop
+    assert "pcc_vthread_persistent_cleanup_active" in c_stop
+    assert "pcc_vthread_poll_queue = NULL" not in c_stop
+    assert "pcc_vthread_io_refresh_registered_fd_locked(entry->fd)" in c_source
+    c_start = c_source.split(
+        "int64_t py_virtual_thread_carrier_pool_start", 1
+    )[1].split("int64_t py_virtual_thread_carrier_pool_stop", 1)[0]
+    assert c_start.index("pcc_vthread_io_waitset_ensure_locked") < (
+        c_start.index("pcc_thread_start")
+    )
+
+    py_stop = py_source.split(
+        '@c_abi_export("py_virtual_thread_carrier_pool_stop")', 1
+    )[1].split('@c_abi_export("py_virtual_thread_current")', 1)[0]
+    assert py_stop.index("pcc_thread_join") < py_stop.index(
+        "_waitset_dispose_locked"
+    )
+    assert py_stop.count("_waitset_dispose_locked") == 1
+    assert "if join_failed != 0:" in py_stop
+    assert "pcc_vthread_persistent_cleanup_active_py" in py_stop
+    assert 'global_store_ptr("pcc_vthread_io_head_py", null())' not in py_stop
+    assert "_io_refresh_registered(load_i64(node, 8))" in py_source
+    py_start = py_source.split(
+        '@c_abi_export("py_virtual_thread_carrier_pool_start")', 1
+    )[1].split(
+        '@c_abi_export("py_virtual_thread_carrier_pool_stop")', 1
+    )[0]
+    assert py_start.index("_waitset_init()") < py_start.index(
+        "pcc_thread_start"
+    )
+
+
+def test_waitset_dispose_resets_backend_generation_and_wake_state() -> None:
+    c_source = (RUNTIME_DIR / "src" / "py_io_waitset.c").read_text(
+        encoding="utf-8"
+    )
+    py_source = (
+        RUNTIME_DIR / "py" / "freestanding_io_waitset.py"
+    ).read_text(encoding="utf-8")
+    c_dispose = c_source.split("void pcc_io_waitset_dispose", 1)[1].split(
+        "int pcc_io_waitset_interrupt", 1
+    )[0]
+    py_dispose = py_source.split(
+        '@c_abi_export("pcc_io_waitset_dispose")', 1
+    )[1].split('@c_abi_export("pcc_io_waitset_interrupt")', 1)[0]
+    assert "ws->next_generation = 0" in c_dispose
+    assert "ws->wake_fd = -1" in c_dispose
+    assert "ws->backend = PCC_IO_WAITSET_BACKEND_POLL" in c_dispose
+    assert "store_i32(ws, 76, 0)" in py_dispose
+    assert "store_i32(ws, 80, -1)" in py_dispose
+    assert "store_i32(ws, 0, 0)" in py_dispose

@@ -220,7 +220,13 @@ void py_weakref_invalidate(PyObject *target) {
                 if (args != NULL) {
                     pcc_runtime_log_event("weakref", "callback", 0, 0, (PyObject *)wr);
                     py_tuple_set_item(args, 0, (PyObject *)wr);
-                    (void)py_obj_call(callback, args, py_None);
+                    /* Weakref callbacks are an unraisable boundary: the
+                     * callback result is ignored, but its owned reference
+                     * must still be released.  py_obj_call classifies a
+                     * silent NULL as RuntimeError before we deliberately
+                     * clear the unraisable exception below. */
+                    PyObject *result = py_obj_call(callback, args, py_None);
+                    if (result != NULL) py_decref(result);
                     py_decref(args);
                 }
                 py_clear_exception();

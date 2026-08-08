@@ -26,6 +26,7 @@ from ..py_ast import (
     TupleType,
 )
 from . import marshal
+from .freestanding_abi_constants import PY_TYPE_BOOL, PY_TYPE_FLOAT, PY_TYPE_STR
 
 
 _I1 = ir.IntType(1)
@@ -42,6 +43,185 @@ def _is_class_type_for_numeric_builtin(ty) -> bool:
 
 
 class NumericBuiltinLoweringMixin:
+    def emit_int_builtin_as_object(self, expr) -> Optional[ir.Value]:
+        """``int(<str>[, base])`` as an OBJECT, skipping the i64 round trip.
+
+        The ordinary lowering parses to an object and then unboxes it to satisfy
+        this builtin's i64 contract, which truncates anything above 2**63-1 to
+        0.  Callers that want the object projection ask for it here instead, so
+        no re-box has to recover a value that was already destroyed.
+
+        Only the statically-str-typed argument is handled, which is the shape
+        the parser uses (`int(e.text, 0)` in `py_lift._e_Num`).  The Dyn form
+        phis four unboxed branches and needs its own object projection; that is
+        deliberately still absent rather than approximated here.
+
+        The result is a NEW owned reference straight from the runtime, which is
+        exactly what an object-wanting caller expects -- no retain, no
+        ownership-transfer bookkeeping, so none of the leak/early-free failure
+        modes that an unbox-then-recover scheme ran into.
+        """
+        if len(expr.args) not in (1, 2):
+            return None
+        arg = expr.args[0]
+        if len(expr.args) == 2:
+            base_val = self._emit_expr_as_i64(expr.args[1])
+            base_val = self.builder.trunc(
+                base_val, _I32, name=self._fresh("int.obj.base")
+            )
+        else:
+            base_val = ir.Constant(_I32, 10)
+        if isinstance(arg.ty, IntType):
+            # `int(<already an int>)` is the identity, so hand back the argument's
+            # OBJECT projection.  Without this the argument goes through
+            # `_emit_expr` -> i64 and a bignum is truncated -- which is the hop
+            # that still lost pcc1's own parse, where `IntLit.value` is re-wrapped
+            # as `int(expr.value)`.  No basic blocks are created here.
+            return self._maybe_emit_exact_int_object(arg)
+        if isinstance(arg.ty, DynType):
+            # ONE call, no basic blocks.  The runtime does the four-way dispatch
+            # (`py_obj_as_int_object`), because building the dispatch here means
+            # creating blocks and a phi inside `_maybe_emit_exact_int_object` --
+            # a probe whose result callers may discard, which orphans the blocks
+            # and leaves the builder parked on the join.  That shape compiled
+            # every small host program and still broke stage1.
+            obj = self._emit_expr(arg)
+            if not isinstance(obj.type, ir.PointerType):
+                return None
+            got = self.builder.call(
+                self.runtime["py_obj_as_int_object"],
+                [obj, base_val],
+                name=self._fresh("int.obj.dyn"),
+            )
+            self._emit_post_call_err_check(getattr(expr, "span", None))
+            self._note_owned_dynamic_call_value(got)
+            return got
+        if not isinstance(arg.ty, StrType):
+            return None
+        s_obj = self._emit_expr(arg)
+        cstr = self.builder.call(
+            self.runtime["py_str_utf8"],
+            [s_obj],
+            name=self._fresh("int.obj.cstr"),
+        )
+        boxed = self.builder.call(
+            self.runtime["py_int_from_cstr_or_raise"],
+            [cstr, base_val],
+            name=self._fresh("int.obj.parse"),
+        )
+        self._emit_post_call_err_check(getattr(expr, "span", None))
+        return boxed
+
+    def _emit_int_dyn_as_object(self, expr, arg) -> Optional[ir.Value]:
+        """``int(<dyn>)`` as an OBJECT: dispatch on the tag, phi the objects.
+
+        The i64-returning form unboxes all four branches and phis them as i64,
+        which destroys a bignum.  Carrying an object phi *there* was tried and
+        leaked: the objects are built eagerly and most callers only want the
+        i64, so nothing consumes them.  Here the caller asked for the object, so
+        the join is always consumed and every branch can hand back an OWNED
+        reference -- the str branch's parse result already is one, the int branch
+        retains its borrowed input, and float/bool box their exact i64.
+        """
+        obj = self._emit_expr(arg)
+        if not isinstance(obj.type, ir.PointerType):
+            return None
+        if len(expr.args) == 2:
+            base_val = self._emit_expr_as_i64(expr.args[1])
+            base_val = self.builder.trunc(
+                base_val, _I32, name=self._fresh("int.dynobj.base")
+            )
+        else:
+            base_val = ir.Constant(_I32, 10)
+        fn = self.builder.function
+        tag = self.builder.call(
+            self.runtime["py_obj_type_tag"], [obj], name=self._fresh("int.dynobj.tag")
+        )
+        str_bb = fn.append_basic_block(name=self._fresh("int.dynobj.str"))
+        non_str_bb = fn.append_basic_block(name=self._fresh("int.dynobj.non_str"))
+        float_bb = fn.append_basic_block(name=self._fresh("int.dynobj.float"))
+        non_float_bb = fn.append_basic_block(name=self._fresh("int.dynobj.non_float"))
+        bool_bb = fn.append_basic_block(name=self._fresh("int.dynobj.bool"))
+        int_bb = fn.append_basic_block(name=self._fresh("int.dynobj.int"))
+        join_bb = fn.append_basic_block(name=self._fresh("int.dynobj.join"))
+
+        self.builder.cbranch(
+            self.builder.icmp_signed(
+                "==", tag, ir.Constant(_I64, PY_TYPE_STR),
+                name=self._fresh("int.dynobj.is_str"),
+            ),
+            str_bb, non_str_bb,
+        )
+
+        self.builder.position_at_end(str_bb)
+        cstr = self.builder.call(
+            self.runtime["py_str_utf8"], [obj], name=self._fresh("int.dynobj.cstr")
+        )
+        str_obj = self.builder.call(
+            self.runtime["py_int_from_cstr_or_raise"],
+            [cstr, base_val],
+            name=self._fresh("int.dynobj.parse"),
+        )
+        self._emit_post_call_err_check(getattr(expr, "span", None))
+        str_exit = self.builder._block
+        self.builder.branch(join_bb)
+
+        self.builder.position_at_end(non_str_bb)
+        self.builder.cbranch(
+            self.builder.icmp_signed(
+                "==", tag, ir.Constant(_I64, PY_TYPE_FLOAT),
+                name=self._fresh("int.dynobj.is_float"),
+            ),
+            float_bb, non_float_bb,
+        )
+
+        self.builder.position_at_end(float_bb)
+        f64 = self.builder.call(
+            self.runtime["py_float_to_f64"], [obj], name=self._fresh("int.dynobj.f64")
+        )
+        float_obj = self.builder.call(
+            self.runtime["py_int_from_i64"],
+            [self.builder.fptosi(f64, _I64, name=self._fresh("int.dynobj.trunc"))],
+            name=self._fresh("int.dynobj.float.obj"),
+        )
+        float_exit = self.builder._block
+        self.builder.branch(join_bb)
+
+        self.builder.position_at_end(non_float_bb)
+        self.builder.cbranch(
+            self.builder.icmp_signed(
+                "==", tag, ir.Constant(_I64, PY_TYPE_BOOL),
+                name=self._fresh("int.dynobj.is_bool"),
+            ),
+            bool_bb, int_bb,
+        )
+
+        self.builder.position_at_end(bool_bb)
+        bool_obj = self.builder.call(
+            self.runtime["py_int_from_i64"],
+            [self.builder.call(
+                self.runtime["py_obj_truthy"], [obj],
+                name=self._fresh("int.dynobj.truthy"),
+            )],
+            name=self._fresh("int.dynobj.bool.obj"),
+        )
+        bool_exit = self.builder._block
+        self.builder.branch(join_bb)
+
+        self.builder.position_at_end(int_bb)
+        self.builder.call(self.runtime["py_incref"], [obj])
+        int_exit = self.builder._block
+        self.builder.branch(join_bb)
+
+        self.builder.position_at_end(join_bb)
+        phi = self.builder.phi(_CSTR, name=self._fresh("int.dynobj"))
+        phi.add_incoming(str_obj, str_exit)
+        phi.add_incoming(float_obj, float_exit)
+        phi.add_incoming(bool_obj, bool_exit)
+        phi.add_incoming(obj, int_exit)
+        self._note_owned_dynamic_call_value(phi)
+        return phi
+
     def _maybe_emit_int_builtin(self, expr: Call) -> Optional[ir.Value]:
         """``int(x)`` / ``int(s, base)``:
 
@@ -168,7 +348,7 @@ class NumericBuiltinLoweringMixin:
             is_str = self.builder.icmp_signed(
                 "==",
                 tag,
-                ir.Constant(_I64, 4),
+                ir.Constant(_I64, PY_TYPE_STR),
                 name=self._fresh("int.dyn.is_str"),
             )
             self.builder.cbranch(is_str, str_bb, non_str_bb)
@@ -204,7 +384,7 @@ class NumericBuiltinLoweringMixin:
             is_float = self.builder.icmp_signed(
                 "==",
                 tag,
-                ir.Constant(_I64, 3),
+                ir.Constant(_I64, PY_TYPE_FLOAT),
                 name=self._fresh("int.dyn.is_float"),
             )
             self.builder.cbranch(is_float, float_bb, non_float_bb)
@@ -227,7 +407,7 @@ class NumericBuiltinLoweringMixin:
             is_bool = self.builder.icmp_signed(
                 "==",
                 tag,
-                ir.Constant(_I64, 1),
+                ir.Constant(_I64, PY_TYPE_BOOL),
                 name=self._fresh("int.dyn.is_bool"),
             )
             self.builder.cbranch(is_bool, bool_bb, int_bb)
@@ -618,9 +798,9 @@ class NumericBuiltinLoweringMixin:
             name=self._fresh(f"{name}.join"),
         )
         incoming: list[tuple[ir.Value, object]] = []
-        for i, elem in enumerate(elems):
-            v = self._emit_expr(elem)
-            truthy = self._truthy(v, elem.ty)
+        for i, literal_elem in enumerate(elems):
+            v = self._emit_expr(literal_elem)
+            truthy = self._truthy(v, literal_elem.ty)
             is_last = i == len(elems) - 1
             if is_last:
                 incoming.append((truthy, self.builder._block))

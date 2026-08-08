@@ -33,7 +33,7 @@ extern void  py_tls_exc_set(void *exc);
 static int py_raise_instance_like(PyObject *o) {
     if (o == NULL || PY_IS_TAGGED_INT(o)) return 0;
     int32_t tag = py_type_of(o);
-    return tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER;
+    return tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER_CLASS_START;
 }
 
 

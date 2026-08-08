@@ -293,6 +293,19 @@ PyObject *py_file_flush(PyObject *file) {
     return py_None;
 }
 
+PyObject *py_file_fileno(PyObject *file) {
+    PyFileObject *f = file_checked_open(file);
+    if (f == NULL) return NULL;
+
+    int fd = fileno(f->fp);
+    if (fd < 0) {
+        py_raise_owned(py_exc_new(PY_EXC_OSERROR,
+                                  "could not get file descriptor"));
+        return NULL;
+    }
+    return py_int_from_i64((int64_t)fd);
+}
+
 void py_file_close(PyObject *file) {
     if (file == NULL || py_type_of(file) != PY_TYPE_FILE) return;
     PyFileObject *f = (PyFileObject *)file;

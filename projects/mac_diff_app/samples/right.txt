@@ -1,0 +1,6 @@
+line one
+line two changed
+line three
+same line
+extra line
+shared bottom

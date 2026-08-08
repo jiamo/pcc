@@ -13,6 +13,8 @@ PY_AST_FIELD_NAME_OVERRIDES = {
     "ByteArrayType": ("name",),
     "MemoryViewType": ("name",),
     "ListType": ("name", "elem"),
+    "SetType": ("name", "elem"),
+    "ValueArrayType": ("name", "elem", "length"),
     "DictType": ("name", "key", "value"),
     "TupleType": ("name", "elems"),
     "FuncType": ("name", "params", "ret"),
@@ -41,7 +43,7 @@ PY_AST_FIELD_NAME_OVERRIDES = {
     "UnaryOp": ("span", "ty", "op", "operand"),
     "Compare": ("span", "ty", "op", "lhs", "rhs"),
     "BoolExpr": ("span", "ty", "op", "left", "right"),
-    "Call": ("span", "ty", "func", "args", "kwargs"),
+    "Call": ("span", "ty", "func", "args", "kwargs", "operand_order"),
     "Attr": ("span", "ty", "obj", "name"),
     "Subscript": ("span", "ty", "obj", "idx"),
     "Slice": ("span", "ty", "lo", "hi", "step"),
@@ -84,4 +86,3 @@ PY_AST_FIELD_NAME_OVERRIDES = {
     "ClassDef": ("span", "name", "bases", "keywords", "body", "decorators"),
     "Module": ("name", "body", "docstring"),
 }
-

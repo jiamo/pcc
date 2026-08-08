@@ -12,7 +12,9 @@ from pcc.project import (
 )
 
 
-PROJECT_DIR = os.path.dirname(os.path.dirname(__file__))
+PROJECT_DIR = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
 LUA_WITH_ONELUA_DIR = os.path.join(PROJECT_DIR, "projects", "lua-5.5.0")
 LUA_CPP_ARGS = ("-DLUA_USE_JUMPTABLE=0", "-DLUA_NOBUILTIN")
 

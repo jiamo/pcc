@@ -63,6 +63,59 @@ def _exit_process(code: int) -> None:
         raise SystemExit(code)
 
 
+def _pipeline_error_text(exc) -> str:
+    message = str(exc)
+    if len(message) != 0:
+        return message
+    diagnostic = repr(exc)
+    if len(diagnostic) != 0:
+        return diagnostic
+    return "PyPipelineError"
+
+
+def _write_pipeline_error_debug(exc) -> None:
+    import os
+
+    enabled = str(os.environ.get("PCC_DEBUG_BOOTSTRAP_TRACE", "") or "")
+    if enabled.strip().lower() not in ("1", "true", "yes", "on"):
+        return
+    _write_text(
+        "pcc_multi debug: exception_type=" + str(type(exc).__name__) + "\n",
+        to_stderr=True,
+    )
+    _write_text(
+        "pcc_multi debug: exception_args="
+        + repr(getattr(exc, "args", None))
+        + "\n",
+        to_stderr=True,
+    )
+    tb = getattr(exc, "__traceback__", None)
+    index = 0
+    while tb is not None and index < 16:
+        frame = getattr(tb, "tb_frame", None)
+        code = getattr(frame, "f_code", None) if frame is not None else None
+        if code is None:
+            _write_text(
+                "pcc_multi debug: tb[" + str(index) + "]=<frame-missing>\n",
+                to_stderr=True,
+            )
+        else:
+            _write_text(
+                "pcc_multi debug: tb["
+                + str(index)
+                + "]="
+                + str(code.co_filename)
+                + ":"
+                + str(tb.tb_lineno)
+                + " "
+                + str(code.co_name)
+                + "\n",
+                to_stderr=True,
+            )
+        tb = getattr(tb, "tb_next", None)
+        index += 1
+
+
 def _parse_src_arg(spec: str):
     """Return ``(path, module_name_or_None)`` for one positional."""
     i = 0
@@ -389,7 +442,11 @@ def main(argv=None) -> int:
                 ir_scaffold_mode=ir_scaffold,
             )
     except PyPipelineError as e:
-        _write_text("pcc_multi: " + str(e) + "\n", to_stderr=True)
+        _write_pipeline_error_debug(e)
+        _write_text(
+            "pcc_multi: " + _pipeline_error_text(e) + "\n",
+            to_stderr=True,
+        )
         return 1
     return 0
 

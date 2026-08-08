@@ -32,7 +32,11 @@ RUNTIME_INC = REPO_ROOT / "pcc" / "py_runtime" / "include"
 # would have to duplicate the OS struct layout exactly, which is fragile. They
 # have no pcc-Python port and no runtime caller, so they are not part of the
 # "pcc compiles its own runtime" oracle gate.
-_CC_ONLY_KERNEL_SOURCES = {"py_os_rss.c", "py_os_heap.c"}
+# LIBC-P2-SDK-STRUCT-HELPERS closed the last two per-source cc
+# dependencies: mach/malloc/rusage declarations now live in the fake
+# libc headers with SDK-locked layouts
+# (tests/python/test_sdk_struct_helpers_pcc.py).
+_CC_ONLY_KERNEL_SOURCES: set[str] = set()
 
 # Large addressable struct assignments now lower to bounded aggregate memory
 # copies, so py_re_engine.c no longer needs a special ~300s exemption. Keep one

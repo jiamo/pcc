@@ -4,6 +4,17 @@ Keep ``py_obj_slice`` in its own archive member so generic getitem/len/truthy
 dispatch does not force list/tuple/str/bytes slicing helpers into ordinary
 executables.
 """
+from pcc.py_runtime.py.py_abi_constants import (
+    PY_TYPE_BYTEARRAY,
+    PY_TYPE_BYTES,
+    PY_TYPE_INT,
+    PY_TYPE_INSTANCE,
+    PY_TYPE_LIST,
+    PY_TYPE_MEMORYVIEW,
+    PY_TYPE_STR,
+    PY_TYPE_TUPLE,
+    PY_TYPE_USER_CLASS_START,
+)
 
 from pcc.extern import c_abi_export, c_int32, c_int64, c_ptr, c_void, extern
 from pcc.unsafe import is_tagged_int, load_i32, null, ptr_is_null
@@ -25,7 +36,7 @@ pcc_runtime_log_event_code = extern(
 
 def _type_of(o) -> int:
     if is_tagged_int(o) != 0:
-        return 2
+        return PY_TYPE_INT
     return load_i32(o, 8)
 
 
@@ -35,15 +46,15 @@ def py_obj_slice(o, lo, hi, step):
         return null()
     tag: int = _type_of(o)
     pcc_runtime_log_event_code(7, 2, tag, 0, o)
-    if tag == 5:
+    if tag == PY_TYPE_LIST:
         return py_list_slice(o, lo, hi, step)
-    if tag == 7:
+    if tag == PY_TYPE_TUPLE:
         return py_tuple_slice(o, lo, hi, step)
-    if tag == 4:
+    if tag == PY_TYPE_STR:
         return py_str_slice(o, lo, hi, step)
-    if tag == 17 or tag == 18 or tag == 19:
+    if tag == PY_TYPE_BYTES or tag == PY_TYPE_BYTEARRAY or tag == PY_TYPE_MEMORYVIEW:
         return py_bytes_slice(o, lo, hi, step)
-    if tag == 11 or tag >= 100:  # PY_TYPE_INSTANCE / user class
+    if tag == PY_TYPE_INSTANCE or tag >= PY_TYPE_USER_CLASS_START:
         # obj[lo:hi:step] dispatches __getitem__(slice(lo, hi, step)) via the
         # generic getitem path, like CPython.
         sl = py_slice_new(lo, hi, step)

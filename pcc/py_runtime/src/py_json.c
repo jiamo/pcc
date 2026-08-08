@@ -1,6 +1,6 @@
-/* pcc/py_runtime/src/py_json.c
- *
- * Minimal native JSON helpers for builtin json.loads/json.dumps dispatch.
+/* Host-C oracle for the pcc-Python production owner in
+ * py/py_json_runtime.py.  This source remains in the ordinary C runtime and
+ * pcc-C comparison archive, but is not linked into libpy_runtime_pcc_py.a.
  */
 
 #include "py_internal.h"

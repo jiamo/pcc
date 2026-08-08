@@ -86,67 +86,8 @@ def _join_strings(parts: list[str], sep: str) -> str:
     return out
 
 
-def _pow10f(exp: int) -> float:
-    out = float(int("1", 10))
-    ten = float(int("10", 10))
-    i = 0
-    while i < exp:
-        out = out * ten
-        i += 1
-    return out
-
-
-def _pow10i(exp: int) -> int:
-    # 10**exp as an EXACT integer (bignum). Used to scale the decimal mantissa
-    # without accumulating float error.
-    out = 1
-    ten = 10
-    i = 0
-    while i < exp:
-        out = out * ten
-        i += 1
-    return out
-
-
 def _parse_float_literal(text: str) -> float:
-    exp = 0
-    mantissa = text
-    lower = text.lower()
-    e_idx = lower.find("e")
-    if e_idx >= 0:
-        mantissa = text[:e_idx]
-        exp = int(text[e_idx + 1 :], 10)
-    dot_idx = mantissa.find(".")
-    frac_len = 0
-    digits = mantissa
-    if dot_idx >= 0:
-        frac_len = len(mantissa) - dot_idx - 1
-        digits = mantissa[:dot_idx] + mantissa[dot_idx + 1 :]
-    if not digits:
-        digits = "0"
-    # value = int(digits) * 10**(exp - frac_len). Scale in EXACT integer space
-    # for the common magnitude range — the old repeated float-mult lost
-    # precision (1e100 -> 1.0000000000000006e+100). The exact path stays within
-    # the double range (<= 10**308) so float() never raises OverflowError; the
-    # extreme tails (overflow->inf / subnormal underflow) fall back to the
-    # original graceful float-mult, which is imprecise but doesn't crash.
-    m = int(digits, 10)
-    net = exp - frac_len
-    ndig = len(digits)
-    if net >= 0 and ndig + net <= 308:
-        # exact integer < 10**308 < DBL_MAX; float() correctly rounds it.
-        return float(m * _pow10i(net))
-    if net < 0 and ndig <= 308 and -net <= 308:
-        # m / 10**|net|: exact denominator + one division. Correctly rounded for
-        # the common range, far better than repeated-mult for big |net|.
-        return float(m) / float(_pow10i(-net))
-    # Extreme exponent (beyond the double range): graceful imprecise fallback.
-    value = float(m)
-    if net > 0:
-        value = value * _pow10f(net)
-    elif net < 0:
-        value = value / _pow10f(-net)
-    return value
+    return float(text.replace("_", ""))
 
 
 @dataclass

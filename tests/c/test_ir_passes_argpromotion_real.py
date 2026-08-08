@@ -1,6 +1,6 @@
 """Real-transform tests for ArgPromotionPass (subset)."""
 
-import shutil
+import pytest
 
 import unittest
 
@@ -8,7 +8,9 @@ from pcc.ir_passes.argpromotion import ArgPromotionPass, argpromotion_module
 from pcc.ir_passes.parity import assert_ir_parity, run_pcc_ir_pass
 
 
-_OPT = shutil.which("opt")
+from pcc.passes.llvm_text_pipeline import find_opt_binary
+
+_OPT = find_opt_binary()
 
 
 class ArgPromotionTests(unittest.TestCase):
@@ -117,7 +119,7 @@ entry:
         self.assertIn("call i32 @helper(i32 %argprom", out)
 
 
-@unittest.skipUnless(_OPT, "requires LLVM opt")
+@pytest.mark.pcc_gate(unavailable=None if _OPT else "matching LLVM opt not installed")
 class UpstreamParityTests(unittest.TestCase):
     def _structural_parity(self, ir: str):
         report = assert_ir_parity(ir, ArgPromotionPass(), "argpromotion")

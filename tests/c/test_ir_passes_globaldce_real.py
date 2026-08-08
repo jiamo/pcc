@@ -4,14 +4,16 @@ Upstream reference:
 - /tmp/llvm-src/llvm-20.1.8.src/lib/Transforms/IPO/GlobalDCE.cpp
 """
 
-import shutil
+import pytest
 import unittest
 
 from pcc.ir_passes.ipo_passes import GlobalDCEPass
 from pcc.ir_passes.parity import assert_ir_parity, run_pcc_ir_pass
 
 
-_OPT = shutil.which("opt")
+from pcc.passes.llvm_text_pipeline import find_opt_binary
+
+_OPT = find_opt_binary()
 
 
 class GlobalDCETests(unittest.TestCase):
@@ -61,7 +63,7 @@ class GlobalDCETests(unittest.TestCase):
         self.assertIn("@counter", out)
 
 
-@unittest.skipUnless(_OPT, "requires opt")
+@pytest.mark.pcc_gate(unavailable=None if _OPT else "matching LLVM opt not installed")
 class UpstreamParityTests(unittest.TestCase):
     def _parity(self, ir: str) -> None:
         report = assert_ir_parity(ir, GlobalDCEPass(), "globaldce")

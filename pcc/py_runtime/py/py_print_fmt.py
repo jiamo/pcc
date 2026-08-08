@@ -5,6 +5,28 @@ float printing is still emitted directly by codegen; this module covers
 object-path print(), list/tuple repr, and print_many.
 """
 from pcc.extern import extern, c_abi_export, c_ptr, c_int32, c_int64, c_void
+from pcc.py_runtime.py.py_abi_constants import (
+    PY_TYPE_CONTINUATION,
+    PY_TYPE_VIRTUAL_THREAD,
+    PY_TYPE_VTHREAD_CHANNEL,
+)
+from pcc.py_runtime.py.py_abi_constants import (
+    PY_TYPE_BOOL,
+    PY_TYPE_BYTEARRAY,
+    PY_TYPE_BYTES,
+    PY_TYPE_COROUTINE,
+    PY_TYPE_DICT,
+    PY_TYPE_EXC,
+    PY_TYPE_FLOAT,
+    PY_TYPE_INSTANCE,
+    PY_TYPE_INT,
+    PY_TYPE_LIST,
+    PY_TYPE_NONE,
+    PY_TYPE_SET,
+    PY_TYPE_STR,
+    PY_TYPE_TUPLE,
+    PY_TYPE_USER_CLASS_START,
+)
 from pcc.unsafe import (
     cstr,
     free,
@@ -54,7 +76,7 @@ pcc_capi_is_cext_type_tag = extern("pcc_capi_is_cext_type_tag", (c_int64,), c_in
 
 def _type_of(obj) -> int:
     if is_tagged_int(obj):
-        return 2       # PY_TYPE_INT
+        return PY_TYPE_INT       # PY_TYPE_INT
     return load_i32(obj, 8)
 
 
@@ -291,16 +313,20 @@ def _format_repr(o) -> None:
         _format_int(o)
         return
     tag: int = load_i32(o, 8)
-    if tag == 4:                    # PY_TYPE_STR
+    if tag == PY_TYPE_STR:                    # PY_TYPE_STR
         _format_str_repr(o)
         return
-    if tag == 17:                   # PY_TYPE_BYTES
+    if tag == PY_TYPE_BYTES:                   # PY_TYPE_BYTES
         _format_bytes(o)
         return
-    if tag == 18:                   # PY_TYPE_BYTEARRAY
+    if tag == PY_TYPE_BYTEARRAY:                   # PY_TYPE_BYTEARRAY
         _format_bytearray(o)
         return
-    if tag == 11 or tag == 12 or tag >= 100:  # PY_TYPE_INSTANCE / EXC / user
+    if (
+        tag == PY_TYPE_INSTANCE
+        or tag == PY_TYPE_EXC
+        or tag >= PY_TYPE_USER_CLASS_START
+    ):
         # repr() of a user instance must dispatch __repr__, not __str__.
         # Container elements recurse here, so a class with both __str__ and
         # __repr__ would otherwise show __str__ inside a list. PY_TYPE_EXC (12):
@@ -323,38 +349,40 @@ def _format(o) -> None:
         return
 
     tag: int = load_i32(o, 8)
-    if tag == 0:                    # PY_TYPE_NONE
+    if tag == PY_TYPE_NONE:                    # PY_TYPE_NONE
         _write_lit(cstr("None"), 4)
-    elif tag == 1:                  # PY_TYPE_BOOL
+    elif tag == PY_TYPE_BOOL:                  # PY_TYPE_BOOL
         if ptr_eq(o, global_load_ptr("py_True")) != 0:
             _write_lit(cstr("True"), 4)
         else:
             _write_lit(cstr("False"), 5)
-    elif tag == 2:                  # PY_TYPE_INT
+    elif tag == PY_TYPE_INT:                  # PY_TYPE_INT
         _format_int(o)
-    elif tag == 3:                  # PY_TYPE_FLOAT
+    elif tag == PY_TYPE_FLOAT:                  # PY_TYPE_FLOAT
         _format_float(o)
-    elif tag == 4:                  # PY_TYPE_STR
+    elif tag == PY_TYPE_STR:                  # PY_TYPE_STR
         _format_str(o)
-    elif tag == 17:                 # PY_TYPE_BYTES
+    elif tag == PY_TYPE_BYTES:                 # PY_TYPE_BYTES
         _format_bytes(o)
-    elif tag == 18:                 # PY_TYPE_BYTEARRAY
+    elif tag == PY_TYPE_BYTEARRAY:                 # PY_TYPE_BYTEARRAY
         _format_bytearray(o)
-    elif tag == 5:                  # PY_TYPE_LIST
+    elif tag == PY_TYPE_LIST:                  # PY_TYPE_LIST
         _format_list(o)
-    elif tag == 7:                  # PY_TYPE_TUPLE
+    elif tag == PY_TYPE_TUPLE:                  # PY_TYPE_TUPLE
         _format_tuple(o)
-    elif tag == 6:                  # PY_TYPE_DICT
+    elif tag == PY_TYPE_DICT:                  # PY_TYPE_DICT
         _format_dict(o)
-    elif tag == 8:                  # PY_TYPE_SET
+    elif tag == PY_TYPE_SET:                  # PY_TYPE_SET
         _format_set(o)
-    elif tag == 20:                 # PY_TYPE_COROUTINE
+    elif tag == PY_TYPE_COROUTINE:                 # PY_TYPE_COROUTINE
         _write_lit(cstr("<coroutine object>"), 18)
-    elif tag == 29:                 # PY_TYPE_CONTINUATION
+    elif tag == PY_TYPE_CONTINUATION:
         _write_lit(cstr("<continuation object>"), 21)
-    elif tag == 30:                 # PY_TYPE_VIRTUAL_THREAD
+    elif tag == PY_TYPE_VIRTUAL_THREAD:
         _write_lit(cstr("<virtual thread object>"), 23)
-    elif tag == 12:                 # PY_TYPE_EXC
+    elif tag == PY_TYPE_VTHREAD_CHANNEL:
+        _write_lit(cstr("<vthread channel object>"), 24)
+    elif tag == PY_TYPE_EXC:                 # PY_TYPE_EXC
         # str(exc) is the str of its single message value (CPython: the
         # exception args). py_exc_get_message returns a borrowed ref, so
         # no decref here; an arg-less exception (NULL message) renders as
@@ -410,12 +438,12 @@ def py_print_many(args_tuple, sep, end) -> None:
 
     if ptr_is_null(sep) == 0:
         if ptr_eq(sep, none) == 0:
-            if _type_of(sep) == 4:
+            if _type_of(sep) == PY_TYPE_STR:
                 sep_data = ptr_add(sep, 40)
                 sep_len = load_i64(sep, 16)
     if ptr_is_null(end) == 0:
         if ptr_eq(end, none) == 0:
-            if _type_of(end) == 4:
+            if _type_of(end) == PY_TYPE_STR:
                 end_data = ptr_add(end, 40)
                 end_len = load_i64(end, 16)
 

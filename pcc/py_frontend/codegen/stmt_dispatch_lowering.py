@@ -259,19 +259,22 @@ class StmtDispatchLoweringMixin:
             self._emit_delete(stmt)
             return
         if isinstance(stmt, FuncDef):
+            stmt_fn = self._funcdef_functions.get(id(stmt))
+            if stmt_fn is None:
+                stmt_fn = self.functions.get(stmt.name)
             # A def nested in a module-scope control-flow block is an
             # executable binding.  Its body was predeclared/emitted by the
             # generation pass; create the callable only when this branch runs
             # and store it in the module namespace.  Function-local nested
             # defs remain closure-hoisted and therefore have no statement-side
             # effect here.
-            if self.current_func_def is None and stmt.name in getattr(
-                self, "_module_block_func_defs", {}
+            if self.current_func_def is None and id(stmt) in getattr(
+                self, "_module_block_funcdef_ids", set()
             ):
                 fn_obj = self._emit_native_func_value(
                     stmt.name,
                     stmt.name,
-                    self.functions[stmt.name],
+                    stmt_fn,
                     (),
                 )
                 self._store_value_at_name(
@@ -296,6 +299,44 @@ class StmtDispatchLoweringMixin:
             # publication to the same undecorated surface that the former
             # end-of-module synchronization exposed; eagerly wrapping every
             # metadata-decorated package function causes severe IR growth.
+            if (
+                self.current_func_def is None
+                and stmt.name in self._duplicate_module_function_names
+            ):
+                if stmt_fn is None:
+                    raise L1CodegenError(
+                        "duplicate function definition has no native body: "
+                        + stmt.name
+                    )
+                decorators = self._func_decorators(stmt)
+                semantic_decorators = bool(
+                    decorators
+                ) and self._decorators_are_native_functions(stmt)
+                if semantic_decorators:
+                    fn_obj = self._emit_decorated_user_function_value(
+                        name=stmt.name,
+                        fn=stmt_fn,
+                        ast_func_def=stmt,
+                    )
+                else:
+                    fn_obj = self._emit_native_func_value(
+                        stmt.name,
+                        stmt.name,
+                        stmt_fn,
+                        (),
+                    )
+                self._store_value_at_name(
+                    Name(
+                        span=stmt.span,
+                        ty=DynType(name="dyn"),
+                        ident=stmt.name,
+                    ),
+                    fn_obj,
+                    DynType(name="dyn"),
+                    value_is_owned=True,
+                )
+                return
+
             if self.current_func_def is None and stmt.name in self.functions:
                 decorators = self._func_decorators(stmt)
                 needs_object = bool(
@@ -325,14 +366,14 @@ class StmtDispatchLoweringMixin:
                     if semantic_decorators:
                         fn_obj = self._emit_decorated_user_function_value(
                             name=stmt.name,
-                            fn=self.functions[stmt.name],
+                            fn=stmt_fn,
                             ast_func_def=stmt,
                         )
                     else:
                         fn_obj = self._emit_native_func_value(
                             stmt.name,
                             stmt.name,
-                            self.functions[stmt.name],
+                            stmt_fn,
                             (),
                         )
                     module_name = self.ast_module.name or "__main__"
@@ -353,8 +394,11 @@ class StmtDispatchLoweringMixin:
                     )
                     self._gc_release(fn_obj)
             return
-        if isinstance(stmt, ClassDef) and self.current_func_def is None:
-            self.class_lowering.emit_class_statement_init(stmt)
+        if isinstance(stmt, ClassDef):
+            if self.current_func_def is None:
+                self.class_lowering.emit_class_statement_init(stmt)
+            else:
+                self.class_lowering.emit_local_class_statement_init(stmt)
             return
         raise NotImplementedError(
             f"Layer 1 does not handle statement {_stmt_kind_name(stmt)}"

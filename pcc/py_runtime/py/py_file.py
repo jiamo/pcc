@@ -9,6 +9,12 @@ from pcc.extern import (
     c_size_t,
     c_void,
 )
+from pcc.py_runtime.py.py_abi_constants import PY_TYPE_FILE, PY_TYPE_INT
+from pcc.py_runtime.py.py_abi_constants import (
+    PY_TYPE_LIST,
+    PY_TYPE_STR,
+    PY_TYPE_TUPLE,
+)
 from pcc.unsafe import (
     cstr,
     free,
@@ -41,6 +47,7 @@ fread = extern("fread", (c_ptr, c_size_t, c_size_t, c_ptr), c_size_t)
 fseek = extern("fseek", (c_ptr, c_int64, c_int32), c_int32)
 ftell = extern("ftell", (c_ptr,), c_int64)
 fwrite = extern("fwrite", (c_ptr, c_size_t, c_size_t, c_ptr), c_size_t)
+fileno = extern("fileno", (c_ptr,), c_int32)
 
 py_decref = extern("py_decref", (c_ptr,), c_void)
 py_incref = extern("py_incref", (c_ptr,), c_void)
@@ -72,14 +79,14 @@ py_str_utf8 = extern("py_str_utf8", (c_ptr,), c_ptr)
 
 def _type_of(obj) -> int:
     if is_tagged_int(obj):
-        return 2
+        return PY_TYPE_INT
     return load_i32(obj, 8)
 
 
 def _coerce_str(o):
     if ptr_is_null(o):
         return null()
-    if _type_of(o) == 4:
+    if _type_of(o) == PY_TYPE_STR:
         return o
     return py_obj_str(o)
 
@@ -87,7 +94,7 @@ def _coerce_str(o):
 def _checked_file(file):
     if ptr_is_null(file):
         return null()
-    if _type_of(file) != 13:
+    if _type_of(file) != PY_TYPE_FILE:
         return null()
     if load_i32(file, 24) != 0:
         return null()
@@ -152,7 +159,7 @@ def py_file_open(path, mode):
         py_raise_owned(py_exc_new(14, cstr("could not open file")))
         return null()
 
-    out = pcc_gc_alloc(40, 13, 0)
+    out = pcc_gc_alloc(40, PY_TYPE_FILE, 0)
     if ptr_is_null(out):
         fclose(fp)
         return null()
@@ -263,7 +270,7 @@ def _checked_open_file(file):
     """
     if ptr_is_null(file):
         return null()
-    if _type_of(file) != 13:
+    if _type_of(file) != PY_TYPE_FILE:
         return null()
     if load_i32(file, 24) != 0 or ptr_is_null(load_ptr(file, 16)):
         # 2 == PY_EXC_VALUEERROR
@@ -361,11 +368,23 @@ def py_file_flush(file):
     return none
 
 
+@c_abi_export("py_file_fileno")
+def py_file_fileno(file):
+    f = _checked_open_file(file)
+    if ptr_is_null(f):
+        return null()
+    fd: int = fileno(load_ptr(f, 16))
+    if fd < 0:
+        py_raise_owned(py_exc_new(14, cstr("could not get file descriptor")))
+        return null()
+    return py_int_from_i64(fd)
+
+
 @c_abi_export("py_file_close")
 def py_file_close(file) -> None:
     if ptr_is_null(file):
         return
-    if _type_of(file) != 13:
+    if _type_of(file) != PY_TYPE_FILE:
         return
     if load_i32(file, 24) == 0:
         fp = load_ptr(file, 16)
@@ -403,11 +422,11 @@ def _files_len(files) -> int:
     if ptr_is_null(files):
         return 0
     tag: int = _type_of(files)
-    if tag == 4:
+    if tag == PY_TYPE_STR:
         return 1
-    if tag == 5:
+    if tag == PY_TYPE_LIST:
         return py_list_len(files)
-    if tag == 7:
+    if tag == PY_TYPE_TUPLE:
         return py_tuple_len(files)
     return 0
 
@@ -416,14 +435,14 @@ def _files_get(files, index: int):
     if ptr_is_null(files):
         return null()
     tag: int = _type_of(files)
-    if tag == 4:
+    if tag == PY_TYPE_STR:
         if index != 0:
             return null()
         py_incref(files)
         return files
-    if tag == 5:
+    if tag == PY_TYPE_LIST:
         return py_list_get(files, index)
-    if tag == 7:
+    if tag == PY_TYPE_TUPLE:
         return py_tuple_get(files, index)
     return null()
 

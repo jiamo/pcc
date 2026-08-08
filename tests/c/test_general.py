@@ -17,7 +17,7 @@ class TestParsing(unittest.TestCase):
         """ Find a c file by name, taking into account the current dir can be
             in a couple of typical places
         """
-        testdir = os.path.dirname(__file__)
+        testdir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         name = os.path.join(testdir, 'c_files', name)
         assert os.path.exists(name)
         return name

@@ -223,7 +223,8 @@ static void py_format_repr(FILE *fp, PyObject *o) {
         py_format_bytearray(fp, o);
         return;
     }
-    if (tag == PY_TYPE_INSTANCE || tag == PY_TYPE_EXC || tag >= PY_TYPE_USER) {
+    if (tag == PY_TYPE_INSTANCE || tag == PY_TYPE_EXC
+        || tag >= PY_TYPE_USER_CLASS_START) {
         /* repr() of a user instance must dispatch __repr__, not __str__.
          * Container elements (list/tuple/dict/set) recurse through here, so a
          * class with both __str__ and __repr__ would otherwise show __str__
@@ -292,6 +293,9 @@ static void py_format(FILE *fp, PyObject *o) {
             break;
         case PY_TYPE_VIRTUAL_THREAD:
             fputs("<virtual thread object>", fp);
+            break;
+        case PY_TYPE_VTHREAD_CHANNEL:
+            fputs("<vthread channel object>", fp);
             break;
         case PY_TYPE_EXC: {
             /* str(exc) == str of its single message value; py_exc_get_message

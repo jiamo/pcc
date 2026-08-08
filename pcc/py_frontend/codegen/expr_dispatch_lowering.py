@@ -414,52 +414,96 @@ class ExprDispatchLoweringMixin:
                 return dict_keys_result
 
             lhs = self._emit_expr(expr.lhs)
+            lhs_cpy_owned = False
+            if lhs in getattr(self, "_cpy_values", ()):
+                self._guard_cpy_value_not_null(lhs)
+                lhs_cpy_owned = self._cpy_value_is_owned(lhs)
+            lhs_release_owned = (
+                isinstance(lhs.type, ir.PointerType)
+                and lhs not in getattr(self, "_cpy_values", ())
+                and self._pcc_pointer_source_is_owned(expr.lhs)
+            )
+            lhs_pin = (
+                isinstance(lhs.type, ir.PointerType)
+                and lhs not in getattr(self, "_cpy_values", ())
+            )
+            if lhs_pin:
+                # The RHS is evaluated before binary dispatch.  Pin even a
+                # borrowed native lhs: a moving collector updates its rooted
+                # slot, not this already-loaded SSA pointer.  Cleanup releases
+                # only fresh values; borrowed pointers are merely unpinned.
+                self._gc_pin(lhs)
+            lhs_pinned_cleanup = (
+                ((lhs, lhs_release_owned),) if lhs_pin else ()
+            )
             if expr.op == "%" and self._is_valueclass_payload_type(expr.rhs.ty):
                 # direct valueclass constructors in %-format operands project
                 # to boxed valueboxes, not identity instances
                 rhs = self._emit_expr_as_pcc_object(expr.rhs)
             else:
-                rhs = self._emit_expr(expr.rhs)
-            lhs_pin = False
-            if (
-                isinstance(lhs.type, ir.PointerType)
-                and lhs not in getattr(self, "_cpy_values", ())
-                and self._raw_scaffold_object_rhs_is_owned(expr.lhs)
-                and self._expr_returns_owned_object(expr.lhs)
-                and _expr_is_binop(expr.lhs, _expr_dispatch_kind_name(expr.lhs))
-            ):
-                self.builder.call(self.runtime["pcc_gc_pin"], [lhs])
-                lhs_pin = True
-            rhs_pin = False
-            if (
+                if lhs_cpy_owned or lhs_pin:
+                    rhs = self._emit_expr_with_cpy_operand_cleanup(
+                        expr.rhs,
+                        (lhs,) if lhs_cpy_owned else (),
+                        (),
+                        lhs_pinned_cleanup,
+                    )
+                else:
+                    rhs = self._emit_expr(expr.rhs)
+            if rhs in getattr(self, "_cpy_values", ()):
+                self._guard_cpy_value_not_null(
+                    rhs,
+                    (lhs,) if lhs_cpy_owned else (),
+                    (),
+                    lhs_pinned_cleanup,
+                )
+            rhs_release_owned = (
                 isinstance(rhs.type, ir.PointerType)
                 and rhs not in getattr(self, "_cpy_values", ())
-                and self._raw_scaffold_object_rhs_is_owned(expr.rhs)
-                and self._expr_returns_owned_object(expr.rhs)
-                and _expr_is_binop(expr.rhs, _expr_dispatch_kind_name(expr.rhs))
-            ):
-                self.builder.call(self.runtime["pcc_gc_pin"], [rhs])
-                rhs_pin = True
+                and self._pcc_pointer_source_is_owned(expr.rhs)
+            )
+            rhs_pin = (
+                isinstance(rhs.type, ir.PointerType)
+                and rhs not in getattr(self, "_cpy_values", ())
+            )
+            if rhs_pin:
+                self._gc_pin(rhs)
+            pinned_pcc_on_error = lhs_pinned_cleanup
+            if rhs_pin:
+                pinned_pcc_on_error = pinned_pcc_on_error + (
+                    (rhs, rhs_release_owned),
+                )
             result = self._emit_binop_value(
-                expr.op, lhs, expr.lhs.ty, rhs, expr.rhs.ty, result_ty=expr.ty
+                expr.op,
+                lhs,
+                expr.lhs.ty,
+                rhs,
+                expr.rhs.ty,
+                result_ty=expr.ty,
+                pinned_pcc_on_error=pinned_pcc_on_error,
             )
             result_pin = False
             if (
                 isinstance(result.type, ir.PointerType)
                 and result not in getattr(self, "_cpy_values", ())
-                and self._raw_scaffold_object_rhs_is_owned(expr)
-                and self._expr_returns_owned_object(expr)
+                and self._pcc_pointer_source_is_owned(expr)
             ):
-                self.builder.call(self.runtime["pcc_gc_pin"], [result])
+                self._gc_pin(result)
                 result_pin = True
             if lhs_pin:
-                self.builder.call(self.runtime["pcc_gc_unpin"], [lhs])
+                self._gc_unpin(lhs)
+            if lhs_release_owned:
+                self._gc_release(lhs)
+            elif not lhs_pin:
+                self._gc_release_if_owned(lhs, expr.lhs)
             if rhs_pin:
-                self.builder.call(self.runtime["pcc_gc_unpin"], [rhs])
-            self._gc_release_if_owned(lhs, expr.lhs)
-            self._gc_release_if_owned(rhs, expr.rhs)
+                self._gc_unpin(rhs)
+            if rhs_release_owned:
+                self._gc_release(rhs)
+            elif not rhs_pin:
+                self._gc_release_if_owned(rhs, expr.rhs)
             if result_pin:
-                self.builder.call(self.runtime["pcc_gc_unpin"], [result])
+                self._gc_unpin(result)
             return result
         if _expr_is_unary(expr, expr_kind):
             return self._emit_unary(expr)

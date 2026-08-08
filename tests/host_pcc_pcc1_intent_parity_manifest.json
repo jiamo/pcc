@@ -1,0 +1,8 @@
+{
+  "candidate_count": 296,
+  "candidate_names_sha256": "f2f137f9a9cedbd4164cab9aeea62f8afbcaa89e756a022a3e342fddfc3e08fe",
+  "default_classification": "applicable",
+  "exclusions": [],
+  "registry": "tests.python.test_intent_constraints.HOST_PCC_PROGRAMS",
+  "schema": "pcc.host-pcc-pcc1-parity-manifest.v1"
+}

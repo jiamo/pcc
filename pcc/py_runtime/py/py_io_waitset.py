@@ -7,7 +7,7 @@ the CPU-only oracle ``pcc/vthread/io_waitset_oracle.py`` (``PollWaitSet`` +
 while stable scheduler nodes retain per-vthread GC roots. See
 ``docs/design/pcc-vthread-oracles.md``.
 
-Two readiness backends, one abstraction (mirroring the oracle and the C file):
+Three named readiness backends, one abstraction:
 
 * POLL FALLBACK -- the level-triggered fallback. Readiness is FED explicitly
   through :meth:`set_ready` (standing in for ``poll(2)``'s revents), so it is
@@ -16,15 +16,20 @@ Two readiness backends, one abstraction (mirroring the oracle and the C file):
   readiness mask, exactly like the C ``while (*cur != NULL)`` loop. Available
   everywhere.
 
-* DARWIN KQUEUE -- the real ``kqueue``/``kevent(2)`` notifier over LIVE fds.
-  That is a C-only syscall path: it cannot be expressed in the pcc-Python subset
-  (no live-fd syscalls), so this port does NOT implement it. Requesting it
-  reports a machine-readable skip, mirroring how the oracle's
+* DARWIN KQUEUE -- the real ``kqueue``/``kevent(2)`` notifier over LIVE fds is
+  owned by ``freestanding_io_waitset.py``, including its EVFILT_USER interrupt
+  channel. This deterministic host mirror does NOT issue those syscalls.
+  Requesting it reports a machine-readable skip, mirroring how the oracle's
   ``real_kqueue_backend()`` returns ``SkippedReason`` and how the standalone C
   ``pcc_io_waitset_real_kqueue_skip`` reports the same path when kqueue is
-  unavailable. The pcc-Python archive links the C scheduler/waitset kernel, so
-  its production scheduler can own kqueue even though this pure Python mirror
-  deliberately cannot issue live-fd syscalls itself.
+  unavailable.
+
+* LINUX EPOLL -- the registration/readiness semantics are represented by
+  :class:`EpollIoWaitSet` for deterministic oracle work.  The production
+  freestanding pcc-Python owner uses compiler-owned
+  ``epoll_create1``/``epoll_ctl``/``epoll_wait`` lowering on Linux x86_64.
+  This host-executed mirror never issues live syscalls and therefore reports
+  its own live capability as unavailable rather than borrowing host Python.
 
 Faithfulness note
 -----------------
@@ -54,6 +59,7 @@ PCC_IO_ALWAYS_REPORTED = 0x0008 | 0x0010 | 0x0020
 
 PCC_IO_WAITSET_BACKEND_POLL = 0
 PCC_IO_WAITSET_BACKEND_KQUEUE = 1
+PCC_IO_WAITSET_BACKEND_EPOLL = 2
 
 
 class IoReadyEvent:
@@ -141,13 +147,87 @@ class PollIoWaitSet:
         return result
 
 
+class EpollIoWaitSet:
+    """Deterministic one-shot model of the Linux epoll backend.
+
+    This class models registration, interest filtering, error delivery and
+    deadline arbitration only.  ``set_ready`` stands in for epoll events; it
+    does not issue live syscalls.  That separation makes the absent production
+    syscall route explicit while allowing the scheduler contract to be tested.
+    """
+
+    def __init__(self) -> None:
+        # fd -> [interest, deadline, ready_mask, edge, generation]
+        self._regs = {}  # type: dict
+        self._next_generation = 0
+
+    def add(self, fd: int, interest: int, deadline: int, edge: int) -> int:
+        ready = 0
+        if fd in self._regs:
+            ready = self._regs[fd][2]
+        self._next_generation += 1
+        self._regs[fd] = [
+            interest,
+            deadline,
+            ready,
+            1 if edge else 0,
+            self._next_generation,
+        ]
+        return 0
+
+    def remove(self, fd: int) -> int:
+        if fd in self._regs:
+            del self._regs[fd]
+            return 1
+        return 0
+
+    def count(self) -> int:
+        return len(self._regs)
+
+    def set_ready(self, fd: int, events: int) -> None:
+        if fd in self._regs:
+            self.set_ready_token(fd, self._regs[fd][4], events)
+
+    def generation(self, fd: int) -> int:
+        if fd not in self._regs:
+            return 0
+        return self._regs[fd][4]
+
+    def set_ready_token(self, fd: int, generation: int, events: int) -> None:
+        """Feed a kernel event only when its registration token is current."""
+        if fd in self._regs and self._regs[fd][4] == generation:
+            self._regs[fd][2] = self._regs[fd][2] | events
+
+    def clear_ready(self, fd: int) -> None:
+        if fd in self._regs:
+            self._regs[fd][2] = 0
+
+    def wait(self, now: int) -> IoWaitResult:
+        result = IoWaitResult()
+        fds = []  # type: list
+        for fd in self._regs:
+            fds.append(fd)
+        for fd in fds:
+            if fd not in self._regs:
+                continue
+            reg = self._regs[fd]
+            hit = reg[2] & (reg[0] | (0x0008 | 0x0010 | 0x0020))
+            expired = reg[1] >= 0 and reg[1] <= now
+            if hit != 0:
+                result.ready.append(IoReadyEvent(fd, hit))
+                del self._regs[fd]
+            elif expired:
+                result.timed_out.append(fd)
+                del self._regs[fd]
+        return result
+
+
 def kqueue_available() -> int:
     """Whether the real kqueue backend is available in THIS runtime tier.
 
-    The pcc-Python port never provides the real kqueue syscall path (that is a
-    C-only capability in ``py_io_waitset.c``), so this always returns 0 here.
-    The C mirror's ``pcc_io_waitset_kqueue_available()`` returns 1 on
-    Darwin/BSD. Callers that get 0 must use :class:`PollIoWaitSet`.
+    This deterministic host mirror never provides the real kqueue syscall
+    path, so this always returns 0 here. The production freestanding
+    pcc-Python owner reports the target capability independently.
     """
     return 0
 
@@ -162,7 +242,41 @@ def real_kqueue_skip():
         "io_waitset.real_kqueue",
         (
             "real kqueue/kevent requires live-fd syscalls; the pcc-Python "
-            "runtime port has no kqueue backend. The C runtime slice owns "
-            "EVFILT_READ/EVFILT_WRITE via kevent(2) on Darwin/BSD."
+            "host mirror has no kqueue backend. The production freestanding "
+            "runtime owns EVFILT_READ/EVFILT_WRITE via kevent(2) on Darwin."
         ),
     ]
+
+
+def epoll_available() -> int:
+    """Whether this runtime tier can issue live epoll syscalls."""
+    return 0
+
+
+def real_epoll_skip():
+    return [
+        "io_waitset.real_epoll",
+        (
+            "This deterministic host mirror does not issue live syscalls; "
+            "the freestanding pcc-Python runtime owns Linux x86_64 epoll."
+        ),
+    ]
+
+
+def backend_label(backend: int) -> str:
+    if backend == 0:
+        return "poll"
+    if backend == 1:
+        return "kqueue"
+    if backend == 2:
+        return "epoll"
+    return "unknown"
+
+
+def default_backend(platform_name: str, live_epoll: int = 0) -> int:
+    """Choose only a backend whose live capability has been proven."""
+    if platform_name == "darwin":
+        return 1
+    if platform_name == "linux" and live_epoll != 0:
+        return 2
+    return 0

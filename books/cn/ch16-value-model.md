@@ -18,7 +18,7 @@
 
 **备选二:一切装箱。** 每个 `int` 都是堆上的 bignum 对象,每次加法都走运行时调用。语义无懈可击,性能退回解释器量级,义务 7 承诺的"热路径性能桥"落空。
 
-**备选三:投影模型。** 这是 pcc 从 Valhalla 蒸馏出的答案,写在 [codex-goal-prompt.md](../../codex-goal-prompt.md) 的 V-track 一节:**语义类型与物理表示分离**。一个语义类型可以有两个物理投影——值投影(value projection)与对象投影(object projection)——由编译器与运行时在显式的接缝处切换;优化只许更换表示,不许更换语义。具体到三个类型:
+**备选三:投影模型。** 这是 pcc 从 Valhalla 蒸馏出的答案,写在 [goal-prompt.md](../../docs/goal/goal-prompt.md) 的 V-track 一节:**语义类型与物理表示分离**。一个语义类型可以有两个物理投影——值投影(value projection)与对象投影(object projection)——由编译器与运行时在显式的接缝处切换;优化只许更换表示,不许更换语义。具体到三个类型:
 
 ```text
 Python int        语义 = 任意精度,永远
@@ -132,7 +132,7 @@ pcc 打印 0——2^80 mod 2^64。同样确认回绕的还有 `+`(`addf(2**63 - 
 2. `binary_op_lowering.py` 的 `_emit_binop_value()` 整数尾部:`lv = _to_int64(lhs); rv = _to_int64(rhs); return self._emit_binop_int(op, lv, rv)`。
 3. `_emit_binop_int()` 对 `+`/`-`/`*` 直接发射 `builder.add`/`builder.sub`/`builder.mul`——裸 i64 指令,无溢出检查,无慢路径。
 
-用投影模型的语言说:这条路径把 Python 的**语义类型** `int` 等同于**机器表示** i64,值投影没有 deopt 点,溢出即回绕。这恰好是 16.1 备选一——被北极星明文禁止的 Java `int` 方向——经由 typed-ABI 的后门溜了进来。[codex-goal-prompt.md](../../codex-goal-prompt.md) 的 V-track 把这条路径点名为"投影模型禁止的那种混淆"。
+用投影模型的语言说:这条路径把 Python 的**语义类型** `int` 等同于**机器表示** i64,值投影没有 deopt 点,溢出即回绕。这恰好是 16.1 备选一——被北极星明文禁止的 Java `int` 方向——经由 typed-ABI 的后门溜了进来。[goal-prompt.md](../../docs/goal/goal-prompt.md) 的 V-track 把这条路径点名为"投影模型禁止的那种混淆"。
 
 值得强调它为什么不是局部补丁能修的,因为调查里有两次失败实验把这一点钉死(2026-05-31):把 `*`/`<<` 从 `_typed_int_expr_is_i64_safe` 的安全集合里剔除,无效果;把 `*` 从 `_expr_is_native_typed_int_shape` 剔除,也无效果。原因是表示约束:一个正确的 bignum 结果**装不进 i64 返回寄存器**。只要 `mul` 的签名还是 `i64(i64, i64)`,任何分析层的收紧都改变不了结果无处安放的事实。修复必须是表示/ABI 级的:`int` 参数、返回值与槽位从 i64 改为可携带标记值或 bignum 的 `PyObject*`。
 
@@ -167,9 +167,9 @@ def _type_is_typed_int_abi_param(self, type_obj: Type) -> bool:
 
 ## 16.4 显式机器整数:`pcc.i64` / `pcc.u64` 的契约
 
-投影模型把任意精度判给 `int` 之后,定宽语义需要一个合法的家。契约写在 [codex-goal-prompt.md](../../codex-goal-prompt.md) 的 V-track:`pcc.i64` / `pcc.u64` 是显式的机器整数语义类型,只有裸 i64/u64 一个投影;**溢出策略——wrap、trap、checked、saturating——写进类型本身**,在源码里可见。Java/C 风格的定宽行为只许住在这里,决不许是 `int` 的默认含义。
+投影模型把任意精度判给 `int` 之后,定宽语义需要一个合法的家。契约写在 [goal-prompt.md](../../docs/goal/goal-prompt.md) 的 V-track:`pcc.i64` / `pcc.u64` 是显式的机器整数语义类型,只有裸 i64/u64 一个投影;**溢出策略——wrap、trap、checked、saturating——写进类型本身**,在源码里可见。Java/C 风格的定宽行为只许住在这里,决不许是 `int` 的默认含义。
 
-诚实标注:截至写作,`pcc.i64`/`pcc.u64` 是设计契约,**尚未实现**——在 [pcc/](../../pcc) 源码树里检索不到对应的类型实现,仅 [codex-goal-prompt.md](../../codex-goal-prompt.md) 载有规格。它不是 16.3 那个缺陷修复的一部分(修复是让 `int` 停止意指 i64),而是 V-track 上独立的类型系统增项:给确实想要机器语义的代码(位操作、哈希、与 C ABI 对话的运行时内核)一个不必撒谎的去处。
+诚实标注:截至写作,`pcc.i64`/`pcc.u64` 是设计契约,**尚未实现**——在 [pcc/](../../pcc) 源码树里检索不到对应的类型实现,仅 [goal-prompt.md](../../docs/goal/goal-prompt.md) 载有规格。它不是 16.3 那个缺陷修复的一部分(修复是让 `int` 停止意指 i64),而是 V-track 上独立的类型系统增项:给确实想要机器语义的代码(位操作、哈希、与 C ABI 对话的运行时内核)一个不必撒谎的去处。
 
 把溢出策略写进类型,与第 4 章 C 前端的符号性教训是同一个论证的两面。C 代码生成里 `int` 与 `unsigned` 同为 i32,符号性作为带外元数据单独跟踪(`_tag_unsigned`/`_is_unsigned_val`),经典失败模式就是元数据在某个表达式形态上丢失、下游静默选错 `sdiv`/`ashr`。带外语义会腐烂;写进类型的语义不会。`pcc.i64` 的设计直接吸收了这条教训:回绕还是陷阱不是某个 pass 的心照不宣,是类型签名的一部分。
 

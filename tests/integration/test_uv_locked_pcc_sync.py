@@ -11,6 +11,8 @@ import zipfile
 
 import pytest
 
+from tests.python.pcc1_gate import find_current_pcc1
+
 pytestmark = pytest.mark.integration
 
 REPO = Path.cwd()
@@ -65,9 +67,11 @@ def _uv_run(project: Path, *args: str, env: dict[str, str], timeout: int = 120):
 def pcc_wheel(tmp_path_factory: pytest.TempPathFactory) -> Path:
     root = tmp_path_factory.mktemp("uv-locked-wheel")
     dist = root / "dist"
+    pcc1 = find_current_pcc1(REPO)
+    assert pcc1 is not None, "current-source pcc1 is required for the wheel"
     env = os.environ.copy()
     env.pop("LC_ALL", None)
-    env["PCC_BUILD_PCC1"] = str(REPO / "build" / "bootstrap" / "pcc1")
+    env["PCC_BUILD_PCC1"] = str(pcc1)
     process = _run(
         ["uv", "build", "--wheel", "--out-dir", str(dist), str(REPO)],
         cwd=REPO,
@@ -323,7 +327,18 @@ def test_uv_locked_numpy_sync_compiles_and_runs_without_libpython(
         counters["link_self_native_split_shards"]
         > counters["link_self_native_split_modules"]
     )
-    assert counters["link_self_native_configured_jobs"] == 1
+    assert 1 <= counters["link_self_native_configured_jobs"] <= 2
+    assert counters["link_self_native_oversized_object_count"] >= 1
+    assert counters["link_self_native_safe_object_count"] >= 1
+    assert counters["link_self_native_oversized_emit_jobs"] == 1
+    assert (
+        counters["link_self_native_safe_emit_jobs"]
+        == counters["link_self_native_configured_jobs"]
+    )
+    assert (
+        counters["link_self_native_emit_jobs"]
+        == counters["link_self_native_configured_jobs"]
+    )
     assert "multi_frontend_codegen_worker_collect" in profile["phase_totals_s"]
     assert "link_self_native_pre_split_collect" in profile["phase_totals_s"]
     assert "link_self_native_post_split_collect" in profile["phase_totals_s"]

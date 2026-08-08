@@ -1,0 +1,93 @@
+{
+  "schema_version": 1,
+  "task_id": "LLVMREF-P3-ALIVE2-CONSTFOLD",
+  "claim": "Finite integer constant folds owned by pcc, checked against independent small-bitwidth mathematical oracles.",
+  "semantic_owners": [
+    {
+      "path": "pcc/codegen/c_integer_fold_contract.py",
+      "symbol": "fold_c_integer_binary",
+      "domain": "C integer promotions already applied; undefined C operations fail closed"
+    },
+    {
+      "path": "pcc/ir_passes/integer_fold_contract.py",
+      "symbol": "fold_llvm_integer_binary",
+      "domain": "LLVM integer binops, poison-producing flags, and bit-width wrapping"
+    },
+    {
+      "path": "pcc/ir_passes/integer_fold_contract.py",
+      "symbol": "fold_llvm_integer_compare",
+      "domain": "LLVM signed and unsigned icmp predicates"
+    }
+  ],
+  "fold_sites": [
+    {
+      "path": "pcc/codegen/c_codegen.py",
+      "symbol": "LLVMCodeGenerator._eval_const_expr",
+      "owner_calls": ["_fold_c_integer_binary(", "_fold_c_integer_unary("]
+    },
+    {
+      "path": "pcc/ir_passes/constant_lattice.py",
+      "symbol": "evaluate_binary/evaluate_compare",
+      "owner_calls": ["fold_llvm_integer_binary(", "fold_llvm_integer_compare("]
+    },
+    {
+      "path": "pcc/ir_passes/sccp.py",
+      "symbol": "run_sccp",
+      "owner_calls": ["evaluate_binary(", "evaluate_compare("]
+    },
+    {
+      "path": "pcc/ir_passes/instsimplify.py",
+      "symbol": "_fold_constant_binop/_simplify_icmp",
+      "owner_calls": ["fold_llvm_integer_binary(", "fold_llvm_integer_compare("]
+    },
+    {
+      "path": "pcc/ir_passes/instcombine.py",
+      "symbol": "_fold_const_binop",
+      "owner_calls": ["fold_llvm_integer_binary("]
+    },
+    {
+      "path": "pcc/ir_passes/reassociate.py",
+      "symbol": "_combine_constants",
+      "owner_calls": ["fold_llvm_integer_binary("]
+    },
+    {
+      "path": "pcc/ir_passes/loop_unroll.py",
+      "symbol": "_constant_trip_count/_try_fold_const_binop",
+      "owner_calls": ["fold_llvm_integer_binary("]
+    },
+    {
+      "path": "pcc/ssa/sccp.py",
+      "symbol": "SSASCCPAnalyzer._evaluate_binary/_evaluate_unary/_evaluate_cast",
+      "owner_calls": ["_fold_c_integer_binary(", "_fold_c_integer_unary("]
+    }
+  ],
+  "verified_rules": {
+    "c_integer": [
+      "promoted signed and unsigned add/sub/mul",
+      "truncating division and remainder",
+      "bitwise operations",
+      "signed and unsigned shifts",
+      "signedness-sensitive comparisons",
+      "unary plus/minus/complement/not",
+      "short-circuit logical and/or"
+    ],
+    "llvm_integer": [
+      "wrapping add/sub/mul",
+      "nsw/nuw add/sub/mul/shl poison",
+      "exact shift/division poison",
+      "out-of-range shift poison",
+      "zero-divisor poison",
+      "signed INT_MIN/-1 division poison",
+      "signed INT_MIN%-1 equals zero",
+      "signed and unsigned comparisons"
+    ]
+  },
+  "excluded": [
+    "LLVM-owned optimizer folds outside pcc's pass implementations",
+    "floating-point reassociation or fast-math equivalence",
+    "variable identities and general optimizer transforms",
+    "backend machine-instruction peepholes",
+    "relational constraint propagation",
+    "implementation-defined C behavior other than pcc's documented arithmetic signed right shift"
+  ]
+}

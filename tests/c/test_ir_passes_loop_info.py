@@ -4,7 +4,7 @@ Upstream reference:
 - /tmp/llvm-src/llvm-20.1.8.src/lib/Analysis/LoopInfo.cpp
 """
 
-import shutil
+import pytest
 import subprocess
 import unittest
 
@@ -13,7 +13,9 @@ import llvmlite.binding as llvm
 from pcc.ir_passes.loop_info import compute_loop_info
 
 
-_OPT = shutil.which("opt")
+from pcc.passes.llvm_text_pipeline import find_opt_binary
+
+_OPT = find_opt_binary()
 
 
 def _parse(ir_text: str, name: str) -> llvm.ValueRef:
@@ -127,7 +129,7 @@ def _cfg(function):
     return CFG.of_function(function)
 
 
-@unittest.skipUnless(_OPT, "requires LLVM 'opt' on PATH")
+@pytest.mark.pcc_gate(unavailable=None if _OPT else "matching LLVM opt not installed")
 class UpstreamParityTests(unittest.TestCase):
     def _upstream_loops(self, ir_text: str, fn: str) -> list[str]:
         proc = subprocess.run(

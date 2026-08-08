@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from . import BackendUnavailable
 from .self_backend_aarch64_darwin_regs import emit_add_offset, emit_const_to_reg
+from .self_backend_aarch64_darwin_regalloc import allocated_register_name
 from .self_backend_aarch64_darwin_slots import load_slot_to_reg
 from .self_backend_aarch64_darwin_symbols import asm_symbol
 from .self_backend_aarch64_darwin_abi import reg_name
@@ -49,7 +50,14 @@ def materialize_index_to_x10(
     if index_value not in func.value_slots:
         raise BackendUnavailable(f"self backend does not know getelementptr index value {index_value!r}")
     index_slot = func.value_slots[index_value]
-    lines = load_slot_to_reg(index_slot, reg_name(index_slot.type, 10))
+    index_reg = reg_name(index_slot.type, 10)
+    allocated_reg = allocated_register_name(func, index_value, index_slot.type)
+    if allocated_reg is None:
+        lines = load_slot_to_reg(index_slot, index_reg)
+    elif allocated_reg == index_reg:
+        lines = []
+    else:
+        lines = [f"  mov {index_reg}, {allocated_reg}"]
     if index_slot.type.is_ptr:
         # A pointer-typed index SSA value carries LLVM's implicit ``ptrtoint``
         # semantics: its 64-bit bit pattern is the index. load_slot_to_reg

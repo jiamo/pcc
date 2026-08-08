@@ -105,6 +105,41 @@ _LLVM_TEXT_PIPELINE_ENV = "PCC_LLVM_PIPELINE"
 _LLVM_PIPELINE_TRANSPORT_ENV = "PCC_LLVM_PIPELINE_TRANSPORT"
 _LLVM_DISABLE_PASSES_ENV = "PCC_LLVM_DISABLE_PASSES"
 _LLVM_OPT_BIN_ENV = "PCC_LLVM_OPT_BIN"
+_SELF_OBJECT_EMITTER_ENV = "PCC_SELF_OBJ"
+_SELF_OBJECT_EMITTER_PCC = "pcc"
+_SELF_OBJECT_EMITTER_SYSTEM_AS = "system-as"
+_SELF_OBJECT_EMITTER_DIRECT_TARGETS = frozenset(
+    {
+        "self-aarch64-darwin-v0",
+        "self-x86_64-linux-v0",
+    }
+)
+_LINUX_FREESTANDING_NON_EXEC_LINK_OPTIONS = frozenset(
+    {
+        "-pie",
+        "--pie",
+        "-static-pie",
+        "--static-pie",
+        "--pic-executable",
+        "-shared",
+        "--shared",
+        "-Bshareable",
+        "-r",
+        "--relocatable",
+    }
+)
+FREESTANDING_C_LIBC_PY_MODULES = (
+    "freestanding_mem_str",
+    "freestanding_allocator",
+    "freestanding_platform_io",
+    "freestanding_platform_fs",
+    "freestanding_platform_env",
+    "freestanding_platform_system",
+    "freestanding_platform_time",
+    "freestanding_platform_process",
+    "freestanding_platform_socket",
+    "freestanding_stdio",
+)
 _DEFAULT_CHEAP_LLVM_PASSES = (
     "add_sroa_pass",
     "add_instruction_combine_pass",
@@ -112,6 +147,42 @@ _DEFAULT_CHEAP_LLVM_PASSES = (
     "add_simplify_cfg_pass",
     "add_aggressive_dce_pass",
 )
+
+
+def _select_self_object_emitter(requested, target_identity):
+    """Resolve the self-backend object writer without an implicit fallback.
+
+    pcc owns direct object emission for AArch64 Mach-O and x86_64 ELF.  Other
+    registered self targets retain the system assembler as their default until
+    they have a native object writer of their own.  An explicit selection is always
+    validated so a misspelling cannot silently cross the system-tool boundary.
+    """
+    if requested is None or requested == "":
+        if target_identity in _SELF_OBJECT_EMITTER_DIRECT_TARGETS:
+            return _SELF_OBJECT_EMITTER_PCC
+        return _SELF_OBJECT_EMITTER_SYSTEM_AS
+    if requested not in (
+        _SELF_OBJECT_EMITTER_PCC,
+        _SELF_OBJECT_EMITTER_SYSTEM_AS,
+    ):
+        raise BackendUnavailable(
+            f"{_SELF_OBJECT_EMITTER_ENV} must be "
+            f"{_SELF_OBJECT_EMITTER_PCC!r} or "
+            f"{_SELF_OBJECT_EMITTER_SYSTEM_AS!r}, got {requested!r}"
+        )
+    if (
+        requested == _SELF_OBJECT_EMITTER_PCC
+        and target_identity not in _SELF_OBJECT_EMITTER_DIRECT_TARGETS
+    ):
+        raise BackendUnavailable(
+            f"{_SELF_OBJECT_EMITTER_ENV}={_SELF_OBJECT_EMITTER_PCC} direct "
+            "object emission requires target "
+            f"one of {sorted(_SELF_OBJECT_EMITTER_DIRECT_TARGETS)!r}, "
+            f"got {target_identity!r}"
+        )
+    return requested
+
+
 _CHEAP_LLVM_PASS_ALIASES = {
     "sroa": "add_sroa_pass",
     "instcombine": "add_instruction_combine_pass",
@@ -1610,7 +1681,8 @@ class CEvaluator(object):
 
         # Build native shared-library disk cache for future fast cold starts.
         if (
-            not llvmdump
+            self.backend != "self"
+            and not llvmdump
             and not prog_args
             and not self.is_cross
             and _compile_cache_enabled(use_compile_cache)
@@ -2084,7 +2156,13 @@ class CEvaluator(object):
         timeout=120,
         capture_output=True,
         text=True,
+        freestanding_libc=False,
     ):
+        link_args = list(link_args or [])
+        self._validate_freestanding_link_args(
+            link_args,
+            enabled=freestanding_libc,
+        )
         if self.backend == "self":
             return self._run_compiled_translation_units_self_backend(
                 compiled_units,
@@ -2095,6 +2173,7 @@ class CEvaluator(object):
                 timeout=timeout,
                 capture_output=capture_output,
                 text=text,
+                freestanding_libc=freestanding_libc,
             )
 
         _raise_if_duplicate_external_definitions(compiled_units)
@@ -2104,7 +2183,6 @@ class CEvaluator(object):
         tmpdir = tempfile.mkdtemp(prefix="pcc_system_link_")
         try:
             obj_paths = []
-            link_args = list(link_args or [])
 
             for unit_name, ir_text, _unit_return_type, _external_defs in compiled_units:
                 llvmmod = self._prepare_llvm_module(
@@ -2122,8 +2200,23 @@ class CEvaluator(object):
                     f.write(target_machine.emit_object(llvmmod))
                 obj_paths.append(obj_path)
 
+            startup_inputs, platform_link_flags, runtime_link_args = (
+                self._freestanding_link_inputs(
+                    tmpdir,
+                    enabled=freestanding_libc,
+                    timeout=timeout,
+                )
+            )
             bin_path = os.path.join(tmpdir, "a.out")
-            link_cmd = [cc] + obj_paths + ["-o", bin_path] + self._platform_link_flags() + link_args
+            link_cmd = (
+                [cc]
+                + obj_paths
+                + startup_inputs
+                + ["-o", bin_path]
+                + platform_link_flags
+                + link_args
+                + runtime_link_args
+            )
             link_run = subprocess.run(
                 link_cmd,
                 capture_output=True,
@@ -2213,7 +2306,29 @@ class CEvaluator(object):
             if self._normalize_opt_level(optimize) > 0
             else compiled_units
         )
-        ir_texts = [ir_text for _unit_name, ir_text, _unit_return_type, _external_defs in prepared_units]
+        ir_texts = [
+            ir_text
+            for _unit_name, ir_text, _unit_return_type, _external_defs
+            in prepared_units
+        ]
+        object_emitter = None
+        if emit_obj:
+            if not ir_texts:
+                raise ValueError("No translation units to emit")
+            target_identities = [
+                self_backend_target_identity(parse_self_backend_target_triple(ir_text))
+                for ir_text in ir_texts
+            ]
+            target_identity = target_identities[0]
+            if any(item != target_identity for item in target_identities[1:]):
+                raise BackendUnavailable(
+                    "self backend object emission cannot combine target identities: "
+                    + ", ".join(sorted(set(target_identities)))
+                )
+            object_emitter = _select_self_object_emitter(
+                os.environ.get(_SELF_OBJECT_EMITTER_ENV),
+                target_identity,
+            )
         asm_text = self._self_backend_asm_text(prepared_units)
 
         if emit_llvm:
@@ -2225,6 +2340,57 @@ class CEvaluator(object):
                 f.write(asm_text)
 
         if emit_obj:
+            # Owned targets default to pcc's assembler + object writer, so
+            # --emit-obj does not serialize and reparse through as(1).
+            # PCC_SELF_OBJ=system-as keeps the host assembler as an explicit
+            # differential oracle.  Selection is fail-closed above: an
+            # unknown value never becomes an accidental system-tool fallback.
+            if object_emitter == _SELF_OBJECT_EMITTER_PCC:
+                if target_identity == "self-aarch64-darwin-v0":
+                    from ..backend.arm64_asm_driver import assemble_file
+                    from ..backend.macho_link import link_relocatable_native
+                    from ..backend.native_object import NativeObject
+
+                    # Each translation unit owns one complete, versioned
+                    # precise-stackmap table.  Concatenating their assembly
+                    # first would concatenate table headers inside a single
+                    # Mach-O section, which is not a valid stackmap payload.
+                    # Assemble units independently, then use the semantic
+                    # relocatable linker to merge/re-encode their tables and
+                    # resolve cross-TU symbols deterministically.
+                    native_objects = []
+                    for (
+                        _unit_name,
+                        ir_text,
+                        _unit_return_type,
+                        _external_defs,
+                    ) in prepared_units:
+                        sections, undefined = assemble_file(emit_self_asm(ir_text))
+                        native_objects.append(
+                            NativeObject.from_sections(
+                                sections,
+                                undefined=undefined,
+                            )
+                        )
+                    native_object = (
+                        native_objects[0]
+                        if len(native_objects) == 1
+                        else link_relocatable_native(native_objects)
+                    )
+                    object_bytes = native_object.to_macho()
+                elif target_identity == "self-x86_64-linux-v0":
+                    from ..backend.elf_x86_64 import emit_relocatable
+                    from ..backend.x86_64_asm_driver import assemble_file
+
+                    object_bytes = emit_relocatable(assemble_file(asm_text))
+                else:
+                    raise BackendUnavailable(
+                        "pcc self object emitter lost target validation for "
+                        + repr(target_identity)
+                    )
+                with open(emit_obj, "wb") as f:
+                    f.write(object_bytes)
+                return
             cc = self._system_cc()
             with tempfile.TemporaryDirectory(prefix="pcc_self_obj_") as tmpdir:
                 asm_path = os.path.join(tmpdir, "self_backend.s")
@@ -2275,6 +2441,162 @@ class CEvaluator(object):
             asm_text += "\n.subsections_via_symbols\n"
         return asm_text
 
+    def _validate_freestanding_link_args(self, link_args, *, enabled):
+        """Keep Linux's freestanding startup on its fixed ET_EXEC contract."""
+        if not enabled or "linux" not in str(self.target_triple or "").lower():
+            return
+
+        rejected_arg = None
+        for raw_arg in link_args:
+            arg = str(raw_arg)
+            candidates = [arg]
+            if arg.startswith("-Wl,"):
+                candidates.extend(arg[4:].split(","))
+            elif arg.startswith("-Xlinker="):
+                candidates.append(arg.split("=", 1)[1])
+            if any(
+                candidate in _LINUX_FREESTANDING_NON_EXEC_LINK_OPTIONS
+                for candidate in candidates
+            ):
+                rejected_arg = arg
+                break
+
+        if rejected_arg is not None:
+            raise RuntimeError(
+                "--freestanding-libc on Linux requires a fixed ET_EXEC "
+                "startup; PIE/static-PIE, shared, and relocatable link "
+                "arguments are unsupported: "
+                + rejected_arg
+            )
+
+    def _freestanding_link_inputs(self, tmpdir, *, enabled, timeout):
+        """Return startup inputs and platform flags for one final C link.
+
+        Darwin deliberately keeps clang's normal crt/libSystem machine
+        boundary. Linux x86_64 replaces crt and libc with a process entry
+        authored in strict pcc-Python and a static, no-interpreter link.
+        """
+        if not enabled:
+            return [], self._platform_link_flags(), []
+
+        triple = str(self.target_triple or "").lower()
+        if "darwin" in triple or "apple" in triple:
+            from pcc.py_frontend.pipeline import _ensure_runtime
+
+            runtime_archive = _ensure_runtime(False, needs_libpython=False)
+            if not runtime_archive:
+                raise RuntimeError(
+                    "--freestanding-libc could not build the shared "
+                    "pcc-Python runtime archive"
+                )
+            if os.path.basename(runtime_archive) != "libpy_runtime_pcc_py.a":
+                raise RuntimeError(
+                    "--freestanding-libc requires libpy_runtime_pcc_py.a; "
+                    "PCC_RUNTIME_ARCHIVE selected "
+                    + os.path.basename(runtime_archive)
+                )
+            return [], self._platform_link_flags(), [runtime_archive]
+        if "linux" not in triple:
+            raise RuntimeError(
+                "--freestanding-libc supports Darwin and Linux x86_64"
+            )
+        if not (triple.startswith("x86_64") or triple.startswith("amd64")):
+            raise RuntimeError(
+                "--freestanding-libc Linux startup currently requires x86_64"
+            )
+        if not sys.platform.startswith("linux") or platform.machine() not in (
+            "x86_64",
+            "AMD64",
+        ):
+            raise RuntimeError(
+                "--freestanding-libc cannot cross-link the Linux startup with "
+                "the host C linker; run it on Linux x86_64"
+            )
+
+        from pcc.py_frontend.pipeline import compile_python
+
+        runtime_root = os.path.join(
+            os.path.dirname(os.path.dirname(__file__)), "py_runtime"
+        )
+        source = os.path.join(runtime_root, "py", "freestanding_c_linux_start.py")
+        ir_path = os.path.join(tmpdir, "freestanding_c_linux_start.ll")
+        asm_path = os.path.join(tmpdir, "freestanding_c_linux_start.s")
+        compile_python(
+            source,
+            ir_path,
+            emit_llvm_only=True,
+            libpython_mode="off",
+            python_library=True,
+            backend="self",
+            target_triple=self.target_triple,
+        )
+        with open(ir_path, "r", encoding="utf-8") as f:
+            startup_ir = f.read()
+        with open(asm_path, "w", encoding="utf-8") as f:
+            f.write(emit_self_asm(startup_ir, self.target_triple))
+
+        libc_objects = []
+        for module_name in FREESTANDING_C_LIBC_PY_MODULES:
+            module_source = os.path.join(runtime_root, "py", module_name + ".py")
+            module_ir_path = os.path.join(tmpdir, module_name + ".ll")
+            module_asm_path = os.path.join(tmpdir, module_name + ".s")
+            module_obj_path = os.path.join(tmpdir, module_name + ".o")
+            compile_python(
+                module_source,
+                module_ir_path,
+                emit_llvm_only=True,
+                libpython_mode="off",
+                python_library=True,
+                backend="self",
+                target_triple=self.target_triple,
+            )
+            with open(module_ir_path, "r", encoding="utf-8") as f:
+                module_ir = f.read()
+            with open(module_asm_path, "w", encoding="utf-8") as f:
+                f.write(emit_self_asm(module_ir, self.target_triple))
+            assemble_run = subprocess.run(
+                [self._system_cc(), "-c", module_asm_path, "-o", module_obj_path],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+            )
+            if assemble_run.returncode != 0:
+                detail = (
+                    assemble_run.stderr
+                    or assemble_run.stdout
+                    or "unknown assembler error"
+                )[:400]
+                raise RuntimeError(
+                    "freestanding pcc-Python libc object assembly failed: "
+                    + detail
+                )
+            libc_objects.append(module_obj_path)
+
+        ar = shutil.which("ar")
+        if not ar:
+            raise RuntimeError("ar is required for --freestanding-libc")
+        archive_path = os.path.join(tmpdir, "libpcc_freestanding_c.a")
+        archive_run = subprocess.run(
+            [ar, "rcs", archive_path] + libc_objects,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        if archive_run.returncode != 0:
+            detail = (
+                archive_run.stderr
+                or archive_run.stdout
+                or "unknown archive error"
+            )[:400]
+            raise RuntimeError(
+                "freestanding pcc-Python libc archive failed: " + detail
+            )
+        return (
+            [asm_path],
+            ["-nostdlib", "-static", "-no-pie", "-Wl,-e,_start"],
+            [archive_path],
+        )
+
     def _run_compiled_translation_units_self_backend(
         self,
         compiled_units,
@@ -2286,6 +2608,7 @@ class CEvaluator(object):
         timeout=120,
         capture_output=False,
         text=False,
+        freestanding_libc=False,
     ):
         cc = self._system_cc()
         prepared_units = (
@@ -2299,8 +2622,22 @@ class CEvaluator(object):
             asm_path = os.path.join(tmpdir, "self_backend.s")
             with open(asm_path, "w") as f:
                 f.write(asm_text)
+            startup_inputs, platform_link_flags, runtime_link_args = (
+                self._freestanding_link_inputs(
+                    tmpdir,
+                    enabled=freestanding_libc,
+                    timeout=timeout,
+                )
+            )
             bin_path = os.path.join(tmpdir, "a.out")
-            link_cmd = [cc, asm_path, "-o", bin_path] + self._platform_link_flags() + list(link_args or [])
+            link_cmd = (
+                [cc, asm_path]
+                + startup_inputs
+                + ["-o", bin_path]
+                + platform_link_flags
+                + list(link_args or [])
+                + runtime_link_args
+            )
             link_run = subprocess.run(
                 link_cmd,
                 capture_output=True,
@@ -2339,7 +2676,13 @@ class CEvaluator(object):
         cpp_args=None,
         use_compile_cache=True,
         cache_dir=None,
+        freestanding_libc=False,
     ):
+        link_args = list(link_args or [])
+        self._validate_freestanding_link_args(
+            link_args,
+            enabled=freestanding_libc,
+        )
         opt_level = self._normalize_opt_level(optimize)
         compiled_units = self.compile_translation_units(
             units,
@@ -2362,6 +2705,7 @@ class CEvaluator(object):
             timeout=timeout,
             capture_output=capture_output,
             text=text,
+            freestanding_libc=freestanding_libc,
         )
 
     @staticmethod

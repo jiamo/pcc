@@ -27,6 +27,16 @@ def _count_py_cpy_in_module_funcs(ir_text: str, mod_prefix: str) -> int:
     return n
 
 
+def _function_body(ir_text: str, symbol: str) -> str:
+    match = re.search(
+        r"define[^\n]+@" + re.escape(symbol) + r"\([^)]*\)[^{]*\{(.+?)\n\}",
+        ir_text,
+        re.DOTALL,
+    )
+    assert match is not None, symbol
+    return match.group(1)
+
+
 def test_ir_py_functions_stay_no_cpy_with_recursive_stdlib():
     """ir.py's own functions should stay py_cpy-free whether or not
     the recursive stdlib walker is enabled."""
@@ -58,13 +68,30 @@ def test_ir_py_functions_stay_no_cpy_with_recursive_stdlib():
         n_with_port = _count_py_cpy_in_module_funcs(
             with_port_text, "user_pcc_llvm_capi_ir_",
         )
+        n_float_bits = _count_py_cpy_in_module_funcs(
+            with_port_text, "user_pcc_stdlib__float_bits_",
+        )
 
         assert n_baseline == 0
         assert n_with_port == 0
+        assert n_float_bits == 0
+        module_str = _function_body(
+            with_port_text,
+            "user_pcc_llvm_capi_ir_Module___str__",
+        )
+        assert "strict.nolib.stub" not in module_str
+        assert "py_cpy_" not in module_str
+        assert "user_pcc_llvm_capi_ir__render_metadata_definition" in module_str
+        metadata_renderer = _function_body(
+            with_port_text,
+            "user_pcc_llvm_capi_ir__render_metadata_definition",
+        )
+        assert "strict.nolib.stub" not in metadata_renderer
+        assert "py_cpy_" not in metadata_renderer
 
 
-def test_ir_py_inline_float_bits_helpers_are_compiled():
-    """The pcc-friendly float bit helpers live directly in ir.py now."""
+def test_ir_py_shared_float_bits_helpers_are_compiled():
+    """IR wrappers and the one canonical float-bit owner are compiled."""
     from pcc.py_frontend.pipeline import compile_python
 
     with tempfile.TemporaryDirectory() as td:
@@ -81,12 +108,15 @@ def test_ir_py_inline_float_bits_helpers_are_compiled():
         assert re.search(
             r"@user_pcc_llvm_capi_ir__round_to_float32_ir\b", text,
         ), "ir._round_to_float32_ir should be defined"
-        assert "@user_pcc_stdlib__float_bits_" not in text
+        assert re.search(
+            r"@user_pcc_stdlib__float_bits__float64_to_bits\b", text,
+        ), "the canonical pcc.stdlib._float_bits helper should be defined"
+        assert "math.copysign.sign.bits" in text
+        assert "@user_pcc_py_stdlib_math_copysign" not in text
 
 
-def test_ir_py_recursive_stdlib_does_not_pull_struct_port():
-    """ir.py no longer imports struct, so recursive stdlib should not
-    pull the struct/_float_bits port into the combined module."""
+def test_ir_py_recursive_stdlib_pulls_float_bits_but_not_struct_port():
+    """IR uses the arithmetic owner without pulling the bytes API."""
     from pcc.py_frontend.pipeline import compile_python
 
     with tempfile.TemporaryDirectory() as td:
@@ -99,4 +129,4 @@ def test_ir_py_recursive_stdlib_does_not_pull_struct_port():
 
         text = out_combined.read_text(encoding="utf-8")
         assert "@user_pcc_stdlib_struct_" not in text
-        assert "@user_pcc_stdlib__float_bits_" not in text
+        assert "@user_pcc_stdlib__float_bits_" in text

@@ -105,7 +105,6 @@ class PageState(enum.Enum):
         EVACUATING--complete---> FREE
         ALLOCATED --evict------> EVICTED       (cold reclaim; identity retained)
         EVICTED   --allocate---> ALLOCATED    (reuse; new serial)
-        EVICTED   --free-------> FREE
 
     Identity (``BlockId.key()``) is invariant across every transition.
     """

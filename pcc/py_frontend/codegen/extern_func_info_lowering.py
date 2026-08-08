@@ -12,6 +12,7 @@ from ..py_ast import (
     DynType,
     FuncDef,
     Name,
+    NoneType,
     SourceSpan,
     StrLit,
     StrType,
@@ -91,11 +92,19 @@ class ExternFuncInfoLoweringMixin:
                     ),
                 )
             )
+        # The schema-carried bool survives self-hosted descriptor degradation
+        # to ("dyn",); keep the reconstructed FuncDef's return coherent with
+        # the void extern declaration (see
+        # native_modules._extern_user_function_return_ir_type).
+        if "returns_none" in info and bool(info["returns_none"]):
+            return_ty = NoneType("None")
+        else:
+            return_ty = decode_type(info.get("return_ty")) or DynType(name="dyn")
         return FuncDef(
             span=span,
             name=name,
             args=tuple(args),
-            return_ty=decode_type(info.get("return_ty")) or DynType(name="dyn"),
+            return_ty=return_ty,
             body=(),
             decorators=(),
             is_async=bool(info.get("is_async", False)),

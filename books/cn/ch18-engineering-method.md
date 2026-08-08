@@ -1,6 +1,6 @@
 # 第 18 章 工程方法论:测试、调查与声明卫生
 
-一本编译器书以方法论收尾,不是出于礼貌。pcc 的多数 bug 不是解析错误,而是语义错误:表达式组合、低层化(lowering)到 IR、再被真实程序锤打之后才显形,第一现场往往离根因隔着好几个子系统。在这样的系统里,"怎么测、怎么查、怎么说"不是工程卫生的附属品,而是设计本身的一部分——自举(bootstrap)不动点(fixed point)与五 GC 矩阵既是产品特性,也是这个仓库最重要的两台测量仪器。本章把仓库里成文的方法论逐一摊开:闸门(gate)体系与基线文件、调试手册的十二条技法、调查工作流的证据链纪律、声明卫生(claim hygiene)的模式标注规则、以及三次有案可查的"假信心"测量事故。所有内容都落在真实文件上:[AGENTS.md](../../AGENTS.md)、[docs/debugging-playbook.md](../../docs/debugging-playbook.md)、[docs/investigation-workflow.md](../../docs/investigation-workflow.md)、[codex-goal-prompt.md](../../codex-goal-prompt.md) 与 [docs/investigations/](../../docs/investigations) 下的调查记录。
+一本编译器书以方法论收尾,不是出于礼貌。pcc 的多数 bug 不是解析错误,而是语义错误:表达式组合、低层化(lowering)到 IR、再被真实程序锤打之后才显形,第一现场往往离根因隔着好几个子系统。在这样的系统里,"怎么测、怎么查、怎么说"不是工程卫生的附属品,而是设计本身的一部分——自举(bootstrap)不动点(fixed point)与五 GC 矩阵既是产品特性,也是这个仓库最重要的两台测量仪器。本章把仓库里成文的方法论逐一摊开:闸门(gate)体系与基线文件、调试手册的十二条技法、调查工作流的证据链纪律、声明卫生(claim hygiene)的模式标注规则、以及三次有案可查的"假信心"测量事故。所有内容都落在真实文件上:[AGENTS.md](../../AGENTS.md)、[docs/debugging-playbook.md](../../docs/debugging-playbook.md)、[docs/investigation-workflow.md](../../docs/investigation-workflow.md)、[goal-prompt.md](../../docs/goal/goal-prompt.md) 与 [docs/investigations/](../../docs/investigations) 下的调查记录。
 
 ## 本章导读:方法论服务于声明卫生
 
@@ -20,7 +20,7 @@
 
 **不动点是全系统差分测试。** `pcc0 -> pcc1 -> pcc2 -> pcc3` 的链条要求编译器复现自己:语义、运行时、代码生成、对象模型、后端、诊断中任何一处的不一致,都会以阶段间分歧的形式暴露。[AGENTS.md](../../AGENTS.md) 把它说破:不动点"不只是字节比较",而是各子系统连贯性的证据。作为测试,它有普通单测不具备的性质——输入是整个编译器自身,任何"只在大程序上出现"的语义 bug 都在它的打击面内;而 pcc2/pcc3 在 Mach-O 签名规范化后必须字节一致([tests/bootstrap_gate_baseline.json](../../tests/bootstrap_gate_baseline.json)),把判据压到了无法讨价还价的程度。差异不允许绕过,只允许分类:语义 / IR 文本 / 类布局 / 对象模型 / 后端非确定性 / 链接元数据 / 仅性能 / 诊断([AGENTS.md](../../AGENTS.md) 义务 5)。
 
-**五 GC 矩阵是同一契约的五个独立观察者。** 五个后端(引用计数+循环、增量、并发、分代、重定位)消费同一份槽位追踪契约(`py_obj_visit_slots` / `py_obj_update_slot` 与根、帧、原生句柄注册)。生产平等规则([codex-goal-prompt.md](../../codex-goal-prompt.md) G-track)禁止任何后端靠弱化终结器、弱引用、复活、挂起协程帧或值载荷语义取胜;于是每个对象图错误有五次被不同算法抓住的机会——前端漏注册一个 GC 根,在后端 #0 上可能被引用计数掩盖,在 #4 的重定位下立刻变成悬垂指针。`tests/python/gc/test_pcc_bootstrap_full_gc{0..4}.py` 把"五个后端各自跑通三阶段自举"固化成一文件一后端的闸门,正是把这台仪器接到不动点那台仪器上。
+**五 GC 矩阵是同一契约的五个独立观察者。** 五个后端(引用计数+循环、增量、并发、分代、重定位)消费同一份槽位追踪契约(`py_obj_visit_slots` / `py_obj_update_slot` 与根、帧、原生句柄注册)。生产平等规则([goal-prompt.md](../../docs/goal/goal-prompt.md) G-track)禁止任何后端靠弱化终结器、弱引用、复活、挂起协程帧或值载荷语义取胜;于是每个对象图错误有五次被不同算法抓住的机会——前端漏注册一个 GC 根,在后端 #0 上可能被引用计数掩盖,在 #4 的重定位下立刻变成悬垂指针。`tests/python/gc/test_pcc_bootstrap_full_gc{0..4}.py` 把"五个后端各自跑通三阶段自举"固化成一文件一后端的闸门,正是把这台仪器接到不动点那台仪器上。
 
 这就是本章的立场:方法论不是围绕设计的脚手架,而是设计的延伸。后文各节是这台仪器组的使用手册。
 
@@ -74,7 +74,7 @@ def _isolate_env_and_caches(tmp_path_factory):
 
 "棘轮"(ratchet)一词值得停一下:这类闸门不断言一个固定值,而断言**单调性**——当前回退数不得劣于基线。它把"进展"本身变成了可回归测试的量,任何让回退面回潮的改动会被机械地拦住,而不依赖评审者记得上个月的数字。
 
-闸门之上是声明强度的分级。[codex-goal-prompt.md](../../codex-goal-prompt.md) §0.7 规定 `DONE_STRONG` 的全部前提:实现必须是通用机制而非硬编码特例;有聚焦回归与负向/边界测试;涉及 pcc1 的声明要有 `PCC_HOST_PYTHON=/bin/false` 级别的无宿主证据;涉及运行时/GC/根/对象生命周期的声明,自举证据必须是全五 GC 的——仅后端 #0 通过不构成强声明;性能声明要有 IR 形状闸门加运行期基准。§0.9 进一步规定证据格式:命令必须完整可复现,没跑就写 `not run` 并说明原因,**禁止写 "should pass"**;凡触及 pcc1、self 后端、no-libpython、运行时/GC、共享低层化路径的切片,完成摘要必须带一行 `bootstrap: passed|failed|not run`,缺这一行本身就是验证缺口。
+闸门之上是声明强度的分级。[goal-prompt.md](../../docs/goal/goal-prompt.md) §0.1 规定 `DONE_STRONG` 的全部前提:实现必须是通用机制而非硬编码特例;有聚焦回归与负向/边界测试;涉及 pcc1 的声明要有 `PCC_HOST_PYTHON=/bin/false` 级别的无宿主证据;涉及运行时/GC/根/对象生命周期的声明,自举证据必须是全五 GC 的——仅后端 #0 通过不构成强声明;性能声明要有 IR 形状闸门加运行期基准。§0.2 进一步规定证据格式:命令必须完整可复现,没跑就写 `not run` 并说明原因,**禁止写 "should pass"**;凡触及 pcc1、self 后端、no-libpython、运行时/GC、共享低层化路径的切片,完成摘要必须带一行 `bootstrap: passed|failed|not run`,缺这一行本身就是验证缺口。
 
 ## 18.3 调试手册:十二条技法
 
@@ -124,7 +124,7 @@ def _isolate_env_and_caches(tmp_path_factory):
 
 ## 18.5 声明卫生:模式是命题的一部分
 
-pcc 的七义务之一是"兼容性必须模式标注"。操作化它的是 [codex-goal-prompt.md](../../codex-goal-prompt.md) §0.10 的声明卫生表,原文八行,值得整段抄录:
+pcc 的七义务之一是"兼容性必须模式标注"。操作化它的是 [goal-prompt.md](../../docs/goal/goal-prompt.md) §0.10 的声明卫生表,原文八行,值得整段抄录:
 
 ```text
 host pcc pass          != pcc1 pass
@@ -155,7 +155,7 @@ microbenchmark win     != whole-program performance win
 
 *事故三:中途读缓冲日志,误判一次成功的自举(2026-05-29)。* 同样在 [docs/current-goal-state.md](../../docs/current-goal-state.md),ob_type 桥接落地的条目里有一段标明"诊断诚实"的自述:作者先**误读**自举为失败——在约 54 秒的运行尚在 stage2 中途时过早读取缓冲中的日志与构建目录,且命令尾随的 `;ls` 掩盖了真实退出码——于是回退了一个正确的改动;重新干净跑一遍后确认是误诊,改动重新落地。记录下的教训:自举结果只在任务完成后读,以完整日志的 `verify:` 行加自举自身的退出码为准,不做中途的制品检查。
 
-三次事故同构:测量动作本身正确,**前提**——缓存新鲜、模式正确、运行完结——被静默违反。这就是为什么 §0.9 要求证据写出完整命令:可复现的命令把前提显式化,让下一个读者有机会发现前提坏了。
+三次事故同构:测量动作本身正确,**前提**——缓存新鲜、模式正确、运行完结——被静默违反。这就是为什么 §0.2 要求证据写出完整命令:可复现的命令把前提显式化,让下一个读者有机会发现前提坏了。
 
 ## 18.7 历史与教训
 

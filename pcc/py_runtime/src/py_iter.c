@@ -9,14 +9,24 @@
 #include "py_internal.h"
 #include <stdlib.h>
 
+static PyObject *iter_require_result(
+    PyObject *result,
+    const char *helper_name,
+    const char *message
+) {
+    if (result == NULL) {
+        py_runtime_error_if_unset(helper_name, message);
+    }
+    return result;
+}
+
 
 static PyObject *py_iter_new(PyObject *seq) {
     if (seq == NULL) return NULL;
-    PyIterObject *it = (PyIterObject *)malloc(sizeof(PyIterObject));
+    PyIterObject *it = (PyIterObject *)pcc_gc_alloc(
+        (int64_t)sizeof(PyIterObject), PY_TYPE_ITER, 0
+    );
     if (it == NULL) return NULL;
-    it->h.refcount = 1;
-    it->h.type_tag = PY_TYPE_ITER;
-    it->h.flags = 0;
     py_incref(seq);
     it->seq = seq;
     it->index = 0;
@@ -49,19 +59,35 @@ void py_dealloc_iter(PyObject *o) {
 #define PY_ITER_CALLABLE_DONE   (-2)
 
 PyObject *py_iter_callable_new(PyObject *callable, PyObject *sentinel) {
-    if (callable == NULL || sentinel == NULL) return NULL;
+    if (callable == NULL || sentinel == NULL) {
+        return iter_require_result(
+            NULL,
+            "py_iter_callable_new",
+            "iter(callable, sentinel) received NULL operand"
+        );
+    }
     PyObject *pair = py_tuple_new(2);
-    if (pair == NULL) return NULL;
+    if (pair == NULL) {
+        return iter_require_result(
+            NULL,
+            "py_tuple_new",
+            "iter(callable, sentinel) could not allocate its state tuple"
+        );
+    }
     py_tuple_set_item(pair, 0, callable);
     py_tuple_set_item(pair, 1, sentinel);
-    PyIterObject *it = (PyIterObject *)malloc(sizeof(PyIterObject));
+    PyIterObject *it = (PyIterObject *)pcc_gc_alloc(
+        (int64_t)sizeof(PyIterObject), PY_TYPE_ITER, 0
+    );
     if (it == NULL) {
+        iter_require_result(
+            NULL,
+            "py_iter_callable_new",
+            "iter(callable, sentinel) could not allocate iterator state"
+        );
         py_decref(pair);
         return NULL;
     }
-    it->h.refcount = 1;
-    it->h.type_tag = PY_TYPE_ITER;
-    it->h.flags = 0;
     /* pair is a fresh reference owned by the iterator; py_dealloc_iter
      * decrefs it->seq, which releases the tuple (and its two members). */
     it->seq = pair;
@@ -72,28 +98,64 @@ PyObject *py_iter_callable_new(PyObject *callable, PyObject *sentinel) {
 
 
 PyObject *py_obj_iter(PyObject *o) {
-    if (o == NULL) return NULL;
+    if (o == NULL) {
+        return iter_require_result(
+            NULL,
+            "py_obj_iter",
+            "py_obj_iter received NULL object"
+        );
+    }
     int32_t tag = py_type_of(o);
-    if (tag == PY_TYPE_ITER || tag == PY_TYPE_GEN) {
+    if (tag == PY_TYPE_ITER || tag == PY_TYPE_GEN || tag == PY_TYPE_FILE) {
         py_incref(o);
         return o;
     }
     if (tag == PY_TYPE_LIST || tag == PY_TYPE_TUPLE || tag == PY_TYPE_STR ||
         tag == PY_TYPE_BYTES || tag == PY_TYPE_BYTEARRAY ||
         tag == PY_TYPE_MEMORYVIEW) {
-        return py_iter_new(o);
+        return iter_require_result(
+            py_iter_new(o),
+            "py_iter_new",
+            "sequence iterator allocation failed without setting an exception"
+        );
     }
     if (tag == PY_TYPE_DICT) {
         PyObject *keys = py_dict_keys(o);
-        if (keys == NULL) return NULL;
+        if (keys == NULL) {
+            return iter_require_result(
+                NULL,
+                "py_dict_keys",
+                "dictionary iterator snapshot failed without setting an exception"
+            );
+        }
         PyObject *it = py_iter_new(keys);
+        if (it == NULL) {
+            iter_require_result(
+                NULL,
+                "py_iter_new",
+                "dictionary iterator allocation failed without setting an exception"
+            );
+        }
         py_decref(keys);
         return it;
     }
     if (tag == PY_TYPE_SET) {
         PyObject *items = py_set_items(o);
-        if (items == NULL) return NULL;
+        if (items == NULL) {
+            return iter_require_result(
+                NULL,
+                "py_set_items",
+                "set iterator snapshot failed without setting an exception"
+            );
+        }
         PyObject *it = py_iter_new(items);
+        if (it == NULL) {
+            iter_require_result(
+                NULL,
+                "py_iter_new",
+                "set iterator allocation failed without setting an exception"
+            );
+        }
         py_decref(items);
         return it;
     }
@@ -112,7 +174,42 @@ PyObject *py_obj_next(PyObject *it_obj) {
     if (it_obj != NULL && !PY_IS_TAGGED_INT(it_obj)) {
         PyObjectHeader *h = py_header(it_obj);
         if (h->type_tag == PY_TYPE_GEN) {
-            return py_gen_next(it_obj);
+            return iter_require_result(
+                py_gen_next(it_obj),
+                "py_gen_next",
+                "generator next returned NULL without StopIteration or an exception"
+            );
+        }
+        if (h->type_tag == PY_TYPE_FILE) {
+            PyObject *line = py_file_readline(it_obj, -1);
+            if (line == NULL) {
+                return iter_require_result(
+                    NULL,
+                    "py_file_readline",
+                    "file iterator readline returned NULL without an exception"
+                );
+            }
+            int32_t line_tag = py_type_of(line);
+            int64_t line_length = -1;
+            if (line_tag == PY_TYPE_STR) {
+                line_length = py_str_len(line);
+            } else if (line_tag == PY_TYPE_BYTES) {
+                line_length = py_bytes_len(line);
+            }
+            if (line_length == 0) {
+                py_decref(line);
+                py_raise_owned(py_exc_new(PY_EXC_STOPITERATION, ""));
+                return NULL;
+            }
+            if (line_length < 0) {
+                py_decref(line);
+                return iter_require_result(
+                    NULL,
+                    "py_file_readline",
+                    "file iterator readline returned a non-line object"
+                );
+            }
+            return line;
         }
         if (pcc_capi_is_cext_type_tag((int64_t)h->type_tag) != 0) {
             PyObject *item = pcc_capi_cext_object_next(it_obj);
@@ -136,9 +233,42 @@ PyObject *py_obj_next(PyObject *it_obj) {
         }
         PyObject *pair = pcc_gc_load_ptr(it_obj, &it->seq);
         PyObject *callable = py_tuple_get(pair, 0);
+        if (callable == NULL) {
+            return iter_require_result(
+                NULL,
+                "py_tuple_get",
+                "callable iterator lost its callable"
+            );
+        }
         PyObject *sentinel = py_tuple_get(pair, 1);
+        if (sentinel == NULL) {
+            iter_require_result(
+                NULL,
+                "py_tuple_get",
+                "callable iterator lost its sentinel"
+            );
+            py_decref(callable);
+            return NULL;
+        }
         PyObject *args = py_tuple_new(0);
+        if (args == NULL) {
+            iter_require_result(
+                NULL,
+                "py_tuple_new",
+                "callable iterator could not allocate its argument tuple"
+            );
+            py_decref(callable);
+            py_decref(sentinel);
+            return NULL;
+        }
         PyObject *result = py_obj_call(callable, args, py_None);
+        if (result == NULL) {
+            iter_require_result(
+                NULL,
+                "py_obj_call",
+                "callable iterator returned NULL without setting an exception"
+            );
+        }
         py_decref(args);
         py_decref(callable);
         if (result == NULL) {
@@ -172,6 +302,13 @@ PyObject *py_obj_next(PyObject *it_obj) {
         n = py_str_len(seq);
         if (it->index >= n) goto exhausted;
         PyObject *idx = py_int_from_i64(it->index);
+        if (idx == NULL) {
+            return iter_require_result(
+                NULL,
+                "py_int_from_i64",
+                "string iterator could not allocate its index"
+            );
+        }
         item = py_str_index(seq, idx);
         py_decref(idx);
     } else if (tag == PY_TYPE_BYTES || tag == PY_TYPE_BYTEARRAY ||
@@ -179,11 +316,25 @@ PyObject *py_obj_next(PyObject *it_obj) {
         n = py_bytes_len(seq);
         if (it->index >= n) goto exhausted;
         PyObject *idx = py_int_from_i64(it->index);
+        if (idx == NULL) {
+            return iter_require_result(
+                NULL,
+                "py_int_from_i64",
+                "bytes iterator could not allocate its index"
+            );
+        }
         item = py_bytes_getitem(seq, idx);
         py_decref(idx);
     } else {
         py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "iterator source is invalid"));
         return NULL;
+    }
+    if (item == NULL) {
+        return iter_require_result(
+            NULL,
+            "py_obj_next",
+            "iterator element lookup returned NULL without setting an exception"
+        );
     }
     it->index++;
     return item;

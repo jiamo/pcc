@@ -1,3 +1,10 @@
+/*
+ * Host-C oracle for py/py_http_runtime.py.
+ *
+ * The production pcc-Python archive compiles the owned implementation and
+ * deliberately excludes this object.  Keep this source as the independent C
+ * behavior oracle for the ordinary C runtime and focused parity tests.
+ */
 #include "py_internal.h"
 
 #include <errno.h>
@@ -219,17 +226,31 @@ static void sha256_final(PccSha256 *ctx, unsigned char out[32]) {
     }
 }
 
-PyObject *py_sha256_file_hex(PyObject *path_obj) {
+static PyObject *sha256_file_hex_bounded(PyObject *path_obj, int64_t max_bytes) {
+    if (max_bytes <= 0) return py_str_new("", 0);
     const char *path = py_str_utf8(path_obj);
     FILE *fh = fopen(path, "rb");
     if (fh == NULL) return py_str_new("", 0);
     PccSha256 ctx;
     sha256_init(&ctx);
     unsigned char buffer[32768];
+    int64_t total = 0;
     for (;;) {
-        size_t count = fread(buffer, 1, sizeof(buffer), fh);
+        int64_t remaining = max_bytes - total;
+        size_t read_cap = sizeof(buffer);
+        if (remaining < (int64_t)sizeof(buffer)) {
+            /* Read one sentinel byte past the admitted payload so an exact
+             * max-sized file is distinguishable from an oversized prefix. */
+            read_cap = (size_t)remaining + 1U;
+        }
+        size_t count = fread(buffer, 1, read_cap, fh);
+        if (count > (size_t)remaining) {
+            fclose(fh);
+            return py_str_new("", 0);
+        }
+        total += (int64_t)count;
         if (count > 0) sha256_update(&ctx, buffer, count);
-        if (count < sizeof(buffer)) {
+        if (count < read_cap) {
             if (ferror(fh)) {
                 fclose(fh);
                 return py_str_new("", 0);
@@ -248,6 +269,14 @@ PyObject *py_sha256_file_hex(PyObject *path_obj) {
     }
     hex[64] = '\0';
     return py_str_new(hex, 64);
+}
+
+PyObject *py_sha256_file_hex(PyObject *path_obj) {
+    return sha256_file_hex_bounded(path_obj, INT64_MAX);
+}
+
+PyObject *py_sha256_file_hex_bounded(PyObject *path_obj, int64_t max_bytes) {
+    return sha256_file_hex_bounded(path_obj, max_bytes);
 }
 
 static int parse_http_url(
@@ -296,9 +325,19 @@ static int parse_http_url(
 static int send_all(int fd, const char *buf, size_t len) {
     size_t off = 0;
     while (off < len) {
+#ifdef PCC_USE_FREESTANDING_PLATFORM_SOCKET
+        int64_t n = pcc_platform_socket_send(
+            (int64_t)fd, buf + off, (int64_t)(len - off), 0
+        );
+#else
         ssize_t n = send(fd, buf + off, len - off, 0);
+#endif
         if (n < 0) {
+#ifdef PCC_USE_FREESTANDING_PLATFORM_SOCKET
+            if (n == -EINTR) continue;
+#else
             if (errno == EINTR) continue;
+#endif
             return -1;
         }
         if (n == 0) return -1;
@@ -308,6 +347,9 @@ static int send_all(int fd, const char *buf, size_t len) {
 }
 
 static int connect_http_socket(const char *host, const char *port) {
+#ifdef PCC_USE_FREESTANDING_PLATFORM_SOCKET
+    return (int)pcc_platform_tcp_connect(host, port);
+#else
     struct addrinfo hints;
     struct addrinfo *result = NULL;
     memset(&hints, 0, sizeof(hints));
@@ -325,6 +367,7 @@ static int connect_http_socket(const char *host, const char *port) {
     }
     freeaddrinfo(result);
     return fd;
+#endif
 }
 #endif
 
@@ -361,17 +404,29 @@ int64_t py_http_download_to_file(PyObject *url_obj, PyObject *dest_obj) {
         host
     );
     if (req_len <= 0 || (size_t)req_len >= sizeof(request)) {
+#ifdef PCC_USE_FREESTANDING_PLATFORM_IO
+        (void)pcc_platform_close((int64_t)fd);
+#else
         close(fd);
+#endif
         return -4;
     }
     if (send_all(fd, request, (size_t)req_len) != 0) {
+#ifdef PCC_USE_FREESTANDING_PLATFORM_IO
+        (void)pcc_platform_close((int64_t)fd);
+#else
         close(fd);
+#endif
         return -5;
     }
 
     FILE *out = fopen(dest, "wb");
     if (out == NULL) {
+#ifdef PCC_USE_FREESTANDING_PLATFORM_IO
+        (void)pcc_platform_close((int64_t)fd);
+#else
         close(fd);
+#endif
         return -6;
     }
 
@@ -381,11 +436,25 @@ int64_t py_http_download_to_file(PyObject *url_obj, PyObject *dest_obj) {
     int header_done = 0;
     int status_ok = 0;
     for (;;) {
+#ifdef PCC_USE_FREESTANDING_PLATFORM_SOCKET
+        int64_t n = pcc_platform_socket_recv(
+            (int64_t)fd, buf, (int64_t)sizeof(buf), 0
+        );
+#else
         ssize_t n = recv(fd, buf, sizeof(buf), 0);
+#endif
         if (n < 0) {
+#ifdef PCC_USE_FREESTANDING_PLATFORM_SOCKET
+            if (n == -EINTR) continue;
+#else
             if (errno == EINTR) continue;
+#endif
             fclose(out);
+#ifdef PCC_USE_FREESTANDING_PLATFORM_IO
+            (void)pcc_platform_close((int64_t)fd);
+#else
             close(fd);
+#endif
             return -7;
         }
         if (n == 0) break;
@@ -412,13 +481,21 @@ int64_t py_http_download_to_file(PyObject *url_obj, PyObject *dest_obj) {
         if (off < (size_t)n) {
             if (fwrite(buf + off, 1, (size_t)n - off, out) != (size_t)n - off) {
                 fclose(out);
+#ifdef PCC_USE_FREESTANDING_PLATFORM_IO
+                (void)pcc_platform_close((int64_t)fd);
+#else
                 close(fd);
+#endif
                 return -8;
             }
         }
     }
     fclose(out);
+#ifdef PCC_USE_FREESTANDING_PLATFORM_IO
+    (void)pcc_platform_close((int64_t)fd);
+#else
     close(fd);
+#endif
     return status_ok ? 0 : -9;
 #endif
 }

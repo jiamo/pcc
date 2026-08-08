@@ -9,10 +9,10 @@ The first real IR passes land in subsequent phases (P2a/b/c); at that
 point additional per-pass parity tests will grow alongside them.
 """
 
-import shutil
 import unittest
 
 import llvmlite.binding as llvm
+import pytest
 
 from pcc.ir_passes import IRPassManager, ModulePass, PreservedAnalyses
 from pcc.ir_passes.parity import (
@@ -25,14 +25,10 @@ from pcc.ir_passes.parity import (
     run_pcc_ir_pass,
     run_upstream_opt,
 )
+from pcc.passes.llvm_text_pipeline import find_opt_binary
 
 
-_OPT_AVAILABLE = shutil.which("opt") is not None
-
-
-def _require_opt():
-    if not _OPT_AVAILABLE:
-        raise unittest.SkipTest("LLVM 'opt' not on PATH")
+_OPT_BINARY = find_opt_binary()
 
 
 _BASIC_IR = """
@@ -197,10 +193,18 @@ class RunPccIRPassTests(unittest.TestCase):
                         or True)
 
 
-@unittest.skipUnless(_OPT_AVAILABLE, "requires LLVM 'opt' on PATH")
+@pytest.mark.pcc_gate(
+    unavailable=(
+        None if _OPT_BINARY is not None else "matching LLVM opt not installed"
+    )
+)
 class UpstreamOptTests(unittest.TestCase):
     def test_instsimplify_folds_add_zero(self):
-        result = run_upstream_opt(_BASIC_IR, "instsimplify")
+        result = run_upstream_opt(
+            _BASIC_IR,
+            "instsimplify",
+            opt_path=_OPT_BINARY,
+        )
         self.assertEqual(result.returncode, 0)
         shape = module_shape(result.ir_text)
         fn = shape.functions[0]
@@ -211,7 +215,12 @@ class UpstreamOptTests(unittest.TestCase):
 
     def test_noop_pcc_pass_diffs_against_instsimplify(self):
         """A no-op pcc pass must *not* match instsimplify output."""
-        report = assert_ir_parity(_BASIC_IR, _NoOpPass(), "instsimplify")
+        report = assert_ir_parity(
+            _BASIC_IR,
+            _NoOpPass(),
+            "instsimplify",
+            opt_path=_OPT_BINARY,
+        )
         self.assertFalse(report.is_equivalent,
                          "no-op pcc pass can't match real instsimplify")
 

@@ -25,6 +25,10 @@ not rebuilding all of CPython.
 | `collections` | skeleton | OrderedDict, defaultdict, namedtuple, deque |
 | `decimal` | skeleton | Decimal type identity; construction fails explicitly |
 | `pathlib` | skeleton | PurePath, Path |
+| `ntpath` | finite port | lexical Windows path operations used by cross-platform build tools |
+| `msvcrt` | platform boundary | compile-owned Windows import; non-Windows import parity and unowned CRT operations fail closed |
+| `unicodedata` | finite port | East-Asian-width classes used by Meson terminal formatting |
+| `xml.etree.ElementTree` | finite port | bounded element construction, parsing, XPath subset, and deterministic XML output |
 | `hashlib` | stub | binds OpenSSL via extern |
 | `time` | stub | binds libc via extern (time, monotonic, sleep) |
 | `string` | skeleton | ascii_lowercase/uppercase/digits constants |

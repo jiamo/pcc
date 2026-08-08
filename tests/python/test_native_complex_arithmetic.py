@@ -168,3 +168,28 @@ def test_complex_pow_zero_to_negative_raises(tmp_path, monkeypatch, runtime_cc):
             main()
     """, runtime_cc=runtime_cc, monkeypatch=monkeypatch)
     assert out.split("\n")[:2] == ["zerodiv raised", "0j"], out
+
+
+@pytest.mark.parametrize("runtime_cc", [False, True], ids=["port", "cc"])
+def test_complex_pow_general_imaginary_exponent_and_numeric_coercion(
+    tmp_path, monkeypatch, runtime_cc
+):
+    out = _run(tmp_path, """
+        def main():
+            print(complex(1, 2) ** complex(3, 4))
+            print(2 ** complex(1, 1))
+            print(complex(2, 3) ** True)
+            print(complex(-1, 0) ** 0.5)
+
+        if __name__ == "__main__":
+            main()
+    """, runtime_cc=runtime_cc, monkeypatch=monkeypatch)
+    actual = [complex(line) for line in out.splitlines()[:4]]
+    expected = [
+        complex(1, 2) ** complex(3, 4),
+        2 ** complex(1, 1),
+        complex(2, 3) ** True,
+        complex(-1, 0) ** 0.5,
+    ]
+    for got, want in zip(actual, expected, strict=True):
+        assert abs(got - want) <= 1e-12 * max(1.0, abs(want))

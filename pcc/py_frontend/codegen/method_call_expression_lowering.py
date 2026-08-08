@@ -31,6 +31,7 @@ from ..py_ast import (
     Type,
 )
 from . import marshal
+from .freestanding_abi_constants import PY_TYPE_STR
 from .errors import L1CodegenError
 
 _I1 = ir.IntType(1)
@@ -244,7 +245,7 @@ class MethodCallExpressionLoweringMixin:
             is_str = self.builder.icmp_signed(
                 "==",
                 tag,
-                ir.Constant(_I64, 4),
+                ir.Constant(_I64, PY_TYPE_STR),
                 name=self._fresh("str.__str__.is_str"),
             )
             ok_bb = self.current_function.append_basic_block(
@@ -266,15 +267,6 @@ class MethodCallExpressionLoweringMixin:
                 [value],
                 name=self._fresh("str.__str__"),
             )
-
-        if _method_is_name(attr.obj):
-            module_name = self._native_builtin_module_for_name(_method_ident(attr.obj))
-            if module_name == "warnings" and attr.name in (
-                "warn",
-                "filterwarnings",
-                "simplefilter",
-            ):
-                return self._emit_none_literal()
 
         if (
             attr.name == "__call__"
@@ -518,6 +510,7 @@ class MethodCallExpressionLoweringMixin:
                     attr.name,
                     expr.args,
                     kwargs=expr.kwargs,
+                    operand_order=expr.operand_order,
                 )
 
         compiled_builtin_call = self._maybe_emit_native_builtin_compiled_call(expr)
@@ -547,6 +540,7 @@ class MethodCallExpressionLoweringMixin:
                     attr.name,
                     expr.args,
                     kwargs=expr.kwargs,
+                    operand_order=expr.operand_order,
                 )
             cpy_gv = getattr(self, "_cpy_module_env", {}).get(attr.obj.ident)
             if cpy_gv is not None:
@@ -555,6 +549,7 @@ class MethodCallExpressionLoweringMixin:
                     attr.name,
                     expr.args,
                     kwargs=expr.kwargs,
+                    operand_order=expr.operand_order,
                 )
             if getattr(self, "_cpy_env_flags", {}).get(attr.obj.ident, False):
                 if attr.name in _STR_METHOD_NATIVE:
@@ -566,6 +561,7 @@ class MethodCallExpressionLoweringMixin:
                     attr.name,
                     expr.args,
                     kwargs=expr.kwargs,
+                    operand_order=expr.operand_order,
                 )
         if isinstance(attr.obj, Attr):
             # Evaluate the chain eagerly; if the result was tagged as a
@@ -577,6 +573,7 @@ class MethodCallExpressionLoweringMixin:
                     attr.name,
                     expr.args,
                     kwargs=expr.kwargs,
+                    operand_order=expr.operand_order,
                 )
         if attr.name == "strftime" and len(expr.args) == 1 and not expr.kwargs:
             # Native datetime/time-like ``obj.strftime(fmt)`` for values whose
@@ -617,6 +614,7 @@ class MethodCallExpressionLoweringMixin:
                     attr.name,
                     expr.args,
                     kwargs=expr.kwargs,
+                    operand_order=expr.operand_order,
                 )
             call_receiver_hint = self._class_hint_for_expr(attr.obj)
             if (
@@ -677,6 +675,7 @@ class MethodCallExpressionLoweringMixin:
                 attr.name,
                 expr.args,
                 kwargs=expr.kwargs,
+                operand_order=expr.operand_order,
             )
 
         # Generator intrinsics. The ``send``/``throw``/``close`` names are
@@ -1089,6 +1088,7 @@ class MethodCallExpressionLoweringMixin:
                         attr.name,
                         expr.args,
                         kwargs=expr.kwargs,
+                        park_expr=expr,
                     )
                 if kind == "classmethod":
                     recv_slot = self.env.get("cls")
@@ -1110,6 +1110,7 @@ class MethodCallExpressionLoweringMixin:
                         attr.name,
                         expr.args,
                         kwargs=expr.kwargs,
+                        park_expr=expr,
                     )
                 self_val = self.builder.load(
                     self.env["self"][0], name=self._fresh("self")
@@ -1123,6 +1124,7 @@ class MethodCallExpressionLoweringMixin:
                         attr.name,
                         expr.args,
                         kwargs=expr.kwargs,
+                        park_expr=expr,
                     )
                 except L1CodegenError as e:
                     if "too many positional args" not in str(e):
@@ -1133,6 +1135,7 @@ class MethodCallExpressionLoweringMixin:
                         attr.name,
                         expr.args,
                         kwargs=expr.kwargs,
+                        park_expr=expr,
                     )
 
         # Case 1b: ``cls.method(...)`` inside a ``@classmethod`` body.
@@ -1162,6 +1165,7 @@ class MethodCallExpressionLoweringMixin:
                             attr.name,
                             expr.args,
                             kwargs=expr.kwargs,
+                            park_expr=expr,
                         )
                     except L1CodegenError as e:
                         if "too many positional args" not in str(e):
@@ -1172,6 +1176,7 @@ class MethodCallExpressionLoweringMixin:
                             attr.name,
                             expr.args,
                             kwargs=expr.kwargs,
+                            park_expr=expr,
                         )
                 if kind == "static":
                     method_fn = method_info.methods[attr.name]
@@ -1181,6 +1186,7 @@ class MethodCallExpressionLoweringMixin:
                         attr.name,
                         expr.args,
                         kwargs=expr.kwargs,
+                        park_expr=expr,
                     )
                 if kind == "classmethod":
                     cls_ptr = self.builder.load(
@@ -1195,6 +1201,7 @@ class MethodCallExpressionLoweringMixin:
                         attr.name,
                         expr.args,
                         kwargs=expr.kwargs,
+                        park_expr=expr,
                     )
                 # Instance method called via ``cls`` — pcc can't
                 # construct a bound instance, so treat as a static
@@ -1209,6 +1216,7 @@ class MethodCallExpressionLoweringMixin:
                     attr.name,
                     expr.args,
                     kwargs=expr.kwargs,
+                    park_expr=expr,
                 )
 
         # Case 2: ``ClassName.method(...)`` — direct static/classmethod
@@ -1300,6 +1308,7 @@ class MethodCallExpressionLoweringMixin:
                         attr.name,
                         expr.args,
                         kwargs=expr.kwargs,
+                        park_expr=expr,
                     )
                 if kind == "classmethod":
                     if call_receiver is not None:
@@ -1317,6 +1326,7 @@ class MethodCallExpressionLoweringMixin:
                         attr.name,
                         expr.args,
                         kwargs=expr.kwargs,
+                        park_expr=expr,
                     )
                 # Explicit base-class instance dispatch such as
                 # ``Base.method(self, ...)`` should pass the caller's
@@ -1330,6 +1340,7 @@ class MethodCallExpressionLoweringMixin:
                         attr.name,
                         expr.args,
                         kwargs=expr.kwargs,
+                        park_expr=expr,
                     )
                 return self._emit_static_method_call(
                     method_fn,
@@ -1337,6 +1348,7 @@ class MethodCallExpressionLoweringMixin:
                     attr.name,
                     expr.args,
                     kwargs=expr.kwargs,
+                    park_expr=expr,
                 )
             # ``KnownClass.method(...)`` where the method is not resolvable
             # on the natively-known MRO (e.g. the base class is
@@ -1384,6 +1396,7 @@ class MethodCallExpressionLoweringMixin:
                                 attr.name,
                                 expr.args,
                                 kwargs=expr.kwargs,
+                                park_expr=expr,
                             )
                         if kind == "classmethod":
                             cls_ptr = self.builder.load(
@@ -1397,6 +1410,7 @@ class MethodCallExpressionLoweringMixin:
                                 attr.name,
                                 expr.args,
                                 kwargs=expr.kwargs,
+                                park_expr=expr,
                             )
                         return self._emit_static_method_call(
                             method_fn,
@@ -1404,6 +1418,7 @@ class MethodCallExpressionLoweringMixin:
                             attr.name,
                             expr.args,
                             kwargs=expr.kwargs,
+                            park_expr=expr,
                         )
 
         # Case 3: ``other_obj.method(...)`` — first try the class hint
@@ -1433,6 +1448,7 @@ class MethodCallExpressionLoweringMixin:
                             attr.name,
                             expr.args,
                             kwargs=expr.kwargs,
+                            park_expr=expr,
                         )
                     obj_val = self._emit_expr(attr.obj)
                     if kind == "classmethod":
@@ -1447,6 +1463,7 @@ class MethodCallExpressionLoweringMixin:
                         attr.name,
                         expr.args,
                         kwargs=expr.kwargs,
+                        park_expr=expr,
                     )
                 class_info = self.class_lowering.classes.get(hint)
                 if class_info is not None and self._class_attr_needs_runtime_lookup(
@@ -1482,6 +1499,7 @@ class MethodCallExpressionLoweringMixin:
                         attr.name,
                         expr.args,
                         kwargs=expr.kwargs,
+                        park_expr=expr,
                     )
                 obj_val = self._emit_expr(attr.obj)
                 if kind == "classmethod":
@@ -1496,6 +1514,7 @@ class MethodCallExpressionLoweringMixin:
                     attr.name,
                     expr.args,
                     kwargs=expr.kwargs,
+                    park_expr=expr,
                 )
             class_info = self.class_lowering.classes.get(receiver_hint)
             if class_info is not None and self._class_attr_needs_runtime_lookup(
@@ -1566,32 +1585,52 @@ class MethodCallExpressionLoweringMixin:
                 and not receiver_is_unhinted_module_global
                 and not receiver_is_module_alias
             ):
+                candidate_info = None
+                candidate_count = 0
                 for info in self.class_lowering.classes.values():
                     if attr.name in info.methods:
-                        kind = info.method_kinds.get(attr.name, "instance")
-                        if kind == "static":
-                            method_fn = info.methods[attr.name]
-                            return self._emit_static_method_call(
-                                method_fn,
-                                info,
-                                attr.name,
-                                expr.args,
-                                kwargs=expr.kwargs,
-                            )
-                        obj_val = self._emit_expr(attr.obj)
-                        if kind == "classmethod":
-                            obj_val = self.builder.load(
-                                info.global_var, name=self._fresh(".cls.recv")
-                            )
-                        method_fn = info.methods[attr.name]
-                        return self._emit_direct_method_call(
+                        candidate_info = info
+                        candidate_count += 1
+                        if candidate_count > 1:
+                            break
+                if candidate_count > 1:
+                    return self._emit_callable_attribute_call(
+                        attr.obj,
+                        attr.name,
+                        expr.args,
+                        expr.kwargs,
+                        expr.span,
+                    )
+                if candidate_info is not None:
+                    kind = candidate_info.method_kinds.get(
+                        attr.name, "instance"
+                    )
+                    if kind == "static":
+                        method_fn = candidate_info.methods[attr.name]
+                        return self._emit_static_method_call(
                             method_fn,
-                            obj_val,
-                            info,
+                            candidate_info,
                             attr.name,
                             expr.args,
                             kwargs=expr.kwargs,
+                            park_expr=expr,
                         )
+                    obj_val = self._emit_expr(attr.obj)
+                    if kind == "classmethod":
+                        obj_val = self.builder.load(
+                            candidate_info.global_var,
+                            name=self._fresh(".cls.recv"),
+                        )
+                    method_fn = candidate_info.methods[attr.name]
+                    return self._emit_direct_method_call(
+                        method_fn,
+                        obj_val,
+                        candidate_info,
+                        attr.name,
+                        expr.args,
+                        kwargs=expr.kwargs,
+                        park_expr=expr,
+                    )
 
         if (
             attr.name in ("__init__", "__new__")
@@ -1724,7 +1763,20 @@ class MethodCallExpressionLoweringMixin:
                 self._gc_release(args_tuple)
             if expr.kwargs or kwargs_expr is not None:
                 self._gc_release(kwargs_obj)
+            # `py_obj_getattr` returns a NEW reference on every path: fields and
+            # `__dict__`/`__class__` incref, the dynamic-attr path goes through
+            # `py_dict_get` (which increfs), a descriptor `__get__` yields an
+            # owned result, and a plain method builds a fresh bound object via
+            # `py_instance_bind_method`.  `py_obj_call` only borrows the
+            # callable, so this frame owns `method_obj` and must consume it.
+            # Without this release EVERY dynamic method call leaked its bound
+            # method object: two million `obj.method()` calls whose method
+            # returns None (so the result cannot be the leak) grew RSS to
+            # 2.8 GB.  Release before the error check so the unwind path does
+            # not leak it either.
+            self._gc_release(method_obj)
             self._emit_post_call_err_check(expr.span)
+            self._note_owned_dynamic_call_value(result)
             return result
         if (
             isinstance(obj_ty, ByteArrayType)
@@ -1977,15 +2029,19 @@ class MethodCallExpressionLoweringMixin:
             if native is not None:
                 return native
             raw_val = self._emit_expr(attr.obj)
-            cpy_val, owned = self._marshal_to_cpython(raw_val, obj_ty)
+            cpy_val, owned = self._marshal_to_cpython_consuming_source(
+                raw_val,
+                obj_ty,
+                attr.obj,
+            )
             result = self._emit_cpy_method_call_src(
                 cpy_val,
                 attr.name,
                 expr.args,
                 kwargs=expr.kwargs,
+                operand_order=expr.operand_order,
+                receiver_owned=owned,
             )
-            if owned:
-                self.builder.call(self.runtime["py_cpy_decref"], [cpy_val])
             return result
         if isinstance(obj_ty, NoneType):
             # Flow-insensitive inference can leave a guarded Optional[str]
@@ -1995,15 +2051,19 @@ class MethodCallExpressionLoweringMixin:
             # real str still works while an actual None preserves
             # CPython's AttributeError behavior.
             raw_val = self._emit_expr(attr.obj)
-            cpy_val, owned = self._marshal_to_cpython(raw_val, obj_ty)
+            cpy_val, owned = self._marshal_to_cpython_consuming_source(
+                raw_val,
+                obj_ty,
+                attr.obj,
+            )
             result = self._emit_cpy_method_call_src(
                 cpy_val,
                 attr.name,
                 expr.args,
                 kwargs=expr.kwargs,
+                operand_order=expr.operand_order,
+                receiver_owned=owned,
             )
-            if owned:
-                self.builder.call(self.runtime["py_cpy_decref"], [cpy_val])
             return result
         if isinstance(obj_ty, (ListType, DictType, TupleType)):
             # Typed-collection receiver whose method isn't on the pcc-
@@ -2014,15 +2074,19 @@ class MethodCallExpressionLoweringMixin:
             # with a native helper when the call reaches the
             # self-host critical path.
             raw_val = self._emit_expr(attr.obj)
-            cpy_val, owned = self._marshal_to_cpython(raw_val, obj_ty)
+            cpy_val, owned = self._marshal_to_cpython_consuming_source(
+                raw_val,
+                obj_ty,
+                attr.obj,
+            )
             result = self._emit_cpy_method_call_src(
                 cpy_val,
                 attr.name,
                 expr.args,
                 kwargs=expr.kwargs,
+                operand_order=expr.operand_order,
+                receiver_owned=owned,
             )
-            if owned:
-                self.builder.call(self.runtime["py_cpy_decref"], [cpy_val])
             return result
         if (
             isinstance(obj_ty, (FloatType, DynType))
@@ -2114,23 +2178,18 @@ class MethodCallExpressionLoweringMixin:
             # through the appropriate boxer so CPython sees a proper
             # Py_Long / Py_Float.
             raw_val = self._emit_expr(attr.obj)
-            boxed = marshal.marshal_to_object(
-                self.builder,
-                self.module,
-                self.runtime,
+            cpy_val, owned = self._marshal_to_cpython_consuming_source(
                 raw_val,
                 obj_ty,
-            )
-            cpy_val = self.builder.call(
-                self.runtime["py_cpy_from_pcc_obj"],
-                [boxed],
-                name=self._fresh(f"cpy.num.{attr.name}"),
+                attr.obj,
             )
             return self._emit_cpy_method_call_src(
                 cpy_val,
                 attr.name,
                 expr.args,
                 kwargs=expr.kwargs,
+                operand_order=expr.operand_order,
+                receiver_owned=owned,
             )
         if isinstance(obj_ty, ClassType):
             receiver_hint = self._class_hint_for_expr(attr.obj)
@@ -2153,15 +2212,19 @@ class MethodCallExpressionLoweringMixin:
             # CPython instead of treating the annotation as a closed
             # pcc class registry entry.
             raw_val = self._emit_expr(attr.obj)
-            cpy_val, owned = self._marshal_to_cpython(raw_val, obj_ty)
+            cpy_val, owned = self._marshal_to_cpython_consuming_source(
+                raw_val,
+                obj_ty,
+                attr.obj,
+            )
             result = self._emit_cpy_method_call_src(
                 cpy_val,
                 attr.name,
                 expr.args,
                 kwargs=expr.kwargs,
+                operand_order=expr.operand_order,
+                receiver_owned=owned,
             )
-            if owned:
-                self.builder.call(self.runtime["py_cpy_decref"], [cpy_val])
             return result
 
         return self._emit_callable_attribute_call(

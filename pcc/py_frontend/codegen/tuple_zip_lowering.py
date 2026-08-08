@@ -17,6 +17,7 @@ from ..py_ast import (
     TupleExpr,
     TupleType,
 )
+from .bootstrap_trace import bootstrap_trace_enabled
 from . import marshal
 
 _I64 = ir.IntType(64)
@@ -143,7 +144,7 @@ class TupleZipLoweringMixin:
                 return result
             self._gc_release(tmp_list)
         elems = _expr_elems(arg)
-        if self.module.name == "pcc.parse.py_lift":
+        if bootstrap_trace_enabled(self.module.name):
             import os
             import sys
 

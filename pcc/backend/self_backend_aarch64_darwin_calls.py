@@ -45,6 +45,70 @@ from .self_backend_parse import (
 )
 
 
+_SIMD_BLOCK_SIZES = frozenset((32, 64, 128))
+
+
+def _normalized_call_arg_alignments(
+    args: tuple[tuple[TypeDesc, str], ...],
+    arg_alignments: tuple[int, ...],
+    *,
+    function_name: str,
+) -> tuple[int, ...]:
+    if not arg_alignments:
+        return (0,) * len(args)
+    if len(arg_alignments) != len(args):
+        raise BackendUnavailable(
+            "self backend call argument alignment count does not match "
+            f"operands in {function_name!r}"
+        )
+    return arg_alignments
+
+
+def _aarch64_simd_block_size(
+    size_value: str,
+    volatile_value: str,
+) -> int | None:
+    size = const_int_from_value(size_value)
+    is_volatile = const_int_from_value(volatile_value)
+    if size not in _SIMD_BLOCK_SIZES or is_volatile != 0:
+        return None
+    return size
+
+
+def _emit_aligned_simd_block_copy(
+    func: ParsedFunction,
+    dst_value: str,
+    src_value: str,
+    size: int,
+    module_symbols: PreparedModuleSymbols,
+) -> list[str]:
+    lines = materialize_pointer(func, dst_value, 9, module_symbols)
+    lines.extend(materialize_pointer(func, src_value, 10, module_symbols))
+    offset = 0
+    while offset < size:
+        address_suffix = "" if offset == 0 else f", #{offset}"
+        lines.append(f"  ldr q0, [x10{address_suffix}]")
+        lines.append(f"  str q0, [x9{address_suffix}]")
+        offset += 16
+    return lines
+
+
+def _emit_aligned_simd_block_zero(
+    func: ParsedFunction,
+    dst_value: str,
+    size: int,
+    module_symbols: PreparedModuleSymbols,
+) -> list[str]:
+    lines = materialize_pointer(func, dst_value, 9, module_symbols)
+    lines.append("  movi v0.16b, #0")
+    offset = 0
+    while offset < size:
+        address_suffix = "" if offset == 0 else f", #{offset}"
+        lines.append(f"  str q0, [x9{address_suffix}]")
+        offset += 16
+    return lines
+
+
 def _vector_lane_stride(vector_type: TypeDesc):
     if (
         not vector_type.is_array
@@ -453,6 +517,7 @@ def emit_bswap_intrinsic_call(
 def emit_memcpy_intrinsic_call(
     func: ParsedFunction,
     args: tuple[tuple[TypeDesc, str], ...],
+    arg_alignments: tuple[int, ...],
     module_symbols: PreparedModuleSymbols,
 ) -> list[str]:
     if len(args) < 4:
@@ -462,10 +527,18 @@ def emit_memcpy_intrinsic_call(
     dst_type, dst_value = args[0]
     src_type, src_value = args[1]
     size_type, size_value = args[2]
-    _isvolatile_type, _isvolatile_value = args[3]
+    _isvolatile_type, isvolatile_value = args[3]
     if not (dst_type.is_ptr and src_type.is_ptr and size_type.is_int):
         raise BackendUnavailable(
             f"self backend memcpy intrinsic arg types not translated yet in {func.name!r}"
+        )
+    alignments = _normalized_call_arg_alignments(
+        args, arg_alignments, function_name=func.name
+    )
+    simd_size = _aarch64_simd_block_size(size_value, isvolatile_value)
+    if simd_size is not None and alignments[0] >= 16 and alignments[1] >= 16:
+        return _emit_aligned_simd_block_copy(
+            func, dst_value, src_value, simd_size, module_symbols
         )
     lines = materialize_pointer(func, dst_value, 0, module_symbols)
     lines.extend(materialize_pointer(func, src_value, 1, module_symbols))
@@ -501,6 +574,7 @@ def emit_memmove_intrinsic_call(
 def emit_memset_intrinsic_call(
     func: ParsedFunction,
     args: tuple[tuple[TypeDesc, str], ...],
+    arg_alignments: tuple[int, ...],
     module_symbols: PreparedModuleSymbols,
 ) -> list[str]:
     if len(args) < 4:
@@ -510,10 +584,19 @@ def emit_memset_intrinsic_call(
     dst_type, dst_value = args[0]
     value_type, value = args[1]
     size_type, size_value = args[2]
-    _isvolatile_type, _isvolatile_value = args[3]
+    _isvolatile_type, isvolatile_value = args[3]
     if not (dst_type.is_ptr and value_type.is_int and size_type.is_int):
         raise BackendUnavailable(
             f"self backend memset intrinsic arg types not translated yet in {func.name!r}"
+        )
+    alignments = _normalized_call_arg_alignments(
+        args, arg_alignments, function_name=func.name
+    )
+    simd_size = _aarch64_simd_block_size(size_value, isvolatile_value)
+    fill_value = const_int_from_value(value)
+    if simd_size is not None and fill_value == 0 and alignments[0] >= 16:
+        return _emit_aligned_simd_block_zero(
+            func, dst_value, simd_size, module_symbols
         )
     lines = materialize_pointer(func, dst_value, 0, module_symbols)
     lines.extend(materialize_value(func, value, value_type, 1, module_symbols))
@@ -1515,7 +1598,7 @@ def emit_is_fpclass_intrinsic_call(
     tmp_reg = "x15" if value_type.width > 32 else "w15"
     tmp2_reg = "x16" if value_type.width > 32 else "w16"
     sign_bit = 1 << (value_type.width - 1)
-    exponent_mask = 0x7FF0000000000000 if value_type.width > 32 else 0x7F800000
+    exponent_mask = ((0x7FF00000 << 32) | 0x0) if value_type.width > 32 else 0x7F800000
     fraction_mask = 0x000FFFFFFFFFFFFF if value_type.width > 32 else 0x007FFFFF
     quiet_nan_bit = 0x0008000000000000 if value_type.width > 32 else 0x00400000
     lines = materialize_value(func, value, value_type, 9, module_symbols)
@@ -1635,8 +1718,25 @@ def emit_call_instruction(
     args: tuple[tuple[TypeDesc, str], ...],
     fixed_arg_count: int,
     is_vararg_call: bool,
-    module_symbols: PreparedModuleSymbols,
+    arg_alignments: tuple[int, ...] | PreparedModuleSymbols = (),
+    module_symbols: PreparedModuleSymbols | None = None,
 ) -> list[str]:
+    # Keep the old direct-helper test/API call shape source-compatible while
+    # parsed calls carry their exact call-site alignments as the eighth data
+    # field.  Only parsed, explicitly aligned intrinsics can enter SIMD.
+    if module_symbols is None:
+        if not isinstance(arg_alignments, PreparedModuleSymbols):
+            raise BackendUnavailable(
+                f"self backend call in {func.name!r} is missing module symbols"
+            )
+        module_symbols = arg_alignments
+        normalized_arg_alignments: tuple[int, ...] = ()
+    else:
+        if isinstance(arg_alignments, PreparedModuleSymbols):
+            raise BackendUnavailable(
+                f"self backend call in {func.name!r} has duplicate module symbols"
+            )
+        normalized_arg_alignments = arg_alignments
     if is_vararg_call and fixed_arg_count > len(args):
         raise BackendUnavailable(
             f"self backend saw malformed variadic call in {func.name!r}: fixed args exceed actual args"
@@ -1658,11 +1758,15 @@ def emit_call_instruction(
             func, dest, ret_type, callee, args, module_symbols
         )
     if not is_indirect and callee.startswith("llvm.memcpy."):
-        return emit_memcpy_intrinsic_call(func, args, module_symbols)
+        return emit_memcpy_intrinsic_call(
+            func, args, normalized_arg_alignments, module_symbols
+        )
     if not is_indirect and callee.startswith("llvm.memmove."):
         return emit_memmove_intrinsic_call(func, args, module_symbols)
     if not is_indirect and callee.startswith("llvm.memset."):
-        return emit_memset_intrinsic_call(func, args, module_symbols)
+        return emit_memset_intrinsic_call(
+            func, args, normalized_arg_alignments, module_symbols
+        )
     if not is_indirect and callee.startswith("llvm.vector.reduce.add."):
         return emit_vector_reduce_add_intrinsic_call(func, dest, ret_type, callee, args)
     if not is_indirect and callee.startswith("llvm.vector.reduce.mul."):

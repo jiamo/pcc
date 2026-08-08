@@ -2,7 +2,7 @@
 
 ## Status
 
-active
+resolved
 
 ## Problem Description
 
@@ -481,3 +481,110 @@ owner are both `pcc-metal`, and `fallback_used=false`.
 This confirms only the owner-neutral Metal thread-binding instruction.  It
 does not claim general schedule IR, tiling, layout transformation, software
 pipelining, autotuning, CUDA/ROCm, or whole-program GPU execution.
+
+## Update 2026-08-02: primary-source closure and finite roadmap
+
+The earlier draft identified the right design families but did not yet make
+every recommendation falsifiable.  This update closes that gap.  It also
+records that Proposal No.1's formerly pending repository gates were completed
+on one unchanged darwin-arm64 tree: the forced five-GC matrix passed in
+363.17s, the exact non-integration suite passed in 756.78s, and the exact
+integration suite passed in 786.99s.  The detailed commands and mode labels are
+preserved in
+[`2026-07-31-bootstrap-phase-reuse-criterion4-closure.md`](../goal/evidence/2026-07-31-bootstrap-phase-reuse-criterion4-closure.md).
+
+### Primary-source coverage
+
+The following table is the source-to-claim map for the requested Cornell
+categories.  Cornell's material is guidance for finding profitable work, not
+evidence that a PCC transformation is legal or fast; each PCC row below still
+requires its own semantic and benchmark gates.
+
+| Requested category | Primary Cornell material | Claim used by PCC |
+|---|---|---|
+| Measurement | [Profiling](https://cvw.cac.cornell.edu/python-performance/assessment/profiling) | Optimize measured call/time hot spots; counters and repeatable workloads precede implementation. |
+| Algorithms | [Rough Tuning](https://cvw.cac.cornell.edu/code-optimization/coding-for-performance/rough-tuning) and [Scalable Algorithms](https://cvw.cac.cornell.edu/scalability/planning-for-parallel/scalable-algorithms) | Algorithm and dependency structure dominate instruction tuning; useful tasks expose independent work and limit communication. |
+| Memory and locality | [Memory Hierarchy](https://cvw.cac.cornell.edu/code-optimization/single-core-optimization/memory-hierarchy), [Memory Access Times](https://cvw.cac.cornell.edu/code-optimization/single-core-optimization/memory-access-times), and [Array Blocking](https://cvw.cac.cornell.edu/code-optimization/cache-considerations/array-blocking) | Compact traversal and reuse matter only when allocation, RSS, or locality samples identify the bottleneck. |
+| Loops | [Loop-Invariant Code Motion](https://cvw.cac.cornell.edu/code-optimization/data-locality/code-motion) | Hoisting is legal only for proven invariant and non-observable operations. |
+| Calls | [Best Practices for Compilers](https://cvw.cac.cornell.edu/code-optimization/opt-via-compilers/best-practice-compilers) | Hot small calls are inlining candidates, but PCC must first prove the callee, effects, ownership, and exception behavior. |
+| Vectorization | [SIMD and Micro-Parallelism](https://cvw.cac.cornell.edu/code-optimization/single-core-optimization/simd-micro-parallelism), [Vectorizable Code](https://cvw.cac.cornell.edu/vector/coding/vectorizable-code), [Data Dependencies](https://cvw.cac.cornell.edu/vector/coding/data-dependencies), and [Optimization Reports](https://cvw.cac.cornell.edu/vector/compilers/optimization-reports) | Widen only countable, independent operations; report both accepted and rejected plans and retain an exact scalar path. |
+| Parallelism | [Multi-Core Cache Sharing](https://cvw.cac.cornell.edu/code-optimization/cache-considerations/multicore-cache-sharing) and [Scaling](https://cvw.cac.cornell.edu/parallel/efficiency/scaling) | Worker count is a measured resource decision; cache sharing, serial work, memory bandwidth, and problem size bound useful speedup. |
+
+The non-Cornell comparisons use primary or owner-maintained material: CPython
+[PEP 659](https://peps.python.org/pep-0659/) and the official
+[Python 3.13 JIT notes](https://docs.python.org/3.13/whatsnew/3.13.html#an-experimental-just-in-time-jit-compiler);
+Go's [`buildid.go`](https://go.dev/src/cmd/go/internal/work/buildid.go),
+[compiler overview](https://go.dev/src/cmd/compile/README),
+[SSA design](https://go.dev/src/cmd/compile/internal/ssa/README), and
+[PGO design](https://go.dev/doc/pgo) (the inspected local Go source is pinned at
+`a961f702a48edbfc044639775f4ffae692b7f0dc`); Oracle's
+[HotSpot tiering/escape-analysis documentation](https://docs.oracle.com/en/java/javase/17/vm/java-hotspot-virtual-machine-performance-enhancements.html)
+and OpenJDK [JEP 197](https://openjdk.org/jeps/197); GraalVM's
+[compiler pipeline](https://www.graalvm.org/jdk21/reference-manual/java/compiler/);
+and LLVM's [new pass manager](https://releases.llvm.org/15.0.0/docs/NewPassManager.html),
+[ThinLTO](https://clang.llvm.org/docs/ThinLTO.html), and
+[vectorizer](https://llvm.org/docs/Vectorizers.html) documentation.  These
+sources support architecture choices; they do not transfer their benchmark
+results to PCC.
+
+### Authoritative closure matrix
+
+This matrix supersedes the shorter draft matrix above for roadmap decisions.
+Every accepted optimization names its legality/invalidation boundary, exact
+fallback, execution owner, expected counter, and a benchmark that can reject
+the proposal.
+
+| Mechanism and classification | Semantic precondition and invalidation/deopt | Exact fallback | Owner/backend consequence | Expected counters | Falsifiable gate |
+|---|---|---|---|---|---|
+| Frontend IR content cache — **implemented now** | All source, compiler-byte, semantic-mode, target, entry-graph, and ABI-producing identities match; corruption or any mismatch is a miss. | Regenerate the full deterministic frontend bundle. | Keying/validation are PCC-owned and common to LLVM/self; a labeled host metadata subprocess is not an execution fallback. | `lookup_s`, `hit`, `miss_reason`, `bytes_loaded`, `bytes_avoided`, `publish_s`. | An isolated same-input repeat must preserve fixed-point bytes and reduce dominant stage wall time; five-GC and both exact suites must finish below 900s. This passed in the linked criterion-4 evidence. |
+| Per-module action DAG/summaries — **generic next slice** | Source plus imported public type/export/effect/layout summaries match; a private implementation edit must not masquerade as a public-summary match. | Rebuild the affected reverse-dependency closure, or the full graph if a summary/ABI cannot be validated. | One summary schema feeds LLVM and self; no package, module-count, or test-name policy. | `actions_total`, `actions_hit`, `actions_rebuilt`, `reverse_closure_size`, `summary_bytes`, per-action wall/RSS. | No-op rebuild must compile zero modules; private leaf edit only its action; public export edit exactly the reverse closure; compiler/runtime ABI edit all actions; results and pcc2/pcc3 fixed point remain equal. Task `PERF-P1-INCREMENTAL-MODULE-ACTION-DAG`. |
+| Pass analysis preservation/invalidation — **generic next slice** | Each pass declares scope, requirements, preserved analyses, and mutations; a deletion or unknown mutation invalidates conservatively. | Recompute the analysis or run the existing uncached pass pipeline. | Owner-neutral manager; backend-only analyses are explicitly named extensions and cannot hide an LLVM run in self mode. | Per-analysis `query`, `hit`, `miss`, `invalidate`, `recompute_s`; pass wall and peak RSS. | A profile-selected repeated analysis must show fewer recomputations and lower pass time without semantic-oracle, fallback-ratchet, or bootstrap drift; an injected mutation must force a miss. Task `PERF-P1-PASS-ANALYSIS-INVALIDATION`. |
+| Compact compiler arenas/dense IDs — **profile-required** | Sampling/allocation evidence names a pointer/map traversal hot spot; stable source-span/type side tables preserve diagnostics and object projection. | Existing object representation and debug materialization. | Implemented in pcc-Python compiler data first; the C kernel and Python object semantics do not change. | Allocation count/bytes by type, materializations, arena bytes, scan time, phase RSS, sample share. | The chosen phase must reduce its profiled allocation bytes by at least 10% or wall time by at least 5%, with no total-RSS regression above 2% and byte-identical output; otherwise reject/revert the representation. Task `PERF-P1-COMPACT-COMPILER-ARENAS`. |
+| Guarded specialization plus loop/vector plan — **value-model/proof required** | Exact type/layout/function/global versions, effects, alias/stride/alignment, integer range, exception order, and target profitability are proved or guarded. Any guard miss invalidates only the fast edge. | The existing generic operation or ordered scalar loop, including arbitrary-precision promotion and exceptions. | One PCC-owned guard/loop-plan vocabulary lowers separately in self and LLVM; Metal consumes it only after an explicit Kernel IR boundary. | Candidate/accepted/rejected plans by reason, guard hits/misses, scalar fallbacks, overflow promotions, vector width, fast/slow time. | A typed value/buffer workload must show equivalent self/LLVM guards, allocation-free accepted IR, oracle equality on hit/miss/overflow/alias cases, and a statistically repeatable speedup; any semantic mismatch or absent speedup denies that plan. Task `PERF-P1-GUARDED-SPECIALIZATION-LOOP-PLAN`. |
+| Escape/scalar replacement — **deferred value-model slice** | No identity, `__dict__`, weakref, finalizer, traceback, suspended-frame, extension, thread, native-handle, or GC-root escape; every observation point can materialize exactly once. | Allocate/materialize the ordinary object under the normal ownership and five-GC trace/update contract. | Self/LLVM share escape facts and materialization ABI; all five GCs see the same slots and roots. | Candidates, rejected escape reasons, eliminated allocations, materializations, GC slot visits, RSS/pause/throughput. | A focused value payload must eliminate allocations while every forced escape preserves `id`/`is`/weakref/finalizer/exception behavior under GC0..4; no backend may rely on LLVM-only escape analysis. Task `PERF-P2-ESCAPE-SCALAR-MATERIALIZATION`. |
+| Replayable GPU schedule — **implemented narrow slice** | Exact semantic IR digest, target, selector, prior binding, and target limits match; stale or post-freeze schedules fail closed. | Reject the requested schedule; an explicitly unscheduled compile retains the semantic module. | One PCC schedule record feeds pcc-metal and labeled tvm-tilelang before freeze; actual owner remains recorded. | Legality rejection reasons, schedule/frozen digests, owner/fallback labels, compile/runtime/device counters. | Cross-owner frozen digest and CPU result must match, and strict pcc-metal must reach a real device result with `fallback_used=false`; the existing thread-binding gates passed. |
+| Conservative code-identified PGO — **lower-priority generic slice** | Representative profile matches source/code identity, semantic mode, ABI, target and schema; stale/unmatched samples are ignored. | Ordinary deterministic AOT decisions. | PCC owns profile matching and decisions; external profilers are labeled inputs and self-host never requires a profile. | Matched/unmatched samples, profile age/skew, decisions by kind, code-size/build-time deltas, workload counters. | Across pinned representative and adversarial-skew workloads, PGO must improve the target metric without statistically significant regression beyond 2% in no-PGO workloads, semantic drift, or fixed-point dependence; otherwise it stays off. Task `PERF-P2-CODE-IDENTIFIED-PGO`. |
+| Optional long-running tier — **deferred until AOT/PGO gates** | A long-lived region crosses explicit heat/cost thresholds; code cache and deopt metadata are bounded; observation can materialize baseline state. | Baseline PCC native AOT code. | Tier is optional, PCC-owned, mode-labeled, and never needed for pcc1/pcc2/pcc3 or native artifact validity. | Compile queue/time, tier entries/exits/deopts, code-cache live/dead/fragmentation, startup, steady throughput, RSS/pause. | A long-running matrix must improve steady throughput while startup, peak RSS, fragmentation, and p99 pause remain within task budgets; a forced-deopt corpus must equal baseline output. Failure leaves tier disabled. Task `PERF-P2-OPTIONAL-RUNTIME-TIER`. |
+
+### Rejected or explicitly deferred transfers
+
+- CPython quickened bytecode, HotSpot/Graal tiering, and LLVM's optimizer may
+  inform PCC, but none may become the hidden owner of `--backend=self` or a
+  prerequisite for the self-host fixed point.
+- Java primitive overflow and `-ffast-math` are incompatible with Python
+  arbitrary-precision `int`, ordered exceptions, and default floating-point
+  semantics.  Only explicit `pcc.i64`/`pcc.u64` or a guarded proven range can
+  use machine arithmetic.
+- LLVM vectorization of a dynamic Python loop without an owner-neutral legality
+  plan is rejected even if it benchmarks well: the self backend, scalar slow
+  path, exception order, and alias behavior would be unproven.
+- Whole-program GPU ownership, ambient-hardware schedules, unbounded autotuning,
+  and package-specific library dispatch remain outside the accepted slices.
+
+### Finite task-board mapping
+
+Proposal No.1 is closed by `PERF-P0-SELF-BOOTSTRAP-PHASE-REUSE`, and No.7 by
+`GPU-P1-OWNER-SCHEDULE-THREAD-BINDING`.  The remaining accepted work is split
+into seven independently gated rows rather than one unbounded optimization
+epic:
+
+1. `PERF-P1-INCREMENTAL-MODULE-ACTION-DAG`
+2. `PERF-P1-PASS-ANALYSIS-INVALIDATION`
+3. `PERF-P1-COMPACT-COMPILER-ARENAS`
+4. `PERF-P1-GUARDED-SPECIALIZATION-LOOP-PLAN`
+5. `PERF-P2-ESCAPE-SCALAR-MATERIALIZATION`
+6. `PERF-P2-CODE-IDENTIFIED-PGO`
+7. `PERF-P2-OPTIONAL-RUNTIME-TIER`
+
+## Report
+
+The audit is resolved as a design and routing task, not as a claim that all
+listed optimizations are implemented.  Primary sources support the mechanism
+shapes; PCC's own counters and gates decide whether each is legal and useful.
+Two proposals have implementation evidence: content-addressed frontend reuse
+and the narrow replayable Metal thread-binding schedule.  The seven remaining
+slices are now finite task-board rows with explicit slow paths, ownership
+labels, counters, rejection thresholds, correctness gates, fixed-point gates,
+and memory/performance gates.  No package, GC number, benchmark input, module
+count, or test name is compiler policy, and no oracle was relabeled as a PCC
+owner.

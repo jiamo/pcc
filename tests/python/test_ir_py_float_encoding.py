@@ -1,13 +1,12 @@
 """Behavior-locking tests for ``ir.Constant`` float encoding.
 
-Currently uses ``struct`` internally — Phase 9.2 attempted to replace
-with pure-arithmetic helpers but discovered the helpers themselves
-introduce more ``py_cpy_*`` calls (via ``int(x, 16)``, ``float("inf")``,
-``str(x)`` builtin lookups) than ``struct`` removes. Reverted; locked
-the existing behaviour here so any future replacement can verify
-byte-identical hex output.
+The implementation uses one pcc-native arithmetic owner shared with the
+stdlib ``struct`` port and self backend.  CPython's ``struct`` remains the
+test oracle for rounding and subnormal boundaries.
 """
 from __future__ import annotations
+
+import struct
 
 import pytest
 
@@ -34,8 +33,9 @@ _HALF = HalfType()
     (11.1, "0x4026333333333333"),
     (1.5e308, "0x7FEAB36D48E1ACF0"),
     (2.2250738585072014e-308, "0x0010000000000000"),  # smallest normal
-    # Subnormals are flushed to zero by the bitwise codepath (rare in
-    # codegen-emitted constants; documented limitation).
+    (2.0 ** -1074, "0x0000000000000001"),
+    (-(2.0 ** -1074), "0x8000000000000001"),
+    (float.fromhex("0x0.fffffffffffffp-1022"), "0x000FFFFFFFFFFFFF"),
 ])
 def test_double_constant_hex(value, expected_hex):
     c = Constant(_DOUBLE, value)
@@ -89,6 +89,22 @@ def test_float_constant_hex(value, expected_hex):
     )
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        2.0 ** -149,
+        -(2.0 ** -149),
+        (2.0 ** -126) - (2.0 ** -149),
+        2.0 ** -150,
+        3.0 * (2.0 ** -150),
+    ],
+)
+def test_float_subnormal_constant_matches_struct_oracle(value):
+    rounded = struct.unpack(">f", struct.pack(">f", value))[0]
+    raw = struct.unpack(">Q", struct.pack(">d", rounded))[0]
+    assert Constant(_FLOAT, value)._ref == f"0x{raw:016X}"
+
+
 # ---------------------------------------------------------------------------
 # Half (16-bit) encoding — round to f16 precision
 # ---------------------------------------------------------------------------
@@ -103,3 +119,19 @@ def test_half_constant_hex_basic(value):
     # The output should be a 16-character hex string starting with 0x
     assert c._ref.startswith("0x")
     assert len(c._ref) == 18  # 0x + 16 hex digits
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        2.0 ** -24,
+        -(2.0 ** -24),
+        (2.0 ** -14) - (2.0 ** -24),
+        2.0 ** -25,
+        3.0 * (2.0 ** -25),
+    ],
+)
+def test_half_subnormal_constant_matches_struct_oracle(value):
+    rounded = struct.unpack(">e", struct.pack(">e", value))[0]
+    raw = struct.unpack(">Q", struct.pack(">d", rounded))[0]
+    assert Constant(_HALF, value)._ref == f"0x{raw:016X}"

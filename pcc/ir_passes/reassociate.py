@@ -34,6 +34,11 @@ import llvmlite.binding as llvm
 
 from .dce import dce_module_text
 from .manager import AnalysisManager, ModulePass, PreservedAnalyses
+from .integer_fold_contract import (
+    FOLD_CONSTANT,
+    fold_llvm_integer_binary,
+    signed_value,
+)
 from .simplifycfg import (
     _function_chunk_module,
     _module_context_for_function,
@@ -85,19 +90,11 @@ def _normalize_signed(value: int, ty: str) -> int:
 
 
 def _combine_constants(op: str, ty: str, lhs: int, rhs: int) -> int:
-    lu = _normalize_unsigned(lhs, ty)
-    ru = _normalize_unsigned(rhs, ty)
-    if op == "add":
-        return _normalize_signed(lu + ru, ty)
-    if op == "mul":
-        return _normalize_signed(lu * ru, ty)
-    if op == "and":
-        return _normalize_signed(lu & ru, ty)
-    if op == "or":
-        return _normalize_signed(lu | ru, ty)
-    if op == "xor":
-        return _normalize_signed(lu ^ ru, ty)
-    raise ValueError(f"unsupported op: {op}")
+    width = _bit_width(ty)
+    status, value = fold_llvm_integer_binary(op, width, lhs, rhs)
+    if status != FOLD_CONSTANT:
+        raise ValueError(f"unsupported op: {op}")
+    return signed_value(value, width)
 
 
 def _single_constant_form(info: dict[str, str]) -> tuple[str, int] | None:
@@ -194,22 +191,23 @@ def _one_function_pass(
                 inner is not None
                 and inner["op"] == op
                 and inner["ty"] == ty
+                and not info["flags"].strip()
+                and not inner["flags"].strip()
             ):
                 inner_single = _single_constant_form(inner)
                 if inner_single is not None:
                     base, c1 = inner_single
                     new_const = _combine_constants(op, ty, c1, rhs_const)
-                    flags = info["flags"] if info["flags"] == inner["flags"] else ""
                     lines[info["line_idx"]] = _format_line(
                         indent=info["indent"],
                         result=name,
                         op=op,
-                        flags=flags,
+                        flags="",
                         ty=ty,
                         lhs=base,
                         rhs=str(new_const),
                     )
-                    info["lhs"], info["rhs"], info["flags"] = base, str(new_const), flags
+                    info["lhs"], info["rhs"], info["flags"] = base, str(new_const), ""
                     rhs_const = new_const
                     changed = True
 
@@ -222,6 +220,9 @@ def _one_function_pass(
                 and right is not None
                 and left["op"] == right["op"] == op
                 and left["ty"] == right["ty"] == ty
+                and not info["flags"].strip()
+                and not left["flags"].strip()
+                and not right["flags"].strip()
             ):
                 left_single = _single_constant_form(left)
                 right_single = _single_constant_form(right)
@@ -229,16 +230,11 @@ def _one_function_pass(
                     left_var, c1 = left_single
                     right_var, c2 = right_single
                     merged = _combine_constants(op, ty, c1, c2)
-                    merged_flags = (
-                        left["flags"]
-                        if left["flags"] == right["flags"] == info["flags"]
-                        else ""
-                    )
                     left_line = _format_line(
                         indent=left["indent"],
                         result=left["result"],
                         op=op,
-                        flags=merged_flags,
+                        flags="",
                         ty=ty,
                         lhs=left_var,
                         rhs=str(merged),
@@ -254,7 +250,7 @@ def _one_function_pass(
                     )
                     lines[left["line_idx"]] = left_line
                     lines[info["line_idx"]] = current_line
-                    left["lhs"], left["rhs"], left["flags"] = left_var, str(merged), merged_flags
+                    left["lhs"], left["rhs"], left["flags"] = left_var, str(merged), ""
                     info["lhs"], info["rhs"] = f"%{left['result']}", right_var
                     changed = True
 

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+import time
 from typing import Any, Callable, Iterable
 
 import llvmlite.binding as llvm
@@ -90,6 +91,21 @@ class AnalysisKey:
     """
 
     name: str
+    scope: str = "module"
+
+    def __post_init__(self) -> None:
+        if self.scope not in ("module", "function", "loop", "scc"):
+            raise ValueError("unknown analysis scope: " + self.scope)
+
+
+@dataclass
+class AnalysisCounters:
+    queries: int = 0
+    hits: int = 0
+    misses: int = 0
+    recomputes: int = 0
+    invalidations: int = 0
+    compute_ns: int = 0
 
 
 class AnalysisResult:
@@ -112,7 +128,10 @@ class AnalysisResult:
 class AnalysisManager:
     """Per-IR-unit analysis cache.
 
-    Keyed by ``(AnalysisKey, id(ir_unit))``. Passes register analysis
+    Keyed by ``(AnalysisKey, ir_unit)``. LLVM ``ValueRef`` wrappers compare
+    and hash by their underlying LLVM pointer, so repeated iterator wrappers
+    for one function share a cache entry without permitting Python ``id``
+    reuse. Passes register analysis
     *computation functions* (``compute(ir_unit) -> AnalysisResult``);
     the manager lazily runs them on first request and caches the
     result until invalidation.
@@ -120,7 +139,15 @@ class AnalysisManager:
 
     def __init__(self) -> None:
         self._computations: dict[AnalysisKey, Callable[[Any], AnalysisResult]] = {}
-        self._cache: dict[tuple[AnalysisKey, int], AnalysisResult] = {}
+        self._cache: dict[tuple[AnalysisKey, Any], AnalysisResult] = {}
+        self._counters: dict[AnalysisKey, AnalysisCounters] = {}
+
+    def _counter(self, key: AnalysisKey) -> AnalysisCounters:
+        counter = self._counters.get(key)
+        if counter is None:
+            counter = AnalysisCounters()
+            self._counters[key] = counter
+        return counter
 
     def register(
         self,
@@ -130,15 +157,52 @@ class AnalysisManager:
         self._computations[key] = compute
 
     def get(self, key: AnalysisKey, ir_unit: Any) -> AnalysisResult:
-        cache_key = (key, id(ir_unit))
+        try:
+            hash(ir_unit)
+        except TypeError as exc:
+            raise TypeError("analysis IR units must be hashable") from exc
+        cache_key = (key, ir_unit)
+        counter = self._counter(key)
+        counter.queries += 1
         if cache_key in self._cache:
+            counter.hits += 1
             return self._cache[cache_key]
+        counter.misses += 1
         compute = self._computations.get(key)
         if compute is None:
             raise KeyError(f"analysis {key.name!r} not registered")
+        started = time.perf_counter_ns()
         result = compute(ir_unit)
+        counter.compute_ns += time.perf_counter_ns() - started
+        counter.recomputes += 1
         self._cache[cache_key] = result
         return result
+
+    def require(
+        self,
+        keys: Iterable[AnalysisKey],
+        ir_unit: Any,
+    ) -> None:
+        for key in keys:
+            self.get(key, ir_unit)
+
+    def require_for_module_pass(
+        self,
+        keys: Iterable[AnalysisKey],
+        module: llvm.ModuleRef,
+    ) -> None:
+        for key in keys:
+            if key.scope == "module":
+                self.get(key, module)
+                continue
+            if key.scope == "function":
+                for function in module.functions:
+                    if not function.is_declaration:
+                        self.get(key, function)
+                continue
+            raise ValueError(
+                "module pass cannot materialize analysis scope " + key.scope
+            )
 
     def invalidate(self, ir_unit: Any, preserved: PreservedAnalyses) -> None:
         """Drop cached results that aren't preserved.
@@ -147,17 +211,58 @@ class AnalysisManager:
         walk all cached results for this IR unit and ask each one
         whether ``preserved`` keeps it valid.
         """
-        unit_id = id(ir_unit)
-        to_drop: list[tuple[AnalysisKey, int]] = []
+        to_drop: list[tuple[AnalysisKey, Any]] = []
         for cache_key, result in self._cache.items():
-            if cache_key[1] != unit_id:
+            if cache_key[1] != ir_unit:
                 continue
             if result.invalidate(ir_unit, preserved):
                 to_drop.append(cache_key)
         for cache_key in to_drop:
+            self._counter(cache_key[0]).invalidations += 1
             self._cache.pop(cache_key, None)
 
+    def invalidate_module_tree(
+        self,
+        module: llvm.ModuleRef,
+        preserved: PreservedAnalyses,
+    ) -> None:
+        self.invalidate(module, preserved)
+        for function in module.functions:
+            if not function.is_declaration:
+                self.invalidate(function, preserved)
+
+    def erase(self, ir_unit: Any) -> None:
+        to_drop = [key for key in self._cache if key[1] == ir_unit]
+        for cache_key in to_drop:
+            self._counter(cache_key[0]).invalidations += 1
+            self._cache.pop(cache_key, None)
+
+    def erase_module_tree(self, module: llvm.ModuleRef) -> None:
+        for function in module.functions:
+            if not function.is_declaration:
+                self.erase(function)
+        self.erase(module)
+
+    def telemetry(self) -> dict[str, dict[str, int]]:
+        out: dict[str, dict[str, int]] = {}
+        ordered = sorted(
+            self._counters.items(),
+            key=lambda item: (item[0].scope, item[0].name),
+        )
+        for key, counter in ordered:
+            out[key.scope + ":" + key.name] = {
+                "queries": counter.queries,
+                "hits": counter.hits,
+                "misses": counter.misses,
+                "recomputes": counter.recomputes,
+                "invalidations": counter.invalidations,
+                "compute_ns": counter.compute_ns,
+            }
+        return out
+
     def clear(self) -> None:
+        for key, _unit_id in self._cache:
+            self._counter(key).invalidations += 1
         self._cache.clear()
 
 
@@ -175,6 +280,12 @@ class ModulePass(ABC):
 
     #: LLVM pass name used for reporting and ablation control.
     name: str = "<anonymous>"
+    scope: str = "module"
+    required_analyses: tuple[AnalysisKey, ...] = ()
+    mutation_class: str = "unknown"
+
+    def register_analyses(self, am: AnalysisManager) -> None:
+        return None
 
     @abstractmethod
     def run(
@@ -193,6 +304,12 @@ class FunctionPass(ABC):
     """
 
     name: str = "<anonymous>"
+    scope: str = "function"
+    required_analyses: tuple[AnalysisKey, ...] = ()
+    mutation_class: str = "unknown"
+
+    def register_analyses(self, am: AnalysisManager) -> None:
+        return None
 
     @abstractmethod
     def run(
@@ -211,6 +328,12 @@ class LoopPass(ABC):
     """
 
     name: str = "<anonymous>"
+    scope: str = "loop"
+    required_analyses: tuple[AnalysisKey, ...] = ()
+    mutation_class: str = "unknown"
+
+    def register_analyses(self, am: AnalysisManager) -> None:
+        return None
 
     @abstractmethod
     def run(
@@ -223,6 +346,30 @@ class LoopPass(ABC):
 # ---------------------------------------------------------------------------
 # Pass manager
 # ---------------------------------------------------------------------------
+
+
+_MUTATION_CLASSES = {
+    "none",
+    "instructions",
+    "cfg",
+    "module",
+    "unknown",
+}
+
+
+def _invalidation_contract(
+    pass_: ModulePass | FunctionPass | LoopPass,
+    reported: PreservedAnalyses,
+) -> PreservedAnalyses:
+    if not isinstance(reported, PreservedAnalyses):
+        raise TypeError(pass_.name + " did not return PreservedAnalyses")
+    if pass_.mutation_class not in _MUTATION_CLASSES:
+        raise ValueError(
+            pass_.name + " has unknown mutation class " + pass_.mutation_class
+        )
+    if pass_.mutation_class == "unknown":
+        return PreservedAnalyses.none()
+    return reported
 
 
 @dataclass
@@ -261,8 +408,18 @@ class IRPassManager:
         for pass_ in self.module_passes:
             if pass_.name in self.disabled_names:
                 continue
+            if pass_.scope != "module":
+                raise ValueError(
+                    pass_.name + " registered in module pipeline with scope "
+                    + pass_.scope
+                )
+            pass_.register_analyses(am)
+            am.require_for_module_pass(pass_.required_analyses, module)
             pass_pa = pass_.run(module, am)
-            am.invalidate(module, pass_pa)
+            am.invalidate_module_tree(
+                module,
+                _invalidation_contract(pass_, pass_pa),
+            )
             # Aggregate: if any pass returns "none preserved", whole
             # pipeline preserves nothing downstream.
             if not pass_pa.preserves(_ALL_KEY):
@@ -291,6 +448,7 @@ class _FunctionPassAdaptor(ModulePass):
     def __init__(self, inner: FunctionPass) -> None:
         self._inner = inner
         self.name = inner.name
+        self.mutation_class = inner.mutation_class
 
     def run(
         self,
@@ -298,11 +456,22 @@ class _FunctionPassAdaptor(ModulePass):
         am: AnalysisManager,
     ) -> PreservedAnalyses:
         any_change = False
+        self._inner.register_analyses(am)
         for function in module.functions:
             if function.is_declaration:
                 continue
+            for key in self._inner.required_analyses:
+                if key.scope != "function":
+                    raise ValueError(
+                        self.name + " function pass requires " + key.scope
+                        + " analysis " + key.name
+                    )
+            am.require(self._inner.required_analyses, function)
             pa = self._inner.run(function, am)
-            am.invalidate(function, pa)
+            am.invalidate(
+                function,
+                _invalidation_contract(self._inner, pa),
+            )
             if not pa.preserves(_ALL_KEY):
                 any_change = True
         return PreservedAnalyses.none() if any_change else PreservedAnalyses.all()

@@ -108,20 +108,33 @@ def test_pcc_python_refcount_backend_exports_gc_surface():
     py_obj = PY_OBJ_PORT.read_text(encoding="utf-8")
     for name in GC_SURFACE[:12]:
         assert f'@c_abi_export("{name}")' in py_obj
-    # py_gc_backend.py covers most of the late surface, but
-    # ``pcc_gc_telemetry`` was extracted into ``py_gc_telemetry.py``.
-    # Check the union of the two backend-side files.
-    py_gc_backend = (
-        REPO_ROOT / "pcc" / "py_runtime" / "py" / "py_gc_backend.py"
-    ).read_text(encoding="utf-8")
-    py_gc_telemetry = (
-        REPO_ROOT / "pcc" / "py_runtime" / "py" / "py_gc_telemetry.py"
-    ).read_text(encoding="utf-8")
-    backend_surface = py_gc_backend + "\n" + py_gc_telemetry
-    for name in GC_SURFACE[12:]:
-        assert f'@c_abi_export("{name}")' in backend_surface, (
-            f"missing @c_abi_export for {name} in either "
-            "py_gc_backend.py or py_gc_telemetry.py"
+    # The late GC surface moved out of py_gc_backend.py/py_gc_telemetry.py
+    # into the freestanding GC modules as the collector policy migrated to
+    # pcc-Python.  Each symbol must be exported by exactly the module that
+    # owns it in the production archive.  The mapping below is derived from
+    # the archive symbol table (nm): one owner per symbol.
+    late_surface = {
+        "pcc_gc_object_id": "freestanding_gc_forwarding_identity.py",
+        "pcc_gc_reset_relocation_set": "py_gc_backend.py",
+        "pcc_gc_select_relocation_set": "freestanding_gc_relocation_selector.py",
+        "pcc_gc_relocation_set_contains": "py_gc_backend.py",
+        "pcc_gc_relocation_set_size": "py_gc_backend.py",
+        "pcc_gc_install_forwarding": "freestanding_gc_forwarding_identity.py",
+        "pcc_gc_relocate_copy": "freestanding_gc_relocation_copy.py",
+        "pcc_gc_backend": "py_gc_backend.py",
+        "pcc_gc_set_backend": "py_gc_backend.py",
+        "pcc_gc_backend_name": "py_gc_backend.py",
+        "pcc_gc_telemetry": "py_gc_telemetry.py",
+        "pcc_gc_telemetry_reset": "py_gc_backend.py",
+        "pcc_gc_step": "freestanding_gc_barrier_dispatcher.py",
+    }
+    cache: dict[str, str] = {}
+    for name, rel in late_surface.items():
+        path = REPO_ROOT / "pcc" / "py_runtime" / "py" / rel
+        if rel not in cache:
+            cache[rel] = path.read_text(encoding="utf-8")
+        assert f'@c_abi_export("{name}")' in cache[rel], (
+            f"missing @c_abi_export for {name} in {rel}"
         )
 
 
@@ -129,25 +142,46 @@ def test_pcc_python_gc_backend_tracks_frame_stack_not_single_root_slot():
     py_gc_backend = (
         REPO_ROOT / "pcc" / "py_runtime" / "py" / "py_gc_backend.py"
     ).read_text(encoding="utf-8")
-    assert 'global_load_ptr("pcc_gc_frame_head")' in py_gc_backend
-    assert 'global_store_ptr("pcc_gc_frame_head", node)' in py_gc_backend
-    seed_body = py_gc_backend.split("def _seed_roots() -> None:", 1)[1]
-    seed_body = seed_body.split("def _begin_mark_cycle() -> None:", 1)[0]
-    frame_roots_body = py_gc_backend.split("def _gray_current_roots() -> None:", 1)[
-        1
-    ]
-    frame_roots_body = frame_roots_body.split("def _begin_mark_cycle() -> None:", 1)[
-        0
-    ]
-    assert "_gray_current_roots()" in seed_body
+    mapped_roots = (
+        REPO_ROOT
+        / "pcc"
+        / "py_runtime"
+        / "py"
+        / "freestanding_gc_mapped_roots.py"
+    ).read_text(encoding="utf-8")
+    object_root_seeding = (
+        REPO_ROOT
+        / "pcc"
+        / "py_runtime"
+        / "py"
+        / "freestanding_gc_object_root_seeding.py"
+    ).read_text(encoding="utf-8")
+    mark_cycle = (
+        REPO_ROOT
+        / "pcc"
+        / "py_runtime"
+        / "py"
+        / "freestanding_gc_common_mark_cycle.py"
+    ).read_text(encoding="utf-8")
+    seed_body = mark_cycle.split("def pcc_gc_seed_roots() -> None:", 1)[1]
+    seed_body = seed_body.split("@c_abi_export", 1)[0]
+    frame_roots_body = object_root_seeding.split(
+        "def pcc_gc_gray_current_roots() -> None:", 1
+    )[1]
+    registered_body = mapped_roots.split(
+        "def pcc_gc_visit_registered_root_slots", 1
+    )[1].split('@c_abi_export("pcc_gc_gray_mapped_roots")', 1)[0]
+    assert "pcc_gc_gray_current_roots()" in seed_body
+    assert '_seed_roots = extern("pcc_gc_seed_roots"' in py_gc_backend
     # Root graying must walk the whole frame stack via the shared
     # mapped-root-slot visitor (slots ptr at frame+8, slot count at
     # frame+40), following the next link at frame+16 — not a single
     # root slot.
-    assert "_py_visit_mapped_root_slots(" in frame_roots_body
-    assert "load_ptr(frame, 8)" in frame_roots_body
-    assert "load_i64(frame, 40)" in frame_roots_body
-    assert "frame = load_ptr(frame, 16)" in frame_roots_body
+    assert "pcc_gc_visit_registered_root_slots(1, 1)" in frame_roots_body
+    assert "pcc_gc_visit_mapped_root_slots(" in registered_body
+    assert "load_ptr(frame, 8)" in registered_body
+    assert "load_i64(frame, 40)" in registered_body
+    assert "frame = load_ptr(frame, 16)" in registered_body
 
 
 def test_pcc_python_collect_uses_gc_hook_not_direct_stub_return():

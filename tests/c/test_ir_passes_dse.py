@@ -1,6 +1,6 @@
 """Tests for DSEPass (block-local subset)."""
 
-import shutil
+import pytest
 import unittest
 
 import llvmlite.binding as llvm
@@ -9,7 +9,9 @@ from pcc.ir_passes.alias_analysis import AliasAnalysis
 from pcc.ir_passes.dse import DSEPass, dse_module_text
 from pcc.ir_passes.parity import assert_ir_parity, run_pcc_ir_pass
 
-_OPT = shutil.which("opt")
+from pcc.passes.llvm_text_pipeline import find_opt_binary
+
+_OPT = find_opt_binary()
 
 
 def _parse(ir_text: str) -> llvm.ModuleRef:
@@ -426,7 +428,7 @@ entry:
 """
 
 
-@unittest.skipUnless(_OPT, "requires LLVM opt")
+@pytest.mark.pcc_gate(unavailable=None if _OPT else "matching LLVM opt not installed")
 class UpstreamParityTests(unittest.TestCase):
     def _parity(self, ir: str):
         report = assert_ir_parity(ir, DSEPass(), "dse")

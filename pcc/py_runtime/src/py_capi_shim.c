@@ -38,6 +38,17 @@ typedef int PyGILState_STATE;
 
 int pcc_capi_visit_slot(PyObject **slot, visitproc visit, void *arg);
 
+/* Exported wrapper over the py_internal.h `static inline py_type_of`.
+ * The production pcc-Python archive owns this ABI in py_capi_core_runtime;
+ * the host-C oracle retains the wrapper here. */
+#if defined(PCC_PY_CAPI_CORE_RUNTIME)
+extern int64_t pcc_py_type_of(PyObject *o);
+#else
+int64_t pcc_py_type_of(PyObject *o) {
+    return (int64_t)py_type_of(o);
+}
+#endif
+
 typedef struct {
     double real;
     double imag;
@@ -142,18 +153,50 @@ void PyErr_Fetch(PyObject **ptype, PyObject **pvalue, PyObject **ptraceback);
 void PyErr_Restore(PyObject *type, PyObject *value, PyObject *traceback);
 long long PyLong_AsLongLong(PyObject *obj);
 long PyLong_AsLong(PyObject *obj);
+int PyLong_AsInt(PyObject *obj);
+int PyLong_AsInt32(PyObject *obj, int32_t *pvalue);
+int PyLong_AsInt64(PyObject *obj, int64_t *pvalue);
+int PyLong_AsLongAndOverflow(PyObject *obj, int *overflow);
+double PyLong_AsDouble(PyObject *obj);
+Py_ssize_t PyLong_AsSsize_t(PyObject *obj);
 unsigned long PyLong_AsUnsignedLong(PyObject *obj);
 unsigned long long PyLong_AsUnsignedLongLong(PyObject *obj);
+unsigned long long PyLong_AsUnsignedLongLongMask(PyObject *obj);
+void *PyLong_AsVoidPtr(PyObject *obj);
+size_t PyLong_AsSize_t(PyObject *obj);
+int PyLong_AsUInt32(PyObject *obj, uint32_t *pvalue);
+int PyLong_AsUInt64(PyObject *obj, uint64_t *pvalue);
+PyObject *PyLong_FromLong(long value);
+PyObject *PyLong_FromLongLong(long long value);
+PyObject *PyLong_FromInt32(int32_t value);
+PyObject *PyLong_FromInt64(int64_t value);
+PyObject *PyLong_FromSsize_t(Py_ssize_t value);
+PyObject *PyLong_FromDouble(double value);
+PyObject *PyLong_FromUnsignedLong(unsigned long value);
+PyObject *PyLong_FromUnsignedLongLong(unsigned long long value);
+PyObject *PyLong_FromUInt32(uint32_t value);
+PyObject *PyLong_FromUInt64(uint64_t value);
+PyObject *PyLong_FromVoidPtr(void *value);
+PyObject *PyLong_FromSize_t(size_t value);
+int PyLong_Check(PyObject *obj);
+int PyLong_CheckExact(PyObject *obj);
+int PyLong_IsZero(PyObject *obj);
 PyObject *PyUnicode_AsEncodedString(PyObject *obj, const char *encoding, const char *errors);
+const char *PyUnicode_AsUTF8(PyObject *obj);
 const char *PyUnicode_AsUTF8AndSize(PyObject *obj, Py_ssize_t *size);
 PyObject *PyUnicode_Substring(PyObject *str, Py_ssize_t start, Py_ssize_t end);
 Py_ssize_t PyUnicode_GetLength(PyObject *obj);
 PyObject *PyUnicode_FromFormatV(const char *format, va_list vargs);
 PyObject *PyObject_Str(PyObject *obj);
 PyObject *PyObject_Repr(PyObject *obj);
+PyObject *pcc_capi_method_func_new(PyObject *self, PyMethodDef *method);
+PyObject *pcc_capi_builtin_object_getattr(PyObject *o, const char *name);
+PyObject *PyObject_GetAttr(PyObject *obj, PyObject *attr);
 PyObject *PyObject_GetAttrString(PyObject *obj, const char *attr);
 int PyObject_SetAttrString(PyObject *obj, const char *attr, PyObject *value);
 PyObject *PyObject_CallMethod(PyObject *obj, const char *name, const char *format, ...);
+
+PyObject *PyImport_ImportModule(const char *name);
 int PyDict_Check(PyObject *obj);
 PyObject *PyDict_Keys(PyObject *dict);
 PyObject *PyDict_Values(PyObject *dict);
@@ -165,7 +208,149 @@ int PyIter_NextItem(PyObject *iter, PyObject **item);
 PyObject *PySequence_Tuple(PyObject *obj);
 PyObject *PyNumber_Index(PyObject *obj);
 PyObject *PyErr_Occurred(void);
+PyObject *PyBool_FromLong(long value);
+int PyBool_Check(PyObject *obj);
+PyObject *PyFloat_FromDouble(double value);
+double PyFloat_AsDouble(PyObject *obj);
+int PyFloat_Check(PyObject *obj);
+int PyFloat_CheckExact(PyObject *obj);
+void *PyMem_Malloc(size_t size);
+void *PyMem_RawMalloc(size_t size);
+void *PyMem_Calloc(size_t nelem, size_t elsize);
+void *PyMem_RawCalloc(size_t nelem, size_t elsize);
+void *PyMem_Realloc(void *ptr, size_t new_size);
+void *PyMem_RawRealloc(void *ptr, size_t new_size);
+void PyMem_Free(void *ptr);
+void PyMem_RawFree(void *ptr);
+void *PyObject_Malloc(size_t size);
+void *PyObject_Calloc(size_t nelem, size_t elsize);
+void *PyObject_Realloc(void *ptr, size_t new_size);
+void PyObject_Free(void *ptr);
+void Py_INCREF(PyObject *obj);
+void Py_DECREF(PyObject *obj);
+Py_ssize_t pcc_capi_refcnt(PyObject *obj);
+void pcc_capi_set_refcnt(PyObject *obj, Py_ssize_t refcnt);
+int PyTraceMalloc_Track(unsigned int domain, uintptr_t ptr, size_t size);
+int PyTraceMalloc_Untrack(unsigned int domain, uintptr_t ptr);
+void *PyEval_SaveThread(void);
+void PyEval_RestoreThread(void *ts);
+int Py_IsInitialized(void);
+int PyUnstable_Object_IsUniqueReferencedTemporary(PyObject *op);
+int PyUnstable_Object_IsUniquelyReferenced(PyObject *obj);
 
+/* The PyExc_* singleton data symbols, Py_Ellipsis, and every PyErr_* error
+ * function are owned by the pcc-Python module py_capi_exc_runtime.py in the
+ * production no-libpython archive (LIBC-P3 closure). PCC_PY_CAPI_EXC_RUNTIME
+ * strips them from this C translation unit so the pcc-Python owner is the
+ * single definition; the host-C oracle archive compiles without the define
+ * and keeps this implementation. */
+#if defined(PCC_PY_CAPI_EXC_RUNTIME)
+/* The PyExc_* singletons are defined by the pcc-Python archive member
+ * py_capi_exc_runtime.o; this TU's remaining code still references them, so
+ * declare them extern and let the linker resolve to the pcc-Python owner. */
+extern PyObject *PyExc_ValueError;
+extern PyObject *PyExc_TypeError;
+extern PyObject *PyExc_RuntimeError;
+extern PyObject *PyExc_KeyError;
+extern PyObject *PyExc_IndexError;
+extern PyObject *PyExc_AttributeError;
+extern PyObject *PyExc_MemoryError;
+extern PyObject *PyExc_OverflowError;
+extern PyObject *PyExc_SystemError;
+extern PyObject *PyExc_NameError;
+extern PyObject *PyExc_NotImplementedError;
+extern PyObject *PyExc_BaseException;
+extern PyObject *PyExc_Exception;
+extern PyObject *PyExc_ArithmeticError;
+extern PyObject *PyExc_LookupError;
+extern PyObject *PyExc_OSError;
+extern PyObject *PyExc_IOError;
+extern PyObject *PyExc_AssertionError;
+extern PyObject *PyExc_StopIteration;
+extern PyObject *PyExc_StopAsyncIteration;
+extern PyObject *PyExc_ZeroDivisionError;
+extern PyObject *PyExc_ReferenceError;
+extern PyObject *PyExc_BufferError;
+extern PyObject *PyExc_ImportError;
+extern PyObject *PyExc_ModuleNotFoundError;
+extern PyObject *PyExc_ImportWarning;
+extern PyObject *PyExc_FloatingPointError;
+extern PyObject *PyExc_RecursionError;
+extern PyObject *PyExc_UnicodeDecodeError;
+extern PyObject *PyExc_UnicodeEncodeError;
+extern PyObject *PyExc_UnicodeError;
+extern PyObject *PyExc_Warning;
+extern PyObject *PyExc_UserWarning;
+extern PyObject *PyExc_RuntimeWarning;
+extern PyObject *PyExc_DeprecationWarning;
+extern PyObject *PyExc_FutureWarning;
+extern PyObject *Py_Ellipsis;
+#endif /* PCC_PY_CAPI_EXC_RUNTIME */
+
+#if defined(PCC_PY_CAPI_DICT_RUNTIME)
+/* The PyDict_* functions are defined by the pcc-Python archive member
+ * py_capi_dict_runtime.o; this TU's remaining code still calls them. */
+extern PyObject *PyDict_New(void);
+extern int PyDict_SetItem(PyObject *d, PyObject *k, PyObject *v);
+extern int PyDict_SetItemString(PyObject *d, const char *k, PyObject *v);
+extern PyObject *PyDict_GetItem(PyObject *d, PyObject *k);
+extern PyObject *PyDict_GetItemString(PyObject *d, const char *k);
+extern PyObject *PyDict_GetItemWithError(PyObject *d, PyObject *k);
+extern int PyDict_GetItemRef(PyObject *d, PyObject *k, PyObject **r);
+extern int PyDict_GetItemStringRef(PyObject *d, const char *k, PyObject **r);
+extern int PyDict_SetDefaultRef(
+    PyObject *d, PyObject *k, PyObject *dv, PyObject **r
+);
+extern int PyDict_Pop(PyObject *d, PyObject *k, PyObject **r);
+extern int PyDict_PopString(PyObject *d, const char *k, PyObject **r);
+extern int PyDict_DelItem(PyObject *d, PyObject *k);
+extern int PyDict_DelItemString(PyObject *d, const char *k);
+extern Py_ssize_t PyDict_Size(PyObject *d);
+extern int PyDict_Contains(PyObject *d, PyObject *k);
+extern int PyDict_ContainsString(PyObject *d, const char *k);
+extern int PyDict_Next(
+    PyObject *d, Py_ssize_t *pos, PyObject **key, PyObject **value
+);
+extern PyObject *PyDict_Keys(PyObject *d);
+extern PyObject *PyDict_Values(PyObject *d);
+extern PyObject *PyDict_Items(PyObject *d);
+extern void PyDict_Clear(PyObject *d);
+extern int PyDict_Check(PyObject *o);
+extern int PyDict_CheckExact(PyObject *o);
+extern PyObject *PyDict_Copy(PyObject *mp);
+extern int PyDict_Merge(PyObject *a, PyObject *b, int override);
+#endif /* PCC_PY_CAPI_DICT_RUNTIME */
+
+#if defined(PCC_PY_CAPI_OBJECT_RUNTIME)
+/* The PyObject_* basics are defined by the pcc-Python archive member
+ * py_capi_object_runtime.o; this TU's remaining code still calls them. */
+extern PyObject *PyObject_Type(PyObject *o);
+extern int PyObject_IsTrue(PyObject *o);
+extern int PyObject_Not(PyObject *o);
+extern PyObject *PyObject_Str(PyObject *o);
+extern PyObject *PyObject_Repr(PyObject *o);
+extern PyObject *PyObject_Bytes(PyObject *o);
+extern PyObject *PyObject_Format(PyObject *o, PyObject *spec);
+extern Py_hash_t PyObject_Hash(PyObject *o);
+extern Py_ssize_t PyObject_Size(PyObject *o);
+extern Py_ssize_t PyObject_Length(PyObject *o);
+extern PyObject *PyObject_GetItem(PyObject *o, PyObject *k);
+extern int PyObject_SetItem(PyObject *o, PyObject *k, PyObject *v);
+extern int PyObject_DelItem(PyObject *o, PyObject *k);
+extern PyObject *PyObject_GetIter(PyObject *o);
+extern PyObject *PyObject_SelfIter(PyObject *o);
+extern int PyObject_RichCompareBool(PyObject *a, PyObject *b, int opid);
+extern PyObject *PyObject_RichCompare(PyObject *a, PyObject *b, int opid);
+extern int PyObject_IsInstance(PyObject *o, PyObject *cls);
+extern void PyObject_ClearWeakRefs(PyObject *o);
+extern void PyObject_GC_Track(void *op);
+extern void PyObject_GC_UnTrack(void *op);
+extern void PyObject_GC_Del(void *op);
+extern int PyObject_AsFileDescriptor(PyObject *o);
+extern Py_ssize_t PyObject_LengthHint(PyObject *o, Py_ssize_t dv);
+#endif /* PCC_PY_CAPI_OBJECT_RUNTIME */
+
+#if !defined(PCC_PY_CAPI_EXC_RUNTIME)
 static int pcc_capi_value_error_sentinel;
 static int pcc_capi_type_error_sentinel;
 static int pcc_capi_runtime_error_sentinel;
@@ -239,6 +424,7 @@ PyObject *PyExc_UserWarning = (PyObject *)&pcc_capi_user_warning_sentinel;
 PyObject *PyExc_RuntimeWarning = (PyObject *)&pcc_capi_runtime_warning_sentinel;
 PyObject *PyExc_DeprecationWarning = (PyObject *)&pcc_capi_deprecation_warning_sentinel;
 PyObject *PyExc_FutureWarning = (PyObject *)&pcc_capi_future_warning_sentinel;
+#endif /* !PCC_PY_CAPI_EXC_RUNTIME */
 
 static int pcc_capi_is_exact_type(PyObject *obj, int32_t tag) {
     return obj != NULL && !PY_IS_TAGGED_INT(obj) && py_type_of(obj) == tag;
@@ -261,6 +447,7 @@ static PyObject *pcc_capi_bytearray_from_memory(const char *data, Py_ssize_t len
     return (PyObject *)obj;
 }
 
+#if !defined(PCC_PY_CAPI_CORE_RUNTIME)
 void Py_INCREF(PyObject *obj) {
     py_incref(obj);
 }
@@ -284,6 +471,7 @@ void pcc_capi_set_refcnt(PyObject *obj, Py_ssize_t refcnt) {
     h->refcount = (int64_t)refcnt;
 #endif
 }
+#endif
 
 /* --- numpy host-symbol gap (B-P0-PKG no-libpython runtime-core scope, 2026-05-29).
  * CPython C-API symbols numpy's _core references that the host (pcc) must
@@ -297,6 +485,7 @@ void pcc_capi_set_refcnt(PyObject *obj, Py_ssize_t refcnt) {
 
 /* tracemalloc is not modeled by pcc's GC; track/untrack are no-ops. CPython
  * returns 0 on success (and when tracing is disabled), so do we. */
+#if !defined(PCC_PY_CAPI_CORE_RUNTIME)
 int PyTraceMalloc_Track(unsigned int domain, uintptr_t ptr, size_t size) {
     (void)domain; (void)ptr; (void)size;
     return 0;
@@ -306,9 +495,14 @@ int PyTraceMalloc_Untrack(unsigned int domain, uintptr_t ptr) {
     (void)domain; (void)ptr;
     return 0;
 }
+#endif
 
 /* CPython's strtol/strtoul wrappers. pcc carries no separate C-locale state on
  * this path, so the libc forms are the correct implementation. */
+#if defined(PCC_PY_CAPI_TYPE_RUNTIME)
+extern long PyOS_strtol(const char *str, char **ptr, int base);
+extern unsigned long PyOS_strtoul(const char *str, char **ptr, int base);
+#else
 long PyOS_strtol(const char *str, char **ptr, int base) {
     return strtol(str, ptr, base);
 }
@@ -316,12 +510,15 @@ long PyOS_strtol(const char *str, char **ptr, int base) {
 unsigned long PyOS_strtoul(const char *str, char **ptr, int base) {
     return strtoul(str, ptr, base);
 }
+#endif /* PCC_PY_CAPI_TYPE_RUNTIME */
 
 /* The Ellipsis singleton (`...`). pcc has no Ellipsis object; numpy references
  * the symbol for slice handling. A stable non-NULL sentinel satisfies identity
  * use and linking (mirrors the PyExc_* sentinel pattern above). */
+#if !defined(PCC_PY_CAPI_EXC_RUNTIME)
 static int pcc_capi_ellipsis_sentinel;
 PyObject *Py_Ellipsis = (PyObject *)&pcc_capi_ellipsis_sentinel;
+#endif /* !PCC_PY_CAPI_EXC_RUNTIME */
 
 /* --- C-extension type bridge (B-P0-PKG runtime core, 2026-05-29).
  * Bridges a C-extension's static `PyTypeObject` onto pcc's `type_tag` object
@@ -485,6 +682,24 @@ typedef struct PccCapiGetSetDef {
 
 #define PCC_CAPI_CEXT_TAG_BASE 0x10000
 #define PCC_CAPI_CEXT_TAG_MAX 1024
+#if defined(PCC_PY_CAPI_TYPE_RUNTIME)
+/* The type tokens, the cext registry, and the type functions are owned by
+ * the pcc-Python module py_capi_type_runtime.py in the production archive
+ * (LIBC-P3 closure). The remaining C helpers in this TU (PyType_FromSpec,
+ * GenericAlloc, cext object helpers, GC visitors, ...) still read/write the
+ * registry and call the type functions, so declare them extern. The host-C
+ * oracle archive compiles without the define and keeps the definitions
+ * below. */
+extern PyTypeObject PyType_Type, PyBaseObject_Type, PyTuple_Type, PyList_Type,
+    PyDict_Type, PyUnicode_Type, PyLong_Type, PyFloat_Type, PyBool_Type,
+    PyBytes_Type, PyByteArray_Type, PySet_Type, PyFrozenSet_Type, PySlice_Type,
+    PyComplex_Type, PyModule_Type, PyFunction_Type, PyCFunction_Type,
+    PyMemberDescr_Type, PyGetSetDescr_Type, PyMethodDescr_Type,
+    PyDictProxy_Type, PyMemoryView_Type;
+extern PyTypeObject *pcc_capi_cext_types[PCC_CAPI_CEXT_TAG_MAX];
+extern PyObject *pcc_capi_cext_type_modules[PCC_CAPI_CEXT_TAG_MAX];
+extern int32_t pcc_capi_cext_type_count;
+#else
 static PyTypeObject *pcc_capi_cext_types[PCC_CAPI_CEXT_TAG_MAX];
 static PyObject *pcc_capi_cext_type_modules[PCC_CAPI_CEXT_TAG_MAX];
 static int32_t pcc_capi_cext_type_count;
@@ -523,7 +738,11 @@ PCC_CAPI_TYPEOBJ(PyMethodDescr_Type, "method_descriptor");
 PCC_CAPI_TYPEOBJ(PyDictProxy_Type, "mappingproxy");
 PCC_CAPI_TYPEOBJ(PyMemoryView_Type, "memoryview");
 #undef PCC_CAPI_TYPEOBJ
+#endif /* PCC_PY_CAPI_TYPE_RUNTIME */
 
+#if defined(PCC_PY_CAPI_TYPE_RUNTIME)
+extern PyObject *pcc_capi_builtin_type_token(PyObject *value);
+#else
 static PyObject *pcc_capi_builtin_type_token(PyObject *value) {
     switch (py_builtin_type_class_tag(value)) {
         case PY_TYPE_BOOL: return (PyObject *)&PyBool_Type;
@@ -543,8 +762,10 @@ static PyObject *pcc_capi_builtin_type_token(PyObject *value) {
         default: return value;
     }
 }
+#endif /* PCC_PY_CAPI_TYPE_RUNTIME */
 
 static PyObject *pcc_capi_prepare_call_args(PyObject *args) {
+
     if (args == NULL || PY_IS_TAGGED_INT(args)
         || py_type_of(args) != PY_TYPE_TUPLE) {
         PyErr_SetString(PyExc_TypeError, "C method args must be a tuple");
@@ -579,6 +800,9 @@ static PyObject *pcc_capi_prepare_call_args(PyObject *args) {
 
 /* Assign (or fetch the cached) dynamic pcc type_tag for a C-ext type. The tag
  * is stashed in tp_version_tag (0 = unassigned); the registry maps it back. */
+#if defined(PCC_PY_CAPI_TYPE_RUNTIME)
+int32_t pcc_capi_cext_tag_for(PyTypeObject *type);
+#else
 static int32_t pcc_capi_cext_tag_for(PyTypeObject *type) {
     if (type == NULL) return PY_TYPE_NONE;
     if (type->tp_version_tag != 0) return (int32_t)type->tp_version_tag;
@@ -589,9 +813,14 @@ static int32_t pcc_capi_cext_tag_for(PyTypeObject *type) {
     type->tp_version_tag = (unsigned int)tag;
     return tag;
 }
+#endif /* PCC_PY_CAPI_TYPE_RUNTIME */
+
 
 PyObject *PyType_GenericAlloc(PyTypeObject *type, Py_ssize_t nitems);
 
+#if defined(PCC_PY_CAPI_TYPE_RUNTIME)
+extern int PyType_Ready(PyTypeObject *type);
+#else
 int PyType_Ready(PyTypeObject *type) {
     if (type == NULL) return -1;
     if (type->tp_flags & Py_TPFLAGS_READY) return 0;
@@ -607,18 +836,33 @@ int PyType_Ready(PyTypeObject *type) {
     type->tp_flags |= Py_TPFLAGS_READY;
     return 0;
 }
+#endif /* PCC_PY_CAPI_TYPE_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_TYPE_RUNTIME)
+extern void PyType_Modified(PyTypeObject *type);
+#else
 void PyType_Modified(PyTypeObject *type) {
     /* CPython invalidates its type lookup cache here. PCC performs no cached
      * C-extension type lookup, so mutation is already immediately visible. */
     (void)type;
 }
+#endif /* PCC_PY_CAPI_TYPE_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_TYPE_RUNTIME)
+int64_t pcc_capi_is_cext_type_tag(int64_t type_tag);
+#else
 int64_t pcc_capi_is_cext_type_tag(int64_t type_tag) {
     int64_t offset = type_tag - PCC_CAPI_CEXT_TAG_BASE;
     return offset >= 0 && offset < pcc_capi_cext_type_count;
 }
+#endif /* PCC_PY_CAPI_TYPE_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_TYPE_RUNTIME)
+PyTypeObject *pcc_capi_cext_type_for_object(PyObject *o);
+#else
 static PyTypeObject *pcc_capi_cext_type_for_object(PyObject *o) {
     if (o == NULL || PY_IS_TAGGED_INT(o)) return NULL;
     int64_t offset = (
@@ -627,19 +871,33 @@ static PyTypeObject *pcc_capi_cext_type_for_object(PyObject *o) {
     if (offset < 0 || offset >= pcc_capi_cext_type_count) return NULL;
     return pcc_capi_cext_types[offset];
 }
+#endif /* PCC_PY_CAPI_TYPE_RUNTIME */
 
-static int pcc_capi_is_seqiter(PyObject *obj);
-static PyObject *pcc_capi_seqiter_next(PyObject *obj);
+
+int pcc_capi_is_seqiter(PyObject *obj);
+PyObject *pcc_capi_seqiter_next(PyObject *obj);
 void PyErr_SetNone(PyObject *type);
 
+#if defined(PCC_PY_CAPI_CEXT_RUNTIME)
+extern PyObject *pcc_capi_cext_object_iter(PyObject *o);
+#else
 PyObject *pcc_capi_cext_object_iter(PyObject *o) {
     PyTypeObject *type = pcc_capi_cext_type_for_object(o);
     if (type == NULL || type->tp_iter == NULL) return NULL;
     PyObject *(*iter_slot)(PyObject *) = (
         PyObject *(*)(PyObject *)
     )type->tp_iter;
-    return iter_slot(o);
+    PyObject *result = iter_slot(o);
+    if (result == NULL) {
+        py_runtime_error_if_unset(
+            "C extension tp_iter",
+            "tp_iter returned NULL without setting an exception"
+        );
+    }
+    return result;
 }
+#endif /* PCC_PY_CAPI_CEXT_RUNTIME */
+
 
 /* Render a C-extension object (e.g. a numpy scalar returned by ndarray element
  * access) by driving its own tp_repr slot directly — mirrors
@@ -647,15 +905,30 @@ PyObject *pcc_capi_cext_object_iter(PyObject *o) {
  * the caller keep the <object tag=N> fallback. Do NOT route this through
  * PyObject_Repr, which falls back to pcc's py_obj_repr and raises "object
  * cannot be converted to repr" for a foreign cext object. */
+#if defined(PCC_PY_CAPI_CEXT_RUNTIME)
+extern PyObject *pcc_capi_cext_object_repr(PyObject *o);
+#else
 PyObject *pcc_capi_cext_object_repr(PyObject *o) {
     PyTypeObject *type = pcc_capi_cext_type_for_object(o);
     if (type == NULL || type->tp_repr == NULL) return NULL;
     PyObject *(*repr_slot)(PyObject *) = (
         PyObject *(*)(PyObject *)
     )type->tp_repr;
-    return repr_slot(o);
+    PyObject *result = repr_slot(o);
+    if (result == NULL) {
+        py_runtime_error_if_unset(
+            "C extension tp_repr",
+            "tp_repr returned NULL without setting an exception"
+        );
+    }
+    return result;
 }
+#endif /* PCC_PY_CAPI_CEXT_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_CEXT_RUNTIME)
+extern PyObject *pcc_capi_cext_object_next(PyObject *o);
+#else
 PyObject *pcc_capi_cext_object_next(PyObject *o) {
     PyObject *result = NULL;
     if (pcc_capi_is_seqiter(o)) {
@@ -673,13 +946,23 @@ PyObject *pcc_capi_cext_object_next(PyObject *o) {
     }
     return result;
 }
+#endif /* PCC_PY_CAPI_CEXT_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_CEXT_RUNTIME)
+extern int64_t pcc_capi_cext_object_is_iterator(PyObject *o);
+#else
 int64_t pcc_capi_cext_object_is_iterator(PyObject *o) {
     if (pcc_capi_is_seqiter(o)) return 1;
     PyTypeObject *type = pcc_capi_cext_type_for_object(o);
     return type != NULL && type->tp_iternext != NULL;
 }
+#endif /* PCC_PY_CAPI_CEXT_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_CEXT_RUNTIME)
+extern PyObject *pcc_capi_cext_object_getitem(PyObject *o, PyObject *key);
+#else
 PyObject *pcc_capi_cext_object_getitem(PyObject *o, PyObject *key) {
     PyTypeObject *type = pcc_capi_cext_type_for_object(o);
     if (type == NULL) return NULL;
@@ -690,7 +973,14 @@ PyObject *pcc_capi_cext_object_getitem(PyObject *o, PyObject *key) {
         PyObject *(*subscript)(PyObject *, PyObject *) = (
             PyObject *(*)(PyObject *, PyObject *)
         )mapping->mp_subscript;
-        return subscript(o, key);
+        PyObject *result = subscript(o, key);
+        if (result == NULL) {
+            py_runtime_error_if_unset(
+                "C extension mp_subscript",
+                "mp_subscript returned NULL without setting an exception"
+            );
+        }
+        return result;
     }
     PccCapiSequenceMethods *sequence = (
         PccCapiSequenceMethods *
@@ -701,10 +991,122 @@ PyObject *pcc_capi_cext_object_getitem(PyObject *o, PyObject *key) {
         PyObject *(*item)(PyObject *, Py_ssize_t) = (
             PyObject *(*)(PyObject *, Py_ssize_t)
         )sequence->sq_item;
-        return item(o, index);
+        PyObject *result = item(o, index);
+        if (result == NULL) {
+            py_runtime_error_if_unset(
+                "C extension sq_item",
+                "sq_item returned NULL without setting an exception"
+            );
+        }
+        return result;
     }
     return NULL;
 }
+#endif /* PCC_PY_CAPI_CEXT_RUNTIME */
+
+
+#if defined(PCC_PY_CAPI_CEXT_RUNTIME)
+extern int64_t pcc_capi_cext_object_setitem(
+    PyObject *o, PyObject *key, PyObject *value
+);
+#else
+int64_t pcc_capi_cext_object_setitem(
+    PyObject *o,
+    PyObject *key,
+    PyObject *value
+) {
+    PyTypeObject *type = pcc_capi_cext_type_for_object(o);
+    if (type == NULL) {
+        PyErr_SetString(PyExc_TypeError, "object does not support item assignment");
+        return -1;
+    }
+    PccCapiMappingMethods *mapping = (
+        PccCapiMappingMethods *
+    )type->tp_as_mapping;
+    if (mapping != NULL && mapping->mp_ass_subscript != NULL) {
+        int (*assign)(PyObject *, PyObject *, PyObject *) = (
+            int (*)(PyObject *, PyObject *, PyObject *)
+        )mapping->mp_ass_subscript;
+        int rc = assign(o, key, value);
+        if (rc < 0 && !py_err_occurred()) {
+            PyErr_SetString(
+                PyExc_RuntimeError,
+                "mp_ass_subscript returned failure without setting an exception"
+            );
+        }
+        return (int64_t)rc;
+    }
+    PccCapiSequenceMethods *sequence = (
+        PccCapiSequenceMethods *
+    )type->tp_as_sequence;
+    if (sequence != NULL && sequence->sq_ass_item != NULL) {
+        Py_ssize_t index = (Py_ssize_t)PyLong_AsLong(key);
+        if (py_err_occurred()) return -1;
+        int (*assign)(PyObject *, Py_ssize_t, PyObject *) = (
+            int (*)(PyObject *, Py_ssize_t, PyObject *)
+        )sequence->sq_ass_item;
+        int rc = assign(o, index, value);
+        if (rc < 0 && !py_err_occurred()) {
+            PyErr_SetString(
+                PyExc_RuntimeError,
+                "sq_ass_item returned failure without setting an exception"
+            );
+        }
+        return (int64_t)rc;
+    }
+    PyErr_SetString(PyExc_TypeError, "object does not support item assignment");
+    return -1;
+}
+#endif /* PCC_PY_CAPI_CEXT_RUNTIME */
+
+#if defined(PCC_PY_CAPI_CEXT_RUNTIME)
+extern int64_t pcc_capi_cext_object_length(PyObject *o);
+#else
+/* len() for a C-extension object: mp_length, else sq_length. Returns -1 when
+ * the type exposes neither, so py_obj_len can fall through to the user-class
+ * __len__ dispatch instead of silently reporting 0 (len(np.array(...)) was
+ * 0 while a[0] worked, because py_obj_len had no cext branch at all while
+ * its neighbour py_obj_getitem did). Real lengths are non-negative, so the
+ * sentinel needs no out-parameter. */
+int64_t pcc_capi_cext_object_length(PyObject *o) {
+    PyTypeObject *type = pcc_capi_cext_type_for_object(o);
+    if (type == NULL) return -1;
+    PccCapiMappingMethods *mapping = (
+        PccCapiMappingMethods *
+    )type->tp_as_mapping;
+    if (mapping != NULL && mapping->mp_length != NULL) {
+        Py_ssize_t (*mlen)(PyObject *) = (
+            Py_ssize_t (*)(PyObject *)
+        )mapping->mp_length;
+        Py_ssize_t result = mlen(o);
+        if (result < 0) {
+            py_runtime_error_if_unset(
+                "C extension mp_length",
+                "mp_length returned a negative result without setting an exception"
+            );
+        }
+        return (int64_t)result;
+    }
+    PccCapiSequenceMethods *sequence = (
+        PccCapiSequenceMethods *
+    )type->tp_as_sequence;
+    if (sequence != NULL && sequence->sq_length != NULL) {
+        Py_ssize_t (*slen)(PyObject *) = (
+            Py_ssize_t (*)(PyObject *)
+        )sequence->sq_length;
+        Py_ssize_t result = slen(o);
+        if (result < 0) {
+            py_runtime_error_if_unset(
+                "C extension sq_length",
+                "sq_length returned a negative result without setting an exception"
+            );
+        }
+        return (int64_t)result;
+    }
+    return -1;
+}
+#endif /* PCC_PY_CAPI_CEXT_RUNTIME */
+
 
 static int pcc_capi_cext_vectorcall_slot(
     PyObject *callable,
@@ -731,7 +1133,10 @@ static int pcc_capi_cext_vectorcall_slot(
     return 1;
 }
 
-static PyObject **pcc_capi_object_dict_slot(
+#if defined(PCC_PY_CAPI_CEXT_RUNTIME)
+extern PyObject **pcc_capi_object_dict_slot(PyObject *o, PyTypeObject *type);
+#else
+PyObject **pcc_capi_object_dict_slot(
     PyObject *o,
     PyTypeObject *type
 ) {
@@ -742,7 +1147,12 @@ static PyObject **pcc_capi_object_dict_slot(
     }
     return (PyObject **)((char *)o + type->tp_dictoffset);
 }
+#endif /* PCC_PY_CAPI_CEXT_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_CEXT_RUNTIME)
+extern int64_t pcc_capi_cext_object_is_callable(PyObject *callable);
+#else
 int64_t pcc_capi_cext_object_is_callable(PyObject *callable) {
     if (callable == NULL || PY_IS_TAGGED_INT(callable)) return 0;
     int64_t offset = (
@@ -752,7 +1162,14 @@ int64_t pcc_capi_cext_object_is_callable(PyObject *callable) {
     PyTypeObject *type = pcc_capi_cext_types[offset];
     return type != NULL && type->tp_call != NULL;
 }
+#endif /* PCC_PY_CAPI_CEXT_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_CEXT_RUNTIME)
+extern PyObject *pcc_capi_call_cext_object(
+    PyObject *callable, PyObject *args, PyObject *kwargs
+);
+#else
 PyObject *pcc_capi_call_cext_object(
     PyObject *callable,
     PyObject *args,
@@ -772,14 +1189,19 @@ PyObject *pcc_capi_call_cext_object(
     PyObject *call_kwargs = kwargs == py_None ? NULL : kwargs;
     PyObject *result = tp_call(callable, args, call_kwargs);
     if (result == NULL && !py_err_occurred()) {
-        PyErr_SetString(
-            PyExc_RuntimeError,
+        py_runtime_error_if_unset(
+            "C extension tp_call",
             "C extension tp_call returned NULL without setting an exception"
         );
     }
     return result;
 }
+#endif /* PCC_PY_CAPI_CEXT_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_CEXT_RUNTIME)
+extern int64_t pcc_capi_dealloc_cext_object(PyObject *o, int64_t type_tag);
+#else
 int64_t pcc_capi_dealloc_cext_object(PyObject *o, int64_t type_tag) {
     int64_t offset = type_tag - PCC_CAPI_CEXT_TAG_BASE;
     if (offset < 0 || offset >= pcc_capi_cext_type_count) return 0;
@@ -795,9 +1217,14 @@ int64_t pcc_capi_dealloc_cext_object(PyObject *o, int64_t type_tag) {
     pcc_gc_free_object_memory(o);
     return 1;
 }
+#endif /* PCC_PY_CAPI_CEXT_RUNTIME */
+
 
 PyObject *PyType_GenericNew(PyTypeObject *type, PyObject *args, PyObject *kwds);
 
+#if defined(PCC_PY_CAPI_TYPE_RUNTIME)
+extern PyObject *PyType_FromSpec(PyType_Spec *spec);
+#else
 PyObject *PyType_FromSpec(PyType_Spec *spec) {
     if (spec == NULL || spec->name == NULL) {
         PyErr_SetString(PyExc_TypeError, "invalid PyType_Spec");
@@ -843,7 +1270,15 @@ PyObject *PyType_FromSpec(PyType_Spec *spec) {
     }
     return (PyObject *)type;
 }
+#endif /* PCC_PY_CAPI_TYPE_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_MODULE_STATE_RUNTIME)
+extern PyObject *PyType_FromModuleAndSpec(
+    PyObject *module, PyType_Spec *spec, PyObject *bases
+);
+extern PyObject *PyType_GetModule(PyTypeObject *type);
+#else
 PyObject *PyType_FromModuleAndSpec(
     PyObject *module,
     PyType_Spec *spec,
@@ -892,6 +1327,11 @@ PyObject *PyType_GetModule(PyTypeObject *type) {
     return pcc_capi_cext_type_modules[offset];
 }
 
+
+#endif /* PCC_PY_CAPI_MODULE_STATE_RUNTIME */
+#if defined(PCC_PY_CAPI_TYPE_RUNTIME)
+extern PyObject *PyType_GenericAlloc(PyTypeObject *type, Py_ssize_t nitems);
+#else
 PyObject *PyType_GenericAlloc(PyTypeObject *type, Py_ssize_t nitems) {
     if (type == NULL) return NULL;
     int32_t tag = pcc_capi_cext_tag_for(type);
@@ -910,13 +1350,23 @@ PyObject *PyType_GenericAlloc(PyTypeObject *type, Py_ssize_t nitems) {
     }
     return obj;
 }
+#endif /* PCC_PY_CAPI_TYPE_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_TYPE_RUNTIME)
+extern PyObject *PyType_GenericNew(PyTypeObject *type, PyObject *args, PyObject *kwds);
+#else
 PyObject *PyType_GenericNew(PyTypeObject *type, PyObject *args, PyObject *kwds) {
     (void)args;
     (void)kwds;
     return PyType_GenericAlloc(type, 0);
 }
+#endif /* PCC_PY_CAPI_TYPE_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_TYPE_RUNTIME)
+int pcc_capi_is_type_object(PyObject *o);
+#else
 static int pcc_capi_is_type_object(PyObject *o) {
     if (o == NULL || PY_IS_TAGGED_INT(o)) return 0;
     if (o == (PyObject *)&PyType_Type
@@ -949,10 +1399,17 @@ static int pcc_capi_is_type_object(PyObject *o) {
     }
     return 0;
 }
+#endif /* PCC_PY_CAPI_TYPE_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_TYPE_RUNTIME)
+int64_t pcc_capi_is_type_object_value(PyObject *value);
+#else
 int64_t pcc_capi_is_type_object_value(PyObject *value) {
     return pcc_capi_is_type_object(value);
 }
+#endif /* PCC_PY_CAPI_TYPE_RUNTIME */
+
 
 static PyObject *pcc_capi_type_method_descriptor(PyMethodDef *method);
 static PyObject *pcc_capi_type_getset_descriptor(PccCapiGetSetDef *getset);
@@ -962,6 +1419,9 @@ static PyObject *pcc_capi_type_richcompare_descriptor(
     const char *name
 );
 
+#if defined(PCC_PY_CAPI_TYPE_DESCRIPTOR_RUNTIME)
+extern PyObject *pcc_capi_type_object_getattr(PyObject *type_object, const char *name);
+#else
 PyObject *pcc_capi_type_object_getattr(PyObject *type_object, const char *name) {
     if (!pcc_capi_is_type_object(type_object) || name == NULL) return NULL;
     if (strcmp(name, "__name__") == 0) {
@@ -1017,14 +1477,28 @@ PyObject *pcc_capi_type_object_getattr(PyObject *type_object, const char *name) 
     }
     return NULL;
 }
+#endif /* PCC_PY_CAPI_TYPE_DESCRIPTOR_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_CEXT_RUNTIME)
+extern int64_t pcc_capi_type_object_is_callable(PyObject *callable);
+#else
 int64_t pcc_capi_type_object_is_callable(PyObject *callable) {
     if (!pcc_capi_is_type_object(callable)) return 0;
     PyTypeObject *type = (PyTypeObject *)callable;
     return type->tp_version_tag >= PCC_CAPI_CEXT_TAG_BASE
         && type->tp_new != NULL;
 }
+#endif /* PCC_PY_CAPI_CEXT_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_CEXT_RUNTIME)
+extern PyObject *pcc_capi_call_type_object(
+    PyObject *callable,
+    PyObject *args,
+    PyObject *kwargs
+);
+#else
 PyObject *pcc_capi_call_type_object(
     PyObject *callable,
     PyObject *args,
@@ -1040,19 +1514,33 @@ PyObject *pcc_capi_call_type_object(
         PyObject *(*)(PyTypeObject *, PyObject *, PyObject *)
     )type->tp_new;
     PyObject *result = tp_new(type, args, call_kwargs);
-    if (result == NULL) return NULL;
+    if (result == NULL) {
+        py_runtime_error_if_unset(
+            "C extension tp_new",
+            "tp_new returned NULL without setting an exception"
+        );
+        return NULL;
+    }
     if (type->tp_init != NULL) {
         int (*tp_init)(PyObject *, PyObject *, PyObject *) = (
             int (*)(PyObject *, PyObject *, PyObject *)
         )type->tp_init;
         if (tp_init(result, args, call_kwargs) != 0) {
+            py_runtime_error_if_unset(
+                "C extension tp_init",
+                "tp_init returned failure without setting an exception"
+            );
             py_decref(result);
             return NULL;
         }
     }
     return result;
 }
+#endif /* PCC_PY_CAPI_CEXT_RUNTIME */
 
+#if defined(PCC_PY_CAPI_TYPE_RUNTIME)
+PyTypeObject *pcc_capi_type(PyObject *o);
+#else
 PyTypeObject *pcc_capi_type(PyObject *o) {
     if (o == NULL) return NULL;
     if (PY_IS_TAGGED_INT(o)) return &PyLong_Type;  /* immediate small ints */
@@ -1091,7 +1579,12 @@ PyTypeObject *pcc_capi_type(PyObject *o) {
     default: return NULL;
     }
 }
+#endif /* PCC_PY_CAPI_TYPE_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_TYPE_RUNTIME)
+PyTypeObject **pcc_capi_type_addr(PyObject *o);
+#else
 PyTypeObject **pcc_capi_type_addr(PyObject *o) {
     static PyTypeObject *tagged_int_type = &PyLong_Type;
     static PyTypeObject *unknown_type = NULL;
@@ -1122,7 +1615,12 @@ PyTypeObject **pcc_capi_type_addr(PyObject *o) {
     unknown_type = pcc_capi_type(o);
     return &unknown_type;
 }
+#endif /* PCC_PY_CAPI_TYPE_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_TYPE_RUNTIME)
+Py_ssize_t pcc_capi_size(PyObject *o);
+#else
 Py_ssize_t pcc_capi_size(PyObject *o) {
     if (o == NULL || PY_IS_TAGGED_INT(o)) return 0;
     int32_t tag = py_type_of(o);
@@ -1143,7 +1641,12 @@ Py_ssize_t pcc_capi_size(PyObject *o) {
             return 0;
     }
 }
+#endif /* PCC_PY_CAPI_TYPE_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_TYPE_RUNTIME)
+void pcc_capi_set_size(PyObject *o, Py_ssize_t size);
+#else
 void pcc_capi_set_size(PyObject *o, Py_ssize_t size) {
     if (o == NULL || PY_IS_TAGGED_INT(o)) return;
     int32_t tag = py_type_of(o);
@@ -1153,7 +1656,12 @@ void pcc_capi_set_size(PyObject *o, Py_ssize_t size) {
         ) = size;
     }
 }
+#endif /* PCC_PY_CAPI_TYPE_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_TYPE_RUNTIME)
+int pcc_capi_typecheck(PyObject *o, PyTypeObject *t);
+#else
 int pcc_capi_typecheck(PyObject *o, PyTypeObject *t) {
     if (o == NULL || t == NULL) return 0;
     /* True if o's type IS t or a subtype: walk the tp_base inheritance chain
@@ -1165,11 +1673,16 @@ int pcc_capi_typecheck(PyObject *o, PyTypeObject *t) {
     }
     return 0;
 }
+#endif /* PCC_PY_CAPI_TYPE_RUNTIME */
+
 
 /* --- More host symbols numpy references (B-P0-PKG runtime core, 2026-05-29 batch 2).
  * Each reuses the type bridge above or is a trivial/correct primitive. */
 
 /* a IS b or descends from b via tp_base (the same walk, on two types). */
+#if defined(PCC_PY_CAPI_TYPE_RUNTIME)
+int PyType_IsSubtype(PyTypeObject *a, PyTypeObject *b);
+#else
 int PyType_IsSubtype(PyTypeObject *a, PyTypeObject *b) {
     for (int guard = 0; a != NULL && guard < 64; guard++) {
         if (a == b) return 1;
@@ -1177,50 +1690,92 @@ int PyType_IsSubtype(PyTypeObject *a, PyTypeObject *b) {
     }
     return 0;
 }
+#endif /* PCC_PY_CAPI_TYPE_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_TYPE_RUNTIME)
+int64_t pcc_capi_type_object_issubclass(PyObject *derived, PyObject *cls);
+#else
 int64_t pcc_capi_type_object_issubclass(PyObject *derived, PyObject *cls) {
     if (!pcc_capi_is_type_object(derived) || !pcc_capi_is_type_object(cls)) {
         return 0;
     }
     return PyType_IsSubtype((PyTypeObject *)derived, (PyTypeObject *)cls);
 }
+#endif /* PCC_PY_CAPI_TYPE_RUNTIME */
+
 
 /* Vectorcall arg count: strip the high "arguments-offset" flag bit. */
 #ifndef PY_VECTORCALL_ARGUMENTS_OFFSET
 #define PY_VECTORCALL_ARGUMENTS_OFFSET (((size_t)1) << (8 * sizeof(size_t) - 1))
 #endif
+#if defined(PCC_PY_CAPI_OBJECT_CALL_RUNTIME)
+extern Py_ssize_t PyVectorcall_NARGS(size_t n);
+#else
 Py_ssize_t PyVectorcall_NARGS(size_t n) {
     return (Py_ssize_t)(n & ~PY_VECTORCALL_ARGUMENTS_OFFSET);
 }
+#endif
 
 /* Allocate an instance of a type (the PyObject_New/NewVar macros call these). */
+#if defined(PCC_PY_CAPI_PRIVATE_RUNTIME)
+extern PyObject *_PyObject_New(PyTypeObject *type);
+extern PyObject *_PyObject_NewVar(PyTypeObject *type, Py_ssize_t nitems);
+#else
 PyObject *_PyObject_New(PyTypeObject *type) {
     return PyType_GenericAlloc(type, 0);
 }
 PyObject *_PyObject_NewVar(PyTypeObject *type, Py_ssize_t nitems) {
     return PyType_GenericAlloc(type, nitems);
 }
+#endif /* PCC_PY_CAPI_PRIVATE_RUNTIME */
+
 
 /* Stamp an already-allocated var object's type tag + size (CPython sets ob_type
  * + ob_size; pcc carries a type_tag + the PyVarObject ob_size slot). */
+#if defined(PCC_PY_CAPI_OBJECT_ATTR_RUNTIME)
+extern void *PyObject_InitVar(void *op, PyTypeObject *type, Py_ssize_t size);
+#else
 void *PyObject_InitVar(void *op, PyTypeObject *type, Py_ssize_t size) {
     if (op == NULL) return op;
     PyObjectHeader *h = (PyObjectHeader *)op;
+    h->refcount = 1;
     h->type_tag = pcc_capi_cext_tag_for(type);
+    h->flags = PY_FLAG_GC_MALLOC_ALLOC;
+    if (pcc_gc_pointer_register((PyObject *)op) < 0) return NULL;
+    int64_t tracked_size = type != NULL
+        ? (int64_t)type->tp_basicsize
+        : (int64_t)sizeof(PyObjectHeader);
+    if (tracked_size < (int64_t)sizeof(PyObjectHeader)) {
+        tracked_size = (int64_t)sizeof(PyObjectHeader);
+    }
+    if (type != NULL && size > 0 && type->tp_itemsize > 0
+        && size <= (INT64_MAX - tracked_size) / type->tp_itemsize) {
+        tracked_size += (int64_t)size * (int64_t)type->tp_itemsize;
+    }
+    pcc_gc_note_object_allocated_sized((PyObject *)op, tracked_size);
     /* ob_size is the Py_ssize_t immediately after the 16-byte header. */
     *(Py_ssize_t *)((char *)op + sizeof(PyObjectHeader)) = size;
     return op;
 }
+#endif /* PCC_PY_CAPI_OBJECT_ATTR_RUNTIME */
 
 /* Free-threading mutex: the no-libpython shim is single-interpreter on this
  * path, so lock/unlock are no-ops (no contention to guard). */
+#if defined(PCC_PY_CAPI_TYPE_RUNTIME)
+extern void PyMutex_Lock(void *m);
+extern void PyMutex_Unlock(void *m);
+#else
 void PyMutex_Lock(void *m) { (void)m; }
 void PyMutex_Unlock(void *m) { (void)m; }
+#endif /* PCC_PY_CAPI_TYPE_RUNTIME */
 
 /* GIL detach/reattach: no detachable thread state on the no-libpython import
  * path, so save returns NULL and restore is a no-op. */
+#if !defined(PCC_PY_CAPI_CORE_RUNTIME)
 void *PyEval_SaveThread(void) { return NULL; }
 void PyEval_RestoreThread(void *ts) { (void)ts; }
+#endif
 
 /* The builtins mapping. pcc's no-libpython runtime exposes builtins as native
  * intrinsics rather than a dict object, so this is a real (initially-empty)
@@ -1232,6 +1787,9 @@ void PyEval_RestoreThread(void *ts) { (void)ts; }
  * file-open path degrades to NULL without crashing. Populating it with pcc
  * builtins-as-callables (e.g. a real "open") is a follow-on gated behind the
  * file-object/array runtime, far past import. */
+#if defined(PCC_PY_CAPI_CORE_RUNTIME)
+extern PyObject *PyEval_GetBuiltins(void);
+#else
 PyObject *PyEval_GetBuiltins(void) {
     static PyObject *builtins = NULL;
     if (builtins == NULL) {
@@ -1239,41 +1797,67 @@ PyObject *PyEval_GetBuiltins(void) {
     }
     return builtins;
 }
+#endif
 
 /* --- Host symbols backed by existing pcc runtime primitives (batch 3). */
 
 /* Invalidate weakrefs to a dying object (pcc's py_weakref_invalidate). */
+#if !defined(PCC_PY_CAPI_OBJECT_RUNTIME)
 void PyObject_ClearWeakRefs(PyObject *obj) {
     if (obj != NULL) py_weakref_invalidate(obj);
 }
+#endif /* !PCC_PY_CAPI_OBJECT_RUNTIME */
 
 /* `raise X from Y`: set exc.__cause__ (pcc's py_exc_set_cause). */
+#if defined(PCC_PY_CAPI_MISC_RUNTIME)
+extern void PyException_SetCause(PyObject *self, PyObject *cause);
+#else
 void PyException_SetCause(PyObject *self, PyObject *cause) {
     py_exc_set_cause(self, cause);
 }
+#endif /* PCC_PY_CAPI_MISC_RUNTIME */
+
 
 /* pcc has no traceback object (no Itanium-style unwinding), so there is nothing
  * to attach; report success. */
+#if defined(PCC_PY_CAPI_MISC_RUNTIME)
+extern int PyException_SetTraceback(PyObject *self, PyObject *tb);
+#else
 int PyException_SetTraceback(PyObject *self, PyObject *tb) {
     (void)self;
     (void)tb;
     return 0;
 }
+#endif /* PCC_PY_CAPI_MISC_RUNTIME */
+
 
 /* issubclass for the type-object case numpy uses (walk tp_base). General
  * class-object issubclass is a follow-on. */
+#if defined(PCC_PY_CAPI_OBJECT_ATTR_RUNTIME)
+extern int PyObject_IsSubclass(PyObject *derived, PyObject *cls);
+#else
 int PyObject_IsSubclass(PyObject *derived, PyObject *cls) {
     return PyType_IsSubtype((PyTypeObject *)derived, (PyTypeObject *)cls);
 }
+#endif /* PCC_PY_CAPI_OBJECT_ATTR_RUNTIME */
+
 
 /* --- Link-readiness host symbols numpy references (clearly-correct, no new
  * mirrors / pcc primitives). batch 4. */
 
 /* tp_flags read off the type (mirror struct above). */
+#if defined(PCC_PY_CAPI_TYPE_RUNTIME)
+extern unsigned long PyType_GetFlags(PyTypeObject *type);
+#else
 unsigned long PyType_GetFlags(PyTypeObject *type) {
     return type != NULL ? type->tp_flags : 0UL;
 }
+#endif /* PCC_PY_CAPI_TYPE_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_TYPE_RUNTIME)
+extern void *PyType_GetSlot(PyTypeObject *type, int slot);
+#else
 void *PyType_GetSlot(PyTypeObject *type, int slot) {
     if (type == NULL) return NULL;
     switch (slot) {
@@ -1295,25 +1879,40 @@ void *PyType_GetSlot(PyTypeObject *type, int slot) {
         default: return NULL;
     }
 }
+#endif /* PCC_PY_CAPI_TYPE_RUNTIME */
+
 
 /* CPython's locale-independent string->double; libc strtod is the correct
  * implementation here (no separate C-locale on this path). overflow_exc is the
  * exception to raise on overflow — unused; callers also check errno/endptr. */
+#if defined(PCC_PY_CAPI_TYPE_RUNTIME)
+extern double PyOS_string_to_double(
+    const char *s, char **endptr, PyObject *overflow_exc
+);
+#else
 double PyOS_string_to_double(const char *s, char **endptr, PyObject *overflow_exc) {
     (void)overflow_exc;
     return strtod(s, endptr);
 }
+#endif /* PCC_PY_CAPI_TYPE_RUNTIME */
 
 /* GC object allocation = ordinary allocation on pcc (the GC tracks via the
  * object header, not a separate gc list). */
+#if defined(PCC_PY_CAPI_PRIVATE_RUNTIME)
+extern PyObject *_PyObject_GC_New(PyTypeObject *type);
+#else
 PyObject *_PyObject_GC_New(PyTypeObject *type) {
     return PyType_GenericAlloc(type, 0);
 }
+#endif /* PCC_PY_CAPI_PRIVATE_RUNTIME */
+
 
 /* Explicit GC track/untrack are CPython gc-list hooks; pcc's GC discovers
  * objects through the header, so these are no-ops. */
+#if !defined(PCC_PY_CAPI_OBJECT_RUNTIME)
 void PyObject_GC_Track(void *op) { (void)op; }
 void PyObject_GC_UnTrack(void *op) { (void)op; }
+#endif /* !PCC_PY_CAPI_OBJECT_RUNTIME */
 
 /* --- batch 5: more link-readiness reusing existing shim primitives.
  * (forward decls — these are defined later in this file) */
@@ -1322,19 +1921,31 @@ void PyObject_Free(void *ptr);
 
 /* The precomputed hash is an optimization; pcc dicts rehash, so routing to the
  * ordinary lookup returns the same item. */
+#if defined(PCC_PY_CAPI_PRIVATE_RUNTIME)
+extern PyObject *_PyDict_GetItem_KnownHash(PyObject *mp, PyObject *key, Py_hash_t hash);
+#else
 PyObject *_PyDict_GetItem_KnownHash(PyObject *mp, PyObject *key, Py_hash_t hash) {
     (void)hash;
     return PyDict_GetItem(mp, key);
 }
+#endif /* PCC_PY_CAPI_PRIVATE_RUNTIME */
+
 
 /* Free a GC object via pcc's object allocator. */
+#if !defined(PCC_PY_CAPI_OBJECT_RUNTIME)
 void PyObject_GC_Del(void *op) { PyObject_Free(op); }
+#endif /* !PCC_PY_CAPI_OBJECT_RUNTIME */
 
 /* Multi-phase module init: PyInit_* returns `PyModuleDef_Init(&def)` for
  * slot-based modules (numpy's _multiarray_umath). The returned thing is the raw
  * def struct (NOT a pcc object), so we stamp a recognizable marker into
  * m_base.ob_base; the loader detects it via pcc_capi_is_moduledef and then runs
  * the Py_mod_exec slots (pcc_capi_module_exec). */
+#if defined(PCC_PY_CAPI_MODULE_RUNTIME)
+extern int pcc_capi_moduledef_marker;
+extern PyObject *PyModuleDef_Init(PyModuleDef *def);
+extern int pcc_capi_is_moduledef(PyObject *o);
+#else
 static int pcc_capi_moduledef_marker;
 PyObject *PyModuleDef_Init(PyModuleDef *def) {
     if (def == NULL) return NULL;
@@ -1349,6 +1960,8 @@ int pcc_capi_is_moduledef(PyObject *o) {
            == (PyObject *)&pcc_capi_moduledef_marker;
 }
 
+
+#endif /* PCC_PY_CAPI_MODULE_RUNTIME */
 /* --- batch 6: PyCFunction accessors. Layout mirror of the fake-libc
  * PyCFunctionObject prefix (PyObject_HEAD is the 16-byte PyObjectHeader, so m_ml
  * sits at offset 16 in both). */
@@ -1358,7 +1971,25 @@ typedef struct {
     PyObject *m_self;
 } pcc_capi_cfunc;
 
+#if defined(PCC_PY_CAPI_METHOD_BRIDGE_RUNTIME)
+/* The C-extension method bridge (call entry, captures, method wrapper) is
+ * owned by the pcc-Python module py_capi_method_bridge_runtime.py. */
+extern PyObject *pcc_capi_method_func_new(PyObject *self, PyMethodDef *method);
+#else
 static PyObject *pcc_capi_method_call_entry(PyObject *captures, PyObject *args);
+
+static PyObject *pcc_capi_method_require_result(
+    PyObject *result,
+    const char *method_name
+) {
+    if (result == NULL) {
+        py_runtime_error_if_unset(
+            method_name != NULL ? method_name : "C extension method",
+            "C extension method returned NULL without setting an exception"
+        );
+    }
+    return result;
+}
 
 static PyMethodDef *pcc_capi_func_method_def(PyObject *op) {
     if (op == NULL || PY_IS_TAGGED_INT(op) || py_type_of(op) != PY_TYPE_FUNC) {
@@ -1441,6 +2072,9 @@ static PyObject *pcc_capi_fast_keyword_call(
     return result;
 }
 
+#if defined(PCC_PY_CAPI_CFUNCTION_RUNTIME)
+extern PyCFunction PyCFunction_GetFunction(PyObject *op);
+#else
 PyCFunction PyCFunction_GetFunction(PyObject *op) {
     if (op == NULL) return NULL;
     if (!PY_IS_TAGGED_INT(op) && py_type_of(op) == PY_TYPE_FUNC) {
@@ -1451,6 +2085,11 @@ PyCFunction PyCFunction_GetFunction(PyObject *op) {
     PyMethodDef *ml = ((pcc_capi_cfunc *)op)->m_ml;
     return ml ? ml->ml_meth : NULL;
 }
+#endif /* PCC_PY_CAPI_CFUNCTION_RUNTIME */
+
+#if defined(PCC_PY_CAPI_CFUNCTION_RUNTIME)
+extern PyObject *PyCFunction_GetSelf(PyObject *op);
+#else
 PyObject *PyCFunction_GetSelf(PyObject *op) {
     if (op != NULL && !PY_IS_TAGGED_INT(op) && py_type_of(op) == PY_TYPE_FUNC) {
         PyMethodDef *method = pcc_capi_func_method_def(op);
@@ -1461,6 +2100,11 @@ PyObject *PyCFunction_GetSelf(PyObject *op) {
     }
     return op ? ((pcc_capi_cfunc *)op)->m_self : NULL;
 }
+#endif /* PCC_PY_CAPI_CFUNCTION_RUNTIME */
+
+#if defined(PCC_PY_CAPI_CFUNCTION_RUNTIME)
+extern int PyCFunction_GetFlags(PyObject *op);
+#else
 int PyCFunction_GetFlags(PyObject *op) {
     if (op == NULL) return -1;
     if (!PY_IS_TAGGED_INT(op) && py_type_of(op) == PY_TYPE_FUNC) {
@@ -1471,6 +2115,8 @@ int PyCFunction_GetFlags(PyObject *op) {
     PyMethodDef *ml = ((pcc_capi_cfunc *)op)->m_ml;
     return ml ? ml->ml_flags : 0;
 }
+#endif /* PCC_PY_CAPI_CFUNCTION_RUNTIME */
+
 
 static PyObject *pcc_capi_method_call_entry(PyObject *captures, PyObject *args) {
     if (captures == NULL || PY_IS_TAGGED_INT(captures)
@@ -1538,8 +2184,9 @@ static PyObject *pcc_capi_method_call_entry(PyObject *captures, PyObject *args) 
                         || py_type_of(kwargs) != PY_TYPE_DICT))) {
                 PyErr_SetString(PyExc_TypeError, "invalid C keyword method call");
             } else {
-                result = pcc_capi_fast_keyword_call(
-                    self, method, call_args, kwargs
+                result = pcc_capi_method_require_result(
+                    pcc_capi_fast_keyword_call(self, method, call_args, kwargs),
+                    method->ml_name
                 );
             }
             py_decref(call_args);
@@ -1559,8 +2206,11 @@ static PyObject *pcc_capi_method_call_entry(PyObject *captures, PyObject *args) 
                         || py_type_of(kwargs) != PY_TYPE_DICT))) {
                 PyErr_SetString(PyExc_TypeError, "invalid C keyword method call");
             } else {
-                result = ((PyCFunctionWithKeywords)method->ml_meth)(
-                    self, call_args, kwargs
+                result = pcc_capi_method_require_result(
+                    ((PyCFunctionWithKeywords)method->ml_meth)(
+                        self, call_args, kwargs
+                    ),
+                    method->ml_name
                 );
             }
             py_decref(call_args);
@@ -1570,14 +2220,18 @@ static PyObject *pcc_capi_method_call_entry(PyObject *captures, PyObject *args) 
         if (nargs != 0) {
             PyErr_SetString(PyExc_TypeError, "method takes no arguments");
         } else {
-            result = method->ml_meth(self, NULL);
+            result = pcc_capi_method_require_result(
+                method->ml_meth(self, NULL), method->ml_name
+            );
         }
     } else if ((flags & METH_O) != 0) {
         if (nargs != 1) {
             PyErr_SetString(PyExc_TypeError, "method takes exactly one argument");
         } else {
             PyObject *arg = py_tuple_get(args, 0);
-            result = method->ml_meth(self, arg);
+            result = pcc_capi_method_require_result(
+                method->ml_meth(self, arg), method->ml_name
+            );
             py_decref(arg);
         }
     } else if ((flags & METH_FASTCALL) != 0
@@ -1596,8 +2250,11 @@ static PyObject *pcc_capi_method_call_entry(PyObject *captures, PyObject *args) 
             if (fastcall_args[i] == NULL) args_ready = 0;
         }
         if (args_ready) {
-            result = ((PyCFunctionFast)method->ml_meth)(
-                self, fastcall_args, (Py_ssize_t)nargs
+            result = pcc_capi_method_require_result(
+                ((PyCFunctionFast)method->ml_meth)(
+                    self, fastcall_args, (Py_ssize_t)nargs
+                ),
+                method->ml_name
             );
         }
         for (int64_t i = 0; i < nargs; i++) {
@@ -1605,7 +2262,9 @@ static PyObject *pcc_capi_method_call_entry(PyObject *captures, PyObject *args) 
         }
         free(fastcall_args);
     } else if ((flags & METH_VARARGS) != 0) {
-        result = method->ml_meth(self, args);
+        result = pcc_capi_method_require_result(
+            method->ml_meth(self, args), method->ml_name
+        );
     } else {
         PyErr_SetString(PyExc_TypeError, "unsupported C method flags");
     }
@@ -1736,7 +2395,7 @@ static PyObject *pcc_capi_method_func_finish(
     return fn;
 }
 
-static PyObject *pcc_capi_method_func_new(PyObject *self, PyMethodDef *method) {
+PyObject *pcc_capi_method_func_new(PyObject *self, PyMethodDef *method) {
     if (method == NULL || method->ml_meth == NULL) return NULL;
     if ((method->ml_flags & METH_KEYWORDS) != 0
         && (method->ml_flags & (METH_VARARGS | METH_FASTCALL)) != 0) {
@@ -1770,6 +2429,8 @@ static PyObject *pcc_capi_method_func_new(PyObject *self, PyMethodDef *method) {
     return NULL;
 }
 
+
+#endif /* PCC_PY_CAPI_METHOD_BRIDGE_RUNTIME */
 /* A type's tp_methods entries are descriptors, not methods bound to the type
  * object.  Keep one unbound function per defining PyMethodDef so inherited
  * class lookup preserves descriptor identity (numpy uses that property to
@@ -1786,6 +2447,14 @@ static PccCapiMethodDescriptor
     pcc_capi_method_descriptors[PCC_CAPI_METHOD_DESCRIPTOR_MAX];
 static int32_t pcc_capi_method_descriptor_count;
 
+#if defined(PCC_PY_CAPI_TYPE_DESCRIPTOR_RUNTIME)
+/* The type-descriptor walk + constructors + caches are owned by the pcc-Python
+ * module py_capi_type_descriptor_runtime.py. */
+extern PyObject *pcc_capi_type_object_getattr(PyObject *type_object, const char *name);
+extern PyObject *pcc_capi_unbound_method_call_entry(PyObject *captures, PyObject *args);
+extern PyObject *pcc_capi_data_descriptor_call_entry(PyObject *captures, PyObject *args);
+extern PyObject *pcc_capi_richcompare_descriptor_call_entry(PyObject *captures, PyObject *args);
+#else
 static PyObject *pcc_capi_unbound_method_call_entry(
     PyObject *captures,
     PyObject *args
@@ -1830,14 +2499,18 @@ static PyObject *pcc_capi_unbound_method_call_entry(
         if (nargs != 1) {
             PyErr_SetString(PyExc_TypeError, "method takes no arguments");
         } else {
-            result = method->ml_meth(self, NULL);
+            result = pcc_capi_method_require_result(
+                method->ml_meth(self, NULL), method->ml_name
+            );
         }
     } else if ((flags & METH_O) != 0) {
         if (nargs != 2) {
             PyErr_SetString(PyExc_TypeError, "method takes exactly one argument");
         } else {
             PyObject *arg = py_tuple_get(args, 1);
-            result = method->ml_meth(self, arg);
+            result = pcc_capi_method_require_result(
+                method->ml_meth(self, arg), method->ml_name
+            );
             py_decref(arg);
         }
     } else if ((flags & METH_VARARGS) != 0) {
@@ -1856,11 +2529,16 @@ static PyObject *pcc_capi_unbound_method_call_entry(
         }
         if (call_args != NULL) {
             if ((flags & METH_KEYWORDS) != 0) {
-                result = ((PyCFunctionWithKeywords)method->ml_meth)(
-                    self, call_args, NULL
+                result = pcc_capi_method_require_result(
+                    ((PyCFunctionWithKeywords)method->ml_meth)(
+                        self, call_args, NULL
+                    ),
+                    method->ml_name
                 );
             } else {
-                result = method->ml_meth(self, call_args);
+                result = pcc_capi_method_require_result(
+                    method->ml_meth(self, call_args), method->ml_name
+                );
             }
             py_decref(call_args);
         }
@@ -2102,22 +2780,35 @@ static PyObject *pcc_capi_type_richcompare_descriptor(
     return descriptor;
 }
 
+
+#endif /* PCC_PY_CAPI_TYPE_DESCRIPTOR_RUNTIME */
 /* --- batch 7: import-critical link-gap host symbols. */
 
 /* One main interpreter + thread state. numpy's subinterpreter guard checks
  * `PyThreadState_Get()->interp != PyInterpreterState_Main()`, so both must
  * agree (interp is the first field, offset 0). void* returns are ABI-compatible
  * with the fake-Python.h opaque PyThreadState / PyInterpreterState pointers. */
+#if defined(PCC_PY_CAPI_MISC_RUNTIME)
+extern void *PyInterpreterState_Main(void);
+extern void *PyThreadState_Get(void);
+#else
 static char pcc_capi_main_interp;
 static struct { void *interp; } pcc_capi_main_tstate = {&pcc_capi_main_interp};
 void *PyInterpreterState_Main(void) { return &pcc_capi_main_interp; }
 void *PyThreadState_Get(void) { return &pcc_capi_main_tstate; }
+#endif /* PCC_PY_CAPI_MISC_RUNTIME */
 
 /* exception __context__ via the pcc primitive (mirrors PyException_SetCause). */
+#if defined(PCC_PY_CAPI_MISC_RUNTIME)
+extern void PyException_SetContext(PyObject *self, PyObject *context);
+#else
 void PyException_SetContext(PyObject *self, PyObject *context) {
     py_exc_set_context(self, context);
 }
+#endif /* PCC_PY_CAPI_MISC_RUNTIME */
 
+
+#if !defined(PCC_PY_CAPI_CORE_RUNTIME)
 int PyUnstable_Object_IsUniqueReferencedTemporary(PyObject *op) {
     (void)op;
     return 0;
@@ -2131,10 +2822,16 @@ int PyUnstable_Object_IsUniquelyReferenced(PyObject *obj) {
     if (obj == NULL || PY_IS_TAGGED_INT(obj)) return 0;
     return ((PyObjectHeader *)obj)->refcount == 1;
 }
+#endif
 
 /* datetime C-API capsule: PyDateTime_IMPORT is a no-op on the no-libpython
- * path, so the table stays NULL; the symbol just needs to exist for linking. */
+ * path, so the table stays NULL; the production data symbol is generated by
+ * py_capi_core_runtime and the host-C oracle retains the definition here. */
+#if defined(PCC_PY_CAPI_CORE_RUNTIME)
+extern void *PyDateTimeAPI;
+#else
 void *PyDateTimeAPI = NULL;
+#endif
 
 /* --- batch 8: link symbols reusing existing shim primitives (forward-declared
  * here; defined later in this file). */
@@ -2142,11 +2839,35 @@ PyObject *PyTuple_New(Py_ssize_t size);
 PyObject *PyTuple_GetItem(PyObject *obj, Py_ssize_t index);
 int PyTuple_SetItem(PyObject *obj, Py_ssize_t index, PyObject *value);
 Py_ssize_t PyTuple_Size(PyObject *obj);
+PyObject *PyTuple_Pack(Py_ssize_t size, ...);
+int PyTuple_Check(PyObject *obj);
+int PyTuple_CheckExact(PyObject *obj);
+PyObject *PyList_New(Py_ssize_t size);
+int PyList_SetItem(PyObject *obj, Py_ssize_t index, PyObject *value);
+PyObject *PyList_GetItem(PyObject *obj, Py_ssize_t index);
+PyObject *PyList_GetItemRef(PyObject *obj, Py_ssize_t index);
+Py_ssize_t PyList_Size(PyObject *obj);
+int PyList_Append(PyObject *obj, PyObject *value);
+PyObject *PyList_AsTuple(PyObject *obj);
+int PyList_Check(PyObject *obj);
+int PyList_CheckExact(PyObject *obj);
+PyObject *PyBytes_FromStringAndSize(const char *value, Py_ssize_t len);
+PyObject *PyBytes_FromString(const char *value);
+char *PyBytes_AsString(PyObject *obj);
+int PyBytes_AsStringAndSize(
+    PyObject *obj, char **buffer, Py_ssize_t *length
+);
+Py_ssize_t PyBytes_Size(PyObject *obj);
+int PyBytes_Check(PyObject *obj);
+int PyBytes_CheckExact(PyObject *obj);
 PyObject *PyUnicode_AsASCIIString(PyObject *obj);
 int PyLong_Check(PyObject *obj);
 long PyLong_AsLong(PyObject *obj);
 
 /* Sub-tuple [lo, hi) — new tuple + copied (incref'd) items. */
+#if defined(PCC_PY_CAPI_MISC_RUNTIME)
+extern PyObject *PyTuple_GetSlice(PyObject *tuple, Py_ssize_t lo, Py_ssize_t hi);
+#else
 PyObject *PyTuple_GetSlice(PyObject *tuple, Py_ssize_t lo, Py_ssize_t hi) {
     if (tuple == NULL) return NULL;
     Py_ssize_t n = PyTuple_Size(tuple);
@@ -2165,37 +2886,53 @@ PyObject *PyTuple_GetSlice(PyObject *tuple, Py_ssize_t lo, Py_ssize_t hi) {
 
 /* latin1 encode — for numpy's ASCII dtype/field names, latin1 == ASCII, so
  * route to the ASCII encoder (full latin1 high-byte support is a follow-on). */
+#if defined(PCC_PY_CAPI_UNICODE_RUNTIME)
+extern PyObject *PyUnicode_AsLatin1String(PyObject *unicode);
+#else
 PyObject *PyUnicode_AsLatin1String(PyObject *unicode) {
     return PyUnicode_AsASCIIString(unicode);
 }
+#endif /* PCC_PY_CAPI_UNICODE_RUNTIME */
+
 
 /* fd from an object: an int IS the fd; otherwise unsupported here (numpy passes
  * integer fds on this path). */
+#if !defined(PCC_PY_CAPI_OBJECT_RUNTIME)
 int PyObject_AsFileDescriptor(PyObject *o) {
     if (o != NULL && PyLong_Check(o)) return (int)PyLong_AsLong(o);
     PyErr_SetString(PyExc_TypeError, "argument must be an int file descriptor");
     return -1;
 }
+#endif /* !PCC_PY_CAPI_OBJECT_RUNTIME */
 
 /* --- batch 9: genuinely-correct / import-safe link symbols only. */
 
 /* pcc raises normalized exception INSTANCES (no separate type/value/tb triple to
  * reconcile), so the triple is already normalized — nothing to do. */
+#if !defined(PCC_PY_CAPI_EXC_RUNTIME)
 void PyErr_NormalizeException(PyObject **exc, PyObject **val, PyObject **tb) {
     (void)exc;
     (void)val;
     (void)tb;
 }
+#endif /* PCC_PY_CAPI_MISC_RUNTIME */
+
+#endif /* !PCC_PY_CAPI_EXC_RUNTIME */
 
 /* `T.__class_getitem__` is set to this at import but only CALLED when user code
  * subscripts the type (`T[X]`), not during import. Return the origin (incref'd):
  * a faithful GenericAlias object is a follow-on; this keeps `T[X] -> T` rather
  * than crashing, and the symbol links. */
+#if defined(PCC_PY_CAPI_MISC_RUNTIME)
+extern PyObject *Py_GenericAlias(PyObject *origin, PyObject *args);
+#else
 PyObject *Py_GenericAlias(PyObject *origin, PyObject *args) {
     (void)args;
     if (origin != NULL) py_incref(origin);
     return origin;
 }
+#endif /* PCC_PY_CAPI_MISC_RUNTIME */
+
 
 /* --- batch 10: a genuinely-correct single-context contextvar (NOT a stub).
  * numpy.errstate creates a ContextVar AT import via PyContextVar_New, so an
@@ -2205,6 +2942,15 @@ PyObject *Py_GenericAlias(PyObject *origin, PyObject *args) {
  * context — correct for single-threaded import and basic get/default use.
  * Only New + Get are provided (the two symbols numpy's C core references);
  * Set/Reset are driven from Python's contextvars module, not the C API. */
+#if defined(PCC_PY_CAPI_CONTEXTVAR_RUNTIME)
+/* The ContextVar type + PyContextVar_New/Get/Set + method callbacks are owned
+ * by the pcc-Python module py_capi_contextvar_runtime.py. */
+extern PyObject *PyContextVar_New(const char *name, PyObject *def);
+extern int PyContextVar_Get(PyObject *var, PyObject *default_value, PyObject **value);
+extern PyObject *PyContextVar_Set(PyObject *var, PyObject *value);
+extern void pcc_capi_contextvar_dealloc(PyObject *obj);
+extern int pcc_capi_contextvar_traverse(PyObject *obj, visitproc visit, void *arg);
+#else
 typedef struct {
     PyObjectHeader header;
     void *ob_type;       /* set by PyType_GenericAlloc at offset sizeof(header) */
@@ -2245,6 +2991,8 @@ static PyMethodDef pcc_capi_contextvar_methods[] = {
     {NULL, NULL, 0, NULL},
 };
 
+
+
 static PyTypeObject pcc_capi_contextvar_type = {
     .ob_base = {1, 0, 0},
     .tp_name = "ContextVar",
@@ -2279,9 +3027,13 @@ int PyContextVar_Get(PyObject *var, PyObject *default_value, PyObject **value) {
                                             /* the var's own default. */
     if (res != NULL) py_incref(res);
     *value = res;                          /* may be NULL = no default anywhere */
+    *value = res;                          /* may be NULL = no default anywhere */
     return 0;
 }
+#endif /* PCC_PY_CAPI_CONTEXTVAR_RUNTIME */
 
+
+#if !defined(PCC_PY_CAPI_MEMORY_RUNTIME)
 void *PyMem_Malloc(size_t size) {
     return malloc(size == 0 ? 1 : size);
 }
@@ -2331,9 +3083,15 @@ void *PyObject_Realloc(void *ptr, size_t new_size) {
 }
 
 void PyObject_Free(void *ptr) {
+    if (pcc_gc_pointer_is_managed((PyObject *)ptr) != 0) {
+        pcc_gc_note_object_freeing((PyObject *)ptr);
+        (void)pcc_gc_pointer_unregister((PyObject *)ptr);
+    }
     PyMem_Free(ptr);
 }
+#endif
 
+#if !defined(PCC_PY_CAPI_STDIO_RUNTIME)
 int PyOS_vsnprintf(char *str, size_t size, const char *format, va_list va) {
     return vsnprintf(str, size, format, va);
 }
@@ -2345,11 +3103,15 @@ int PyOS_snprintf(char *str, size_t size, const char *format, ...) {
     va_end(va);
     return result;
 }
+#endif
 
+#if !defined(PCC_PY_CAPI_SIGNED_LONG_RUNTIME)
 PyObject *PyLong_FromLong(long value) {
     return py_int_from_i64((int64_t)value);
 }
+#endif
 
+#if !defined(PCC_PY_CAPI_UNSIGNED_LONG_RUNTIME)
 static PyObject *pcc_capi_uint_to_pyobject(unsigned long long value) {
     if (value <= (unsigned long long)INT64_MAX) {
         return py_int_from_i64((int64_t)value);
@@ -2363,15 +3125,21 @@ static PyObject *pcc_capi_uint_to_pyobject(unsigned long long value) {
 PyObject *PyLong_FromUnsignedLong(unsigned long value) {
     return pcc_capi_uint_to_pyobject((unsigned long long)value);
 }
+#endif
 
+#if !defined(PCC_PY_CAPI_SIGNED_LONG_RUNTIME)
 PyObject *PyLong_FromLongLong(long long value) {
     return py_int_from_i64((int64_t)value);
 }
+#endif
 
+#if !defined(PCC_PY_CAPI_UNSIGNED_LONG_RUNTIME)
 PyObject *PyLong_FromUnsignedLongLong(unsigned long long value) {
     return pcc_capi_uint_to_pyobject(value);
 }
+#endif
 
+#if !defined(PCC_PY_CAPI_SIGNED_LONG_RUNTIME)
 PyObject *PyLong_FromInt32(int32_t value) {
     return PyLong_FromLong((long)value);
 }
@@ -2379,7 +3147,9 @@ PyObject *PyLong_FromInt32(int32_t value) {
 PyObject *PyLong_FromInt64(int64_t value) {
     return PyLong_FromLongLong((long long)value);
 }
+#endif
 
+#if !defined(PCC_PY_CAPI_UNSIGNED_LONG_RUNTIME)
 PyObject *PyLong_FromUInt32(uint32_t value) {
     return PyLong_FromUnsignedLong((unsigned long)value);
 }
@@ -2391,15 +3161,21 @@ PyObject *PyLong_FromUInt64(uint64_t value) {
 PyObject *PyLong_FromVoidPtr(void *value) {
     return pcc_capi_uint_to_pyobject((unsigned long long)(uintptr_t)value);
 }
+#endif
 
+#if !defined(PCC_PY_CAPI_SIGNED_LONG_RUNTIME)
 PyObject *PyLong_FromSsize_t(Py_ssize_t value) {
     return py_int_from_i64((int64_t)value);
 }
+#endif
 
+#if !defined(PCC_PY_CAPI_UNSIGNED_LONG_RUNTIME)
 PyObject *PyLong_FromSize_t(size_t value) {
     return pcc_capi_uint_to_pyobject((unsigned long long)value);
 }
+#endif
 
+#if !defined(PCC_PY_CAPI_SIGNED_LONG_RUNTIME)
 PyObject *PyLong_FromDouble(double value) {
     if (isnan(value)) {
         PyErr_SetString(PyExc_ValueError, "cannot convert NaN to integer");
@@ -2418,7 +3194,9 @@ PyObject *PyLong_FromDouble(double value) {
     }
     return py_int_from_i64((int64_t)value);
 }
+#endif
 
+#if !defined(PCC_PY_CAPI_BOOL_FLOAT_RUNTIME)
 PyObject *PyBool_FromLong(long value) {
     PyObject *obj = py_bool_from_bit(value != 0);
     py_incref(obj);
@@ -2454,17 +3232,25 @@ int PyFloat_Check(PyObject *obj) {
 int PyFloat_CheckExact(PyObject *obj) {
     return PyFloat_Check(obj);
 }
+#endif
 
 static int pcc_capi_is_complex(PyObject *obj) {
     return obj != NULL && !PY_IS_TAGGED_INT(obj) && py_type_of(obj) == PY_TYPE_COMPLEX;
 }
 
+#if defined(PCC_PY_CAPI_TYPE_RUNTIME)
+/* The complete PyComplex_* surface is owned by the pcc-Python module
+ * py_capi_type_runtime.py, including the two-f64 Py_complex aggregate ABI. */
+extern PyObject *PyComplex_FromDoubles(double real, double imag);
+extern double PyComplex_RealAsDouble(PyObject *obj);
+extern double PyComplex_ImagAsDouble(PyObject *obj);
+extern int PyComplex_Check(PyObject *obj);
+extern int PyComplex_CheckExact(PyObject *obj);
+extern PyObject *PyComplex_FromCComplex(Py_complex value);
+extern Py_complex PyComplex_AsCComplex(PyObject *obj);
+#else
 PyObject *PyComplex_FromDoubles(double real, double imag) {
     return py_complex_new(real, imag);
-}
-
-PyObject *PyComplex_FromCComplex(Py_complex value) {
-    return PyComplex_FromDoubles(value.real, value.imag);
 }
 
 double PyComplex_RealAsDouble(PyObject *obj) {
@@ -2491,6 +3277,18 @@ double PyComplex_ImagAsDouble(PyObject *obj) {
     return -1.0;
 }
 
+int PyComplex_Check(PyObject *obj) {
+    return pcc_capi_is_complex(obj);
+}
+
+int PyComplex_CheckExact(PyObject *obj) {
+    return PyComplex_Check(obj);
+}
+
+PyObject *PyComplex_FromCComplex(Py_complex value) {
+    return PyComplex_FromDoubles(value.real, value.imag);
+}
+
 Py_complex PyComplex_AsCComplex(PyObject *obj) {
     Py_complex value;
     if (pcc_capi_is_complex(obj)) {
@@ -2514,15 +3312,9 @@ Py_complex PyComplex_AsCComplex(PyObject *obj) {
     value.imag = 0.0;
     return value;
 }
+#endif /* PCC_PY_CAPI_TYPE_RUNTIME */
 
-int PyComplex_Check(PyObject *obj) {
-    return pcc_capi_is_complex(obj);
-}
-
-int PyComplex_CheckExact(PyObject *obj) {
-    return PyComplex_Check(obj);
-}
-
+#if !defined(PCC_PY_CAPI_SIGNED_LONG_RUNTIME)
 long PyLong_AsLong(PyObject *obj) {
     if (obj == py_True) return 1;
     if (obj == py_False) return 0;
@@ -2570,7 +3362,9 @@ int PyLong_AsInt64(PyObject *obj, int64_t *pvalue) {
     *pvalue = (int64_t)value;
     return 0;
 }
+#endif
 
+#if !defined(PCC_PY_CAPI_UNSIGNED_LONG_RUNTIME)
 int PyLong_AsUInt32(PyObject *obj, uint32_t *pvalue) {
     if (pvalue == NULL) {
         PyErr_SetString(PyExc_TypeError, "NULL uint32 output pointer");
@@ -2596,7 +3390,9 @@ int PyLong_AsUInt64(PyObject *obj, uint64_t *pvalue) {
     *pvalue = (uint64_t)value;
     return 0;
 }
+#endif
 
+#if !defined(PCC_PY_CAPI_SIGNED_LONG_RUNTIME)
 int PyLong_AsLongAndOverflow(PyObject *obj, int *overflow) {
     if (obj == py_True || obj == py_False) {
         if (overflow != NULL) *overflow = 0;
@@ -2646,7 +3442,9 @@ double PyLong_AsDouble(PyObject *obj) {
     }
     return py_float_to_f64(obj);
 }
+#endif
 
+#if !defined(PCC_PY_CAPI_UNSIGNED_LONG_RUNTIME)
 static int pcc_capi_unsigned_from_pyobject(
     PyObject *obj,
     unsigned long long *out,
@@ -2725,19 +3523,25 @@ unsigned long long PyLong_AsUnsignedLongLongMask(PyObject *obj) {
     if (!pcc_capi_unsigned_from_pyobject(obj, &value, 1)) return (unsigned long long)-1;
     return value;
 }
+#endif
 
+#if !defined(PCC_PY_CAPI_SIGNED_LONG_RUNTIME)
 Py_ssize_t PyLong_AsSsize_t(PyObject *obj) {
     long value = PyLong_AsLong(obj);
     if (py_err_occurred()) return (Py_ssize_t)-1;
     return (Py_ssize_t)value;
 }
+#endif
 
+#if !defined(PCC_PY_CAPI_UNSIGNED_LONG_RUNTIME)
 size_t PyLong_AsSize_t(PyObject *obj) {
     unsigned long value = PyLong_AsUnsignedLong(obj);
     if (py_err_occurred()) return (size_t)-1;
     return (size_t)value;
 }
+#endif
 
+#if !defined(PCC_PY_CAPI_SIGNED_LONG_RUNTIME)
 int PyLong_Check(PyObject *obj) {
     if (obj == NULL) return 0;
     if (PY_IS_TAGGED_INT(obj)) return 1;
@@ -2762,12 +3566,21 @@ int PyLong_IsZero(PyObject *obj) {
     PyIntObject *value = (PyIntObject *)obj;
     return value->sign == 0 || value->ndigits == 0;
 }
+#endif
 
+#if defined(PCC_PY_CAPI_UNICODE_RUNTIME)
+PyObject *PyUnicode_FromString(const char *value);
+#else
 PyObject *PyUnicode_FromString(const char *value) {
     if (value == NULL) value = "";
     return py_str_new(value, (int64_t)strlen(value));
 }
+#endif /* PCC_PY_CAPI_UNICODE_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_UNICODE_RUNTIME)
+PyObject *PyUnicode_FromStringAndSize(const char *value, Py_ssize_t len);
+#else
 PyObject *PyUnicode_FromStringAndSize(const char *value, Py_ssize_t len) {
     if (len < 0) {
         PyErr_SetString(PyExc_ValueError, "negative unicode size");
@@ -2779,7 +3592,12 @@ PyObject *PyUnicode_FromStringAndSize(const char *value, Py_ssize_t len) {
     }
     return py_str_new(value, (int64_t)len);
 }
+#endif /* PCC_PY_CAPI_UNICODE_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_UNICODE_RUNTIME)
+PyObject *PyUnicode_FromObject(PyObject *obj);
+#else
 PyObject *PyUnicode_FromObject(PyObject *obj) {
     if (!pcc_capi_is_exact_type(obj, PY_TYPE_STR)) {
         PyErr_SetString(PyExc_TypeError, "expected str");
@@ -2788,7 +3606,12 @@ PyObject *PyUnicode_FromObject(PyObject *obj) {
     Py_INCREF(obj);
     return obj;
 }
+#endif /* PCC_PY_CAPI_UNICODE_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_UNICODE_RUNTIME)
+extern PyObject *PyUnicode_New(Py_ssize_t size, Py_UCS4 maxchar);
+#else
 PyObject *PyUnicode_New(Py_ssize_t size, Py_UCS4 maxchar) {
     (void)maxchar;
     if (size < 0) {
@@ -2804,10 +3627,17 @@ PyObject *PyUnicode_New(Py_ssize_t size, Py_UCS4 maxchar) {
     );
     return NULL;
 }
+#endif /* PCC_PY_CAPI_UNICODE_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_UNICODE_RUNTIME)
+PyObject *PyUnicode_InternFromString(const char *value);
+#else
 PyObject *PyUnicode_InternFromString(const char *value) {
     return PyUnicode_FromString(value);
 }
+#endif /* PCC_PY_CAPI_UNICODE_RUNTIME */
+
 
 static int pcc_capi_utf8_codepoint_len(uint32_t ch) {
     if (ch <= 0x7fU) return 1;
@@ -2859,6 +3689,9 @@ static uint32_t pcc_capi_unicode_read_kind(const void *buffer, int kind, Py_ssiz
     return ((const Py_UCS4 *)buffer)[i];
 }
 
+#if defined(PCC_PY_CAPI_UNICODE_RUNTIME)
+extern PyObject *PyUnicode_FromKindAndData(int kind, const void *buffer, Py_ssize_t size);
+#else
 PyObject *PyUnicode_FromKindAndData(int kind, const void *buffer, Py_ssize_t size) {
     if (size < 0) {
         PyErr_SetString(PyExc_ValueError, "negative unicode size");
@@ -2909,7 +3742,12 @@ PyObject *PyUnicode_FromKindAndData(int kind, const void *buffer, Py_ssize_t siz
     if (out == NULL) PyErr_NoMemory();
     return out;
 }
+#endif /* PCC_PY_CAPI_UNICODE_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_UNICODE_RUNTIME)
+extern PyObject *PyUnicode_FromOrdinal(int ordinal);
+#else
 PyObject *PyUnicode_FromOrdinal(int ordinal) {
     if (ordinal < 0 || ordinal > 0x10ffff) {
         PyErr_SetString(PyExc_ValueError, "unicode ordinal out of range");
@@ -2918,6 +3756,8 @@ PyObject *PyUnicode_FromOrdinal(int ordinal) {
     Py_UCS4 ch = (Py_UCS4)ordinal;
     return PyUnicode_FromKindAndData(PyUnicode_4BYTE_KIND, &ch, 1);
 }
+#endif /* PCC_PY_CAPI_UNICODE_RUNTIME */
+
 
 static int pcc_capi_utf8_next_u4(
     const unsigned char *data,
@@ -2982,6 +3822,11 @@ static int pcc_capi_utf8_next_u4(
     return -1;
 }
 
+#if defined(PCC_PY_CAPI_UNICODE_SEARCH_RUNTIME)
+extern Py_UCS4 pcc_capi_unicode_read(
+    int kind, const void *data, Py_ssize_t index
+);
+#else
 Py_UCS4 pcc_capi_unicode_read(int kind, const void *data, Py_ssize_t index) {
     (void)kind;
     if (data == NULL || index < 0) return (Py_UCS4)-1;
@@ -3005,6 +3850,8 @@ Py_UCS4 pcc_capi_unicode_read(int kind, const void *data, Py_ssize_t index) {
     }
     return (Py_UCS4)-1;
 }
+#endif /* PCC_PY_CAPI_UNICODE_SEARCH_RUNTIME */
+
 
 static int pcc_unicode_writer_reserve(
     PyUnicodeWriter *writer,
@@ -3051,6 +3898,21 @@ static int pcc_unicode_writer_append(
     return 0;
 }
 
+#if defined(PCC_PY_CAPI_UNICODE_WRITER_RUNTIME)
+/* The PyUnicodeWriter_* surface is owned by the pcc-Python module
+ * py_capi_unicode_writer_runtime.py. */
+extern PyUnicodeWriter *PyUnicodeWriter_Create(Py_ssize_t length);
+extern PyObject *PyUnicodeWriter_Finish(PyUnicodeWriter *writer);
+extern void PyUnicodeWriter_Discard(PyUnicodeWriter *writer);
+extern int PyUnicodeWriter_WriteChar(PyUnicodeWriter *writer, Py_UCS4 ch);
+extern int PyUnicodeWriter_WriteUTF8(
+    PyUnicodeWriter *writer, const char *str, Py_ssize_t size
+);
+extern int PyUnicodeWriter_WriteStr(PyUnicodeWriter *writer, PyObject *obj);
+extern int PyUnicodeWriter_WriteSubstring(
+    PyUnicodeWriter *writer, PyObject *str, Py_ssize_t start, Py_ssize_t end
+);
+#else
 PyUnicodeWriter *PyUnicodeWriter_Create(Py_ssize_t length) {
     if (length < 0) {
         PyErr_SetString(PyExc_ValueError, "negative unicode writer length");
@@ -3158,6 +4020,8 @@ int PyUnicodeWriter_WriteSubstring(
     return result;
 }
 
+
+#endif /* PCC_PY_CAPI_UNICODE_WRITER_RUNTIME */
 static Py_ssize_t pcc_capi_unicode_ucs4_len(PyObject *unicode) {
     const unsigned char *raw = (const unsigned char *)py_str_utf8(unicode);
     int64_t byte_len = py_str_byte_len(unicode);
@@ -3176,6 +4040,9 @@ static Py_ssize_t pcc_capi_unicode_ucs4_len(PyObject *unicode) {
     return count;
 }
 
+#if defined(PCC_PY_CAPI_UNICODE_SEARCH_RUNTIME)
+extern Py_UCS4 PyUnicode_ReadChar(PyObject *unicode, Py_ssize_t index);
+#else
 Py_UCS4 PyUnicode_ReadChar(PyObject *unicode, Py_ssize_t index) {
     if (!pcc_capi_is_exact_type(unicode, PY_TYPE_STR)) {
         PyErr_SetString(PyExc_TypeError, "expected str");
@@ -3202,6 +4069,8 @@ Py_UCS4 PyUnicode_ReadChar(PyObject *unicode, Py_ssize_t index) {
     PyErr_SetString(PyExc_IndexError, "string index out of range");
     return (Py_UCS4)-1;
 }
+#endif /* PCC_PY_CAPI_UNICODE_SEARCH_RUNTIME */
+
 
 static Py_ssize_t pcc_capi_unicode_clamp_index(Py_ssize_t index, Py_ssize_t len) {
     if (index < 0) index += len;
@@ -3210,6 +4079,11 @@ static Py_ssize_t pcc_capi_unicode_clamp_index(Py_ssize_t index, Py_ssize_t len)
     return index;
 }
 
+#if defined(PCC_PY_CAPI_UNICODE_SEARCH_RUNTIME)
+extern Py_ssize_t PyUnicode_FindChar(
+    PyObject *str, Py_UCS4 ch, Py_ssize_t start, Py_ssize_t end, int direction
+);
+#else
 Py_ssize_t PyUnicode_FindChar(
     PyObject *str,
     Py_UCS4 ch,
@@ -3251,7 +4125,14 @@ Py_ssize_t PyUnicode_FindChar(
     }
     return found;
 }
+#endif /* PCC_PY_CAPI_UNICODE_SEARCH_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_UNICODE_SEARCH_RUNTIME)
+extern Py_ssize_t PyUnicode_Find(
+    PyObject *str, PyObject *substr, Py_ssize_t start, Py_ssize_t end, int direction
+);
+#else
 Py_ssize_t PyUnicode_Find(
     PyObject *str,
     PyObject *substr,
@@ -3280,7 +4161,14 @@ Py_ssize_t PyUnicode_Find(
     if (found < 0) return -1;
     return start + (Py_ssize_t)found;
 }
+#endif /* PCC_PY_CAPI_UNICODE_SEARCH_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_UNICODE_SEARCH_RUNTIME)
+extern Py_ssize_t PyUnicode_Count(
+    PyObject *str, PyObject *substr, Py_ssize_t start, Py_ssize_t end
+);
+#else
 Py_ssize_t PyUnicode_Count(
     PyObject *str,
     PyObject *substr,
@@ -3307,7 +4195,12 @@ Py_ssize_t PyUnicode_Count(
     py_decref(window);
     return count;
 }
+#endif /* PCC_PY_CAPI_UNICODE_SEARCH_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_UNICODE_RUNTIME)
+extern Py_UCS4 *PyUnicode_AsUCS4(PyObject *unicode, Py_UCS4 *buffer, Py_ssize_t buflen, int copy_null);
+#else
 Py_UCS4 *PyUnicode_AsUCS4(
     PyObject *unicode,
     Py_UCS4 *buffer,
@@ -3349,7 +4242,12 @@ Py_UCS4 *PyUnicode_AsUCS4(
     if (copy_null) buffer[out] = 0;
     return buffer;
 }
+#endif /* PCC_PY_CAPI_UNICODE_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_UNICODE_RUNTIME)
+extern Py_UCS4 *PyUnicode_AsUCS4Copy(PyObject *unicode);
+#else
 Py_UCS4 *PyUnicode_AsUCS4Copy(PyObject *unicode) {
     if (!pcc_capi_is_exact_type(unicode, PY_TYPE_STR)) {
         PyErr_SetString(PyExc_TypeError, "expected str");
@@ -3372,7 +4270,12 @@ Py_UCS4 *PyUnicode_AsUCS4Copy(PyObject *unicode) {
     }
     return buffer;
 }
+#endif /* PCC_PY_CAPI_UNICODE_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_UNICODE_RUNTIME)
+extern PyObject *PyUnicode_FromEncodedObject(PyObject *obj, const char *encoding, const char *errors);
+#else
 PyObject *PyUnicode_FromEncodedObject(
     PyObject *obj,
     const char *encoding,
@@ -3406,7 +4309,12 @@ PyObject *PyUnicode_FromEncodedObject(
     PyBytesObject *bytes = (PyBytesObject *)obj;
     return py_str_new(bytes->data, bytes->byte_len);
 }
+#endif /* PCC_PY_CAPI_UNICODE_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_UNICODE_RUNTIME)
+extern PyObject *PyUnicode_DecodeUTF8(const char *str, Py_ssize_t size, const char *errors);
+#else
 PyObject *PyUnicode_DecodeUTF8(
     const char *str,
     Py_ssize_t size,
@@ -3437,7 +4345,12 @@ PyObject *PyUnicode_DecodeUTF8(
     }
     return py_str_new(str, (int64_t)size);
 }
+#endif /* PCC_PY_CAPI_UNICODE_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_UNICODE_RUNTIME)
+extern PyObject *PyUnicode_Decode(const char *str, Py_ssize_t size, const char *errors, const char *encoding);
+#else
 PyObject *PyUnicode_Decode(
     const char *str,
     Py_ssize_t size,
@@ -3480,6 +4393,9 @@ static int pcc_capi_encoding_is(const char *encoding, const char *a, const char 
     return strcmp(encoding, a) == 0 || (b != NULL && strcmp(encoding, b) == 0);
 }
 
+#if defined(PCC_PY_CAPI_UNICODE_RUNTIME)
+const char *PyUnicode_AsUTF8(PyObject *obj);
+#else
 const char *PyUnicode_AsUTF8(PyObject *obj) {
     if (obj == NULL || PY_IS_TAGGED_INT(obj) || py_type_of(obj) != PY_TYPE_STR) {
         PyErr_SetString(PyExc_TypeError, "expected str");
@@ -3487,7 +4403,12 @@ const char *PyUnicode_AsUTF8(PyObject *obj) {
     }
     return py_str_utf8(obj);
 }
+#endif /* PCC_PY_CAPI_UNICODE_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_UNICODE_RUNTIME)
+const char *PyUnicode_AsUTF8AndSize(PyObject *obj, Py_ssize_t *size);
+#else
 const char *PyUnicode_AsUTF8AndSize(PyObject *obj, Py_ssize_t *size) {
     if (obj == NULL || PY_IS_TAGGED_INT(obj) || py_type_of(obj) != PY_TYPE_STR) {
         PyErr_SetString(PyExc_TypeError, "expected str");
@@ -3498,7 +4419,12 @@ const char *PyUnicode_AsUTF8AndSize(PyObject *obj, Py_ssize_t *size) {
     }
     return py_str_utf8(obj);
 }
+#endif /* PCC_PY_CAPI_UNICODE_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_UNICODE_RUNTIME)
+PyObject *PyUnicode_AsUTF8String(PyObject *obj);
+#else
 PyObject *PyUnicode_AsUTF8String(PyObject *obj) {
     if (!pcc_capi_is_exact_type(obj, PY_TYPE_STR)) {
         PyErr_SetString(PyExc_TypeError, "expected str");
@@ -3506,7 +4432,12 @@ PyObject *PyUnicode_AsUTF8String(PyObject *obj) {
     }
     return py_bytes_new(py_str_utf8(obj), py_str_byte_len(obj));
 }
+#endif /* PCC_PY_CAPI_UNICODE_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_UNICODE_RUNTIME)
+PyObject *PyUnicode_AsASCIIString(PyObject *obj);
+#else
 PyObject *PyUnicode_AsASCIIString(PyObject *obj) {
     if (!pcc_capi_is_exact_type(obj, PY_TYPE_STR)) {
         PyErr_SetString(PyExc_TypeError, "expected str");
@@ -3522,7 +4453,16 @@ PyObject *PyUnicode_AsASCIIString(PyObject *obj) {
     }
     return py_bytes_new(raw, n);
 }
+#endif /* PCC_PY_CAPI_UNICODE_RUNTIME */
 
+#endif /* PCC_PY_CAPI_UNICODE_RUNTIME */
+
+
+#if defined(PCC_PY_CAPI_UNICODE_RUNTIME)
+extern PyObject *PyUnicode_AsEncodedString(
+    PyObject *obj, const char *encoding, const char *errors
+);
+#else
 PyObject *PyUnicode_AsEncodedString(
     PyObject *obj,
     const char *encoding,
@@ -3555,7 +4495,12 @@ PyObject *PyUnicode_AsEncodedString(
     PyErr_SetString(PyExc_ValueError, "unsupported encoding");
     return NULL;
 }
+#endif /* PCC_PY_CAPI_UNICODE_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_UNICODE_RUNTIME)
+PyObject *PyUnicode_Substring(PyObject *str, Py_ssize_t start, Py_ssize_t end);
+#else
 PyObject *PyUnicode_Substring(PyObject *str, Py_ssize_t start, Py_ssize_t end) {
     if (!pcc_capi_is_exact_type(str, PY_TYPE_STR)) {
         PyErr_SetString(PyExc_TypeError, "expected str");
@@ -3573,7 +4518,12 @@ PyObject *PyUnicode_Substring(PyObject *str, Py_ssize_t start, Py_ssize_t end) {
     py_decref(hi);
     return out;
 }
+#endif /* PCC_PY_CAPI_UNICODE_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_UNICODE_RUNTIME)
+PyObject *PyUnicode_Replace(PyObject *str, PyObject *substr, PyObject *replstr, Py_ssize_t maxcount);
+#else
 PyObject *PyUnicode_Replace(
     PyObject *str,
     PyObject *substr,
@@ -3590,7 +4540,12 @@ PyObject *PyUnicode_Replace(
     }
     return py_str_replace_count(str, substr, replstr, (int64_t)maxcount);
 }
+#endif /* PCC_PY_CAPI_UNICODE_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_UNICODE_RUNTIME)
+int PyUnicode_Contains(PyObject *container, PyObject *element);
+#else
 int PyUnicode_Contains(PyObject *container, PyObject *element) {
     if (
         !pcc_capi_is_exact_type(container, PY_TYPE_STR)
@@ -3601,7 +4556,12 @@ int PyUnicode_Contains(PyObject *container, PyObject *element) {
     }
     return py_str_contains(container, element) ? 1 : 0;
 }
+#endif /* PCC_PY_CAPI_UNICODE_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_UNICODE_RUNTIME)
+Py_ssize_t PyUnicode_Tailmatch(PyObject *str, PyObject *substr, Py_ssize_t start, Py_ssize_t end, int direction);
+#else
 Py_ssize_t PyUnicode_Tailmatch(
     PyObject *str,
     PyObject *substr,
@@ -3629,15 +4589,30 @@ Py_ssize_t PyUnicode_Tailmatch(
     py_decref(window);
     return matched ? 1 : 0;
 }
+#endif /* PCC_PY_CAPI_UNICODE_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_UNICODE_RUNTIME)
+int PyUnicode_Check(PyObject *obj);
+#else
 int PyUnicode_Check(PyObject *obj) {
     return pcc_capi_is_exact_type(obj, PY_TYPE_STR);
 }
+#endif /* PCC_PY_CAPI_UNICODE_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_UNICODE_RUNTIME)
+int PyUnicode_CheckExact(PyObject *obj);
+#else
 int PyUnicode_CheckExact(PyObject *obj) {
     return PyUnicode_Check(obj);
 }
+#endif /* PCC_PY_CAPI_UNICODE_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_UNICODE_RUNTIME)
+Py_ssize_t PyUnicode_GetLength(PyObject *obj);
+#else
 Py_ssize_t PyUnicode_GetLength(PyObject *obj) {
     if (!PyUnicode_Check(obj)) {
         PyErr_SetString(PyExc_TypeError, "expected str");
@@ -3645,7 +4620,16 @@ Py_ssize_t PyUnicode_GetLength(PyObject *obj) {
     }
     return (Py_ssize_t)py_str_len(obj);
 }
+#endif /* PCC_PY_CAPI_UNICODE_RUNTIME */
 
+/* Unicode comparisons are pcc-Python-owned in production and remain here for
+ * the host-C oracle archive. */
+#if defined(PCC_PY_CAPI_UNICODE_RUNTIME)
+extern int PyUnicode_Compare(PyObject *left, PyObject *right);
+extern int PyUnicode_CompareWithASCIIString(
+    PyObject *left, const char *right
+);
+#else
 int PyUnicode_Compare(PyObject *left, PyObject *right) {
     if (!PyUnicode_Check(left) || !PyUnicode_Check(right)) {
         PyErr_SetString(PyExc_TypeError, "expected str");
@@ -3663,7 +4647,12 @@ int PyUnicode_CompareWithASCIIString(PyObject *left, const char *right) {
     py_decref(right_obj);
     return result;
 }
+#endif
 
+
+#if defined(PCC_PY_CAPI_UNICODE_RUNTIME)
+PyObject *PyUnicode_Concat(PyObject *left, PyObject *right);
+#else
 PyObject *PyUnicode_Concat(PyObject *left, PyObject *right) {
     if (!PyUnicode_Check(left) || !PyUnicode_Check(right)) {
         PyErr_SetString(PyExc_TypeError, "expected str");
@@ -3671,7 +4660,12 @@ PyObject *PyUnicode_Concat(PyObject *left, PyObject *right) {
     }
     return py_str_concat(left, right);
 }
+#endif /* PCC_PY_CAPI_UNICODE_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_UNICODE_RUNTIME)
+int PyUnicode_EqualToUTF8AndSize(PyObject *unicode, const char *str, Py_ssize_t str_len);
+#else
 int PyUnicode_EqualToUTF8AndSize(
     PyObject *unicode,
     const char *str,
@@ -3692,11 +4686,18 @@ int PyUnicode_EqualToUTF8AndSize(
     PyErr_Restore(exc_type, exc_value, exc_traceback);
     return result;
 }
+#endif /* PCC_PY_CAPI_UNICODE_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_UNICODE_RUNTIME)
+int PyUnicode_EqualToUTF8(PyObject *unicode, const char *str);
+#else
 int PyUnicode_EqualToUTF8(PyObject *unicode, const char *str) {
     if (str == NULL) return 0;
     return PyUnicode_EqualToUTF8AndSize(unicode, str, (Py_ssize_t)strlen(str));
 }
+#endif /* PCC_PY_CAPI_UNICODE_RUNTIME */
+
 
 static PyObject *pcc_capi_list_sort_key_call(PyObject *key, PyObject *item) {
     if (key == NULL || key == py_None) {
@@ -3787,6 +4788,9 @@ static PyMethodDef pcc_capi_list_sort_def = {
     NULL,
 };
 
+#if defined(PCC_PY_CAPI_METHOD_BRIDGE_RUNTIME)
+extern PyObject *pcc_capi_builtin_object_getattr(PyObject *o, const char *name);
+#else
 PyObject *pcc_capi_builtin_object_getattr(PyObject *o, const char *name) {
     if (o == NULL || name == NULL || PY_IS_TAGGED_INT(o)) return NULL;
     if (py_type_of(o) == PY_TYPE_LIST && strcmp(name, "sort") == 0) {
@@ -3794,13 +4798,22 @@ PyObject *pcc_capi_builtin_object_getattr(PyObject *o, const char *name) {
     }
     return NULL;
 }
+#endif /* PCC_PY_CAPI_METHOD_BRIDGE_RUNTIME */
 
+#if defined(PCC_PY_CAPI_OBJECT_ATTR_RUNTIME)
+extern PyObject *PyObject_GetAttr(PyObject *obj, PyObject *attr);
+#else
 PyObject *PyObject_GetAttr(PyObject *obj, PyObject *attr) {
     const char *name = PyUnicode_AsUTF8(attr);
     if (name == NULL) return NULL;
     return PyObject_GetAttrString(obj, name);
 }
+#endif /* PCC_PY_CAPI_OBJECT_ATTR_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_OBJECT_ATTR_RUNTIME)
+extern PyObject *PyObject_GetAttrString(PyObject *obj, const char *attr);
+#else
 PyObject *PyObject_GetAttrString(PyObject *obj, const char *attr) {
     if (obj == NULL || attr == NULL) {
         PyErr_SetString(PyExc_TypeError, "invalid PyObject_GetAttrString call");
@@ -3810,7 +4823,12 @@ PyObject *PyObject_GetAttrString(PyObject *obj, const char *attr) {
     if (builtin_attr != NULL || py_err_occurred()) return builtin_attr;
     return py_obj_getattr(obj, attr);
 }
+#endif /* PCC_PY_CAPI_OBJECT_ATTR_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_OBJECT_ATTR_RUNTIME)
+extern int PyObject_GetOptionalAttr(PyObject *obj, PyObject *attr, PyObject **result);
+#else
 int PyObject_GetOptionalAttr(PyObject *obj, PyObject *attr, PyObject **result) {
     if (result == NULL) {
         PyErr_SetString(PyExc_TypeError, "NULL result pointer");
@@ -3824,7 +4842,12 @@ int PyObject_GetOptionalAttr(PyObject *obj, PyObject *attr, PyObject **result) {
     }
     return py_err_occurred() ? -1 : 0;
 }
+#endif /* PCC_PY_CAPI_OBJECT_ATTR_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_OBJECT_ATTR_RUNTIME)
+extern int PyObject_GetOptionalAttrString(PyObject *obj, const char *attr, PyObject **result);
+#else
 int PyObject_GetOptionalAttrString(
     PyObject *obj,
     const char *attr,
@@ -3842,13 +4865,23 @@ int PyObject_GetOptionalAttrString(
     }
     return py_err_occurred() ? -1 : 0;
 }
+#endif /* PCC_PY_CAPI_OBJECT_ATTR_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_OBJECT_ATTR_RUNTIME)
+extern int PyObject_SetAttr(PyObject *obj, PyObject *attr, PyObject *value);
+#else
 int PyObject_SetAttr(PyObject *obj, PyObject *attr, PyObject *value) {
     const char *name = PyUnicode_AsUTF8(attr);
     if (name == NULL) return -1;
     return PyObject_SetAttrString(obj, name, value);
 }
+#endif /* PCC_PY_CAPI_OBJECT_ATTR_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_OBJECT_ATTR_RUNTIME)
+extern int PyObject_SetAttrString(PyObject *obj, const char *attr, PyObject *value);
+#else
 int PyObject_SetAttrString(PyObject *obj, const char *attr, PyObject *value) {
     if (obj == NULL || attr == NULL || value == NULL) {
         PyErr_SetString(PyExc_TypeError, "invalid PyObject_SetAttrString call");
@@ -3856,7 +4889,12 @@ int PyObject_SetAttrString(PyObject *obj, const char *attr, PyObject *value) {
     }
     return py_obj_setattr(obj, attr, value) == 0 ? 0 : -1;
 }
+#endif /* PCC_PY_CAPI_OBJECT_ATTR_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_OBJECT_ATTR_RUNTIME)
+extern int PyObject_HasAttrWithError(PyObject *obj, PyObject *attr);
+#else
 int PyObject_HasAttrWithError(PyObject *obj, PyObject *attr) {
     PyObject *value = PyObject_GetAttr(obj, attr);
     if (value == NULL) {
@@ -3869,7 +4907,12 @@ int PyObject_HasAttrWithError(PyObject *obj, PyObject *attr) {
     py_decref(value);
     return 1;
 }
+#endif /* PCC_PY_CAPI_OBJECT_ATTR_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_OBJECT_ATTR_RUNTIME)
+extern int PyObject_HasAttrStringWithError(PyObject *obj, const char *attr);
+#else
 int PyObject_HasAttrStringWithError(PyObject *obj, const char *attr) {
     PyObject *value = PyObject_GetAttrString(obj, attr);
     if (value == NULL) {
@@ -3882,7 +4925,12 @@ int PyObject_HasAttrStringWithError(PyObject *obj, const char *attr) {
     py_decref(value);
     return 1;
 }
+#endif /* PCC_PY_CAPI_OBJECT_ATTR_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_OBJECT_ATTR_RUNTIME)
+extern int PyObject_HasAttr(PyObject *obj, PyObject *attr);
+#else
 int PyObject_HasAttr(PyObject *obj, PyObject *attr) {
     int rc = PyObject_HasAttrWithError(obj, attr);
     if (rc < 0) {
@@ -3891,7 +4939,12 @@ int PyObject_HasAttr(PyObject *obj, PyObject *attr) {
     }
     return rc;
 }
+#endif /* PCC_PY_CAPI_OBJECT_ATTR_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_OBJECT_ATTR_RUNTIME)
+extern int PyObject_HasAttrString(PyObject *obj, const char *attr);
+#else
 int PyObject_HasAttrString(PyObject *obj, const char *attr) {
     int rc = PyObject_HasAttrStringWithError(obj, attr);
     if (rc < 0) {
@@ -3900,7 +4953,9 @@ int PyObject_HasAttrString(PyObject *obj, const char *attr) {
     }
     return rc;
 }
+#endif /* PCC_PY_CAPI_OBJECT_ATTR_RUNTIME */
 
+#if !defined(PCC_PY_CAPI_OBJECT_RUNTIME)
 int PyObject_IsTrue(PyObject *obj) {
     int64_t truth = py_obj_truthy(obj);
     if (py_err_occurred()) return -1;
@@ -3912,6 +4967,7 @@ int PyObject_Not(PyObject *obj) {
     if (truth < 0) return -1;
     return truth ? 0 : 1;
 }
+#endif /* !PCC_PY_CAPI_OBJECT_RUNTIME */
 
 static int pcc_capi_is_intlike(PyObject *obj) {
     if (obj == NULL) return 0;
@@ -3991,6 +5047,11 @@ static const char *pcc_capi_binary_number_symbol(int64_t op) {
     }
 }
 
+#if defined(PCC_PY_CAPI_CEXT_RUNTIME)
+extern PyObject *pcc_capi_cext_binary_number(
+    PyObject *left, PyObject *right, int64_t op
+);
+#else
 PyObject *pcc_capi_cext_binary_number(
     PyObject *left,
     PyObject *right,
@@ -4046,11 +5107,82 @@ PyObject *pcc_capi_cext_binary_number(
     }
     return pcc_capi_numeric_error(pcc_capi_binary_number_symbol(op));
 }
+#endif /* PCC_PY_CAPI_CEXT_RUNTIME */
 
+
+static void *pcc_capi_inplace_number_slot(
+    PccCapiNumberMethods *methods,
+    int64_t op
+) {
+    if (methods == NULL) return NULL;
+    switch (op) {
+        case 0: return methods->nb_inplace_add;
+        case 1: return methods->nb_inplace_subtract;
+        case 2: return methods->nb_inplace_multiply;
+        case 3: return methods->nb_inplace_true_divide;
+        case 4: return methods->nb_inplace_floor_divide;
+        case 5: return methods->nb_inplace_remainder;
+        default: return NULL;
+    }
+}
+
+static const char *pcc_capi_inplace_number_slot_name(int64_t op) {
+    switch (op) {
+        case 0: return "nb_inplace_add";
+        case 1: return "nb_inplace_subtract";
+        case 2: return "nb_inplace_multiply";
+        case 3: return "nb_inplace_true_divide";
+        case 4: return "nb_inplace_floor_divide";
+        case 5: return "nb_inplace_remainder";
+        default: return "in-place number slot";
+    }
+}
+
+#if defined(PCC_PY_CAPI_CEXT_RUNTIME)
+extern PyObject *pcc_capi_cext_inplace_number(
+    PyObject *left, PyObject *right, int64_t op
+);
+#else
+/* Try only the left operand's in-place number slot.  A missing slot is not
+ * an error: CPython falls through to the ordinary binary protocol, so return
+ * an owned NotImplemented reference as an unambiguous sentinel. */
+PyObject *pcc_capi_cext_inplace_number(
+    PyObject *left,
+    PyObject *right,
+    int64_t op
+) {
+    if (op < 0 || op > 5) {
+        PyErr_SetString(PyExc_ValueError, "invalid in-place number operation");
+        return NULL;
+    }
+    PyTypeObject *left_type = pcc_capi_cext_type_for_object(left);
+    PccCapiNumberMethods *methods = left_type == NULL
+        ? NULL
+        : (PccCapiNumberMethods *)left_type->tp_as_number;
+    void *slot = pcc_capi_inplace_number_slot(methods, op);
+    if (slot == NULL) {
+        py_incref(py_NotImplemented);
+        return py_NotImplemented;
+    }
+    return pcc_capi_call_binary_number_slot(
+        slot, left, right, pcc_capi_inplace_number_slot_name(op)
+    );
+}
+#endif /* PCC_PY_CAPI_CEXT_RUNTIME */
+
+
+#if defined(PCC_PY_CAPI_CEXT_RUNTIME)
+extern PyObject *pcc_capi_cext_subtract(PyObject *left, PyObject *right);
+#else
 PyObject *pcc_capi_cext_subtract(PyObject *left, PyObject *right) {
     return pcc_capi_cext_binary_number(left, right, 1);
 }
+#endif /* PCC_PY_CAPI_CEXT_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_CEXT_RUNTIME)
+extern PyObject *pcc_capi_cext_absolute(PyObject *value);
+#else
 PyObject *pcc_capi_cext_absolute(PyObject *value) {
     PyTypeObject *type = pcc_capi_cext_type_for_object(value);
     PccCapiNumberMethods *methods = type == NULL
@@ -4062,12 +5194,10 @@ PyObject *pcc_capi_cext_absolute(PyObject *value) {
     PyObject *(*unary)(PyObject *) = (PyObject *(*)(PyObject *))slot;
     PyObject *result = unary(value);
     if (result == NULL) {
-        if (!py_err_occurred()) {
-            PyErr_SetString(
-                PyExc_RuntimeError,
-                "nb_absolute returned NULL without setting an exception"
-            );
-        }
+        py_runtime_error_if_unset(
+            "C extension nb_absolute",
+            "nb_absolute returned NULL without setting an exception"
+        );
         return NULL;
     }
     if (result == py_NotImplemented) {
@@ -4076,7 +5206,12 @@ PyObject *pcc_capi_cext_absolute(PyObject *value) {
     }
     return result;
 }
+#endif /* PCC_PY_CAPI_CEXT_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_CEXT_RUNTIME)
+extern int64_t pcc_capi_cext_truthy(PyObject *value);
+#else
 int64_t pcc_capi_cext_truthy(PyObject *value) {
     PyTypeObject *type = pcc_capi_cext_type_for_object(value);
     PccCapiNumberMethods *methods = type == NULL
@@ -4098,6 +5233,8 @@ int64_t pcc_capi_cext_truthy(PyObject *value) {
     }
     return result != 0 ? 1 : 0;
 }
+#endif /* PCC_PY_CAPI_CEXT_RUNTIME */
+
 
 static int pcc_capi_swapped_richcompare_op(int op) {
     static const int swapped[6] = {Py_GT, Py_GE, Py_EQ, Py_NE, Py_LT, Py_LE};
@@ -4133,6 +5270,11 @@ static int64_t pcc_capi_call_richcompare_slot(
     return truth ? 1 : 0;
 }
 
+#if defined(PCC_PY_CAPI_CEXT_RUNTIME)
+extern int64_t pcc_capi_cext_richcompare_bool(
+    PyObject *left, PyObject *right, int64_t op
+);
+#else
 int64_t pcc_capi_cext_richcompare_bool(
     PyObject *left,
     PyObject *right,
@@ -4177,8 +5319,17 @@ int64_t pcc_capi_cext_richcompare_bool(
     PyErr_SetString(PyExc_TypeError, "unsupported rich comparison");
     return -1;
 }
+#endif /* PCC_PY_CAPI_CEXT_RUNTIME */
 
-static PyObject *pcc_capi_call_int_conversion_slot(
+
+#if defined(PCC_PY_CAPI_NUMBER_RUNTIME)
+extern PyObject *pcc_capi_call_int_conversion_slot(
+    PyObject *obj,
+    void *slot,
+    const char *slot_name
+);
+#else
+PyObject *pcc_capi_call_int_conversion_slot(
     PyObject *obj,
     void *slot,
     const char *slot_name
@@ -4186,7 +5337,13 @@ static PyObject *pcc_capi_call_int_conversion_slot(
     if (slot == NULL) return NULL;
     PyObject *(*convert)(PyObject *) = (PyObject *(*)(PyObject *))slot;
     PyObject *result = convert(obj);
-    if (result == NULL) return NULL;
+    if (result == NULL) {
+        py_runtime_error_if_unset(
+            "pcc_capi_call_int_conversion_slot",
+            "integer conversion slot returned NULL without setting an exception"
+        );
+        return NULL;
+    }
     if (!pcc_capi_is_intlike(result)) {
         py_decref(result);
         PyErr_Format(PyExc_TypeError, "%s returned a non-int", slot_name);
@@ -4194,6 +5351,7 @@ static PyObject *pcc_capi_call_int_conversion_slot(
     }
     return result;
 }
+#endif /* PCC_PY_CAPI_NUMBER_RUNTIME */
 
 static PyObject *pcc_capi_int_operand(PyObject *obj) {
     if (obj != NULL && !PY_IS_TAGGED_INT(obj) && py_type_of(obj) == PY_TYPE_BOOL) {
@@ -4257,6 +5415,33 @@ static PyObject *pcc_capi_repeat_sequence(PyObject *seq, PyObject *count_obj) {
     return NULL;
 }
 
+#if defined(PCC_PY_CAPI_NUMBER_RUNTIME)
+/* The PyNumber_* surface is owned by the pcc-Python module
+ * py_capi_number_runtime.py.  The C-extension number slot dispatch
+ * (pcc_capi_cext_binary_number, pcc_capi_cext_absolute and
+ * pcc_capi_number_methods) stays here. */
+extern int PyNumber_Check(PyObject *obj);
+extern PyObject *PyNumber_Long(PyObject *obj);
+extern PyObject *PyNumber_Float(PyObject *obj);
+extern PyObject *PyNumber_Index(PyObject *obj);
+extern PyObject *PyNumber_Absolute(PyObject *obj);
+extern PyObject *PyNumber_Negative(PyObject *obj);
+extern PyObject *PyNumber_Positive(PyObject *obj);
+extern PyObject *PyNumber_Invert(PyObject *obj);
+extern PyObject *PyNumber_Add(PyObject *left, PyObject *right);
+extern PyObject *PyNumber_Subtract(PyObject *left, PyObject *right);
+extern PyObject *PyNumber_Multiply(PyObject *left, PyObject *right);
+extern PyObject *PyNumber_Remainder(PyObject *left, PyObject *right);
+extern PyObject *PyNumber_FloorDivide(PyObject *left, PyObject *right);
+extern PyObject *PyNumber_TrueDivide(PyObject *left, PyObject *right);
+extern PyObject *PyNumber_Lshift(PyObject *left, PyObject *right);
+extern PyObject *PyNumber_Rshift(PyObject *left, PyObject *right);
+extern PyObject *PyNumber_And(PyObject *left, PyObject *right);
+extern PyObject *PyNumber_Xor(PyObject *left, PyObject *right);
+extern PyObject *PyNumber_Or(PyObject *left, PyObject *right);
+extern PyObject *PyNumber_Power(PyObject *left, PyObject *right, PyObject *mod);
+extern Py_ssize_t PyNumber_AsSsize_t(PyObject *obj, PyObject *exc);
+#else
 int PyNumber_Check(PyObject *obj) {
     if (pcc_capi_is_numberlike(obj)) return 1;
     PccCapiNumberMethods *methods = pcc_capi_number_methods(obj);
@@ -4307,23 +5492,6 @@ PyObject *PyNumber_Long(PyObject *obj) {
  * py_int_to_i64 (pcc-Python port + this C baseline) calls this before giving up
  * on a non-PY_TYPE_INT object, so ``int(numpy_scalar)`` / ``int(a[i])`` unbox
  * instead of silently returning 0. */
-int64_t py_cext_number_to_i64(PyObject *o, int *overflow) {
-    if (overflow) *overflow = 1;
-    if (o == NULL || PY_IS_TAGGED_INT(o)) return 0;
-    int32_t tag = py_header(o)->type_tag;
-    if (pcc_capi_is_cext_type_tag((int64_t)tag) == 0) return 0;
-    PyObject *boxed = PyNumber_Long(o);
-    if (boxed == NULL) {
-        if (py_err_occurred()) PyErr_Clear();
-        return 0;
-    }
-    int ov = 0;
-    int64_t value = py_int_to_i64(boxed, &ov);
-    py_decref(boxed);
-    if (overflow) *overflow = ov;
-    return value;
-}
-
 PyObject *PyNumber_Float(PyObject *obj) {
     if (pcc_capi_is_floatlike(obj)) {
         py_incref(obj);
@@ -4595,6 +5763,7 @@ Py_ssize_t PyNumber_AsSsize_t(PyObject *obj, PyObject *exc) {
     return value;
 }
 
+#if !defined(PCC_PY_CAPI_OBJECT_RUNTIME)
 Py_hash_t PyObject_Hash(PyObject *obj) {
     if (obj == NULL) {
         PyErr_SetString(PyExc_TypeError, "NULL object");
@@ -4602,7 +5771,36 @@ Py_hash_t PyObject_Hash(PyObject *obj) {
     }
     return (Py_hash_t)py_obj_hash(obj);
 }
+#endif /* !PCC_PY_CAPI_OBJECT_RUNTIME */
 
+
+#endif /* PCC_PY_CAPI_NUMBER_RUNTIME */
+
+#if defined(PCC_PY_CAPI_CEXT_RUNTIME)
+extern int64_t py_cext_number_to_i64(PyObject *o, int *overflow);
+#else
+int64_t py_cext_number_to_i64(PyObject *o, int *overflow) {
+    if (overflow) *overflow = 1;
+    if (o == NULL || PY_IS_TAGGED_INT(o)) return 0;
+    int32_t tag = py_header(o)->type_tag;
+    if (pcc_capi_is_cext_type_tag((int64_t)tag) == 0) return 0;
+    PyObject *boxed = PyNumber_Long(o);
+    if (boxed == NULL) {
+        if (py_err_occurred()) PyErr_Clear();
+        return 0;
+    }
+    int ov = 0;
+    int64_t value = py_int_to_i64(boxed, &ov);
+    py_decref(boxed);
+    if (overflow) *overflow = ov;
+    return value;
+}
+#endif /* PCC_PY_CAPI_CEXT_RUNTIME */
+
+
+#if defined(PCC_PY_CAPI_CEXT_RUNTIME)
+extern int PyCallable_Check(PyObject *obj);
+#else
 int PyCallable_Check(PyObject *obj) {
     if (obj == NULL || PY_IS_TAGGED_INT(obj)) return 0;
     int32_t tag = py_type_of(obj);
@@ -4610,7 +5808,10 @@ int PyCallable_Check(PyObject *obj) {
         || pcc_capi_cext_object_is_callable(obj)
         || pcc_capi_type_object_is_callable(obj);
 }
+#endif /* PCC_PY_CAPI_CEXT_RUNTIME */
 
+
+#if !defined(PCC_PY_CAPI_OBJECT_RUNTIME)
 PyObject *PyObject_Str(PyObject *obj) {
     PyObject *out = py_obj_str(obj);
     if (out == NULL && !py_err_occurred()) {
@@ -4642,7 +5843,28 @@ PyObject *PyObject_Format(PyObject *obj, PyObject *format_spec) {
     }
     return out;
 }
+#endif /* !PCC_PY_CAPI_OBJECT_RUNTIME */
 
+/* FILE* write helpers are retained only for the C differential oracle.  The
+ * production pcc-Python owner distinguishes pcc-owned FILE objects from
+ * Darwin libSystem FILE objects without relying on symbol interposition. */
+#if defined(PCC_PY_CAPI_MISC_RUNTIME)
+extern int64_t pcc_capi_file_write(const void *data, int64_t n, void *fp);
+extern int pcc_capi_file_flush(void *fp);
+#else
+int64_t pcc_capi_file_write(const void *data, int64_t n, void *fp) {
+    if (fp == NULL || (data == NULL && n > 0)) return 0;
+    return (int64_t)fwrite(data, 1, (size_t)n, (FILE *)fp);
+}
+int pcc_capi_file_flush(void *fp) {
+    if (fp == NULL) return -1;
+    return fflush((FILE *)fp);
+}
+#endif /* PCC_PY_CAPI_MISC_RUNTIME */
+
+#if defined(PCC_PY_CAPI_MISC_RUNTIME)
+extern int PyObject_Print(PyObject *obj, FILE *fp, int flags);
+#else
 int PyObject_Print(PyObject *obj, FILE *fp, int flags) {
     if (fp == NULL) {
         PyErr_SetString(PyExc_TypeError, "NULL FILE pointer");
@@ -4665,7 +5887,10 @@ int PyObject_Print(PyObject *obj, FILE *fp, int flags) {
     fflush(fp);
     return 0;
 }
+#endif /* PCC_PY_CAPI_MISC_RUNTIME */
 
+
+#if !defined(PCC_PY_CAPI_OBJECT_RUNTIME)
 PyObject *PyObject_Type(PyObject *obj) {
     if (obj == NULL) {
         PyErr_SetString(PyExc_TypeError, "NULL object");
@@ -4757,7 +5982,9 @@ Py_ssize_t PyObject_Size(PyObject *obj) {
 Py_ssize_t PyObject_Length(PyObject *obj) {
     return PyObject_Size(obj);
 }
+#endif /* !PCC_PY_CAPI_OBJECT_RUNTIME */
 
+#if !defined(PCC_PY_CAPI_OBJECT_RUNTIME)
 static int pcc_capi_len_hint_value(PyObject *obj, int64_t *out) {
     if (obj == NULL || PY_IS_TAGGED_INT(obj) || out == NULL) return 0;
     int32_t tag = py_type_of(obj);
@@ -4773,7 +6000,7 @@ static int pcc_capi_len_hint_value(PyObject *obj, int64_t *out) {
             *out = py_obj_len(obj);
             return 1;
         default:
-            if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER) {
+            if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER_CLASS_START) {
                 int64_t handled = 0;
                 int64_t user_len = py_user_len_dispatch(obj, &handled);
                 if (handled) {
@@ -4798,11 +6025,31 @@ Py_ssize_t PyObject_LengthHint(PyObject *obj, Py_ssize_t default_value) {
     }
     return (Py_ssize_t)n;
 }
+#endif /* !PCC_PY_CAPI_OBJECT_RUNTIME */
 
+#if defined(PCC_PY_CAPI_MAPPING_RUNTIME)
+/* The PyMapping_* surface is owned by the pcc-Python module
+ * py_capi_mapping_runtime.py. */
+extern int PyMapping_Check(PyObject *obj);
+extern Py_ssize_t PyMapping_Size(PyObject *obj);
+extern Py_ssize_t PyMapping_Length(PyObject *obj);
+extern PyObject *PyMapping_Keys(PyObject *obj);
+extern PyObject *PyMapping_Values(PyObject *obj);
+extern PyObject *PyMapping_Items(PyObject *obj);
+extern PyObject *PyMapping_GetItemString(PyObject *obj, const char *key);
+extern int PyMapping_SetItemString(PyObject *obj, const char *key, PyObject *value);
+extern int PyMapping_GetOptionalItem(PyObject *obj, PyObject *key, PyObject **result);
+extern int PyMapping_GetOptionalItemString(PyObject *obj, const char *key, PyObject **result);
+extern int PyMapping_HasKey(PyObject *obj, PyObject *key);
+extern int PyMapping_HasKeyString(PyObject *obj, const char *key);
+extern int PyMapping_HasKeyWithError(PyObject *obj, PyObject *key);
+extern int PyMapping_HasKeyStringWithError(PyObject *obj, const char *key);
+#else
 int PyMapping_Check(PyObject *obj) {
     if (obj == NULL || PY_IS_TAGGED_INT(obj)) return 0;
     int32_t tag = py_type_of(obj);
-    return tag == PY_TYPE_DICT || tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER;
+    return tag == PY_TYPE_DICT || tag == PY_TYPE_INSTANCE
+        || tag >= PY_TYPE_USER_CLASS_START;
 }
 
 Py_ssize_t PyMapping_Size(PyObject *obj) {
@@ -4926,6 +6173,28 @@ int PyMapping_HasKeyString(PyObject *obj, const char *key) {
     return rc;
 }
 
+
+#endif /* PCC_PY_CAPI_MAPPING_RUNTIME */
+#if defined(PCC_PY_CAPI_CAPSULE_RUNTIME)
+/* The PyCapsule_* surface and its lazy capsule-class mechanism are owned by
+ * the pcc-Python module py_capi_capsule_runtime.py. */
+extern PyObject *PyCapsule_New(
+    void *pointer, const char *name, PyCapsule_Destructor destructor
+);
+extern int PyCapsule_CheckExact(PyObject *capsule);
+extern int PyCapsule_IsValid(PyObject *capsule, const char *name);
+extern const char *PyCapsule_GetName(PyObject *capsule);
+extern void *PyCapsule_GetContext(PyObject *capsule);
+extern PyCapsule_Destructor PyCapsule_GetDestructor(PyObject *capsule);
+extern void *PyCapsule_GetPointer(PyObject *capsule, const char *name);
+extern int PyCapsule_SetPointer(PyObject *capsule, void *pointer);
+extern int PyCapsule_SetContext(PyObject *capsule, void *context);
+extern int PyCapsule_SetDestructor(
+    PyObject *capsule, PyCapsule_Destructor destructor
+);
+extern int PyCapsule_SetName(PyObject *capsule, const char *name);
+extern void *PyCapsule_Import(const char *name, int no_block);
+#else
 static void pcc_capi_capsule_del(PyObject *capsule);
 
 static PyClassObject *pcc_capi_capsule_class(void) {
@@ -4952,7 +6221,7 @@ static PyClassObject *pcc_capi_capsule_class(void) {
 static int pcc_capi_is_capsule_object(PyObject *obj) {
     if (obj == NULL || PY_IS_TAGGED_INT(obj)) return 0;
     int32_t tag = py_type_of(obj);
-    if (tag != PY_TYPE_INSTANCE && tag < PY_TYPE_USER) return 0;
+    if (tag != PY_TYPE_INSTANCE && tag < PY_TYPE_USER_CLASS_START) return 0;
     PyInstanceObject *inst = (PyInstanceObject *)obj;
     PyClassObject *cls = (PyClassObject *)pcc_gc_load_ptr(
         obj,
@@ -5247,6 +6516,9 @@ void *PyCapsule_Import(const char *name, int no_block) {
     return pointer;
 }
 
+
+#endif /* PCC_PY_CAPI_CAPSULE_RUNTIME */
+#if !defined(PCC_PY_CAPI_COLLECTIONS_RUNTIME)
 Py_ssize_t PyTuple_Size(PyObject *obj) {
     if (!pcc_capi_is_exact_type(obj, PY_TYPE_TUPLE)) {
         PyErr_SetString(PyExc_TypeError, "expected tuple");
@@ -5423,7 +6695,9 @@ int PyList_Check(PyObject *obj) {
 int PyList_CheckExact(PyObject *obj) {
     return PyList_Check(obj);
 }
+#endif
 
+#if !defined(PCC_PY_CAPI_DICT_RUNTIME)
 PyObject *PyDict_New(void) {
     return py_dict_new();
 }
@@ -5707,7 +6981,21 @@ int PyDict_Check(PyObject *obj) {
 int PyDict_CheckExact(PyObject *obj) {
     return PyDict_Check(obj);
 }
+#endif /* !PCC_PY_CAPI_DICT_RUNTIME */
 
+#if defined(PCC_PY_CAPI_SET_RUNTIME)
+/* The PySet_* / PyAnySet_* surface is owned by the pcc-Python module
+ * py_capi_set_runtime.py. */
+extern PyObject *PySet_New(PyObject *iterable);
+extern int PySet_Add(PyObject *set, PyObject *key);
+extern int PySet_Contains(PyObject *set, PyObject *key);
+extern int PySet_Discard(PyObject *set, PyObject *key);
+extern Py_ssize_t PySet_Size(PyObject *set);
+extern int PySet_Check(PyObject *obj);
+extern int PySet_CheckExact(PyObject *obj);
+extern int PyAnySet_Check(PyObject *obj);
+extern int PyAnySet_CheckExact(PyObject *obj);
+#else
 PyObject *PySet_New(PyObject *iterable) {
     PyObject *set = py_set_new();
     if (set == NULL) return NULL;
@@ -5793,6 +7081,9 @@ int PyAnySet_CheckExact(PyObject *obj) {
     return PySet_Check(obj);
 }
 
+
+#endif /* PCC_PY_CAPI_SET_RUNTIME */
+#if !defined(PCC_PY_CAPI_COLLECTIONS_RUNTIME)
 PyObject *PyBytes_FromStringAndSize(const char *value, Py_ssize_t len) {
     if (len < 0) {
         PyErr_SetString(PyExc_ValueError, "negative bytes size");
@@ -5849,7 +7140,9 @@ int PyBytes_Check(PyObject *obj) {
 int PyBytes_CheckExact(PyObject *obj) {
     return PyBytes_Check(obj);
 }
+#endif
 
+#if !defined(PCC_PY_CAPI_EXC_RUNTIME)
 static int pcc_capi_exception_tag(PyObject *type) {
     if (type == PyExc_BaseException) return PY_EXC_BASE;
     if (type == PyExc_Exception) return PY_EXC_EXCEPTION;
@@ -6208,17 +7501,32 @@ PyObject *PyErr_FormatV(PyObject *type, const char *format, va_list vargs) {
     PyErr_SetString(type, message);
     return NULL;
 }
+#endif /* !PCC_PY_CAPI_EXC_RUNTIME */
 
-static const char *pcc_capi_errno_message(void) {
+/* Oracle-only errno message helper. Production PCC_PY_CAPI_MISC_RUNTIME links
+ * freestanding_errno.py and formats into caller-owned storage. */
+#if !defined(PCC_PY_CAPI_MISC_RUNTIME)
+const char *pcc_capi_errno_message(void) {
     const char *message = strerror(errno);
     return message != NULL ? message : "system error";
 }
+#endif
 
+#if defined(PCC_PY_CAPI_MISC_RUNTIME)
+extern PyObject *PyErr_SetFromErrno(PyObject *type);
+#else
 PyObject *PyErr_SetFromErrno(PyObject *type) {
     PyErr_SetString(type, pcc_capi_errno_message());
     return NULL;
 }
+#endif /* PCC_PY_CAPI_MISC_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_MISC_RUNTIME)
+extern PyObject *PyErr_SetFromErrnoWithFilenameObject(
+    PyObject *type, PyObject *filenameObject
+);
+#else
 PyObject *PyErr_SetFromErrnoWithFilenameObject(
     PyObject *type,
     PyObject *filenameObject
@@ -6237,7 +7545,10 @@ PyObject *PyErr_SetFromErrnoWithFilenameObject(
     }
     return NULL;
 }
+#endif /* PCC_PY_CAPI_MISC_RUNTIME */
 
+
+#if !defined(PCC_PY_CAPI_EXC_RUNTIME)
 PyObject *PyErr_NewException(const char *name, PyObject *base, PyObject *dict) {
     (void)dict;
     if (name == NULL || name[0] == '\0') {
@@ -6379,6 +7690,7 @@ void PyErr_Restore(PyObject *type, PyObject *value, PyObject *traceback) {
     py_decref(value);
     py_decref(traceback);
 }
+#endif /* !PCC_PY_CAPI_EXC_RUNTIME */
 
 static int pcc_capi_buffer_data(
     PyObject *obj,
@@ -6410,13 +7722,21 @@ static int pcc_capi_buffer_data(
     return -1;
 }
 
+#if defined(PCC_PY_CAPI_BUFFER_RUNTIME)
+extern int PyObject_CheckBuffer(PyObject *obj);
+#else
 int PyObject_CheckBuffer(PyObject *obj) {
     void *buf = NULL;
     Py_ssize_t len = 0;
     int readonly = 1;
     return pcc_capi_buffer_data(obj, &buf, &len, &readonly) == 0 ? 1 : 0;
 }
+#endif /* PCC_PY_CAPI_BUFFER_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_BUFFER_RUNTIME)
+extern int PyObject_GetBuffer(PyObject *obj, Py_buffer *view, int flags);
+#else
 int PyObject_GetBuffer(PyObject *obj, Py_buffer *view, int flags) {
     if (view == NULL) {
         PyErr_SetString(PyExc_RuntimeError, "NULL Py_buffer");
@@ -6462,7 +7782,12 @@ int PyObject_GetBuffer(PyObject *obj, Py_buffer *view, int flags) {
     py_incref(obj);
     return 0;
 }
+#endif /* PCC_PY_CAPI_BUFFER_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_MISC_RUNTIME)
+extern void PyBuffer_Release(Py_buffer *view);
+#else
 void PyBuffer_Release(Py_buffer *view) {
     if (view == NULL) return;
     if (view->obj != NULL) {
@@ -6473,12 +7798,32 @@ void PyBuffer_Release(Py_buffer *view) {
     }
     memset(view, 0, sizeof(*view));
 }
+#endif /* PCC_PY_CAPI_MISC_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_BUFFER_RUNTIME)
+extern int PyMemoryView_Check(PyObject *obj);
+#else
 int PyMemoryView_Check(PyObject *obj) {
     if (obj == NULL || PY_IS_TAGGED_INT(obj)) return 0;
     return py_type_of(obj) == PY_TYPE_MEMORYVIEW ? 1 : 0;
 }
+#endif /* PCC_PY_CAPI_BUFFER_RUNTIME */
 
+
+/* The transitional C implementation still uses TLS.  Production links define
+ * PCC_PY_CAPI_BUFFER_RUNTIME and keep each Py_buffer with its memoryview in the
+ * pcc-Python owner instead, so this helper must not enter py_capi_compat.o. */
+#if !defined(PCC_PY_CAPI_BUFFER_RUNTIME)
+void *pcc_capi_memoryview_tls_buffer(void) {
+    static _Thread_local Py_buffer cached_view;
+    return &cached_view;
+}
+#endif /* !PCC_PY_CAPI_BUFFER_RUNTIME */
+
+#if defined(PCC_PY_CAPI_BUFFER_RUNTIME)
+extern Py_buffer *pcc_PyMemoryView_GET_BUFFER(PyObject *obj);
+#else
 Py_buffer *pcc_PyMemoryView_GET_BUFFER(PyObject *obj) {
     static _Thread_local Py_buffer cached_view;
     if (!PyMemoryView_Check(obj)) {
@@ -6493,7 +7838,12 @@ Py_buffer *pcc_PyMemoryView_GET_BUFFER(PyObject *obj) {
     }
     return &cached_view;
 }
+#endif /* PCC_PY_CAPI_BUFFER_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_BUFFER_RUNTIME)
+extern PyObject *pcc_PyMemoryView_GET_BASE(PyObject *obj);
+#else
 PyObject *pcc_PyMemoryView_GET_BASE(PyObject *obj) {
     if (!PyMemoryView_Check(obj)) {
         PyErr_SetString(PyExc_TypeError, "expected memoryview");
@@ -6502,7 +7852,12 @@ PyObject *pcc_PyMemoryView_GET_BASE(PyObject *obj) {
     PyMemoryViewObject *view = (PyMemoryViewObject *)obj;
     return pcc_gc_load_ptr(obj, &view->base);
 }
+#endif /* PCC_PY_CAPI_BUFFER_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_BUFFER_RUNTIME)
+extern PyObject *PyMemoryView_FromObject(PyObject *obj);
+#else
 PyObject *PyMemoryView_FromObject(PyObject *obj) {
     void *buf = NULL;
     Py_ssize_t len = 0;
@@ -6516,7 +7871,12 @@ PyObject *PyMemoryView_FromObject(PyObject *obj) {
     (void)readonly;
     return py_memoryview_new(obj);
 }
+#endif /* PCC_PY_CAPI_BUFFER_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_BUFFER_RUNTIME)
+extern PyObject *PyMemoryView_FromMemory(char *mem, Py_ssize_t size, int flags);
+#else
 PyObject *PyMemoryView_FromMemory(char *mem, Py_ssize_t size, int flags) {
     PyObject *base = NULL;
     PyObject *view = NULL;
@@ -6541,7 +7901,12 @@ PyObject *PyMemoryView_FromMemory(char *mem, Py_ssize_t size, int flags) {
     py_decref(base);
     return view;
 }
+#endif /* PCC_PY_CAPI_BUFFER_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_OBJECT_CALL_RUNTIME)
+extern PyObject *PyObject_Call(PyObject *callable, PyObject *args, PyObject *kwargs);
+#else
 PyObject *PyObject_Call(PyObject *callable, PyObject *args, PyObject *kwargs) {
     PyObject *call_args = args;
     PyObject *result = NULL;
@@ -6565,18 +7930,35 @@ PyObject *PyObject_Call(PyObject *callable, PyObject *args, PyObject *kwargs) {
         kwargs = py_None;
     }
     result = py_obj_call(callable, call_args, kwargs);
+    if (result == NULL && py_err_occurred() == 0) {
+        /* py_obj_call owns the user-facing callable diagnosis. Reaching this
+         * guard is an internal runtime contract violation, not evidence that
+         * this shim should invent a second generic TypeError. */
+        py_runtime_error_if_unset(
+            "py_obj_call",
+            "py_obj_call returned NULL without setting an exception"
+        );
+        pcc_runtime_log_event_code(
+            7, 10,
+            PY_IS_TAGGED_INT(callable) ? -1 : (int64_t)py_type_of(callable),
+            99, callable
+        );
+    }
     if (made_args) {
         py_decref(call_args);
     }
-    if (result == NULL && py_err_occurred() == 0) {
-        PyErr_SetString(PyExc_TypeError, "object is not callable");
-    }
     return result;
 }
+#endif /* PCC_PY_CAPI_OBJECT_CALL_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_OBJECT_CALL_RUNTIME)
+extern PyObject *PyObject_CallObject(PyObject *callable, PyObject *args);
+#else
 PyObject *PyObject_CallObject(PyObject *callable, PyObject *args) {
     return PyObject_Call(callable, args, NULL);
 }
+#endif /* PCC_PY_CAPI_OBJECT_CALL_RUNTIME */
 
 static PyObject *pcc_capi_call_objargs_v(PyObject *callable, va_list *ap) {
     if (callable == NULL) {
@@ -6608,6 +7990,10 @@ static PyObject *pcc_capi_call_objargs_v(PyObject *callable, va_list *ap) {
     return result;
 }
 
+
+#if defined(PCC_PY_CAPI_CALL_RUNTIME)
+extern PyObject *PyObject_CallFunctionObjArgs(PyObject *callable, ...);
+#else
 PyObject *PyObject_CallFunctionObjArgs(PyObject *callable, ...) {
     va_list ap;
     va_start(ap, callable);
@@ -6615,7 +8001,12 @@ PyObject *PyObject_CallFunctionObjArgs(PyObject *callable, ...) {
     va_end(ap);
     return result;
 }
+#endif /* PCC_PY_CAPI_CALL_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_CALL_RUNTIME)
+extern PyObject *PyObject_CallMethodObjArgs(PyObject *obj, PyObject *name, ...);
+#else
 PyObject *PyObject_CallMethodObjArgs(PyObject *obj, PyObject *name, ...) {
     if (obj == NULL || name == NULL) {
         PyErr_SetString(PyExc_TypeError, "invalid PyObject_CallMethodObjArgs call");
@@ -6631,11 +8022,20 @@ PyObject *PyObject_CallMethodObjArgs(PyObject *obj, PyObject *name, ...) {
     py_decref(method);
     return result;
 }
+#endif /* PCC_PY_CAPI_CALL_RUNTIME */
 
+#if defined(PCC_PY_CAPI_OBJECT_CALL_RUNTIME)
+extern PyObject *PyObject_CallNoArgs(PyObject *callable);
+#else
 PyObject *PyObject_CallNoArgs(PyObject *callable) {
     return PyObject_CallFunctionObjArgs(callable, NULL);
 }
+#endif /* PCC_PY_CAPI_OBJECT_CALL_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_OBJECT_CALL_RUNTIME)
+extern PyObject *PyObject_CallOneArg(PyObject *callable, PyObject *arg);
+#else
 PyObject *PyObject_CallOneArg(PyObject *callable, PyObject *arg) {
     if (arg == NULL) {
         PyErr_SetString(PyExc_TypeError, "NULL call argument");
@@ -6643,7 +8043,24 @@ PyObject *PyObject_CallOneArg(PyObject *callable, PyObject *arg) {
     }
     return PyObject_CallFunctionObjArgs(callable, arg, NULL);
 }
+#endif /* PCC_PY_CAPI_OBJECT_CALL_RUNTIME */
 
+/* Vectorcall entry points are pcc-Python-owned in production and remain here
+ * for the host-C oracle archive. */
+#if defined(PCC_PY_CAPI_OBJECT_CALL_RUNTIME)
+extern PyObject *PyObject_Vectorcall(
+    PyObject *callable,
+    PyObject *const *args,
+    size_t nargsf,
+    PyObject *kwnames
+);
+extern PyObject *PyObject_VectorcallMethod(
+    PyObject *name,
+    PyObject *const *args,
+    size_t nargsf,
+    PyObject *kwnames
+);
+#else
 PyObject *PyObject_Vectorcall(
     PyObject *callable,
     PyObject *const *args,
@@ -6749,7 +8166,12 @@ PyObject *PyObject_VectorcallMethod(
     py_decref(method);
     return result;
 }
+#endif
 
+
+#if defined(PCC_PY_CAPI_CALL_RUNTIME)
+extern PyObject *PyObject_CallMethodNoArgs(PyObject *obj, PyObject *name);
+#else
 PyObject *PyObject_CallMethodNoArgs(PyObject *obj, PyObject *name) {
     PyObject *method = PyObject_GetAttr(obj, name);
     if (method == NULL) return NULL;
@@ -6757,7 +8179,14 @@ PyObject *PyObject_CallMethodNoArgs(PyObject *obj, PyObject *name) {
     py_decref(method);
     return result;
 }
+#endif /* PCC_PY_CAPI_CALL_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_CALL_RUNTIME)
+extern PyObject *PyObject_CallMethodOneArg(
+    PyObject *obj, PyObject *name, PyObject *arg
+);
+#else
 PyObject *PyObject_CallMethodOneArg(PyObject *obj, PyObject *name, PyObject *arg) {
     PyObject *method = PyObject_GetAttr(obj, name);
     if (method == NULL) return NULL;
@@ -6765,11 +8194,20 @@ PyObject *PyObject_CallMethodOneArg(PyObject *obj, PyObject *name, PyObject *arg
     py_decref(method);
     return result;
 }
+#endif /* PCC_PY_CAPI_CALL_RUNTIME */
 
+
+#if !defined(PCC_PY_CAPI_CORE_RUNTIME)
 int Py_IsInitialized(void) {
     return 1;
 }
+#endif
 
+#if defined(PCC_PY_CAPI_TYPE_RUNTIME)
+extern PyGILState_STATE PyGILState_Ensure(void);
+extern void PyGILState_Release(PyGILState_STATE state);
+extern int PyGILState_Check(void);
+#else
 PyGILState_STATE PyGILState_Ensure(void) {
     return 0;
 }
@@ -6781,7 +8219,28 @@ void PyGILState_Release(PyGILState_STATE state) {
 int PyGILState_Check(void) {
     return 1;
 }
+#endif /* PCC_PY_CAPI_TYPE_RUNTIME */
 
+#if defined(PCC_PY_CAPI_SEQUENCE_RUNTIME)
+/* The PySequence_* surface is owned by the pcc-Python module
+ * py_capi_sequence_runtime.py.  The C-extension item dispatch
+ * (pcc_capi_cext_object_getitem) stays here. */
+extern int PySequence_Check(PyObject *obj);
+extern Py_ssize_t PySequence_Size(PyObject *obj);
+extern Py_ssize_t PySequence_Length(PyObject *obj);
+extern PyObject *PySequence_GetItem(PyObject *obj, Py_ssize_t index);
+extern int PySequence_SetItem(PyObject *obj, Py_ssize_t index, PyObject *value);
+extern int PySequence_Contains(PyObject *obj, PyObject *value);
+extern PyObject *PySequence_Concat(PyObject *left, PyObject *right);
+extern PyObject *PySequence_InPlaceConcat(PyObject *left, PyObject *right);
+extern PyObject *PySequence_Repeat(PyObject *obj, Py_ssize_t count);
+extern PyObject *PySequence_InPlaceRepeat(PyObject *obj, Py_ssize_t count);
+extern PyObject *PySequence_Fast(PyObject *obj, const char *message);
+extern PyObject *PySequence_Fast_GET_SIZE(PyObject *obj);
+extern PyObject *PySequence_Fast_ITEMS(PyObject *obj);
+extern PyObject *PySequence_List(PyObject *obj);
+extern PyObject *PySequence_Tuple(PyObject *obj);
+#else
 int PySequence_Check(PyObject *obj) {
     if (obj == NULL || PY_IS_TAGGED_INT(obj)) return 0;
     int32_t tag = py_type_of(obj);
@@ -6815,6 +8274,7 @@ int PySequence_Check(PyObject *obj) {
     return 0;
 }
 
+#if !defined(PCC_PY_CAPI_OBJECT_RUNTIME)
 PyObject *PyObject_GetIter(PyObject *obj) {
     if (obj == NULL) {
         PyErr_SetString(PyExc_TypeError, "NULL object is not iterable");
@@ -6831,7 +8291,15 @@ PyObject *PyObject_SelfIter(PyObject *obj) {
     Py_INCREF(obj);
     return obj;
 }
+#endif /* !PCC_PY_CAPI_OBJECT_RUNTIME */
+#endif /* PCC_PY_CAPI_SEQUENCE_RUNTIME (port-owned surface above) */
 
+/* Iterator protocol entry points are pcc-Python-owned in production and
+ * remain here for the host-C oracle archive. */
+#if defined(PCC_PY_CAPI_SEQITER_RUNTIME)
+extern int PyIter_Check(PyObject *obj);
+extern PyObject *PyIter_Next(PyObject *obj);
+#else
 int PyIter_Check(PyObject *obj) {
     if (obj == NULL || PY_IS_TAGGED_INT(obj)) return 0;
     int32_t tag = py_type_of(obj);
@@ -6841,8 +8309,8 @@ int PyIter_Check(PyObject *obj) {
 
 /* batch 17 forward decls: the PySeqIter_New object (defined at end of file) is
  * iterated through the C-API PyIter_Next path here. */
-static int pcc_capi_is_seqiter(PyObject *obj);
-static PyObject *pcc_capi_seqiter_next(PyObject *obj);
+int pcc_capi_is_seqiter(PyObject *obj);
+PyObject *pcc_capi_seqiter_next(PyObject *obj);
 
 PyObject *PyIter_Next(PyObject *obj) {
     if (obj == NULL) {
@@ -6858,7 +8326,11 @@ PyObject *PyIter_Next(PyObject *obj) {
     }
     return item;
 }
+#endif
 
+#if defined(PCC_PY_CAPI_SEQITER_RUNTIME)
+extern int PyIter_NextItem(PyObject *iter, PyObject **item);
+#elif !defined(PCC_PY_CAPI_SEQUENCE_RUNTIME)
 int PyIter_NextItem(PyObject *iter, PyObject **item) {
     if (item == NULL) {
         PyErr_SetString(PyExc_SystemError, "NULL result pointer");
@@ -6873,7 +8345,9 @@ int PyIter_NextItem(PyObject *iter, PyObject **item) {
     if (*item != NULL) return 1;
     return PyErr_Occurred() == NULL ? 0 : -1;
 }
+#endif
 
+#if !defined(PCC_PY_CAPI_SEQUENCE_RUNTIME)
 Py_ssize_t PySequence_Size(PyObject *obj) {
     if (!PySequence_Check(obj)) {
         PyErr_SetString(PyExc_TypeError, "expected sequence");
@@ -7026,6 +8500,8 @@ PyObject *PySequence_Tuple(PyObject *obj) {
     return out;
 }
 
+
+#endif /* PCC_PY_CAPI_SEQUENCE_RUNTIME */
 typedef int (*PccCapiArgConverter)(PyObject *, void *);
 
 static int pcc_capi_parse_one(
@@ -7411,6 +8887,10 @@ static PyObject *pcc_capi_build_many(
     return tuple;
 }
 
+
+#if defined(PCC_PY_CAPI_BUILDVALUE_RUNTIME)
+extern PyObject *Py_BuildValue(const char *format, ...);
+#else
 PyObject *Py_BuildValue(const char *format, ...) {
     if (format == NULL) {
         PyErr_SetString(PyExc_ValueError, "NULL Py_BuildValue format");
@@ -7423,6 +8903,8 @@ PyObject *Py_BuildValue(const char *format, ...) {
     va_end(ap);
     return out;
 }
+#endif /* PCC_PY_CAPI_BUILDVALUE_RUNTIME */
+
 
 static PyObject *pcc_capi_build_call_args(const char *format, va_list *ap) {
     if (format == NULL) {
@@ -7432,6 +8914,11 @@ static PyObject *pcc_capi_build_call_args(const char *format, va_list *ap) {
     return pcc_capi_build_many(&p, ap, '\0', 1);
 }
 
+
+
+#if defined(PCC_PY_CAPI_CALL_RUNTIME)
+extern PyObject *PyObject_CallFunction(PyObject *callable, const char *format, ...);
+#else
 PyObject *PyObject_CallFunction(PyObject *callable, const char *format, ...) {
     va_list ap;
     va_start(ap, format);
@@ -7442,7 +8929,14 @@ PyObject *PyObject_CallFunction(PyObject *callable, const char *format, ...) {
     py_decref(args);
     return result;
 }
+#endif /* PCC_PY_CAPI_CALL_RUNTIME */
 
+
+#if defined(PCC_PY_CAPI_CALL_RUNTIME)
+extern PyObject *PyObject_CallMethod(
+    PyObject *obj, const char *name, const char *format, ...
+);
+#else
 PyObject *PyObject_CallMethod(PyObject *obj, const char *name, const char *format, ...) {
     if (obj == NULL || name == NULL) {
         PyErr_SetString(PyExc_TypeError, "invalid PyObject_CallMethod call");
@@ -7464,273 +8958,241 @@ PyObject *PyObject_CallMethod(PyObject *obj, const char *name, const char *forma
     py_decref(method);
     return result;
 }
+#endif /* PCC_PY_CAPI_CALL_RUNTIME */
 
-int PyArg_ParseTuple(PyObject *args, const char *format, ...) {
-    if (args == NULL || PY_IS_TAGGED_INT(args) || py_type_of(args) != PY_TYPE_TUPLE) {
-        PyErr_SetString(PyExc_TypeError, "expected argument tuple");
-        return 0;
-    }
-    int required = 0;
-    int total = 0;
-    pcc_capi_format_counts(format, &required, &total);
-    int64_t nargs = py_tuple_len(args);
-    if (nargs < required || nargs > total) {
-        PyErr_SetString(PyExc_TypeError, "argument count mismatch");
-        return 0;
-    }
-    va_list ap;
-    va_start(ap, format);
-    int index = 0;
-    int ok = 1;
-    for (const char *p = format; p != NULL && *p != '\0'; p++) {
-        char c = *p;
-        if (c == ':' || c == ';') break;
-        if (c == '|') continue;
-        if (!pcc_capi_is_parse_code(c)) continue;
-        char object_modifier = (
-            c == 'O' && (p[1] == '!' || p[1] == '&') ? p[1] : '\0'
-        );
-        int has_hash = (c == 's' || c == 'y') && p[1] == '#';
-        if (index < nargs) {
-            PyObject *item = py_tuple_get(args, (int64_t)index);
-            int parsed = has_hash
-                ? pcc_capi_parse_one_hash(item, c, &ap)
-                : pcc_capi_parse_one(item, c, object_modifier, &ap);
-            py_decref(item);
-            if (!parsed) {
-                ok = 0;
-                break;
-            }
-        } else {
-            pcc_capi_skip_parse_dest(c, object_modifier, has_hash, &ap);
-        }
-        index++;
-        if (has_hash) p++;
-        else if (object_modifier != '\0') p++;
-    }
-    va_end(ap);
-    if (!ok) {
-        PyErr_SetString(PyExc_TypeError, "argument type mismatch");
-        return 0;
-    }
-    return 1;
-}
 
-/* va_list CORE (canonical CPython structure: the `...` PyArg_ParseTupleAndKeywords
- * below is a thin wrapper over this). numpy's C core references this directly
- * (e.g. METH_VARARGS|METH_KEYWORDS helpers that forward their own va_list).
- * va_copy so the caller's va_list is not consumed (it is an array type on
- * arm64/x86-64 SysV — passing it shares state with the caller otherwise). */
-int PyArg_VaParseTupleAndKeywords(
-    PyObject *args,
-    PyObject *kwargs,
-    const char *format,
-    char **kwlist,
-    va_list va
-) {
-    if (args == NULL || PY_IS_TAGGED_INT(args) || py_type_of(args) != PY_TYPE_TUPLE) {
-        PyErr_SetString(PyExc_TypeError, "expected argument tuple");
-        return 0;
-    }
-    if (kwargs != NULL && kwargs != py_None
-        && (PY_IS_TAGGED_INT(kwargs) || py_type_of(kwargs) != PY_TYPE_DICT)) {
-        PyErr_SetString(PyExc_TypeError, "expected keyword dict");
-        return 0;
-    }
 
-    int required = 0;
-    int total = 0;
-    pcc_capi_format_counts(format, &required, &total);
-    int64_t nargs = py_tuple_len(args);
-    if (nargs > total) {
-        PyErr_Format(
-            PyExc_TypeError,
-            "too many positional arguments (got %lld, max %d)",
-            (long long)nargs,
-            total
-        );
-        return 0;
-    }
 
-    va_list ap;
-    va_copy(ap, va);
-    int index = 0;
-    int ok = 1;
-    for (const char *p = format; p != NULL && *p != '\0'; p++) {
-        char c = *p;
-        if (c == ':' || c == ';') break;
-        if (c == '|') continue;
-        if (!pcc_capi_is_parse_code(c)) continue;
-        char object_modifier = (
-            c == 'O' && (p[1] == '!' || p[1] == '&') ? p[1] : '\0'
-        );
 
-        int has_hash = (c == 's' || c == 'y') && p[1] == '#';
-        PyObject *owned_item = NULL;
-        PyObject *item = NULL;
-        if (index < nargs) {
-            owned_item = py_tuple_get(args, (int64_t)index);
-            item = owned_item;
-        } else if (kwargs != NULL && kwargs != py_None
-            && kwlist != NULL && kwlist[index] != NULL) {
-            item = PyDict_GetItemString(kwargs, kwlist[index]);
-        }
 
-        if (item == NULL) {
-            if (index < required) {
-                ok = 0;
-                if (owned_item != NULL) py_decref(owned_item);
-                break;
-            }
-            pcc_capi_skip_parse_dest(c, object_modifier, has_hash, &ap);
-        } else {
-            int parsed = has_hash
-                ? pcc_capi_parse_one_hash(item, c, &ap)
-                : pcc_capi_parse_one(item, c, object_modifier, &ap);
-            if (!parsed) ok = 0;
-        }
-        if (owned_item != NULL) py_decref(owned_item);
-        if (!ok) break;
-        index++;
-        if (has_hash) p++;
-        else if (object_modifier != '\0') p++;
-    }
-    va_end(ap);
-    if (!ok) {
-        PyErr_SetString(PyExc_TypeError, "argument type mismatch");
-        return 0;
-    }
-    return 1;
-}
 
-int PyArg_ParseTupleAndKeywords(
-    PyObject *args,
-    PyObject *kwargs,
-    const char *format,
-    char **kwlist,
-    ...
-) {
-    va_list va;
-    va_start(va, kwlist);
-    int r = PyArg_VaParseTupleAndKeywords(args, kwargs, format, kwlist, va);
-    va_end(va);
-    return r;
-}
+/* --- batch 9: genuinely-correct / import-safe link symbols only. */
 
-typedef struct PccCapiModuleStateNode {
-    PyObject *module;
-    PyModuleDef *def;
-    void *state;
-    struct PccCapiModuleStateNode *next;
-} PccCapiModuleStateNode;
+/* pcc raises normalized exception INSTANCES (no separate type/value/tb triple to
+ * reconcile), so the triple is already normalized — nothing to do. */
+#if !defined(PCC_PY_CAPI_EXC_RUNTIME)
+#endif /* !PCC_PY_CAPI_EXC_RUNTIME */
 
-static PccCapiModuleStateNode *pcc_capi_module_states = NULL;
-
-static PccCapiModuleStateNode *pcc_capi_find_module_state(PyObject *module) {
-    for (
-        PccCapiModuleStateNode *n = pcc_capi_module_states;
-        n != NULL;
-        n = n->next
-    ) {
-        if (n->module == module) return n;
-    }
-    return NULL;
-}
-
-PyObject *PyType_GetModuleByDef(PyTypeObject *type, PyModuleDef *def) {
-    if (type == NULL || def == NULL) {
-        PyErr_SetString(PyExc_TypeError, "invalid type or module definition");
+#if defined(PCC_PY_CAPI_CEXT_RUNTIME)
+extern PyObject *PyObject_GenericGetDict(PyObject *o, void *context);
+#else
+PyObject *PyObject_GenericGetDict(PyObject *o, void *context) {
+    (void)context;
+    if (o == NULL) {
+        PyErr_SetString(PyExc_TypeError, "NULL object has no __dict__");
         return NULL;
     }
-    for (int guard = 0; type != NULL && guard < 64; guard++) {
-        PyObject *module = NULL;
-        if (type->tp_version_tag >= PCC_CAPI_CEXT_TAG_BASE) {
-            int32_t offset = (
-                (int32_t)type->tp_version_tag - PCC_CAPI_CEXT_TAG_BASE
-            );
-            if (offset >= 0 && offset < pcc_capi_cext_type_count) {
-                module = pcc_capi_cext_type_modules[offset];
+    PyTypeObject *type = pcc_capi_cext_type_for_object(o);
+    if (type == NULL) return py_obj_getattr(o, "__dict__");
+    PyObject **slot = pcc_capi_object_dict_slot(o, type);
+    if (slot == NULL) {
+        PyErr_SetString(PyExc_AttributeError, "object has no __dict__");
+        return NULL;
+    }
+    PyObject *dict = pcc_gc_load_ptr(o, slot);
+    if (dict != NULL) {
+        py_incref(dict);
+        return dict;
+    }
+    dict = py_dict_new();
+    if (dict == NULL) return NULL;
+    pcc_gc_store_ptr(o, slot, dict);
+    return dict;
+}
+#endif /* PCC_PY_CAPI_CEXT_RUNTIME */
+
+
+PyObject *pcc_capi_member_get(PyObject *o, PccCapiMemberDef *member);
+
+#if defined(PCC_PY_CAPI_CEXT_RUNTIME)
+extern PyObject *PyObject_GenericGetAttr(PyObject *o, PyObject *name);
+#else
+PyObject *PyObject_GenericGetAttr(PyObject *o, PyObject *name) {
+    PyTypeObject *type = pcc_capi_cext_type_for_object(o);
+    if (name == NULL || PY_IS_TAGGED_INT(name)
+        || py_type_of(name) != PY_TYPE_STR) {
+        PyErr_SetString(PyExc_TypeError, "attribute name must be a string");
+        return NULL;
+    }
+    if (type == NULL) return PyObject_GetAttr(o, name);
+    const char *attr = py_str_utf8(name);
+    for (PyTypeObject *current = type; current != NULL;
+         current = (PyTypeObject *)current->tp_base) {
+        PccCapiGetSetDef *getset = (PccCapiGetSetDef *)current->tp_getset;
+        for (; getset != NULL && getset->name != NULL; getset++) {
+            if (strcmp(attr, getset->name) == 0 && getset->get != NULL) {
+                PyObject *result = getset->get(o, getset->closure);
+                if (result == NULL) {
+                    py_runtime_error_if_unset(
+                        "C extension getset getter",
+                        "getset getter returned NULL without setting an exception"
+                    );
+                }
+                return result;
             }
         }
-        PccCapiModuleStateNode *state = pcc_capi_find_module_state(module);
-        if (state != NULL && state->def == def) return module;
-        type = (PyTypeObject *)type->tp_base;
+        PccCapiMemberDef *member = (PccCapiMemberDef *)current->tp_members;
+        for (; member != NULL && member->name != NULL; member++) {
+            if (strcmp(attr, member->name) != 0) continue;
+            return pcc_capi_member_get(o, member);
+        }
     }
-    PyErr_SetString(PyExc_TypeError, "module definition not found in type MRO");
+    PyObject **dict_slot = pcc_capi_object_dict_slot(o, type);
+    if (dict_slot != NULL) {
+        PyObject *dict = pcc_gc_load_ptr(o, dict_slot);
+        if (dict != NULL) {
+            PyObject *value = py_dict_get(dict, name);
+            if (value != NULL) return value;
+        }
+    }
+    for (PyTypeObject *current = type; current != NULL;
+         current = (PyTypeObject *)current->tp_base) {
+        PyMethodDef *method = (PyMethodDef *)current->tp_methods;
+        for (; method != NULL && method->ml_name != NULL; method++) {
+            if (strcmp(attr, method->ml_name) == 0) {
+                return pcc_capi_method_func_new(o, method);
+            }
+        }
+    }
+    PyErr_SetString(PyExc_AttributeError, attr);
     return NULL;
 }
+#endif /* PCC_PY_CAPI_CEXT_RUNTIME */
 
-static int pcc_capi_register_module_state(
-    PyObject *module,
-    PyModuleDef *def,
-    void *state
-) {
-    PccCapiModuleStateNode *node = (
-        PccCapiModuleStateNode *
-    )calloc(1, sizeof(PccCapiModuleStateNode));
-    if (node == NULL) return -1;
-    node->module = module;
-    node->def = def;
-    node->state = state;
-    node->next = pcc_capi_module_states;
-    pcc_capi_module_states = node;
-    if (
-        module != NULL
-        && !PY_IS_TAGGED_INT(module)
-        && (py_header_flags_load(py_header(module)) & PY_FLAG_GC_PINNED) == 0
-    ) {
-        pcc_gc_pin(module);
+
+#if defined(PCC_PY_CAPI_CEXT_RUNTIME)
+extern int PyObject_GenericSetAttr(PyObject *o, PyObject *name, PyObject *value);
+#else
+int PyObject_GenericSetAttr(PyObject *o, PyObject *name, PyObject *value) {
+    PyTypeObject *type = pcc_capi_cext_type_for_object(o);
+    if (name == NULL || PY_IS_TAGGED_INT(name)
+        || py_type_of(name) != PY_TYPE_STR) {
+        PyErr_SetString(PyExc_TypeError, "attribute name must be a string");
+        return -1;
     }
+    if (type == NULL) return PyObject_SetAttr(o, name, value);
+    const char *attr = py_str_utf8(name);
+    for (PyTypeObject *current = type; current != NULL;
+         current = (PyTypeObject *)current->tp_base) {
+        PccCapiGetSetDef *getset = (PccCapiGetSetDef *)current->tp_getset;
+        for (; getset != NULL && getset->name != NULL; getset++) {
+            if (strcmp(attr, getset->name) != 0) continue;
+            if (getset->set == NULL) {
+                PyErr_SetString(PyExc_AttributeError, attr);
+                return -1;
+            }
+            int result = getset->set(o, value, getset->closure);
+            if (result != 0) {
+                py_runtime_error_if_unset(
+                    "C extension getset setter",
+                    "getset setter returned failure without setting an exception"
+                );
+            }
+            return result;
+        }
+    }
+    PyObject **slot = pcc_capi_object_dict_slot(o, type);
+    if (slot == NULL || value == NULL) {
+        PyErr_SetString(PyExc_AttributeError, attr);
+        return -1;
+    }
+    PyObject *dict = pcc_gc_load_ptr(o, slot);
+    if (dict == NULL) {
+        dict = py_dict_new();
+        if (dict == NULL) return -1;
+        pcc_gc_store_ptr(o, slot, dict);
+        py_decref(dict);
+        dict = pcc_gc_load_ptr(o, slot);
+    }
+    py_dict_set(dict, name, value);
     return 0;
 }
+#endif /* PCC_PY_CAPI_CEXT_RUNTIME */
 
-PyObject *PyModule_Create2(PyModuleDef *def, int api_version) {
-    (void)api_version;
-    if (def == NULL || def->m_name == NULL) {
-        PyErr_SetString(PyExc_RuntimeError, "invalid module definition");
-        return NULL;
-    }
-    PyClassObject *cls = pcc_runtime_module_class();
-    if (cls == NULL) return NULL;
-    PyObject *module = py_instance_new(cls);
-    if (module == NULL) return NULL;
 
-    if (def->m_size > 0) {
-        void *state = calloc(1, (size_t)def->m_size);
-        if (state == NULL) {
-            py_decref(module);
-            return PyErr_NoMemory();
+#if defined(PCC_PY_CAPI_CEXT_RUNTIME)
+extern PyObject *pcc_capi_member_get(PyObject *o, PccCapiMemberDef *member);
+#else
+PyObject *pcc_capi_member_get(
+    PyObject *o,
+    PccCapiMemberDef *member
+) {
+    char *address = (char *)o + member->offset;
+    switch (member->type) {
+        case PCC_CAPI_T_SHORT:
+            return PyLong_FromLong((long)*(short *)address);
+        case PCC_CAPI_T_INT:
+            return PyLong_FromLong((long)*(int *)address);
+        case PCC_CAPI_T_LONG:
+            return PyLong_FromLong(*(long *)address);
+        case PCC_CAPI_T_FLOAT:
+            return PyFloat_FromDouble((double)*(float *)address);
+        case PCC_CAPI_T_DOUBLE:
+            return PyFloat_FromDouble(*(double *)address);
+        case PCC_CAPI_T_STRING: {
+            const char *value = *(const char **)address;
+            if (value == NULL) {
+                PyErr_SetString(PyExc_AttributeError, member->name);
+                return NULL;
+            }
+            return PyUnicode_FromString(value);
         }
-        if (pcc_capi_register_module_state(module, def, state) != 0) {
-            free(state);
-            py_decref(module);
-            return PyErr_NoMemory();
+        case PCC_CAPI_T_OBJECT:
+        case PCC_CAPI_T_OBJECT_EX: {
+            PyObject *value = pcc_gc_load_ptr(o, (PyObject **)address);
+            if (value == NULL && member->type == PCC_CAPI_T_OBJECT_EX) {
+                PyErr_SetString(PyExc_AttributeError, member->name);
+                return NULL;
+            }
+            if (value == NULL) value = py_None;
+            py_incref(value);
+            return value;
         }
+        case PCC_CAPI_T_CHAR:
+            return PyUnicode_FromStringAndSize(address, 1);
+        case PCC_CAPI_T_BYTE:
+            return PyLong_FromLong((long)*(signed char *)address);
+        case PCC_CAPI_T_UBYTE:
+            return PyLong_FromUnsignedLong((unsigned long)*(unsigned char *)address);
+        case PCC_CAPI_T_USHORT:
+            return PyLong_FromUnsignedLong((unsigned long)*(unsigned short *)address);
+        case PCC_CAPI_T_UINT:
+            return PyLong_FromUnsignedLong((unsigned long)*(unsigned int *)address);
+        case PCC_CAPI_T_ULONG:
+            return PyLong_FromUnsignedLong(*(unsigned long *)address);
+        case PCC_CAPI_T_STRING_INPLACE:
+            return PyUnicode_FromString(address);
+        case PCC_CAPI_T_BOOL:
+            return PyBool_FromLong(*(char *)address != 0);
+        case PCC_CAPI_T_LONGLONG:
+            return PyLong_FromLongLong(*(long long *)address);
+        case PCC_CAPI_T_ULONGLONG:
+            return PyLong_FromUnsignedLongLong(*(unsigned long long *)address);
+        case PCC_CAPI_T_PYSSIZET:
+            return PyLong_FromSsize_t(*(Py_ssize_t *)address);
+        case PCC_CAPI_T_NONE:
+            py_incref(py_None);
+            return py_None;
+        default:
+            PyErr_SetString(PyExc_TypeError, "unsupported C member type");
+            return NULL;
     }
-
-    PyObject *name = py_str_new(def->m_name, (int64_t)strlen(def->m_name));
-    if (name != NULL) {
-        py_instance_setattr((PyInstanceObject *)module, "__name__", name);
-        py_decref(name);
-    }
-
-    PyMethodDef *method = def->m_methods;
-    while (method != NULL && method->ml_name != NULL) {
-        PyObject *fn = pcc_capi_method_func_new(module, method);
-        if (fn != NULL) {
-            py_instance_setattr((PyInstanceObject *)module, method->ml_name, fn);
-            py_decref(fn);
-        }
-        method++;
-    }
-    return module;
 }
+#endif /* PCC_PY_CAPI_CEXT_RUNTIME */
 
-void *PyModule_GetState(PyObject *module) {
-    PccCapiModuleStateNode *node = pcc_capi_find_module_state(module);
-    return node != NULL ? node->state : NULL;
-}
 
+#if defined(PCC_PY_CAPI_VISIT_RUNTIME)
+/* The object-slot visit surface is owned by the pcc-Python module
+ * py_capi_visit_runtime.py. */
+extern int pcc_capi_visit_slot(PyObject **slot, visitproc visit, void *arg);
+extern int pcc_capi_visit_cext_object_slots(
+    PyObject *o, PyObjSlotVisitor visit, void *ctx
+);
+extern int pcc_capi_visit_cext_object_slots_i64(
+    PyObject *o, PccPyObjSlotVisitorI64 visit, void *ctx
+);
+extern int pcc_capi_visit_cext_object_slot_ref(PyObject *obj, void *arg);
+#else
 typedef struct PccCapiObjectSlotVisitCtx {
     PyObjSlotVisitor visit;
     void *ctx;
@@ -7805,6 +9267,8 @@ int pcc_capi_visit_cext_object_slots_i64(
     );
 }
 
+
+#endif /* PCC_PY_CAPI_VISIT_RUNTIME */
 typedef struct PccCapiModuleStateVisitCtx {
     PccGcRootVisitor visit;
     void *ctx;
@@ -7827,133 +9291,89 @@ static int pcc_capi_visit_module_state_ref(PyObject *obj, void *arg) {
     return 0;
 }
 
-void pcc_capi_visit_extension_module_state_roots(
-    PccGcRootVisitor visit,
-    void *ctx
-) {
-    if (visit == NULL) return;
-    PccCapiModuleStateVisitCtx visit_ctx = {visit, ctx};
-    for (
-        PccCapiModuleStateNode *n = pcc_capi_module_states;
-        n != NULL;
-        n = n->next
-    ) {
-        if (n->module != NULL) visit(n->module, ctx);
-        if (n->def == NULL || n->def->m_traverse == NULL) continue;
-        traverseproc traverse = (traverseproc)n->def->m_traverse;
-        (void)traverse(n->module, pcc_capi_visit_module_state_ref, &visit_ctx);
-    }
-}
 
-/* Multi-phase init is split so the extension loader can register the module in
- * its load-once cache BETWEEN creation and exec (CPython's PEP 489 contract:
- * the module enters sys.modules before exec_module runs, so a nested import of
- * the same module during exec returns the in-progress module instead of
- * re-running PyInit — numpy's _multiarray_umath rejects a second init per
- * process). */
-PyObject *pcc_capi_module_from_def(PyObject *def_as_obj) {
-    PyModuleDef *def = (PyModuleDef *)def_as_obj;
-    if (def == NULL) return NULL;
-    return PyModule_Create2(def, 0);
-}
 
-/* Invoke each Py_mod_exec slot with the module (where numpy registers ndarray /
- * the PyArray_API capsule / static data). Returns 0, or -1 on a slot error. */
-int pcc_capi_module_run_exec_slots(PyObject *def_as_obj, PyObject *module) {
-    PyModuleDef *def = (PyModuleDef *)def_as_obj;
-    if (def == NULL || module == NULL) return -1;
-    if (def->m_slots != NULL) {
-        for (PyModuleDef_Slot *s = def->m_slots; s->slot != 0; s++) {
-            if (s->slot == PCC_Py_mod_exec && s->value != NULL) {
-                int (*exec_fn)(PyObject *) = (int (*)(PyObject *))s->value;
-                if (exec_fn(module) != 0) {
-                    if (!py_err_occurred()) {
-                        PyErr_SetString(PyExc_SystemError,
-                                        "module exec slot failed");
-                    }
-                    return -1;
-                }
-            }
-            /* PCC_Py_mod_create is rarely used by numpy; default module is fine. */
-        }
-    }
-    return 0;
-}
-
-/* Create + exec in one step. Kept for callers that have no nested-import
- * re-entry concern. */
-PyObject *pcc_capi_module_exec(PyObject *def_as_obj) {
-    PyObject *module = pcc_capi_module_from_def(def_as_obj);
-    if (module == NULL) return NULL;
-    if (pcc_capi_module_run_exec_slots(def_as_obj, module) != 0) {
-        py_decref(module);
+#if defined(PCC_PY_CAPI_STR_CONV_RUNTIME)
+extern PyObject *PyFloat_FromString(PyObject *str);
+#else
+PyObject *PyFloat_FromString(PyObject *str) {
+    if (str == NULL) {
+        PyErr_SetString(PyExc_TypeError, "PyFloat_FromString requires a str");
         return NULL;
     }
-    return module;
-}
-
-PyObject *PyModule_GetDict(PyObject *module) {
-    if (module == NULL) {
-        PyErr_SetString(PyExc_TypeError, "NULL module");
+    const char *s = PyUnicode_AsUTF8(str);
+    if (s == NULL) return NULL;
+    char *end = NULL;
+    double v = PyOS_string_to_double(s, &end, NULL);   /* locale-independent */
+    if (end == s) {
+        PyErr_SetString(PyExc_ValueError, "could not convert string to float");
         return NULL;
     }
-    PyObject *dict = py_obj_getattr(module, "__dict__");
-    if (dict == NULL) {
-        PyErr_SetString(PyExc_TypeError, "expected module object");
+    return PyFloat_FromDouble(v);
+}
+#endif /* PCC_PY_CAPI_STR_CONV_RUNTIME */
+
+
+#if defined(PCC_PY_CAPI_STR_CONV_RUNTIME)
+extern PyObject *PyLong_FromUnicodeObject(PyObject *u, int base);
+#else
+PyObject *PyLong_FromUnicodeObject(PyObject *u, int base) {
+    if (u == NULL) {
+        PyErr_SetString(PyExc_TypeError, "PyLong_FromUnicodeObject requires a str");
         return NULL;
     }
-    /* py_obj_getattr returns owned; CPython PyModule_GetDict returns borrowed. */
-    py_decref(dict);
-    return dict;
-}
-
-int PyModule_AddObject(PyObject *module, const char *name, PyObject *value) {
-    if (module == NULL || name == NULL || value == NULL) {
-        PyErr_SetString(PyExc_RuntimeError, "invalid PyModule_AddObject call");
-        return -1;
+    const char *s = PyUnicode_AsUTF8(u);
+    if (s == NULL) return NULL;
+    char *end = NULL;
+    long long v = strtoll(s, &end, base == 0 ? 10 : base);
+    if (end == s) {
+        PyErr_SetString(PyExc_ValueError, "invalid literal for int()");
+        return NULL;
     }
-    int64_t rc = py_obj_setattr(module, name, value);
-    if (rc != 0) return -1;
-    py_decref(value);
-    return 0;
+    return PyLong_FromLongLong(v);
 }
+#endif /* PCC_PY_CAPI_STR_CONV_RUNTIME */
 
-int PyModule_AddObjectRef(PyObject *module, const char *name, PyObject *value) {
-    if (value == NULL) {
-        if (!py_err_occurred()) {
-            PyErr_SetString(
-                PyExc_SystemError,
-                "PyModule_AddObjectRef must be called with an exception raised if value is NULL"
-            );
-        }
-        return -1;
+
+#if defined(PCC_PY_CAPI_CEXT_RUNTIME)
+extern Py_hash_t _Py_HashDouble(PyObject *inst, double v);
+#else
+Py_hash_t _Py_HashDouble(PyObject *inst, double v) {
+    const int bits = 61;
+    const uint64_t modulus = (((uint64_t)1 << bits) - 1);
+    int e, sign;
+    double m;
+    uint64_t x, y;
+    if (!isfinite(v)) {
+        if (isinf(v)) return v > 0 ? 314159 : -314159;
+        return inst ? (Py_hash_t)py_obj_hash(inst) : 0;   /* nan */
     }
-    py_incref(value);
-    int rc = PyModule_AddObject(module, name, value);
-    if (rc != 0) {
-        py_decref(value);
+    m = frexp(v, &e);
+    sign = 1;
+    if (m < 0) { sign = -1; m = -m; }
+    x = 0;
+    while (m) {
+        x = ((x << 28) & modulus) | x >> (bits - 28);
+        m *= 268435456.0;   /* 2**28 */
+        e -= 28;
+        y = (uint64_t)m;
+        m -= y;
+        x += y;
+        if (x >= modulus) x -= modulus;
     }
-    return rc;
+    e = e % bits;
+    if (e < 0) e += bits;
+    x = ((x << e) & modulus) | x >> (bits - e);
+    x = x * (uint64_t)sign;
+    if (x == (uint64_t)-1) x = (uint64_t)-2;
+    return (Py_hash_t)x;
 }
+#endif /* PCC_PY_CAPI_CEXT_RUNTIME */
 
-int PyModule_Add(PyObject *module, const char *name, PyObject *value) {
-    int rc = PyModule_AddObjectRef(module, name, value);
-    if (value != NULL) Py_DECREF(value);
-    return rc;
-}
 
-int PyModule_AddIntConstant(PyObject *module, const char *name, long value) {
-    PyObject *obj = PyLong_FromLong(value);
-    if (obj == NULL) return -1;
-    return PyModule_AddObject(module, name, obj);
-}
-
-int PyModule_AddStringConstant(PyObject *module, const char *name, const char *value) {
-    PyObject *obj = PyUnicode_FromString(value == NULL ? "" : value);
-    if (obj == NULL) return -1;
-    return PyModule_AddObject(module, name, obj);
-}
-
+#if defined(PCC_PY_CAPI_IMPORT_RUNTIME)
+extern PyObject *py_builtin_import(PyObject *name, PyObject *fromlist);
+#else
 PyObject *PyImport_ImportModule(const char *name) {
     if (name == NULL || name[0] == '\0') {
         PyErr_SetString(PyExc_ValueError, "empty module name");
@@ -7973,12 +9393,6 @@ PyObject *PyImport_ImportModule(const char *name) {
     return module;
 }
 
-/* --- batch 14: full-_core host symbols routed to existing pcc primitives /
- * extending the batch-10 contextvar. All genuine, not stubs. */
-
-/* PyImport_Import(name_obj) is importlib's entry; PyImport_ImportModule is a
- * faithful implementation for the by-name case numpy uses (it interns the name
- * then imports). */
 PyObject *PyImport_Import(PyObject *name) {
     if (name == NULL) {
         PyErr_SetString(PyExc_TypeError, "import name required");
@@ -7996,9 +9410,28 @@ PyObject *py_builtin_import(PyObject *name, PyObject *fromlist) {
     }
     const char *cname = py_str_utf8(name);
     if (cname == NULL) return NULL;
+    if (py_str_byte_len(name) == 0) {
+        PyErr_SetString(PyExc_ValueError, "Empty module name");
+        return NULL;
+    }
+    if ((int64_t)strlen(cname) != py_str_byte_len(name)) {
+        PyErr_SetString(PyExc_ValueError, "module name contains a null character");
+        return NULL;
+    }
 
-    PyObject *module = PyImport_ImportModule(cname);
-    if (module == NULL) return NULL;
+    /* Python-level __import__ reports ModuleNotFoundError.  Keep the public
+     * extension-facing PyImport_ImportModule diagnostic above unchanged, but
+     * do not route the language builtin through its RuntimeError boundary. */
+    PyObject *module = py_native_extension_import_by_name(cname);
+    if (module == NULL && !py_err_occurred()) {
+        module = py_compiled_module_import_by_name(cname);
+    }
+    if (module == NULL) {
+        if (!py_err_occurred()) {
+            PyErr_Format(PyExc_ModuleNotFoundError, "No module named '%s'", cname);
+        }
+        return NULL;
+    }
 
     int64_t fromlist_count = 0;
     if (fromlist != NULL && fromlist != py_None) {
@@ -8026,11 +9459,14 @@ PyObject *py_builtin_import(PyObject *name, PyObject *fromlist) {
     py_decref(module);
     return top_module;
 }
+#endif /* PCC_PY_CAPI_IMPORT_RUNTIME */
 
-/* Generic tp_call entry used by vectorcall-aware C extension types.  numpy's
- * ufunc and array-function dispatcher types store a vectorcallfunc in each
- * instance and install this function as tp_call.  Calling PyObject_Call again
- * before reading that slot would recurse through tp_call until stack overflow. */
+
+#if defined(PCC_PY_CAPI_OBJECT_CALL_RUNTIME)
+extern PyObject *PyVectorcall_Call(
+    PyObject *callable, PyObject *tuple, PyObject *dict
+);
+#else
 PyObject *PyVectorcall_Call(PyObject *callable, PyObject *tuple, PyObject *dict) {
     vectorcallfunc vectorcall = NULL;
     if (!pcc_capi_cext_vectorcall_slot(callable, &vectorcall)) {
@@ -8116,47 +9552,292 @@ PyObject *PyVectorcall_Call(PyObject *callable, PyObject *tuple, PyObject *dict)
     free(values);
     return result;
 }
+#endif
 
-/* Update the single-context value and return an opaque token represented as
- * (var, previously-set, previous-value).  The explicit set bit is required to
- * distinguish an unset variable from a variable whose value was actually
- * None, which makes the Python-visible reset() bridge below semantic rather
- * than a NumPy-only set-and-discard shim. */
-PyObject *PyContextVar_Set(PyObject *var, PyObject *value) {
-    if (var == NULL) {
-        PyErr_SetString(PyExc_TypeError, "ContextVar required");
-        return NULL;
+#if defined(PCC_PY_CAPI_ARG_RUNTIME)
+extern int PyArg_ParseTuple(PyObject *args, const char *format, ...);
+#else
+int PyArg_ParseTuple(PyObject *args, const char *format, ...) {
+    if (args == NULL || PY_IS_TAGGED_INT(args) || py_type_of(args) != PY_TYPE_TUPLE) {
+        PyErr_SetString(PyExc_TypeError, "expected argument tuple");
+        return 0;
     }
-    pcc_capi_contextvar *cv = (pcc_capi_contextvar *)var;
-    PyObject *prev = pcc_gc_load_ptr(var, &cv->value);
-                                          /* owned by cv, may be NULL (unset) */
-    if (value != NULL) py_incref(value);
-    cv->value = value;                   /* move cv's old ownership to token */
-    pcc_gc_note_slot_write_barrier(var, &cv->value, value);
-    PyObject *tok = PyTuple_New(3);
-    if (tok == NULL) {
-        if (value != NULL) py_decref(value);
-        cv->value = prev;                /* restore: keep cv's reference intact */
-        pcc_gc_note_slot_write_barrier(var, &cv->value, prev);
-        return NULL;
+    int required = 0;
+    int total = 0;
+    pcc_capi_format_counts(format, &required, &total);
+    int64_t nargs = py_tuple_len(args);
+    if (nargs < required || nargs > total) {
+        PyErr_SetString(PyExc_TypeError, "argument count mismatch");
+        return 0;
     }
-    py_incref(var);
-    PyTuple_SetItem(tok, 0, var);        /* steals the extra ref */
-    PyObject *had_value = PyBool_FromLong(prev != NULL);
-    if (had_value == NULL || PyTuple_SetItem(tok, 1, had_value) != 0) {
-        if (had_value != NULL) py_decref(had_value);
-        py_decref(tok);
-        return NULL;
+    va_list ap;
+    va_start(ap, format);
+    int index = 0;
+    int ok = 1;
+    for (const char *p = format; p != NULL && *p != '\0'; p++) {
+        char c = *p;
+        if (c == ':' || c == ';') break;
+        if (c == '|') continue;
+        if (!pcc_capi_is_parse_code(c)) continue;
+        char object_modifier = (
+            c == 'O' && (p[1] == '!' || p[1] == '&') ? p[1] : '\0'
+        );
+        int has_hash = (c == 's' || c == 'y') && p[1] == '#';
+        if (index < nargs) {
+            PyObject *item = py_tuple_get(args, (int64_t)index);
+            int parsed = has_hash
+                ? pcc_capi_parse_one_hash(item, c, &ap)
+                : pcc_capi_parse_one(item, c, object_modifier, &ap);
+            py_decref(item);
+            if (!parsed) {
+                ok = 0;
+                break;
+            }
+        } else {
+            pcc_capi_skip_parse_dest(c, object_modifier, has_hash, &ap);
+        }
+        index++;
+        if (has_hash) p++;
+        else if (object_modifier != '\0') p++;
     }
-    if (prev == NULL) {
-        py_incref(py_None);
-        PyTuple_SetItem(tok, 2, py_None);
-    } else {
-        PyTuple_SetItem(tok, 2, prev);   /* token takes over cv's old reference */
+    va_end(ap);
+    if (!ok) {
+        PyErr_SetString(PyExc_TypeError, "argument type mismatch");
+        return 0;
     }
-    return tok;
+    return 1;
+}
+#endif /* PCC_PY_CAPI_ARG_RUNTIME */
+
+
+#if defined(PCC_PY_CAPI_ARG_RUNTIME)
+extern int PyArg_VaParseTupleAndKeywords(
+    PyObject *args, PyObject *kwargs, const char *format,
+    char **kwlist, va_list va
+);
+#else
+int PyArg_VaParseTupleAndKeywords(
+    PyObject *args,
+    PyObject *kwargs,
+    const char *format,
+    char **kwlist,
+    va_list va
+) {
+    if (args == NULL || PY_IS_TAGGED_INT(args) || py_type_of(args) != PY_TYPE_TUPLE) {
+        PyErr_SetString(PyExc_TypeError, "expected argument tuple");
+        return 0;
+    }
+    if (kwargs != NULL && kwargs != py_None
+        && (PY_IS_TAGGED_INT(kwargs) || py_type_of(kwargs) != PY_TYPE_DICT)) {
+        PyErr_SetString(PyExc_TypeError, "expected keyword dict");
+        return 0;
+    }
+
+    int required = 0;
+    int total = 0;
+    pcc_capi_format_counts(format, &required, &total);
+    int64_t nargs = py_tuple_len(args);
+    if (nargs > total) {
+        PyErr_Format(
+            PyExc_TypeError,
+            "too many positional arguments (got %lld, max %d)",
+            (long long)nargs,
+            total
+        );
+        return 0;
+    }
+
+    va_list ap;
+    va_copy(ap, va);
+    int index = 0;
+    int ok = 1;
+    for (const char *p = format; p != NULL && *p != '\0'; p++) {
+        char c = *p;
+        if (c == ':' || c == ';') break;
+        if (c == '|') continue;
+        if (!pcc_capi_is_parse_code(c)) continue;
+        char object_modifier = (
+            c == 'O' && (p[1] == '!' || p[1] == '&') ? p[1] : '\0'
+        );
+
+        int has_hash = (c == 's' || c == 'y') && p[1] == '#';
+        PyObject *owned_item = NULL;
+        PyObject *item = NULL;
+        if (index < nargs) {
+            owned_item = py_tuple_get(args, (int64_t)index);
+            item = owned_item;
+        } else if (kwargs != NULL && kwargs != py_None
+            && kwlist != NULL && kwlist[index] != NULL) {
+            item = PyDict_GetItemString(kwargs, kwlist[index]);
+        }
+
+        if (item == NULL) {
+            if (index < required) {
+                ok = 0;
+                if (owned_item != NULL) py_decref(owned_item);
+                break;
+            }
+            pcc_capi_skip_parse_dest(c, object_modifier, has_hash, &ap);
+        } else {
+            int parsed = has_hash
+                ? pcc_capi_parse_one_hash(item, c, &ap)
+                : pcc_capi_parse_one(item, c, object_modifier, &ap);
+            if (!parsed) ok = 0;
+        }
+        if (owned_item != NULL) py_decref(owned_item);
+        if (!ok) break;
+        index++;
+        if (has_hash) p++;
+        else if (object_modifier != '\0') p++;
+    }
+    va_end(ap);
+    if (!ok) {
+        PyErr_SetString(PyExc_TypeError, "argument type mismatch");
+        return 0;
+    }
+    return 1;
+}
+#endif /* PCC_PY_CAPI_ARG_RUNTIME */
+
+
+#if defined(PCC_PY_CAPI_ARG_RUNTIME)
+extern int PyArg_ParseTupleAndKeywords(
+    PyObject *args, PyObject *kwargs, const char *format, char **kwlist, ...
+);
+#else
+int PyArg_ParseTupleAndKeywords(
+    PyObject *args,
+    PyObject *kwargs,
+    const char *format,
+    char **kwlist,
+    ...
+) {
+    va_list va;
+    va_start(va, kwlist);
+    int r = PyArg_VaParseTupleAndKeywords(args, kwargs, format, kwlist, va);
+    va_end(va);
+    return r;
+}
+#endif /* PCC_PY_CAPI_ARG_RUNTIME */
+
+
+#if defined(PCC_PY_CAPI_ARG_RUNTIME)
+extern int PyArg_UnpackTuple(
+    PyObject *args, const char *name, Py_ssize_t min, Py_ssize_t max, ...
+);
+#else
+int PyArg_UnpackTuple(PyObject *args, const char *name, Py_ssize_t min,
+                      Py_ssize_t max, ...) {
+    (void)name;
+    if (args == NULL || PY_IS_TAGGED_INT(args)
+        || py_type_of(args) != PY_TYPE_TUPLE) {
+        PyErr_SetString(PyExc_TypeError, "PyArg_UnpackTuple requires a tuple");
+        return 0;
+    }
+    Py_ssize_t n = (Py_ssize_t)py_tuple_len(args);
+    if (n < min || n > max) {
+        PyErr_SetString(PyExc_TypeError,
+                        "PyArg_UnpackTuple: wrong number of arguments");
+        return 0;
+    }
+    va_list ap;
+    va_start(ap, max);
+    for (Py_ssize_t i = 0; i < n; i++) {
+        PyObject **dest = va_arg(ap, PyObject **);
+        PyObject *item = py_tuple_get(args, (int64_t)i);  /* owned */
+        *dest = item;
+        if (item != NULL) py_decref(item);  /* hand back a borrowed ref */
+    }
+    va_end(ap);
+    return 1;
+}
+#endif /* PCC_PY_CAPI_ARG_RUNTIME */
+
+#if defined(PCC_PY_CAPI_SEQITER_RUNTIME)
+/* The sequence-iterator type + PySeqIter_New + pcc_capi_is_seqiter /
+ * pcc_capi_seqiter_next are owned by the pcc-Python module
+ * py_capi_seqiter_runtime.py. */
+extern PyObject *PySeqIter_New(PyObject *seq);
+extern int pcc_capi_is_seqiter(PyObject *obj);
+extern PyObject *pcc_capi_seqiter_next(PyObject *obj);
+extern void pcc_capi_seqiter_dealloc(PyObject *obj);
+extern int pcc_capi_seqiter_traverse(PyObject *obj, visitproc visit, void *arg);
+#else
+typedef struct {
+    PyObjectHeader header;
+    void *ob_type;       /* set by PyType_GenericAlloc at offset sizeof(header) */
+    PyObject *seq;       /* the underlying sequence (owned) */
+    Py_ssize_t index;    /* next index to fetch */
+} pcc_capi_seqiter;
+
+int pcc_capi_seqiter_traverse(
+    PyObject *obj,
+    visitproc visit,
+    void *arg
+) {
+    pcc_capi_seqiter *it = (pcc_capi_seqiter *)obj;
+    return pcc_capi_visit_slot(&it->seq, visit, arg);
 }
 
+void pcc_capi_seqiter_dealloc(PyObject *obj) {
+    pcc_capi_seqiter *it = (pcc_capi_seqiter *)obj;
+    PyObject *seq = pcc_gc_load_ptr(obj, &it->seq);
+    it->seq = NULL;
+    py_decref(seq);
+}
+
+static PyTypeObject pcc_capi_seqiter_type = {
+    .ob_base = {1, 0, 0},
+    .tp_name = "iterator",
+    .tp_flags = (
+        Py_TPFLAGS_READY
+        | Py_TPFLAGS_HAVE_GC
+        | PCC_TPFLAGS_MANAGED_DEALLOC
+    ),
+    .tp_basicsize = (Py_ssize_t)sizeof(pcc_capi_seqiter),
+    .tp_dealloc = pcc_capi_seqiter_dealloc,
+    .tp_traverse = pcc_capi_seqiter_traverse,
+};
+
+int pcc_capi_is_seqiter(PyObject *obj) {
+    return obj != NULL && !PY_IS_TAGGED_INT(obj)
+        && py_type_of(obj) == pcc_capi_cext_tag_for(&pcc_capi_seqiter_type);
+}
+
+PyObject *pcc_capi_seqiter_next(PyObject *obj) {
+    pcc_capi_seqiter *it = (pcc_capi_seqiter *)obj;
+    PyObject *seq = pcc_gc_load_ptr(obj, &it->seq);
+    PyObject *item = PySequence_GetItem(seq, it->index);
+    if (item == NULL) {
+        /* IndexError (or any error) ends iteration: clear and stop. */
+        if (py_err_occurred()) PyErr_Clear();
+        return NULL;
+    }
+    it->index++;
+    return item;
+}
+
+PyObject *PySeqIter_New(PyObject *seq) {
+    if (seq == NULL) {
+        PyErr_SetString(PyExc_TypeError, "iteration over a non-sequence");
+        return NULL;
+    }
+    PyObject *obj = PyType_GenericAlloc(&pcc_capi_seqiter_type, 0);
+    if (obj == NULL) return NULL;
+    pcc_capi_seqiter *it = (pcc_capi_seqiter *)obj;
+    pcc_gc_store_ptr(obj, &it->seq, seq);
+                            /* index left 0 (calloc'd) */
+    return obj;
+}
+
+
+#endif /* PCC_PY_CAPI_SEQITER_RUNTIME */
+
+
+#if defined(PCC_PY_CAPI_CONTEXTVAR_RUNTIME)
+#else
+int PyContextVar_Get(PyObject *var, PyObject *default_value, PyObject **value);
+PyObject *PyContextVar_Set(PyObject *var, PyObject *value);
 static PyObject *pcc_capi_contextvar_get_method(PyObject *self, PyObject *args) {
     Py_ssize_t nargs = PyTuple_Size(args);
     if (nargs < 0) return NULL;
@@ -8200,330 +9881,45 @@ static PyObject *pcc_capi_contextvar_reset_method(PyObject *self, PyObject *toke
     return py_None;
 }
 
-/* --- batch 15: sys.flags for numpy module init. numpy npy_static_data init
- * reads sys.flags.optimize at IMPORT (a NULL return fails init with "cannot get
- * sys.flags"). pcc's no-libpython runtime has no sys object, so build a real
- * namespace (a PyClassObject supports get/setattr) carrying the flags numpy
- * reads. optimize=0 is accurate for pcc's no-`-O` compile. Other sys.* names
- * return NULL until a real consumer needs them. Returns a BORROWED reference
- * (CPython contract); the singleton is GC-pinned for the process. */
-PyObject *PySys_GetObject(const char *name) {
-    if (name == NULL) return NULL;
-    if (strcmp(name, "flags") == 0) {
-        static PyObject *flags = NULL;
-        if (flags == NULL) {
-            PyClassObject *cls = py_class_new("sys.flags", NULL, 0, NULL, 0);
-            if (cls == NULL) return NULL;
-            pcc_gc_pin((PyObject *)cls);
-            PyObject *zero = PyLong_FromLong(0);
-            if (zero != NULL) {
-                PyObject_SetAttrString((PyObject *)cls, "optimize", zero);
-                py_decref(zero);  /* py_class_setattr -> py_dict_set incref's */
-            }
-            flags = (PyObject *)cls;
-        }
-        return flags;
-    }
-    return NULL;
-}
 
-/* --- batch 16: object __dict__ getset. numpy installs this as a `__dict__`
- * getset function pointer (arrayfunction_override.c:752); it is called only when
- * Python accesses `obj.__dict__`. Route to the runtime's attribute machinery,
- * which returns the object's own dict (new ref) or raises AttributeError when
- * the object has none — exactly CPython's PyObject_GenericGetDict contract. */
-PyObject *PyObject_GenericGetDict(PyObject *o, void *context) {
-    (void)context;
-    if (o == NULL) {
-        PyErr_SetString(PyExc_TypeError, "NULL object has no __dict__");
+#endif /* PCC_PY_CAPI_CONTEXTVAR_RUNTIME */
+
+#if defined(PCC_PY_CAPI_CONTEXTVAR_RUNTIME)
+extern PyObject *PyContextVar_Set(PyObject *var, PyObject *value);
+#else
+PyObject *PyContextVar_Set(PyObject *var, PyObject *value) {
+    if (var == NULL) {
+        PyErr_SetString(PyExc_TypeError, "ContextVar required");
         return NULL;
     }
-    PyTypeObject *type = pcc_capi_cext_type_for_object(o);
-    if (type == NULL) return py_obj_getattr(o, "__dict__");
-    PyObject **slot = pcc_capi_object_dict_slot(o, type);
-    if (slot == NULL) {
-        PyErr_SetString(PyExc_AttributeError, "object has no __dict__");
+    pcc_capi_contextvar *cv = (pcc_capi_contextvar *)var;
+    PyObject *prev = pcc_gc_load_ptr(var, &cv->value);
+                                          /* owned by cv, may be NULL (unset) */
+    if (value != NULL) py_incref(value);
+    cv->value = value;                   /* move cv's old ownership to token */
+    pcc_gc_note_slot_write_barrier(var, &cv->value, value);
+    PyObject *tok = PyTuple_New(3);
+    if (tok == NULL) {
+        if (value != NULL) py_decref(value);
+        cv->value = prev;                /* restore: keep cv's reference intact */
+        pcc_gc_note_slot_write_barrier(var, &cv->value, prev);
         return NULL;
     }
-    PyObject *dict = pcc_gc_load_ptr(o, slot);
-    if (dict != NULL) {
-        py_incref(dict);
-        return dict;
-    }
-    dict = py_dict_new();
-    if (dict == NULL) return NULL;
-    pcc_gc_store_ptr(o, slot, dict);
-    return dict;
-}
-
-/* --- batch 17: PySeqIter_New (real sequence iterator) + PyMethod_New (bound
- * method via the runtime's instance-method machinery). */
-
-/* A sequence iterator object: holds (seq, index) and yields seq[index++] via
- * PySequence_GetItem until it runs off the end. C-API iteration through
- * PyIter_Next (wired above) is genuine; pcc's Python for-loop dispatch
- * (py_obj_next) only knows PY_TYPE_ITER/GEN, so iterating this from Python is
- * array-runtime-era. numpy returns it from array tp_iter (arrayobject.c:1222). */
-typedef struct {
-    PyObjectHeader header;
-    void *ob_type;       /* set by PyType_GenericAlloc at offset sizeof(header) */
-    PyObject *seq;       /* the underlying sequence (owned) */
-    Py_ssize_t index;    /* next index to fetch */
-} pcc_capi_seqiter;
-
-static int pcc_capi_seqiter_traverse(
-    PyObject *obj,
-    visitproc visit,
-    void *arg
-) {
-    pcc_capi_seqiter *it = (pcc_capi_seqiter *)obj;
-    return pcc_capi_visit_slot(&it->seq, visit, arg);
-}
-
-static void pcc_capi_seqiter_dealloc(PyObject *obj) {
-    pcc_capi_seqiter *it = (pcc_capi_seqiter *)obj;
-    PyObject *seq = pcc_gc_load_ptr(obj, &it->seq);
-    it->seq = NULL;
-    py_decref(seq);
-}
-
-static PyTypeObject pcc_capi_seqiter_type = {
-    .ob_base = {1, 0, 0},
-    .tp_name = "iterator",
-    .tp_flags = (
-        Py_TPFLAGS_READY
-        | Py_TPFLAGS_HAVE_GC
-        | PCC_TPFLAGS_MANAGED_DEALLOC
-    ),
-    .tp_basicsize = (Py_ssize_t)sizeof(pcc_capi_seqiter),
-    .tp_dealloc = pcc_capi_seqiter_dealloc,
-    .tp_traverse = pcc_capi_seqiter_traverse,
-};
-
-static int pcc_capi_is_seqiter(PyObject *obj) {
-    return obj != NULL && !PY_IS_TAGGED_INT(obj)
-        && py_type_of(obj) == pcc_capi_cext_tag_for(&pcc_capi_seqiter_type);
-}
-
-static PyObject *pcc_capi_seqiter_next(PyObject *obj) {
-    pcc_capi_seqiter *it = (pcc_capi_seqiter *)obj;
-    PyObject *seq = pcc_gc_load_ptr(obj, &it->seq);
-    PyObject *item = PySequence_GetItem(seq, it->index);
-    if (item == NULL) {
-        /* IndexError (or any error) ends iteration: clear and stop. */
-        if (py_err_occurred()) PyErr_Clear();
+    py_incref(var);
+    PyTuple_SetItem(tok, 0, var);        /* steals the extra ref */
+    PyObject *had_value = PyBool_FromLong(prev != NULL);
+    if (had_value == NULL || PyTuple_SetItem(tok, 1, had_value) != 0) {
+        if (had_value != NULL) py_decref(had_value);
+        py_decref(tok);
         return NULL;
     }
-    it->index++;
-    return item;
-}
-
-PyObject *PySeqIter_New(PyObject *seq) {
-    if (seq == NULL) {
-        PyErr_SetString(PyExc_TypeError, "iteration over a non-sequence");
-        return NULL;
+    if (prev == NULL) {
+        py_incref(py_None);
+        PyTuple_SetItem(tok, 2, py_None);
+    } else {
+        PyTuple_SetItem(tok, 2, prev);   /* token takes over cv's old reference */
     }
-    PyObject *obj = PyType_GenericAlloc(&pcc_capi_seqiter_type, 0);
-    if (obj == NULL) return NULL;
-    pcc_capi_seqiter *it = (pcc_capi_seqiter *)obj;
-    pcc_gc_store_ptr(obj, &it->seq, seq);
-                            /* index left 0 (calloc'd) */
-    return obj;
-}
-
-/* PyMethod_New(func, self) -> a bound method that calls func(self, *args), built
- * with the runtime's standard instance-method machinery (the same path every
- * `instance.method` uses), so the result is a real callable PY_TYPE_FUNC. numpy
- * returns it from a descriptor __get__ (arrayfunction_override.c:724). */
-PyObject *PyMethod_New(PyObject *func, PyObject *self) {
-    if (func == NULL || self == NULL) {
-        PyErr_SetString(PyExc_TypeError, "PyMethod_New requires func and self");
-        return NULL;
-    }
-    return py_instance_bind_method(func, self, NULL);
-}
-
-/* --- batch 18: full-module host symbols routed to existing pcc primitives.
- * (These are referenced by the broader _core once all 95 compilable files are
- * considered; they are declared in Python.h but had no runtime impl.) */
-
-PyObject *PyDict_Copy(PyObject *mp) {
-    if (mp == NULL) {
-        PyErr_SetString(PyExc_TypeError, "PyDict_Copy requires a dict");
-        return NULL;
-    }
-    PyObject *copy = PyDict_New();
-    if (copy == NULL) return NULL;
-    py_dict_update(copy, mp);   /* shallow copy = update an empty dict */
-    return copy;
-}
-
-int PyDict_Merge(PyObject *a, PyObject *b, int override) {
-    if (a == NULL || b == NULL) {
-        PyErr_SetString(PyExc_TypeError, "PyDict_Merge requires two dicts");
-        return -1;
-    }
-    if (override) {
-        py_dict_update(a, b);   /* b's values win */
-        return 0;
-    }
-    /* override == 0: keep a's existing keys, only add b's missing keys. */
-    Py_ssize_t pos = 0;
-    PyObject *k = NULL, *v = NULL;
-    while (PyDict_Next(b, &pos, &k, &v)) {
-        if (PyDict_GetItem(a, k) == NULL) {
-            if (PyDict_SetItem(a, k, v) != 0) return -1;
-        }
-    }
-    return 0;
-}
-
-static PyObject *pcc_capi_member_get(
-    PyObject *o,
-    PccCapiMemberDef *member
-) {
-    char *address = (char *)o + member->offset;
-    switch (member->type) {
-        case PCC_CAPI_T_SHORT:
-            return PyLong_FromLong((long)*(short *)address);
-        case PCC_CAPI_T_INT:
-            return PyLong_FromLong((long)*(int *)address);
-        case PCC_CAPI_T_LONG:
-            return PyLong_FromLong(*(long *)address);
-        case PCC_CAPI_T_FLOAT:
-            return PyFloat_FromDouble((double)*(float *)address);
-        case PCC_CAPI_T_DOUBLE:
-            return PyFloat_FromDouble(*(double *)address);
-        case PCC_CAPI_T_STRING: {
-            const char *value = *(const char **)address;
-            if (value == NULL) {
-                PyErr_SetString(PyExc_AttributeError, member->name);
-                return NULL;
-            }
-            return PyUnicode_FromString(value);
-        }
-        case PCC_CAPI_T_OBJECT:
-        case PCC_CAPI_T_OBJECT_EX: {
-            PyObject *value = pcc_gc_load_ptr(o, (PyObject **)address);
-            if (value == NULL && member->type == PCC_CAPI_T_OBJECT_EX) {
-                PyErr_SetString(PyExc_AttributeError, member->name);
-                return NULL;
-            }
-            if (value == NULL) value = py_None;
-            py_incref(value);
-            return value;
-        }
-        case PCC_CAPI_T_CHAR:
-            return PyUnicode_FromStringAndSize(address, 1);
-        case PCC_CAPI_T_BYTE:
-            return PyLong_FromLong((long)*(signed char *)address);
-        case PCC_CAPI_T_UBYTE:
-            return PyLong_FromUnsignedLong((unsigned long)*(unsigned char *)address);
-        case PCC_CAPI_T_USHORT:
-            return PyLong_FromUnsignedLong((unsigned long)*(unsigned short *)address);
-        case PCC_CAPI_T_UINT:
-            return PyLong_FromUnsignedLong((unsigned long)*(unsigned int *)address);
-        case PCC_CAPI_T_ULONG:
-            return PyLong_FromUnsignedLong(*(unsigned long *)address);
-        case PCC_CAPI_T_STRING_INPLACE:
-            return PyUnicode_FromString(address);
-        case PCC_CAPI_T_BOOL:
-            return PyBool_FromLong(*(char *)address != 0);
-        case PCC_CAPI_T_LONGLONG:
-            return PyLong_FromLongLong(*(long long *)address);
-        case PCC_CAPI_T_ULONGLONG:
-            return PyLong_FromUnsignedLongLong(*(unsigned long long *)address);
-        case PCC_CAPI_T_PYSSIZET:
-            return PyLong_FromSsize_t(*(Py_ssize_t *)address);
-        case PCC_CAPI_T_NONE:
-            py_incref(py_None);
-            return py_None;
-        default:
-            PyErr_SetString(PyExc_TypeError, "unsupported C member type");
-            return NULL;
-    }
-}
-
-PyObject *PyObject_GenericGetAttr(PyObject *o, PyObject *name) {
-    PyTypeObject *type = pcc_capi_cext_type_for_object(o);
-    if (name == NULL || PY_IS_TAGGED_INT(name)
-        || py_type_of(name) != PY_TYPE_STR) {
-        PyErr_SetString(PyExc_TypeError, "attribute name must be a string");
-        return NULL;
-    }
-    if (type == NULL) return PyObject_GetAttr(o, name);
-    const char *attr = py_str_utf8(name);
-    for (PyTypeObject *current = type; current != NULL;
-         current = (PyTypeObject *)current->tp_base) {
-        PccCapiGetSetDef *getset = (PccCapiGetSetDef *)current->tp_getset;
-        for (; getset != NULL && getset->name != NULL; getset++) {
-            if (strcmp(attr, getset->name) == 0 && getset->get != NULL) {
-                return getset->get(o, getset->closure);
-            }
-        }
-        PccCapiMemberDef *member = (PccCapiMemberDef *)current->tp_members;
-        for (; member != NULL && member->name != NULL; member++) {
-            if (strcmp(attr, member->name) != 0) continue;
-            return pcc_capi_member_get(o, member);
-        }
-    }
-    PyObject **dict_slot = pcc_capi_object_dict_slot(o, type);
-    if (dict_slot != NULL) {
-        PyObject *dict = pcc_gc_load_ptr(o, dict_slot);
-        if (dict != NULL) {
-            PyObject *value = py_dict_get(dict, name);
-            if (value != NULL) return value;
-        }
-    }
-    for (PyTypeObject *current = type; current != NULL;
-         current = (PyTypeObject *)current->tp_base) {
-        PyMethodDef *method = (PyMethodDef *)current->tp_methods;
-        for (; method != NULL && method->ml_name != NULL; method++) {
-            if (strcmp(attr, method->ml_name) == 0) {
-                return pcc_capi_method_func_new(o, method);
-            }
-        }
-    }
-    PyErr_SetString(PyExc_AttributeError, attr);
-    return NULL;
-}
-
-int PyObject_GenericSetAttr(PyObject *o, PyObject *name, PyObject *value) {
-    PyTypeObject *type = pcc_capi_cext_type_for_object(o);
-    if (name == NULL || PY_IS_TAGGED_INT(name)
-        || py_type_of(name) != PY_TYPE_STR) {
-        PyErr_SetString(PyExc_TypeError, "attribute name must be a string");
-        return -1;
-    }
-    if (type == NULL) return PyObject_SetAttr(o, name, value);
-    const char *attr = py_str_utf8(name);
-    for (PyTypeObject *current = type; current != NULL;
-         current = (PyTypeObject *)current->tp_base) {
-        PccCapiGetSetDef *getset = (PccCapiGetSetDef *)current->tp_getset;
-        for (; getset != NULL && getset->name != NULL; getset++) {
-            if (strcmp(attr, getset->name) != 0) continue;
-            if (getset->set == NULL) {
-                PyErr_SetString(PyExc_AttributeError, attr);
-                return -1;
-            }
-            return getset->set(o, value, getset->closure);
-        }
-    }
-    PyObject **slot = pcc_capi_object_dict_slot(o, type);
-    if (slot == NULL || value == NULL) {
-        PyErr_SetString(PyExc_AttributeError, attr);
-        return -1;
-    }
-    PyObject *dict = pcc_gc_load_ptr(o, slot);
-    if (dict == NULL) {
-        dict = py_dict_new();
-        if (dict == NULL) return -1;
-        pcc_gc_store_ptr(o, slot, dict);
-        py_decref(dict);
-        dict = pcc_gc_load_ptr(o, slot);
-    }
-    py_dict_set(dict, name, value);
-    return 0;
+    return tok;
 }
 
 PyObject *pcc_capi_cext_object_getattr(PyObject *o, const char *name) {
@@ -8539,6 +9935,12 @@ PyObject *pcc_capi_cext_object_getattr(PyObject *o, const char *name) {
         result = getattro(o, name_obj);
     } else {
         result = PyObject_GenericGetAttr(o, name_obj);
+    }
+    if (result == NULL) {
+        py_runtime_error_if_unset(
+            "C extension tp_getattro",
+            "tp_getattro returned NULL without setting an exception"
+        );
     }
     py_decref(name_obj);
     return result;
@@ -8562,34 +9964,20 @@ int64_t pcc_capi_cext_object_setattr(
     } else {
         result = PyObject_GenericSetAttr(o, name_obj, value);
     }
+    if (result != 0) {
+        py_runtime_error_if_unset(
+            "C extension tp_setattro",
+            "tp_setattro returned failure without setting an exception"
+        );
+    }
     py_decref(name_obj);
     return result;
 }
+#endif /* PCC_PY_CAPI_CONTEXTVAR_RUNTIME */
 
-PyObject *PyUnicode_Format(PyObject *format, PyObject *args) {
-    if (format == NULL) {
-        PyErr_SetString(PyExc_TypeError, "PyUnicode_Format requires a format");
-        return NULL;
-    }
-    return py_str_mod(format, args);   /* the `fmt % args` runtime path */
-}
-
-/* --- batch 19: the last 5 full-module host symbols. */
-
-/* Stamp refcount + type onto an already-allocated object (CPython sets ob_refcnt
- * + ob_type; pcc carries refcount + type_tag + the ob_type slot). */
-PyObject *PyObject_Init(PyObject *op, PyTypeObject *type) {
-    if (op == NULL) return op;
-    PyObjectHeader *h = (PyObjectHeader *)op;
-    h->refcount = 1;
-    h->type_tag = pcc_capi_cext_tag_for(type);
-    *(PyTypeObject **)((char *)op + sizeof(PyObjectHeader)) = type;
-    return op;
-}
-
-/* pcc has no separate read-only proxy type; return the mapping itself as a
- * readable view (read access is correct; read-only ENFORCEMENT is a follow-on).
- * numpy uses this to expose a type dict for reading. */
+#if defined(PCC_PY_CAPI_MISC_RUNTIME)
+extern PyObject *PyDictProxy_New(PyObject *mapping);
+#else
 PyObject *PyDictProxy_New(PyObject *mapping) {
     if (mapping == NULL) {
         PyErr_SetString(PyExc_TypeError, "PyDictProxy_New requires a mapping");
@@ -8598,58 +9986,548 @@ PyObject *PyDictProxy_New(PyObject *mapping) {
     py_incref(mapping);
     return mapping;
 }
+#endif /* PCC_PY_CAPI_MISC_RUNTIME */
 
-/* Unpack a tuple's items into PyObject* slots. Like CPython, the stored refs are
- * BORROWED (valid while `args` lives); optional slots beyond the arg count are
- * left untouched. */
-int PyArg_UnpackTuple(PyObject *args, const char *name, Py_ssize_t min,
-                      Py_ssize_t max, ...) {
-    (void)name;
-    if (args == NULL || PY_IS_TAGGED_INT(args)
-        || py_type_of(args) != PY_TYPE_TUPLE) {
-        PyErr_SetString(PyExc_TypeError, "PyArg_UnpackTuple requires a tuple");
+
+#if defined(PCC_PY_CAPI_DICT_RUNTIME)
+extern PyObject *PyDict_Copy(PyObject *mp);
+#else
+PyObject *PyDict_Copy(PyObject *mp) {
+    if (mp == NULL) {
+        PyErr_SetString(PyExc_TypeError, "PyDict_Copy requires a dict");
+        return NULL;
+    }
+    PyObject *copy = PyDict_New();
+    if (copy == NULL) return NULL;
+    py_dict_update(copy, mp);   /* shallow copy = update an empty dict */
+    return copy;
+}
+#endif /* PCC_PY_CAPI_DICT_RUNTIME */
+
+
+#if defined(PCC_PY_CAPI_DICT_RUNTIME)
+extern int PyDict_Merge(PyObject *a, PyObject *b, int override);
+#else
+int PyDict_Merge(PyObject *a, PyObject *b, int override) {
+    if (a == NULL || b == NULL) {
+        PyErr_SetString(PyExc_TypeError, "PyDict_Merge requires two dicts");
+        return -1;
+    }
+    if (override) {
+        py_dict_update(a, b);   /* b's values win */
         return 0;
     }
-    Py_ssize_t n = (Py_ssize_t)py_tuple_len(args);
-    if (n < min || n > max) {
-        PyErr_SetString(PyExc_TypeError,
-                        "PyArg_UnpackTuple: wrong number of arguments");
-        return 0;
+    /* override == 0: keep a's existing keys, only add b's missing keys. */
+    Py_ssize_t pos = 0;
+    PyObject *k = NULL, *v = NULL;
+    while (PyDict_Next(b, &pos, &k, &v)) {
+        if (PyDict_GetItem(a, k) == NULL) {
+            if (PyDict_SetItem(a, k, v) != 0) return -1;
+        }
     }
-    va_list ap;
-    va_start(ap, max);
-    for (Py_ssize_t i = 0; i < n; i++) {
-        PyObject **dest = va_arg(ap, PyObject **);
-        PyObject *item = py_tuple_get(args, (int64_t)i);  /* owned */
-        *dest = item;
-        if (item != NULL) py_decref(item);  /* hand back a borrowed ref */
+    return 0;
+}
+#endif /* PCC_PY_CAPI_DICT_RUNTIME */
+
+
+#if defined(PCC_PY_CAPI_METHOD_BRIDGE_RUNTIME)
+extern PyObject *PyMethod_New(PyObject *func, PyObject *self);
+#else
+PyObject *PyMethod_New(PyObject *func, PyObject *self) {
+    if (func == NULL || self == NULL) {
+        PyErr_SetString(PyExc_TypeError, "PyMethod_New requires func and self");
+        return NULL;
     }
-    va_end(ap);
+    return py_instance_bind_method(func, self, NULL);
+}
+#endif /* PCC_PY_CAPI_METHOD_BRIDGE_RUNTIME */
+
+
+#if defined(PCC_PY_CAPI_NUMBER_RUNTIME)
+extern PyObject *PyNumber_Divmod(PyObject *o1, PyObject *o2);
+#else
+PyObject *PyNumber_Divmod(PyObject *o1, PyObject *o2) {
+    PyObject *q = PyNumber_FloorDivide(o1, o2);
+    if (q == NULL) return NULL;
+    PyObject *r = PyNumber_Remainder(o1, o2);
+    if (r == NULL) {
+        py_decref(q);
+        return NULL;
+    }
+    PyObject *t = PyTuple_Pack(2, q, r);   /* packs new refs */
+    py_decref(q);
+    py_decref(r);
+    return t;
+}
+#endif /* PCC_PY_CAPI_NUMBER_RUNTIME */
+
+
+#if defined(PCC_PY_CAPI_OBJECT_ATTR_RUNTIME)
+extern PyObject *PyObject_Init(PyObject *op, PyTypeObject *type);
+#else
+PyObject *PyObject_Init(PyObject *op, PyTypeObject *type) {
+    if (op == NULL) return op;
+    PyObjectHeader *h = (PyObjectHeader *)op;
+    h->refcount = 1;
+    h->type_tag = pcc_capi_cext_tag_for(type);
+    h->flags = PY_FLAG_GC_MALLOC_ALLOC;
+    if (pcc_gc_pointer_register(op) < 0) return NULL;
+    int64_t tracked_size = type != NULL
+        ? (int64_t)type->tp_basicsize
+        : (int64_t)sizeof(PyObjectHeader);
+    if (tracked_size < (int64_t)sizeof(PyObjectHeader)) {
+        tracked_size = (int64_t)sizeof(PyObjectHeader);
+    }
+    pcc_gc_note_object_allocated_sized(op, tracked_size);
+    *(PyTypeObject **)((char *)op + sizeof(PyObjectHeader)) = type;
+    return op;
+}
+#endif /* PCC_PY_CAPI_OBJECT_ATTR_RUNTIME */
+
+
+#if defined(PCC_PY_CAPI_MISC_RUNTIME)
+extern PyObject *PySys_GetObject(const char *name);
+#else
+PyObject *PySys_GetObject(const char *name) {
+    if (name == NULL) return NULL;
+    if (strcmp(name, "flags") == 0) {
+        static PyObject *flags = NULL;
+        if (flags == NULL) {
+            PyClassObject *cls = py_class_new("sys.flags", NULL, 0, NULL, 0);
+            if (cls == NULL) return NULL;
+            pcc_gc_pin((PyObject *)cls);
+            PyObject *zero = PyLong_FromLong(0);
+            if (zero != NULL) {
+                PyObject_SetAttrString((PyObject *)cls, "optimize", zero);
+                py_decref(zero);  /* py_class_setattr -> py_dict_set incref's */
+            }
+            flags = (PyObject *)cls;
+        }
+        return flags;
+    }
+    return NULL;
+}
+#endif /* PCC_PY_CAPI_MISC_RUNTIME */
+
+
+#if defined(PCC_PY_CAPI_MISC_RUNTIME)
+extern PyObject *PyUnicode_Format(PyObject *format, PyObject *args);
+#else
+PyObject *PyUnicode_Format(PyObject *format, PyObject *args) {
+    if (format == NULL) {
+        PyErr_SetString(PyExc_TypeError, "PyUnicode_Format requires a format");
+        return NULL;
+    }
+    return py_str_mod(format, args);   /* the `fmt % args` runtime path */
+}
+#endif /* PCC_PY_CAPI_MISC_RUNTIME */
+
+
+#if defined(PCC_PY_CAPI_UNICODE_RUNTIME)
+extern int PyUnicode_KIND(PyObject *op);
+#else
+int PyUnicode_KIND(PyObject *op) {
+    (void)op;
     return 1;
 }
+#endif /* PCC_PY_CAPI_UNICODE_RUNTIME */
 
-/* A slice object {start, stop, step}. pcc lowers Python `a[i:j]` directly to
- * py_*_slice without materializing a slice, so a slice object only exists when
- * PySlice_New (here) makes one; PySlice_GetIndicesEx below reads it back. */
-typedef struct {
-    PyObjectHeader header;
-    void *ob_type;
-    PyObject *start, *stop, *step;
-} pcc_capi_slice;
+#if defined(PCC_PY_CAPI_MODULE_STATE_RUNTIME)
+extern PyObject *pcc_capi_module_from_def(PyObject *def_as_obj);
+#else
+PyObject *pcc_capi_module_from_def(PyObject *def_as_obj) {
+    PyModuleDef *def = (PyModuleDef *)def_as_obj;
+    if (def == NULL) return NULL;
+    return PyModule_Create2(def, 0);
+}
+#endif /* PCC_PY_CAPI_MODULE_STATE_RUNTIME */
 
-static int pcc_capi_slice_traverse(
-    PyObject *obj,
-    visitproc visit,
-    void *arg
+
+#if defined(PCC_PY_CAPI_MODULE_STATE_RUNTIME)
+extern int pcc_capi_module_run_exec_slots(PyObject *def_as_obj, PyObject *module);
+#else
+int pcc_capi_module_run_exec_slots(PyObject *def_as_obj, PyObject *module) {
+    PyModuleDef *def = (PyModuleDef *)def_as_obj;
+    if (def == NULL || module == NULL) return -1;
+    if (def->m_slots != NULL) {
+        for (PyModuleDef_Slot *s = def->m_slots; s->slot != 0; s++) {
+            if (s->slot == PCC_Py_mod_exec && s->value != NULL) {
+                int (*exec_fn)(PyObject *) = (int (*)(PyObject *))s->value;
+                if (exec_fn(module) != 0) {
+                    if (!py_err_occurred()) {
+                        PyErr_SetString(PyExc_SystemError,
+                                        "module exec slot failed");
+                    }
+                    return -1;
+                }
+            }
+            /* PCC_Py_mod_create is rarely used by numpy; default module is fine. */
+        }
+    }
+    return 0;
+}
+#endif /* PCC_PY_CAPI_MODULE_STATE_RUNTIME */
+
+
+#if defined(PCC_PY_CAPI_MODULE_STATE_RUNTIME)
+extern PyObject *pcc_capi_module_exec(PyObject *def_as_obj);
+#else
+PyObject *pcc_capi_module_exec(PyObject *def_as_obj) {
+    PyObject *module = pcc_capi_module_from_def(def_as_obj);
+    if (module == NULL) return NULL;
+    if (pcc_capi_module_run_exec_slots(def_as_obj, module) != 0) {
+        py_decref(module);
+        return NULL;
+    }
+    return module;
+}
+#endif /* PCC_PY_CAPI_MODULE_STATE_RUNTIME */
+
+
+#if defined(PCC_PY_CAPI_MODULE_STATE_RUNTIME)
+extern int pcc_capi_register_module_state(
+    PyObject *module,
+    PyModuleDef *def,
+    void *state
+);
+#else
+static int pcc_capi_register_module_state(
+    PyObject *module,
+    PyModuleDef *def,
+    void *state
 ) {
-    pcc_capi_slice *slice = (pcc_capi_slice *)obj;
-    int result = pcc_capi_visit_slot(&slice->start, visit, arg);
-    if (result != 0) return result;
-    result = pcc_capi_visit_slot(&slice->stop, visit, arg);
-    if (result != 0) return result;
-    return pcc_capi_visit_slot(&slice->step, visit, arg);
+    PccCapiModuleStateNode *node = (
+        PccCapiModuleStateNode *
+    )calloc(1, sizeof(PccCapiModuleStateNode));
+    if (node == NULL) return -1;
+    node->module = module;
+    node->def = def;
+    node->state = state;
+    node->next = pcc_capi_module_states;
+    pcc_capi_module_states = node;
+    if (
+        module != NULL
+        && !PY_IS_TAGGED_INT(module)
+        && (py_header_flags_load(py_header(module)) & PY_FLAG_GC_PINNED) == 0
+    ) {
+        pcc_gc_pin(module);
+    }
+    return 0;
+}
+#endif /* PCC_PY_CAPI_MODULE_STATE_RUNTIME */
+
+
+#if defined(PCC_PY_CAPI_MODULE_STATE_RUNTIME)
+extern PyObject *PyType_GetModuleByDef(PyTypeObject *type, PyModuleDef *def);
+#else
+PyObject *PyType_GetModuleByDef(PyTypeObject *type, PyModuleDef *def) {
+    if (type == NULL || def == NULL) {
+        PyErr_SetString(PyExc_TypeError, "invalid type or module definition");
+        return NULL;
+    }
+    for (int guard = 0; type != NULL && guard < 64; guard++) {
+        PyObject *module = NULL;
+        if (type->tp_version_tag >= PCC_CAPI_CEXT_TAG_BASE) {
+            int32_t offset = (
+                (int32_t)type->tp_version_tag - PCC_CAPI_CEXT_TAG_BASE
+            );
+            if (offset >= 0 && offset < pcc_capi_cext_type_count) {
+                module = pcc_capi_cext_type_modules[offset];
+            }
+        }
+        PccCapiModuleStateNode *state = pcc_capi_find_module_state(module);
+        if (state != NULL && state->def == def) return module;
+        type = (PyTypeObject *)type->tp_base;
+    }
+    PyErr_SetString(PyExc_TypeError, "module definition not found in type MRO");
+    return NULL;
+}
+#endif /* PCC_PY_CAPI_MODULE_STATE_RUNTIME */
+
+
+#if defined(PCC_PY_CAPI_SLICE_RUNTIME)
+extern PyObject *PySlice_New(PyObject *start, PyObject *stop, PyObject *step);
+#else
+PyObject *PySlice_New(PyObject *start, PyObject *stop, PyObject *step) {
+    PyObject *obj = PyType_GenericAlloc(&pcc_capi_slice_obj_type, 0);
+    if (obj == NULL) return NULL;
+    pcc_capi_slice *s = (pcc_capi_slice *)obj;
+    if (start == NULL) start = py_None;
+    if (stop == NULL) stop = py_None;
+    if (step == NULL) step = py_None;
+    pcc_gc_store_ptr(obj, &s->start, start);
+    pcc_gc_store_ptr(obj, &s->stop, stop);
+    pcc_gc_store_ptr(obj, &s->step, step);
+    return obj;
+}
+#endif /* PCC_PY_CAPI_SLICE_RUNTIME */
+
+
+#if defined(PCC_PY_CAPI_SLICE_RUNTIME)
+extern int PySlice_GetIndicesEx(PyObject *r, Py_ssize_t length, Py_ssize_t *start,
+                         Py_ssize_t *stop, Py_ssize_t *step,
+                         Py_ssize_t *slicelen);
+#else
+int PySlice_GetIndicesEx(PyObject *r, Py_ssize_t length, Py_ssize_t *start,
+                         Py_ssize_t *stop, Py_ssize_t *step,
+                         Py_ssize_t *slicelen) {
+    pcc_capi_slice *s = (pcc_capi_slice *)r;
+    PyObject *start_obj = NULL;
+    PyObject *stop_obj = NULL;
+    PyObject *step_obj = NULL;
+    int native_slice = py_obj_is_slice(r) != 0;
+    if (native_slice) {
+        start_obj = py_obj_getattr(r, "start");
+        stop_obj = py_obj_getattr(r, "stop");
+        step_obj = py_obj_getattr(r, "step");
+        if (start_obj == NULL || stop_obj == NULL || step_obj == NULL) {
+            if (start_obj != NULL) py_decref(start_obj);
+            if (stop_obj != NULL) py_decref(stop_obj);
+            if (step_obj != NULL) py_decref(step_obj);
+            return -1;
+        }
+    } else {
+        start_obj = pcc_gc_load_ptr(r, &s->start);
+        stop_obj = pcc_gc_load_ptr(r, &s->stop);
+        step_obj = pcc_gc_load_ptr(r, &s->step);
+    }
+    Py_ssize_t stp;
+    if (step_obj == py_None) {
+        stp = 1;
+    } else {
+        stp = (Py_ssize_t)PyLong_AsLong(step_obj);
+        if (stp == 0) {
+            PyErr_SetString(PyExc_ValueError, "slice step cannot be zero");
+            if (native_slice) {
+                py_decref(start_obj); py_decref(stop_obj); py_decref(step_obj);
+            }
+            return -1;
+        }
+    }
+    int neg = stp < 0;
+    Py_ssize_t lower = neg ? -1 : 0;
+    Py_ssize_t upper = neg ? length - 1 : length;
+    Py_ssize_t st, sp;
+    if (start_obj == py_None) {
+        st = neg ? upper : lower;
+    } else {
+        st = (Py_ssize_t)PyLong_AsLong(start_obj);
+        if (st < 0) st += length;
+        if (st < lower) st = lower;
+        if (st > upper) st = upper;
+    }
+    if (stop_obj == py_None) {
+        sp = neg ? lower : upper;
+    } else {
+        sp = (Py_ssize_t)PyLong_AsLong(stop_obj);
+        if (sp < 0) sp += length;
+        if (sp < lower) sp = lower;
+        if (sp > upper) sp = upper;
+    }
+    *start = st;
+    *stop = sp;
+    *step = stp;
+    if (neg) {
+        *slicelen = (sp < st) ? (st - sp - 1) / (-stp) + 1 : 0;
+    } else {
+        *slicelen = (st < sp) ? (sp - st - 1) / stp + 1 : 0;
+    }
+    if (native_slice) {
+        py_decref(start_obj); py_decref(stop_obj); py_decref(step_obj);
+    }
+    return 0;
+}
+#endif /* PCC_PY_CAPI_SLICE_RUNTIME */
+
+
+#if defined(PCC_PY_CAPI_MODULE_RUNTIME)
+extern PyObject *PyModule_GetDict(PyObject *module);
+#else
+PyObject *PyModule_GetDict(PyObject *module) {
+    if (module == NULL) {
+        PyErr_SetString(PyExc_TypeError, "NULL module");
+        return NULL;
+    }
+    PyObject *dict = py_obj_getattr(module, "__dict__");
+    if (dict == NULL) {
+        PyErr_SetString(PyExc_TypeError, "expected module object");
+        return NULL;
+    }
+    /* py_obj_getattr returns owned; CPython PyModule_GetDict returns borrowed. */
+    py_decref(dict);
+    return dict;
+}
+#endif /* PCC_PY_CAPI_MODULE_RUNTIME */
+
+
+#if defined(PCC_PY_CAPI_MODULE_RUNTIME)
+extern int PyModule_AddObject(PyObject *module, const char *name, PyObject *value);
+#else
+int PyModule_AddObject(PyObject *module, const char *name, PyObject *value) {
+    if (module == NULL || name == NULL || value == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "invalid PyModule_AddObject call");
+        return -1;
+    }
+    int64_t rc = py_obj_setattr(module, name, value);
+    if (rc != 0) return -1;
+    py_decref(value);
+    return 0;
+}
+#endif /* PCC_PY_CAPI_MODULE_RUNTIME */
+
+
+#if defined(PCC_PY_CAPI_MODULE_RUNTIME)
+extern int PyModule_AddObjectRef(PyObject *module, const char *name, PyObject *value);
+#else
+int PyModule_AddObjectRef(PyObject *module, const char *name, PyObject *value) {
+    if (value == NULL) {
+        if (!py_err_occurred()) {
+            PyErr_SetString(
+                PyExc_SystemError,
+                "PyModule_AddObjectRef must be called with an exception raised if value is NULL"
+            );
+        }
+        return -1;
+    }
+    py_incref(value);
+    int rc = PyModule_AddObject(module, name, value);
+    if (rc != 0) {
+        py_decref(value);
+    }
+    return rc;
+}
+#endif /* PCC_PY_CAPI_MODULE_RUNTIME */
+
+
+#if defined(PCC_PY_CAPI_MODULE_RUNTIME)
+extern int PyModule_Add(PyObject *module, const char *name, PyObject *value);
+#else
+int PyModule_Add(PyObject *module, const char *name, PyObject *value) {
+    int rc = PyModule_AddObjectRef(module, name, value);
+    if (value != NULL) Py_DECREF(value);
+    return rc;
+}
+#endif /* PCC_PY_CAPI_MODULE_RUNTIME */
+
+
+#if defined(PCC_PY_CAPI_MODULE_RUNTIME)
+extern int PyModule_AddIntConstant(PyObject *module, const char *name, long value);
+#else
+int PyModule_AddIntConstant(PyObject *module, const char *name, long value) {
+    PyObject *obj = PyLong_FromLong(value);
+    if (obj == NULL) return -1;
+    return PyModule_AddObject(module, name, obj);
+}
+#endif /* PCC_PY_CAPI_MODULE_RUNTIME */
+
+
+#if defined(PCC_PY_CAPI_MODULE_RUNTIME)
+extern int PyModule_AddStringConstant(PyObject *module, const char *name, const char *value);
+#else
+int PyModule_AddStringConstant(PyObject *module, const char *name, const char *value) {
+    PyObject *obj = PyUnicode_FromString(value == NULL ? "" : value);
+    if (obj == NULL) return -1;
+    return PyModule_AddObject(module, name, obj);
+}
+#endif /* PCC_PY_CAPI_MODULE_RUNTIME */
+
+
+#if defined(PCC_PY_CAPI_MODULE_STATE_RUNTIME)
+#else
+ PccCapiModuleStateNode;
+
+static PccCapiModuleStateNode *pcc_capi_module_states = NULL;
+
+static PccCapiModuleStateNode *pcc_capi_find_module_state(PyObject *module) {
+    for (
+        PccCapiModuleStateNode *n = pcc_capi_module_states;
+        n != NULL;
+        n = n->next
+    ) {
+        if (n->module == module) return n;
+    }
+    return NULL;
 }
 
+#endif /* PCC_PY_CAPI_MODULE_STATE_RUNTIME */
+
+typedef struct PccCapiModuleStateNode {
+    PyObject *module;
+    PyModuleDef *def;
+    void *state;
+    struct PccCapiModuleStateNode *next;
+} PccCapiModuleStateNode;
+
+#if defined(PCC_PY_CAPI_MODULE_STATE_RUNTIME)
+extern PyObject *PyModule_Create2(PyModuleDef *def, int api_version);
+#else
+PyObject *PyModule_Create2(PyModuleDef *def, int api_version) {
+    (void)api_version;
+    if (def == NULL || def->m_name == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "invalid module definition");
+        return NULL;
+    }
+    PyClassObject *cls = pcc_runtime_module_class();
+    if (cls == NULL) return NULL;
+    PyObject *module = py_instance_new(cls);
+    if (module == NULL) return NULL;
+
+    if (def->m_size > 0) {
+        void *state = calloc(1, (size_t)def->m_size);
+        if (state == NULL) {
+            py_decref(module);
+            return PyErr_NoMemory();
+        }
+        if (pcc_capi_register_module_state(module, def, state) != 0) {
+            free(state);
+            py_decref(module);
+            return PyErr_NoMemory();
+        }
+    }
+
+    PyObject *name = py_str_new(def->m_name, (int64_t)strlen(def->m_name));
+    if (name != NULL) {
+        py_instance_setattr((PyInstanceObject *)module, "__name__", name);
+        py_decref(name);
+    }
+
+    PyMethodDef *method = def->m_methods;
+    while (method != NULL && method->ml_name != NULL) {
+        PyObject *fn = pcc_capi_method_func_new(module, method);
+        if (fn != NULL) {
+            py_instance_setattr((PyInstanceObject *)module, method->ml_name, fn);
+            py_decref(fn);
+        }
+        method++;
+    }
+    return module;
+}
+#endif /* PCC_PY_CAPI_MODULE_STATE_RUNTIME */
+
+
+#if defined(PCC_PY_CAPI_MODULE_STATE_RUNTIME)
+extern void *PyModule_GetState(PyObject *module);
+#else
+void *PyModule_GetState(PyObject *module) {
+    PccCapiModuleStateNode *node = pcc_capi_find_module_state(module);
+    return node != NULL ? node->state : NULL;
+}
+#endif /* PCC_PY_CAPI_MODULE_STATE_RUNTIME */
+
+
+#if defined(PCC_PY_CAPI_CEXT_RUNTIME)
+extern void pcc_capi_set_type(PyObject *o, PyTypeObject *t);
+#else
+void pcc_capi_set_type(PyObject *o, PyTypeObject *t) {
+    if (o == NULL) return;
+    PyObjectHeader *h = (PyObjectHeader *)o;
+    h->type_tag = pcc_capi_cext_tag_for(t);
+    *(PyTypeObject **)((char *)o + sizeof(PyObjectHeader)) = t;
+}
+#endif /* PCC_PY_CAPI_CEXT_RUNTIME */
+
+#if defined(PCC_PY_CAPI_SLICE_RUNTIME)
+#else
 static void pcc_capi_slice_dealloc(PyObject *obj) {
     pcc_capi_slice *slice = (pcc_capi_slice *)obj;
     PyObject *start = pcc_gc_load_ptr(obj, &slice->start);
@@ -8761,139 +10639,27 @@ int PySlice_GetIndicesEx(PyObject *r, Py_ssize_t length, Py_ssize_t *start,
     return 0;
 }
 
-/* --- batch 20: unicode-kind for numpy textreading. pcc strings are UTF-8
- * (1-byte storage), so the PEP-393 "kind" is always 1; the matching data buffer
- * (PyUnicode_1BYTE_DATA, defined as py_str_utf8 in Python.h) is the UTF-8 bytes. */
-int PyUnicode_KIND(PyObject *op) {
-    (void)op;
-    return 1;
+
+#endif /* PCC_PY_CAPI_SLICE_RUNTIME */
+
+
+#if defined(PCC_PY_CAPI_MODULE_STATE_RUNTIME)
+#else
+void pcc_capi_visit_extension_module_state_roots(
+    PccGcRootVisitor visit,
+    void *ctx
+) {
+    if (visit == NULL) return;
+    PccCapiModuleStateVisitCtx visit_ctx = {visit, ctx};
+    for (
+        PccCapiModuleStateNode *n = pcc_capi_module_states;
+        n != NULL;
+        n = n->next
+    ) {
+        if (n->module != NULL) visit(n->module, ctx);
+        if (n->def == NULL || n->def->m_traverse == NULL) continue;
+        traverseproc traverse = (traverseproc)n->def->m_traverse;
+        (void)traverse(n->module, pcc_capi_visit_module_state_ref, &visit_ctx);
+    }
 }
-
-/* --- batch 21: divmod + double hash for numpy scalar types (the last 2 host
- * symbols referenced once all 98 _core files compile). */
-
-PyObject *PyNumber_Divmod(PyObject *o1, PyObject *o2) {
-    PyObject *q = PyNumber_FloorDivide(o1, o2);
-    if (q == NULL) return NULL;
-    PyObject *r = PyNumber_Remainder(o1, o2);
-    if (r == NULL) {
-        py_decref(q);
-        return NULL;
-    }
-    PyObject *t = PyTuple_Pack(2, q, r);   /* packs new refs */
-    py_decref(q);
-    py_decref(r);
-    return t;
-}
-
-/* CPython's float hash (Objects/object.c): a value congruent modulo 2^61-1 so
- * equal float/int values hash equally. Implemented directly so numpy scalar
- * hashes match CPython. */
-Py_hash_t _Py_HashDouble(PyObject *inst, double v) {
-    const int bits = 61;
-    const uint64_t modulus = (((uint64_t)1 << bits) - 1);
-    int e, sign;
-    double m;
-    uint64_t x, y;
-    if (!isfinite(v)) {
-        if (isinf(v)) return v > 0 ? 314159 : -314159;
-        return inst ? (Py_hash_t)py_obj_hash(inst) : 0;   /* nan */
-    }
-    m = frexp(v, &e);
-    sign = 1;
-    if (m < 0) { sign = -1; m = -m; }
-    x = 0;
-    while (m) {
-        x = ((x << 28) & modulus) | x >> (bits - 28);
-        m *= 268435456.0;   /* 2**28 */
-        e -= 28;
-        y = (uint64_t)m;
-        m -= y;
-        x += y;
-        if (x >= modulus) x -= modulus;
-    }
-    e = e % bits;
-    if (e < 0) e += bits;
-    x = ((x << e) & modulus) | x >> (bits - e);
-    x = x * (uint64_t)sign;
-    if (x == (uint64_t)-1) x = (uint64_t)-2;
-    return (Py_hash_t)x;
-}
-
-/* --- batch 22: link symbols introduced by the now-compiling numpy _core C++
- * (umath) layer, routed to existing primitives. */
-
-PyObject *PyLong_FromUnicodeObject(PyObject *u, int base) {
-    if (u == NULL) {
-        PyErr_SetString(PyExc_TypeError, "PyLong_FromUnicodeObject requires a str");
-        return NULL;
-    }
-    const char *s = PyUnicode_AsUTF8(u);
-    if (s == NULL) return NULL;
-    char *end = NULL;
-    long long v = strtoll(s, &end, base == 0 ? 10 : base);
-    if (end == s) {
-        PyErr_SetString(PyExc_ValueError, "invalid literal for int()");
-        return NULL;
-    }
-    return PyLong_FromLongLong(v);
-}
-
-PyObject *PyFloat_FromString(PyObject *str) {
-    if (str == NULL) {
-        PyErr_SetString(PyExc_TypeError, "PyFloat_FromString requires a str");
-        return NULL;
-    }
-    const char *s = PyUnicode_AsUTF8(str);
-    if (s == NULL) return NULL;
-    char *end = NULL;
-    double v = PyOS_string_to_double(s, &end, NULL);   /* locale-independent */
-    if (end == s) {
-        PyErr_SetString(PyExc_ValueError, "could not convert string to float");
-        return NULL;
-    }
-    return PyFloat_FromDouble(v);
-}
-
-/* pcc's PyLong_AsLongLong already handles the value range; full overflow
- * detection would need bigint comparison, so report no overflow (sufficient for
- * numpy's in-range scalar parsing). */
-long long PyLong_AsLongLongAndOverflow(PyObject *obj, int *overflow) {
-    if (overflow != NULL) *overflow = 0;
-    return PyLong_AsLongLong(obj);
-}
-
-/* CPython's PySlice_AdjustIndices: clamp already-resolved start/stop to bounds
- * given step (!= 0) and return the resulting slice length. */
-Py_ssize_t PySlice_AdjustIndices(Py_ssize_t length, Py_ssize_t *start,
-                                 Py_ssize_t *stop, Py_ssize_t step) {
-    if (*start < 0) {
-        *start += length;
-        if (*start < 0) *start = (step < 0) ? -1 : 0;
-    } else if (*start >= length) {
-        *start = (step < 0) ? length - 1 : length;
-    }
-    if (*stop < 0) {
-        *stop += length;
-        if (*stop < 0) *stop = (step < 0) ? -1 : 0;
-    } else if (*stop >= length) {
-        *stop = (step < 0) ? length - 1 : length;
-    }
-    if (step < 0) {
-        if (*stop < *start) return (*start - *stop - 1) / (-step) + 1;
-    } else {
-        if (*start < *stop) return (*stop - *start - 1) / step + 1;
-    }
-    return 0;
-}
-
-/* --- batch 23: Py_SET_TYPE backing. numpy sets an object's type (array/scalar
- * types registered via PyType_Ready). Stamp the type_tag + the ob_type slot
- * (mirrors PyObject_Init's type half). This was the SOLE undefined symbol when
- * link-testing numpy's full _core under pcc-native. */
-void pcc_capi_set_type(PyObject *o, PyTypeObject *t) {
-    if (o == NULL) return;
-    PyObjectHeader *h = (PyObjectHeader *)o;
-    h->type_tag = pcc_capi_cext_tag_for(t);
-    *(PyTypeObject **)((char *)o + sizeof(PyObjectHeader)) = t;
-}
+#endif /* PCC_PY_CAPI_MODULE_STATE_RUNTIME */

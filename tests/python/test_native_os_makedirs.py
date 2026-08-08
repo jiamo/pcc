@@ -16,8 +16,8 @@ def test_os_makedirs_emits_native_no_libpython_call(tmp_path):
             """
             import os
 
-            def make(path: str, ok: bool):
-                os.makedirs(path, exist_ok=ok)
+            def make(path: str, mode: int, ok: bool):
+                os.makedirs(path, mode=mode, exist_ok=ok)
             """
         ).lstrip(),
         encoding="utf-8",
@@ -58,7 +58,7 @@ def test_os_makedirs_runtime_and_exist_ok(
             import os
 
             target = {str(target)!r}
-            os.makedirs(target)
+            os.makedirs(target, mode=0o700)
             print(os.path.isdir(target))
             os.makedirs(target, exist_ok=True)
             try:
@@ -79,3 +79,4 @@ def test_os_makedirs_runtime_and_exist_ok(
     assert run.returncode == 0, run.stderr
     assert run.stdout == "True\nexists\n"
     assert target.is_dir()
+    assert target.stat().st_mode & 0o777 == 0o700

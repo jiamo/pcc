@@ -43,10 +43,12 @@ from .py_frontend.pipeline import (
     run_python_multi_codegen_worker as _run_python_multi_codegen_worker,
 )
 from .cli_bootstrap_array_core import _run_native_package_array_core_from_pcc1
+from .cli_bootstrap_pytest import run_pcc1_pytest as _run_pcc1_pytest_harness
 
 _DEFAULT_EMIT_LL = DEFAULT_EMIT_LL
 _VALID_DIAGNOSTIC_FORMATS = DIAGNOSTIC_FORMAT_CHOICES
 _DEFAULT_BOOTSTRAP_SUBPROCESS_TIMEOUT_SECONDS = 300
+_PYTHON_ARGV0_MARKER = "--pcc-internal-python-argv0-v1"
 
 
 def _bootstrap_subprocess_timeout_seconds() -> int:
@@ -115,7 +117,9 @@ def _restart_with_locked_environment_defaults(raw_argv, applied_defaults):
         return 1
 
 
-_HELP_TEXT = """Usage: pcc [OPTIONS] PATH
+_HELP_TEXT = """Usage: pcc [OPTIONS] PATH [-- ARGS...]
+       pcc -c COMMAND [ARGS...]
+       pcc - [ARGS...]
 
 Bootstrap-oriented Python entry for pcc self-hosting.
 
@@ -127,6 +131,8 @@ Options:
   -h, --help                Show this help message and exit.
   env info [--json]         Inspect the selected pcc package environment.
   -m MODULE [ARGS...]       Compile and run a Python module through pcc1.
+  -c COMMAND [ARGS...]      Compile and run a Python command through pcc1.
+  - [ARGS...]               Compile and run Python source read from stdin.
   --backend BACKEND         Native emission backend: llvm or self.
   --python-libpython MODE   off (default), auto, or on for Python fallback linkage.
   --python-library          Emit a Python library module without @main.
@@ -138,9 +144,13 @@ Options:
   --disable-pass NAME       Accept optimizer pass disabling for host CLI parity.
   --diagnostic-format FMT   text (default), json, or sarif for hard errors.
   --profile-json PATH       Write compiler profile JSON.
+  --tooling-capabilities    Print the pcc1 tooling capability manifest.
   --explain-fallback        Include fallback routing details when known.
   --verbose                 Print Python pipeline timing.
   --pytest [ARGS...]        Run the pcc1-native pytest subset.
+
+Interactive REPL sessions are not yet runtime-owned and fail closed with
+PCC-CPY-UNSUPPORTED-L3-TOOLING-INTERACTIVE-REPL; pcc1 never invokes CPython.
 """
 
 
@@ -161,6 +171,41 @@ def _write_text(text: str, *, err: bool = False, nl: bool = True) -> None:
             sys.stderr.write(text)
         else:
             sys.stdout.write(text)
+
+
+def python_tooling_capabilities_json() -> str:
+    """Return the mode-labelled, no-host tooling surface owned by pcc1."""
+    return (
+        '{"schema":"pcc.python-tooling.v1",'
+        '"claim_mode":"pcc1/pcc-native/self/no-libpython",'
+        '"supported":["script","module","command","stdin",'
+        '"traceback","source-map","inspect","compiler-profile",'
+        '"codegen-debug","warning-filters"],'
+        '"unsupported":{'
+        '"interactive-repl":"PCC-CPY-UNSUPPORTED-L3-TOOLING-INTERACTIVE-REPL",'
+        '"line-debugger":"PCC-CPY-UNSUPPORTED-L3-TOOLING-DEBUGGER",'
+        '"runtime-profiler":"PCC-CPY-UNSUPPORTED-L3-TOOLING-PROFILER",'
+        '"coverage":"PCC-CPY-UNSUPPORTED-L3-TOOLING-COVERAGE"}}'
+    )
+
+
+def _unsupported_tooling_module(module_name: str):
+    if module_name == "pdb":
+        return (
+            "PCC-CPY-UNSUPPORTED-L3-TOOLING-DEBUGGER",
+            "the runtime-owned line debugger is not implemented",
+        )
+    if module_name in ("coverage", "coverage.__main__", "trace"):
+        return (
+            "PCC-CPY-UNSUPPORTED-L3-TOOLING-COVERAGE",
+            "runtime line/branch coverage events are not implemented",
+        )
+    if module_name in ("cProfile", "profile"):
+        return (
+            "PCC-CPY-UNSUPPORTED-L3-TOOLING-PROFILER",
+            "runtime call/return profiling events are not implemented",
+        )
+    return None
 
 
 def _normalized_sys_argv():
@@ -234,6 +279,12 @@ def _seed_package_site_for_python_entry(src_path: str) -> None:
         os.environ["PCC_PACKAGE_SITE"] = _path_list_sep().join(roots)
 
 
+# Deliberately self-contained: this module compiles with ZERO CPython
+# fallbacks as a single translation unit (tests/fallback_baseline.json),
+# and importing the shared copy turns these calls into cross-module
+# getattr bridges worth 47 fallbacks. The duplication is pinned instead:
+# tests/python/test_cli_shared_helpers_contract.py fails if this copy and
+# pcc/cli_shared_paths.py ever diverge (AUD-P2-CLI-SHARED-HELPER-DUPLICATION).
 def _fnv1a_update_u64(value: int, text: str) -> int:
     h = value & 0xFFFFFFFFFFFFFFFF
     data = str(text or "")
@@ -411,307 +462,13 @@ def _is_pytest_request(argv) -> bool:
     return first == "--pytest" or first == "pytest"
 
 
-def _pytest_marker_arg(pytest_args) -> str:
-    marker = ""
-    i = 0
-    while i < len(pytest_args):
-        arg = pytest_args[i]
-        if arg == "-m":
-            if i + 1 < len(pytest_args):
-                marker = pytest_args[i + 1]
-                i += 1
-        elif arg.startswith("-m") and len(arg) > 2:
-            marker = arg[2:]
-        i += 1
-    if marker == "":
-        marker = "not integration"
-    if len(marker) >= 2:
-        first = marker[0]
-        last = marker[len(marker) - 1]
-        if (first == "'" and last == "'") or (first == '"' and last == '"'):
-            marker = marker[1 : len(marker) - 1]
-    return marker
-
-
-def _pytest_path_args(pytest_args):
-    paths = []
-    i = 0
-    while i < len(pytest_args):
-        arg = pytest_args[i]
-        if arg in ("-m", "-k", "-n", "--maxfail", "--tb"):
-            i += 2
-            continue
-        if (
-            arg == "-q"
-            or arg == "-s"
-            or arg == "-v"
-            or arg == "-n0"
-            or arg.startswith("--")
-            or arg.startswith("-m")
-            or arg.startswith("-k")
-            or arg.startswith("--tb=")
-            or arg.startswith("--maxfail=")
-        ):
-            i += 1
-            continue
-        if arg.startswith("-"):
-            i += 1
-            continue
-        paths.append(arg)
-        i += 1
-    if len(paths) == 0:
-        paths.append("tests")
-    return paths
-
-
-def _pcc1_pytest_is_test_file(path: str) -> bool:
-    name = os.path.basename(path)
-    return name.endswith(".py") and (
-        name.startswith("test_") or name.endswith("_test.py")
-    )
-
-
-def _pcc1_pytest_collect_files_from(path: str, out) -> None:
-    if os.path.isfile(path):
-        if _pcc1_pytest_is_test_file(path):
-            out.append(path)
-        return
-    if not os.path.isdir(path):
-        return
-    try:
-        names = sorted(os.listdir(path))
-    except Exception:
-        return
-    i = 0
-    while i < len(names):
-        name = names[i]
-        child = os.path.join(path, name)
-        if (
-            name == "__pycache__"
-            or name == ".pytest_cache"
-            or name == ".git"
-            or name == "build"
-            or name == "build_py"
-            or name == "projects"
-        ):
-            i += 1
-            continue
-        if os.path.isdir(child):
-            _pcc1_pytest_collect_files_from(child, out)
-        elif _pcc1_pytest_is_test_file(child):
-            out.append(child)
-        i += 1
-
-
-def _pcc1_pytest_collect_files(paths):
-    out = []
-    i = 0
-    while i < len(paths):
-        _pcc1_pytest_collect_files_from(paths[i], out)
-        i += 1
-    return out
-
-
-def _pcc1_pytest_module_is_integration(text: str) -> bool:
-    return (
-        _native_find_from(text, "pytestmark = pytest.mark.integration", 0) >= 0
-        or _native_find_from(text, "pytestmark=pytest.mark.integration", 0) >= 0
-        or _native_find_from(text, "pytestmark = [pytest.mark.integration", 0) >= 0
-        or _native_find_from(text, "pytestmark=[pytest.mark.integration", 0) >= 0
-    )
-
-
-def _pcc1_pytest_include_by_marker(is_integration: bool, marker: str) -> bool:
-    if marker == "integration":
-        return is_integration
-    if marker == "not integration":
-        return not is_integration
-    return True
-
-
-def _pcc1_pytest_skipif_literal(stripped: str):
-    prefix = "@pytest.mark.skipif("
-    if not stripped.startswith(prefix):
-        return None
-    rest = stripped[len(prefix) :]
-    if rest.startswith("True") and (len(rest) == 4 or rest[4] == "," or rest[4] == ")"):
-        return True
-    if rest.startswith("False") and (
-        len(rest) == 5 or rest[5] == "," or rest[5] == ")"
-    ):
-        return False
-    return None
-
-
-def _pcc1_pytest_is_skip_decorator(stripped: str) -> bool:
-    return stripped == "@pytest.mark.skip" or stripped.startswith("@pytest.mark.skip(")
-
-
-def _pcc1_pytest_def_name(line: str):
-    if not line.startswith("def test_"):
-        return None
-    paren = _native_find_from(line, "(", 0)
-    if paren < 0:
-        return None
-    return line[4:paren]
-
-
-def _pcc1_pytest_discover_funcs(text: str, marker: str):
-    funcs = []
-    module_integration = _pcc1_pytest_module_is_integration(text)
-    pending_integration = False
-    pending_skip = False
-    lines = text.split("\n")
-    i = 0
-    while i < len(lines):
-        raw = lines[i]
-        stripped = raw.strip()
-        if stripped.startswith("@pytest.mark.integration"):
-            pending_integration = True
-            i += 1
-            continue
-        if _pcc1_pytest_is_skip_decorator(stripped):
-            pending_skip = True
-            i += 1
-            continue
-        skipif = _pcc1_pytest_skipif_literal(stripped)
-        if skipif is not None:
-            if skipif:
-                pending_skip = True
-            i += 1
-            continue
-        name = None
-        if raw.startswith("def test_"):
-            name = _pcc1_pytest_def_name(raw)
-        if name is not None:
-            is_integration = module_integration or pending_integration
-            if not pending_skip and _pcc1_pytest_include_by_marker(
-                is_integration, marker
-            ):
-                funcs.append(name)
-            pending_integration = False
-            pending_skip = False
-            i += 1
-            continue
-        if stripped.startswith("@"):
-            i += 1
-            continue
-        if stripped != "" and not stripped.startswith("#"):
-            pending_integration = False
-            pending_skip = False
-        i += 1
-    return funcs
-
-
-def _pcc1_pytest_rewrite_metadata_assignments(text: str) -> str:
-    out = []
-    lines = text.split("\n")
-    i = 0
-    while i < len(lines):
-        raw = lines[i]
-        stripped = raw.strip()
-        if (
-            raw == stripped
-            and stripped.startswith("pytestmark")
-            and _native_find_from(stripped, "pytest.mark.integration", 0) >= 0
-        ):
-            out.append("pytestmark = None")
-        else:
-            out.append(raw)
-        i += 1
-    return "\n".join(out)
-
-
-def _pcc1_pytest_write_runner_source(src_path: str, dest_path: str, marker: str):
-    try:
-        with open(src_path, "r", encoding="utf-8") as fh:
-            text = fh.read()
-    except Exception:
-        _write_text("Error: pcc1 pytest could not read " + src_path, err=True)
-        return 0
-    funcs = _pcc1_pytest_discover_funcs(text, marker)
-    if len(funcs) == 0:
-        return 0
-    text = _pcc1_pytest_rewrite_metadata_assignments(text)
-    with open(dest_path, "w", encoding="utf-8") as fh:
-        fh.write(text)
-        if not text.endswith("\n"):
-            fh.write("\n")
-        fh.write("\nfrom pcc.test_runner import run_tests\n")
-        fh.write('\nif __name__ == "__main__":\n')
-        fh.write("    run_tests([")
-        i = 0
-        while i < len(funcs):
-            if i > 0:
-                fh.write(", ")
-            fh.write(funcs[i])
-            i += 1
-        fh.write("])\n")
-    return len(funcs)
-
-
 def _run_pytest_from_pcc1(argv) -> int:
-    pytest_args = _copy_seq(argv[1:])
-    marker = _pytest_marker_arg(pytest_args)
-    if marker != "integration" and marker != "not integration":
-        _write_text(
-            "Error: pcc1 pytest subset supports only -m integration or "
-            "-m 'not integration'",
-            err=True,
-        )
-        return 2
-    files = _pcc1_pytest_collect_files(_pytest_path_args(pytest_args))
-    if len(files) == 0:
-        _write_text("pcc1 pytest: no tests collected")
-        return 5
-    root = os.environ.get("TMPDIR") or "/tmp"
-    scratch = os.path.join(root, "pcc1-pytest-" + str(os.getpid()))
-    try:
-        _bootstrap_subprocess_run(["mkdir", "-p", scratch], check=True)
-    except Exception:
-        _write_text("Error: pcc1 pytest could not create scratch directory", err=True)
-        return 1
-    compiled = 0
-    failed = 0
-    i = 0
-    while i < len(files):
-        src = files[i]
-        tag = _sanitize_tag(src)
-        runner_src = os.path.join(scratch, "runner_" + str(i) + "_" + tag + ".py")
-        exe = os.path.join(scratch, "runner_" + str(i) + "_" + tag + ".out")
-        count = _pcc1_pytest_write_runner_source(src, runner_src, marker)
-        if count <= 0:
-            i += 1
-            continue
-        compiled += 1
-        try:
-            _bootstrap_subprocess_run(
-                [
-                    sys.executable,
-                    runner_src,
-                    "-o",
-                    exe,
-                    "--python-libpython=off",
-                    "--ir-scaffold=on",
-                ],
-                check=True,
-            )
-            _bootstrap_subprocess_run([exe], check=True)
-        except Exception:
-            failed += 1
-        i += 1
-    if compiled == 0:
-        _write_text("pcc1 pytest: no tests selected")
-        return 5
-    _write_text(
-        str(compiled - failed)
-        + " pcc1 pytest file(s) passed, "
-        + str(failed)
-        + " failed"
+    """Thin facade retaining the historical bootstrap CLI dispatch point."""
+    return _run_pcc1_pytest_harness(
+        argv,
+        sys.executable,
+        _bootstrap_subprocess_timeout_seconds(),
     )
-    if failed != 0:
-        return 1
-    return 0
 
 
 def _is_module_request(argv) -> bool:
@@ -783,6 +540,92 @@ def _make_bootstrap_run_tempdir(prefix: str) -> str:
 
 def _remove_bootstrap_run_tempdir(path: str) -> None:
     _bootstrap_subprocess_run(["rm", "-rf", path], check=True)
+
+
+def _python_program_command(
+    executable: str, execution_mode: str, logical_argv0: str, program_args
+):
+    """Build the private argv envelope consumed by ``py_set_program_args``.
+
+    The OS necessarily starts the compiled artifact with its executable path
+    in argv[0].  Script, ``-m``, ``-c`` and stdin execution instead expose the
+    same logical argv[0] values as python3.  The runtime strips this private
+    three-field envelope before publishing ``sys.argv``; direct execution of
+    a compiled artifact remains unchanged.
+    """
+    command = [executable, _PYTHON_ARGV0_MARKER, execution_mode, logical_argv0]
+    i = 0
+    while i < len(program_args):
+        command.append(program_args[i])
+        i += 1
+    return command
+
+
+def _read_python_stdin_source() -> str:
+    chunks = []
+    while True:
+        line = sys.stdin.readline()
+        if line == "":
+            break
+        chunks.append(line)
+    return "".join(chunks)
+
+
+def _run_inline_python_request(kind: str, source: str, program_args) -> int:
+    """Materialize command/stdin source and reuse the strict script pipeline."""
+    if kind not in ("command", "stdin"):
+        raise ValueError("unsupported inline Python execution mode: " + str(kind))
+    td = _make_bootstrap_run_tempdir("pcc1-python-input-")
+    old_package_site = str(os.environ.get("PCC_PACKAGE_SITE") or "")
+    old_disable_cache = str(os.environ.get("PCC_DISABLE_PY_RUN_CACHE") or "")
+    if kind == "command":
+        filename = "__pcc_command__.py"
+        logical_argv0 = "-c"
+    else:
+        filename = "__pcc_stdin__.py"
+        logical_argv0 = "-"
+    path = os.path.join(td, filename)
+    status = 1
+    try:
+        roots = [os.getcwd()]
+        if old_package_site:
+            roots.extend(_split_path_list(old_package_site))
+        os.environ["PCC_PACKAGE_SITE"] = _path_list_sep().join(roots)
+        # Inline source has a process-scoped temporary path.  Caching it would
+        # either retain dead paths or hash the entire current working tree.
+        os.environ["PCC_DISABLE_PY_RUN_CACHE"] = "1"
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(source)
+            if source and not source.endswith("\n"):
+                fh.write("\n")
+        forwarded = [path]
+        i = 0
+        while i < len(program_args):
+            forwarded.append(program_args[i])
+            i += 1
+        status = _bootstrap_cli_main_impl(
+            forwarded,
+            _logical_argv0=logical_argv0,
+            _execution_mode=kind,
+        )
+    except Exception:
+        _write_text("Error: pcc1 inline Python compile/run failed", err=True)
+        status = 1
+    finally:
+        # Assignment is intentional: the standalone pcc1 compiler owns native
+        # environment assignment, while mapping ``pop`` would introduce a
+        # libpython bridge into its closed-world bootstrap.  Every pcc
+        # consumer treats an empty value as absent, matching the pre-existing
+        # bootstrap environment contract.
+        os.environ["PCC_PACKAGE_SITE"] = old_package_site
+        os.environ["PCC_DISABLE_PY_RUN_CACHE"] = old_disable_cache
+    try:
+        _remove_bootstrap_run_tempdir(td)
+    except Exception:
+        if status == 0:
+            _write_text("Error: pcc1 inline Python scratch cleanup failed", err=True)
+            status = 1
+    return status
 
 
 def _json_str_or_null(text) -> str:
@@ -4521,6 +4364,7 @@ def _native_build_exec_json(
     from_meson_introspection: bool,
     configure_meson: bool,
     enforce_generated_c: bool,
+    build_mode: str = "owned",
 ) -> str:
     pkg_name = (name or "").strip() or "package"
     root = _native_package_path(pkg_name, explicit_path)
@@ -4902,6 +4746,9 @@ def _native_build_exec_json(
     actions += "]"
     out = "{"
     out += '"actions": ' + actions
+    out += ', "build_backend": "pcc-native"'
+    out += ', "build_mode_requested": ' + _json_str(build_mode)
+    out += ', "build_ownership": "owned"'
     out += ', "build_plan": ' + _native_build_plan_json(pkg_name, root)
     out += ', "diagnostics": ' + _json_str_list(diagnostics)
     out += ', "execute": ' + ("true" if execute else "false")
@@ -4918,6 +4765,9 @@ def _native_build_exec_json(
     )
     out += ', "configure_meson": ' + ("true" if configure_meson else "false")
     out += ', "generated_c_provenance": ' + generated_c_provenance
+    out += ', "host_assisted": false'
+    out += ', "host_free_build_claim": ' + ("true" if ok else "false")
+    out += ', "host_python": null'
     out += ', "linkage": ' + linkage
     out += ', "name": ' + _json_str(pkg_name)
     out += ', "ok": ' + ("true" if ok else "false")
@@ -6864,7 +6714,10 @@ def _run_native_pip_shim_from_pcc1(module_args) -> int:
     if len(raw) == 0:
         raw = ["install", "--dry-run"]
     if len(raw) > 0 and (raw[0] == "-h" or raw[0] == "--help"):
-        _write_text("usage: pcc -m pip [install] [packages...] [--dry-run]")
+        _write_text(
+            "usage: pcc -m pip [install] [packages...] [--dry-run] "
+            "[--build=owned|host] [--force]"
+        )
         return 0
     command = raw[0] if len(raw) > 0 else "install"
     dry_run = 0
@@ -6876,6 +6729,8 @@ def _run_native_pip_shim_from_pcc1(module_args) -> int:
     index_urls = []
     no_index = False
     acquire_mode = "auto"
+    build_mode = "owned"
+    force = False
     target_python = os.environ.get("PCC_PACKAGE_TARGET_PYTHON") or "3.11"
     packages = []
     i = 1
@@ -6883,6 +6738,8 @@ def _run_native_pip_shim_from_pcc1(module_args) -> int:
         arg = raw[i]
         if arg == "--dry-run":
             dry_run = 1
+        elif arg == "--force":
+            force = True
         elif arg == "--json":
             pass
         elif arg == "--report":
@@ -6931,6 +6788,16 @@ def _run_native_pip_shim_from_pcc1(module_args) -> int:
             i += 1
         elif arg.startswith("--acquire="):
             acquire_mode = arg.split("=", 1)[1]
+        elif arg == "--build":
+            if i + 1 >= len(raw):
+                _write_text(
+                    '{"command": "install", "error": "--build requires a value", "ok": false}'
+                )
+                return 2
+            build_mode = raw[i + 1]
+            i += 1
+        elif arg.startswith("--build="):
+            build_mode = arg.split("=", 1)[1]
         elif arg == "--python-version" or arg == "--target-python":
             if i + 1 >= len(raw):
                 _write_text(
@@ -7000,6 +6867,13 @@ def _run_native_pip_shim_from_pcc1(module_args) -> int:
             '{"command": "install", "diagnostic": '
             '"PCC-PKG-ACQUIRE-MODE-INVALID", "error": '
             '"PCC-PKG-ACQUIRE-MODE-INVALID", "ok": false}'
+        )
+        return 2
+    if not (build_mode == "owned" or build_mode == "host"):
+        _write_text(
+            '{"command": "install", "diagnostic": '
+            '"PCC-PKG-BUILD-MODE-INVALID", "error": '
+            '"PCC-PKG-BUILD-MODE-INVALID", "ok": false}'
         )
         return 2
     if not _native_target_python_valid(target_python):
@@ -7102,6 +6976,7 @@ def _run_native_pip_shim_from_pcc1(module_args) -> int:
         out += '"command": "install"'
         out += ', "abi": ' + _json_str(abi)
         out += ', "acquire_mode_requested": ' + _json_str(acquire_mode)
+        out += ', "build_mode_requested": ' + _json_str(build_mode)
         out += ', "acquisitions": ' + acquisitions
         out += ', "dry_run": false'
         out += ', "error": ' + _json_str(acquisition_error)
@@ -7156,6 +7031,8 @@ def _run_native_pip_shim_from_pcc1(module_args) -> int:
                 abi,
                 [],
                 resolved_from_override,
+                build_mode,
+                force,
             )
             if _native_find_from(install_json, '"ok": false', 0) >= 0:
                 all_ok = False
@@ -7166,6 +7043,7 @@ def _run_native_pip_shim_from_pcc1(module_args) -> int:
         out += '"command": "install"'
         out += ', "abi": ' + _json_str(abi)
         out += ', "acquire_mode_requested": ' + _json_str(acquire_mode)
+        out += ', "build_mode_requested": ' + _json_str(build_mode)
         out += ', "acquisitions": [' + ", ".join(acquisition_jsons) + "]"
         out += ', "dry_run": false'
         out += ', "find_links": ' + _json_str_list(find_links)
@@ -7205,6 +7083,7 @@ def _run_native_pip_shim_from_pcc1(module_args) -> int:
     out += '"command": "install"'
     out += ', "abi": ' + _json_str(abi)
     out += ', "acquire_mode_requested": ' + _json_str(acquire_mode)
+    out += ', "build_mode_requested": ' + _json_str(build_mode)
     out += ', "acquisitions": []'
     out += ', "dry_run": true'
     out += ', "find_links": ' + _json_str_list(find_links)
@@ -8605,15 +8484,39 @@ def _native_build_log_tail(path: str) -> str:
     return text
 
 
-def _native_ensure_meson_build_outputs_json(source) -> str:
+def _native_ensure_meson_build_outputs_json(
+    source, build_mode: str = "owned"
+) -> str:
+    if not (build_mode == "owned" or build_mode == "host"):
+        return (
+            '{"actions": [], "build_mode_requested": '
+            + _json_str(build_mode)
+            + ', "build_ownership": "unresolved", '
+            '"diagnostics": ["PCC-PKG-BUILD-MODE-INVALID"], '
+            '"host_assisted": false, "host_free_build_claim": false, '
+            '"host_python": null, "ok": false, '
+            '"reason": "build_mode_invalid", "skipped": false}'
+        )
     if source is None or not os.path.isdir(source):
         return (
-            '{"actions": [], "ok": true, "reason": "not_source_tree", "skipped": true}'
+            '{"actions": [], "build_mode_requested": '
+            + _json_str(build_mode)
+            + ', "build_ownership": "not-required", '
+            '"host_assisted": false, "host_free_build_claim": true, '
+            '"host_python": null, "ok": true, '
+            '"reason": "not_source_tree", "skipped": true}'
         )
     if not os.path.isfile(os.path.join(source, "meson.build")):
         return (
-            '{"actions": [], "ok": true, "reason": "no_meson_build", "skipped": true}'
+            '{"actions": [], "build_mode_requested": '
+            + _json_str(build_mode)
+            + ', "build_ownership": "not-required", '
+            '"host_assisted": false, "host_free_build_claim": true, '
+            '"host_python": null, "ok": true, '
+            '"reason": "no_meson_build", "skipped": true}'
         )
+    if build_mode == "owned":
+        return _native_owned_build_tool_required_json(build_mode)
 
     build_dir = os.path.join(source, "build", "pcc-package", "meson-build")
     tool_dir = _native_prepare_build_tools(source)
@@ -8640,7 +8543,8 @@ def _native_ensure_meson_build_outputs_json(source) -> str:
                 source, build_dir, tool_dir
             )
             if setup_command is None:
-                skipped = True
+                ok = False
+                skipped = False
                 reason = "meson_not_available"
             else:
                 redirected = _native_redirected_shell_command(
@@ -8717,6 +8621,16 @@ def _native_ensure_meson_build_outputs_json(source) -> str:
     actions += "]"
     out = "{"
     out += '"actions": ' + actions
+    out += ', "build_backend": "meson"'
+    out += ', "build_mode_requested": ' + _json_str(build_mode)
+    out += ', "build_ownership": "host"'
+    out += ', "host_assisted": true'
+    out += ', "host_free_build_claim": false'
+    out += ', "host_python": ' + _json_str(
+        os.environ.get("PCC_BUILD_PYTHON")
+        or os.environ.get("PCC_HOST_PYTHON")
+        or "python3"
+    )
     out += ', "ok": ' + ("true" if ok else "false")
     out += ', "reason": ' + _json_str_or_null(reason)
     out += ', "skipped": ' + ("true" if skipped else "false")
@@ -9068,34 +8982,615 @@ def _native_single_package_extension_target(root: str):
     return None
 
 
-def _native_build_install_source_json(name: str, source, abi: str) -> str:
+def _native_json_field_is(text: str, key: str, literal: str) -> bool:
+    marker = '"' + key + '"'
+    pos = _native_find_from(text, marker, 0)
+    if pos < 0:
+        return False
+    colon = _native_find_from(text, ":", pos + len(marker))
+    if colon < 0:
+        return False
+    i = colon + 1
+    while i < len(text) and (
+        text[i] == " " or text[i] == "\t" or text[i] == "\r" or text[i] == "\n"
+    ):
+        i += 1
+    return text[i : i + len(literal)] == literal
+
+
+def _native_json_string_field(text: str, key: str):
+    """Read one JSON string field without importing the host json module."""
+    marker = '"' + key + '"'
+    pos = _native_find_from(text, marker, 0)
+    if pos < 0:
+        return None
+    colon = _native_find_from(text, ":", pos + len(marker))
+    if colon < 0:
+        return None
+    i = colon + 1
+    while i < len(text) and (
+        text[i] == " " or text[i] == "\t" or text[i] == "\r" or text[i] == "\n"
+    ):
+        i += 1
+    if i >= len(text) or text[i] != '"':
+        return None
+    return _native_json_string_after(text, '"', i)
+
+
+def _native_satisfied_manifest_response(text: str, manifest_path: str) -> str:
+    """Return an existing install receipt with a no-op action label."""
+    end = len(text)
+    while end > 0 and (
+        text[end - 1] == " "
+        or text[end - 1] == "\t"
+        or text[end - 1] == "\r"
+        or text[end - 1] == "\n"
+    ):
+        end -= 1
+    if end == 0 or text[end - 1] != "}":
+        return ""
+    body = text[: end - 1]
+    installed = '"install_action": "installed"'
+    pos = _native_find_from(body, installed, 0)
+    if pos >= 0:
+        body = (
+            body[:pos]
+            + '"install_action": "already-satisfied"'
+            + body[pos + len(installed) :]
+        )
+    else:
+        body += ', "install_action": "already-satisfied"'
+    body += ', "manifest_path": ' + _json_str(manifest_path)
+    return body + "}"
+
+
+def _native_already_satisfied_manifest_json(
+    site: str, name: str, digest: str, abi: str
+):
+    """Find a live pcc1 install matching one immutable artifact receipt."""
+    if digest == "" or not os.path.isdir(site):
+        return None
+    try:
+        children = sorted(os.listdir(site))
+    except Exception:
+        return None
+    i = 0
+    while i < len(children):
+        manifest_path = os.path.join(site, children[i], "pcc-package.json")
+        if os.path.isfile(manifest_path):
+            try:
+                with open(manifest_path, "r", encoding="utf-8") as fh:
+                    text = fh.read()
+            except Exception:
+                text = ""
+            installed_path = _native_json_string_field(text, "installed_path")
+            if (
+                _native_json_field_is(text, "name", _json_str(name))
+                and _native_json_field_is(
+                    text, "artifact_sha256", _json_str(digest)
+                )
+                and _native_json_field_is(text, "abi_mode", _json_str(abi))
+                and _native_json_field_is(text, "install_success", "true")
+                and installed_path is not None
+                and os.path.isdir(installed_path)
+            ):
+                response = _native_satisfied_manifest_response(text, manifest_path)
+                if response != "":
+                    return response
+        i += 1
+    return None
+
+
+def _native_owned_build_tool_required_json(build_mode: str) -> str:
+    return (
+        '{"actions": [], "build_backend": "meson", '
+        '"build_mode_requested": '
+        + _json_str(build_mode)
+        + ', "build_ownership": "owned-unavailable", '
+        '"diagnostics": ["PCC-PKG-OWNED-BUILD-TOOL-REQUIRED"], '
+        '"host_assisted": false, "host_free_build_claim": false, '
+        '"host_python": null, "ok": false, '
+        '"reason": "owned_build_tool_required", "skipped": false}'
+    )
+
+
+def _native_owned_meson_entry(source: str):
+    """Return the source entry for the Meson program owned by this build.
+
+    A source distribution may carry its own pinned Meson checkout.  That is
+    the only implicit source accepted here: an ambient ``meson`` executable
+    may be a Python console script and therefore cannot prove an owned build.
+    Tests and controlled packagers may point at an equivalent source entry
+    explicitly, but the value must still be a real Python source file.
+    """
+    explicit = str(os.environ.get("PCC_PACKAGE_OWNED_MESON_SOURCE") or "").strip()
+    if explicit != "":
+        explicit = os.path.abspath(explicit)
+        if os.path.isfile(explicit) and explicit.endswith(".py"):
+            return explicit
+        return None
+    vendored = os.path.join(source, "vendored-meson", "meson", "meson.py")
+    if os.path.isfile(vendored):
+        return vendored
+    return None
+
+
+def _native_owned_build_exec_entry():
+    """Locate the pcc-Python target replay entry without importing it."""
+    explicit = str(
+        os.environ.get("PCC_PACKAGE_OWNED_BUILD_EXEC_SOURCE") or ""
+    ).strip()
+    candidates = []
+    if explicit != "":
+        candidates.append(os.path.abspath(explicit))
+    repo_root = str(os.environ.get("PCC_REPO_ROOT") or "").strip()
+    if repo_root != "":
+        candidates.append(
+            os.path.join(os.path.abspath(repo_root), "pcc", "package", "build_exec.py")
+        )
+    candidates.append(
+        os.path.join(os.path.abspath(os.getcwd()), "pcc", "package", "build_exec.py")
+    )
+    try:
+        candidates.append(
+            os.path.join(os.path.dirname(os.path.abspath(__file__)), "package", "build_exec.py")
+        )
+    except Exception:
+        pass
+    i = 0
+    while i < len(candidates):
+        if os.path.isfile(candidates[i]):
+            return candidates[i]
+        i += 1
+    return None
+
+
+def _native_owned_meson_receipt_path(build_dir: str) -> str:
+    return os.path.join(build_dir, ".pcc-owned-meson-receipt")
+
+
+def _native_owned_file_sha256(path: str) -> str:
+    """Return one compiler-owned file digest or fail closed.
+
+    The native ``os`` port owns this primitive, so producing an owned-build
+    receipt never imports host ``hashlib``.  Validate the result here because
+    an absent or malformed digest must not degrade into an existence marker.
+    """
+    try:
+        value = str(os._pcc_sha256_file_hex(path) or "").lower()
+    except Exception:
+        return ""
+    if len(value) != 64:
+        return ""
+    i = 0
+    while i < len(value):
+        ch = value[i]
+        if not ("0" <= ch <= "9" or "a" <= ch <= "f"):
+            return ""
+        i += 1
+    return value
+
+
+def _native_owned_meson_receipt_text(
+    compiler: str, meson_source: str, meson_tool: str
+) -> str:
+    """Bind a configured graph to its compiler, tool, and source closure."""
+    compiler_sha = _native_owned_file_sha256(compiler)
+    tool_sha = _native_owned_file_sha256(meson_tool)
+    source_root = os.path.abspath(os.path.dirname(meson_source))
+    sources = _iter_py_sources_under(source_root)
+    if compiler_sha == "" or tool_sha == "" or len(sources) == 0:
+        return ""
+    entry = os.path.abspath(meson_source)
+    found_entry = False
+    out = "pcc-owned-meson-receipt-v2\n"
+    out += "compiler-sha256=" + compiler_sha + "\n"
+    out += "tool-sha256=" + tool_sha + "\n"
+    out += "source-count=" + str(len(sources)) + "\n"
+    i = 0
+    while i < len(sources):
+        path = os.path.abspath(sources[i])
+        if path == entry:
+            found_entry = True
+        digest = _native_owned_file_sha256(path)
+        if digest == "":
+            return ""
+        rel = os.path.relpath(path, source_root)
+        out += "source=" + str(len(rel)) + ":" + rel + ":" + digest + "\n"
+        i += 1
+    if not found_entry:
+        return ""
+    return out
+
+
+def _native_owned_meson_receipt_matches(path: str, expected: str) -> bool:
+    if expected == "" or not os.path.isfile(path):
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            actual = fh.read()
+    except Exception:
+        return False
+    return actual == expected
+
+
+def _native_meson_graph_host_python_command(build_dir: str):
+    """Name the first generated command that would reintroduce host Python.
+
+    The compiled Meson process is owned, but generated custom commands are a
+    second execution boundary.  Do not call Ninja and then infer ownership
+    from its success: reject a graph containing a Python/Cython/uv command
+    before it executes.  This deliberately scans only Ninja ``command =``
+    records, so source paths containing the word ``python`` do not create a
+    false ownership claim or a false rejection.
+    """
+    ninja_path = os.path.join(build_dir, "build.ninja")
+    try:
+        with open(ninja_path, "r", encoding="utf-8") as fh:
+            text = fh.read()
+    except Exception:
+        return None
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        stripped = lines[i].strip()
+        if stripped.startswith("command ="):
+            command = stripped[len("command =") :].strip()
+            # Inspect command tokens, not arbitrary substrings: a compiler
+            # argument such as ``-I.../python/include`` is not a host process.
+            token_text = command
+            for separator in ("&&", "||", ";", "|", "(", ")"):
+                token_text = token_text.replace(separator, " ")
+            tokens = token_text.split()
+            j = 0
+            while j < len(tokens):
+                token = tokens[j].strip("'\"` ,")
+                base = os.path.basename(token).lower()
+                is_python = base == "python" or base.startswith("python3")
+                is_pypy = base == "pypy" or base.startswith("pypy3")
+                is_cython = base == "cython" or base.startswith("cython3")
+                is_env_python = base in ("$python", "${python}", "%python%")
+                is_uv_python = base in ("uv", "uvx") and (
+                    base == "uvx"
+                    or (j + 1 < len(tokens) and tokens[j + 1].lower() == "run")
+                )
+                if (
+                    is_python
+                    or is_pypy
+                    or is_cython
+                    or is_env_python
+                    or is_uv_python
+                ):
+                    return command
+                j += 1
+        i += 1
+    return None
+
+
+def _native_owned_meson_build_json(name: str, source: str) -> str:
+    """Compile and execute Meson through the current native pcc stage.
+
+    ``sys.executable`` is not sufficient evidence here: in a host invocation
+    it is CPython, while in pcc1 it is the native compiler.  Require the
+    bootstrap executable discriminator, compile the source-carried Meson
+    entry into its own native artifact, and only then configure/build.  Every
+    successful report therefore has no host-interpreter process in this
+    orchestration path.
+    """
+    compiler = _native_bootstrap_executable()
+    meson_source = _native_owned_meson_entry(source)
+    build_exec_source = _native_owned_build_exec_entry()
+    build_root = os.path.join(source, "build", "pcc-package")
+    build_dir = os.path.join(build_root, "meson-build")
+    tool_dir = os.path.join(build_root, "owned-tools")
+    meson_tool = os.path.join(tool_dir, "meson")
+    build_exec_tool = os.path.join(tool_dir, "pcc-package-build-exec")
+    build_report_path = os.path.join(
+        build_root, "eager-meson-build-report.json"
+    )
+    receipt_path = _native_owned_meson_receipt_path(build_dir)
+    expected_receipt = ""
+    actions = "["
+    diagnostics = []
+    ok = True
+    reason = None
+
+    def add_action(kind: str, command, status: str, returncode) -> None:
+        nonlocal actions, ok
+        if actions != "[":
+            actions += ", "
+        command_text = ""
+        j = 0
+        while j < len(command):
+            if command_text != "":
+                command_text += " "
+            command_text += _native_shell_quote(str(command[j]))
+            j += 1
+        actions += _native_build_report_action_json(
+            kind,
+            command_text,
+            status,
+            returncode,
+            "",
+        )
+        if status != "passed":
+            ok = False
+
+    if compiler == "":
+        diagnostics.append("PCC-PKG-OWNED-BUILD-COMPILER-REQUIRED")
+        ok = False
+        reason = "owned_build_compiler_required"
+    elif meson_source is None:
+        diagnostics.append("PCC-PKG-OWNED-MESON-SOURCE-REQUIRED")
+        ok = False
+        reason = "owned_meson_source_required"
+    elif build_exec_source is None:
+        diagnostics.append("PCC-PKG-OWNED-BUILD-EXEC-SOURCE-REQUIRED")
+        ok = False
+        reason = "owned_build_exec_source_required"
+
+    compile_command = []
+    if ok:
+        compile_command = [
+            compiler,
+            "--backend=self",
+            "--python-libpython=off",
+            "--ir-scaffold=on",
+            meson_source,
+            "-o",
+            meson_tool,
+        ]
+        try:
+            _bootstrap_subprocess_run(["mkdir", "-p", tool_dir], check=True)
+            _bootstrap_subprocess_run(compile_command, check=True)
+            if not os.path.isfile(meson_tool) or not os.access(meson_tool, os.X_OK):
+                raise RuntimeError(
+                    "owned Meson compile returned without an executable artifact"
+                )
+            add_action("owned_meson_compile", compile_command, "passed", 0)
+        except Exception:
+            add_action("owned_meson_compile", compile_command, "failed", 1)
+            diagnostics.append("PCC-PKG-OWNED-MESON-COMPILE-FAILED")
+            reason = "owned_meson_compile_failed"
+
+    if ok:
+        expected_receipt = _native_owned_meson_receipt_text(
+            compiler, meson_source, meson_tool
+        )
+        if expected_receipt == "":
+            diagnostics.append("PCC-PKG-OWNED-BUILD-RECEIPT-FAILED")
+            ok = False
+            reason = "owned_build_receipt_failed"
+
+    if ok and os.path.isfile(os.path.join(build_dir, "build.ninja")):
+        if not _native_owned_meson_receipt_matches(
+            receipt_path, expected_receipt
+        ):
+            diagnostics.append("PCC-PKG-BUILD-PROVENANCE-UNVERIFIED")
+            ok = False
+            reason = "existing_meson_build_provenance_unverified"
+
+    if ok and not os.path.isfile(os.path.join(build_dir, "build.ninja")):
+        setup_command = [meson_tool, "setup", build_dir, source]
+        try:
+            _bootstrap_subprocess_run(["mkdir", "-p", build_dir], check=True)
+            _bootstrap_subprocess_run(setup_command, check=True)
+            if not os.path.isfile(os.path.join(build_dir, "build.ninja")):
+                raise RuntimeError(
+                    "owned Meson setup returned without build.ninja"
+                )
+            final_receipt = _native_owned_meson_receipt_text(
+                compiler, meson_source, meson_tool
+            )
+            if final_receipt == "" or final_receipt != expected_receipt:
+                raise RuntimeError(
+                    "owned Meson inputs changed while configuring the graph"
+                )
+            with open(receipt_path, "w", encoding="utf-8") as fh:
+                fh.write(final_receipt)
+            add_action("owned_meson_setup", setup_command, "passed", 0)
+        except Exception:
+            add_action("owned_meson_setup", setup_command, "failed", 1)
+            diagnostics.append("PCC-PKG-OWNED-MESON-SETUP-FAILED")
+            reason = "owned_meson_setup_failed"
+
+    if ok:
+        host_command = _native_meson_graph_host_python_command(build_dir)
+        if host_command is not None:
+            diagnostics.append("PCC-PKG-OWNED-BUILD-GRAPH-HOST-PYTHON")
+            ok = False
+            reason = "owned_build_graph_uses_host_python"
+
+    if ok:
+        build_exec_compile_command = [
+            compiler,
+            "--backend=self",
+            "--python-libpython=off",
+            "--ir-scaffold=on",
+            build_exec_source,
+            "-o",
+            build_exec_tool,
+        ]
+        try:
+            _bootstrap_subprocess_run(build_exec_compile_command, check=True)
+            if not os.path.isfile(build_exec_tool) or not os.access(
+                build_exec_tool, os.X_OK
+            ):
+                raise RuntimeError(
+                    "owned target replay compile returned without an executable"
+                )
+            add_action(
+                "owned_build_exec_compile",
+                build_exec_compile_command,
+                "passed",
+                0,
+            )
+        except Exception:
+            add_action(
+                "owned_build_exec_compile",
+                build_exec_compile_command,
+                "failed",
+                1,
+            )
+            diagnostics.append("PCC-PKG-OWNED-BUILD-EXEC-COMPILE-FAILED")
+            reason = "owned_build_exec_compile_failed"
+
+    if ok:
+        jobs_text = str(os.environ.get("PCC_PACKAGE_BUILD_JOBS") or "2")
+        try:
+            jobs = int(jobs_text)
+        except Exception:
+            jobs = 2
+        if jobs < 1:
+            jobs = 1
+        timeout_text = str(os.environ.get("PCC_PACKAGE_BUILD_TIMEOUT") or "300")
+        build_command = [
+            build_exec_tool,
+            name,
+            "--path",
+            source,
+            "--execute",
+            "--eager-meson-extensions",
+            "--jobs",
+            str(jobs),
+            "--timeout",
+            timeout_text,
+            "--build-mode",
+            "owned",
+            "--report",
+            build_report_path,
+            "--json",
+        ]
+        build_process_ok = False
+        try:
+            with open(build_report_path, "w", encoding="utf-8") as fh:
+                fh.write("")
+            _bootstrap_subprocess_run(build_command, check=True)
+            build_process_ok = True
+        except Exception:
+            pass
+        try:
+            with open(build_report_path, "r", encoding="utf-8") as fh:
+                build_report = fh.read()
+        except Exception:
+            build_report = ""
+        report_ok = (
+            build_process_ok
+            and _native_json_field_is(build_report, "ok", "true")
+            and _native_json_field_is(
+                build_report, "build_ownership", '"owned"'
+            )
+            and _native_json_field_is(build_report, "host_assisted", "false")
+            and _native_json_field_is(build_report, "host_python", "null")
+            and _native_json_field_is(
+                build_report, "host_free_build_claim", "true"
+            )
+        )
+        if report_ok:
+            add_action("owned_meson_target_replay", build_command, "passed", 0)
+        else:
+            add_action("owned_meson_target_replay", build_command, "failed", 1)
+            diagnostics.append("PCC-PKG-OWNED-MESON-BUILD-FAILED")
+            reason = "owned_meson_build_failed"
+
+    actions += "]"
+    out = "{"
+    out += '"actions": ' + actions
+    out += ', "build_backend": "pcc-native-meson"'
+    out += ', "build_compiler": ' + _json_str_or_null(
+        compiler if compiler != "" else None
+    )
+    out += ', "build_mode_requested": "owned"'
+    out += ', "build_ownership": "owned"'
+    out += ', "diagnostics": ' + _json_str_list(diagnostics)
+    out += ', "host_assisted": false'
+    out += ', "host_free_build_claim": ' + ("true" if ok else "false")
+    out += ', "host_python": null'
+    out += ', "meson_source": ' + _json_str_or_null(meson_source)
+    out += ', "name": ' + _json_str(name)
+    out += ', "ok": ' + ("true" if ok else "false")
+    out += ', "reason": ' + _json_str_or_null(reason)
+    out += ', "skipped": false'
+    out += "}"
+    return out
+
+
+def _native_build_install_source_json(
+    name: str, source, abi: str, build_mode: str = "owned"
+) -> str:
+    if not (build_mode == "owned" or build_mode == "host"):
+        return (
+            '{"actions": [], "build_mode_requested": '
+            + _json_str(build_mode)
+            + ', "build_ownership": "unresolved", '
+            '"diagnostics": ["PCC-PKG-BUILD-MODE-INVALID"], '
+            '"host_assisted": false, "host_free_build_claim": false, '
+            '"host_python": null, "ok": false, '
+            '"reason": "build_mode_invalid", "skipped": false}'
+        )
     if source is None or not os.path.isdir(source):
         return (
-            '{"actions": [], "ok": true, "reason": "not_source_tree", "skipped": true}'
+            '{"actions": [], "build_mode_requested": '
+            + _json_str(build_mode)
+            + ', "build_ownership": "not-required", '
+            '"host_assisted": false, "host_free_build_claim": true, '
+            '"host_python": null, "ok": true, '
+            '"reason": "not_source_tree", "skipped": true}'
         )
-    if (
-        os.path.isfile(os.path.join(source, "meson.build"))
-        and abi == "pcc-native"
-        and _native_has_installable_meson_payload(name, source)
-    ):
+    has_meson_build = os.path.isfile(os.path.join(source, "meson.build"))
+    if build_mode == "owned" and has_meson_build:
+        # A source-tree report is not an ownership authority.  Re-enter the
+        # compiler/tool/source-bound receipt path; it may reuse its verified
+        # configured graph, but it never accepts a package-authored JSON claim
+        # as proof that a host interpreter was absent.
+        return _native_owned_meson_build_json(name, source)
+    if abi == "pcc-native" and _native_has_installable_meson_payload(name, source):
+        if build_mode == "owned":
+            return (
+                '{"actions": [], "build_backend": "existing", '
+                '"build_mode_requested": "owned", '
+                '"build_ownership": "prebuilt-unverified", '
+                '"diagnostics": ["PCC-PKG-BUILD-PROVENANCE-UNVERIFIED"], '
+                '"host_assisted": null, "host_free_build_claim": false, '
+                '"host_python": null, "ok": false, '
+                '"reason": "existing_build_provenance_unverified", '
+                '"skipped": false}'
+            )
         return (
             '{"actions": [], "build_backend": "existing", '
-            '"host_assisted": false, "ok": true, '
+            '"build_mode_requested": '
+            + _json_str(build_mode)
+            + ', "build_ownership": "prebuilt-unverified"'
+            + ', "host_assisted": null'
+            + ', "host_free_build_claim": false'
+            + ', "host_python": null, "ok": true, '
             '"reason": "existing_build_outputs", "skipped": true}'
         )
-    if os.path.isfile(os.path.join(source, "meson.build")) and abi == "pcc-native":
+    if has_meson_build and abi == "pcc-native":
         return _native_host_eager_meson_build_json(name, source)
-    if os.path.isfile(os.path.join(source, "meson.build")):
-        return _native_ensure_meson_build_outputs_json(source)
+    if has_meson_build:
+        return _native_ensure_meson_build_outputs_json(source, build_mode)
     c_files = _native_collect_suffix_files(source, [".c"], True)
     if len(c_files) == 0:
-        return '{"actions": [], "ok": true, "reason": "no_native_sources", "skipped": true}'
+        return (
+            '{"actions": [], "build_mode_requested": '
+            + _json_str(build_mode)
+            + ', "build_ownership": "not-required", '
+            '"host_assisted": false, "host_free_build_claim": true, '
+            '"host_python": null, "ok": true, '
+            '"reason": "no_native_sources", "skipped": true}'
+        )
     target = _native_single_package_extension_target(source)
     if target is None:
         return (
-            '{"actions": [], "diagnostics": '
+            '{"actions": [], "build_backend": "pcc-native", '
+            '"build_mode_requested": '
+            + _json_str(build_mode)
+            + ', "build_ownership": "owned", "diagnostics": '
             '["PCC-PKG-EXTENSION-TARGET-AMBIGUOUS"], '
-            '"ok": false, "reason": "extension_target_ambiguous", "skipped": false}'
+            '"host_assisted": false, "host_free_build_claim": false, '
+            '"host_python": null, "ok": false, '
+            '"reason": "extension_target_ambiguous", "skipped": false}'
         )
     return _native_build_exec_json(
         name,
@@ -9113,11 +9608,22 @@ def _native_build_install_source_json(name: str, source, abi: str) -> str:
         False,
         False,
         False,
+        build_mode,
     )
 
 
 def _native_has_installable_meson_payload(name: str, source: str) -> bool:
     """Return whether a matching importable Meson payload already exists."""
+    # A cached source tree is itself the already-built payload: it carries the
+    # package __init__.py plus the built native artifacts, but no meson build
+    # directory. Only looking under build/pcc-package/meson-build made a cache
+    # hit re-enter the configure path on a tree that has no build system, so
+    # the same spec installed twice reported success then failure.
+    if (
+        os.path.isfile(os.path.join(source, "__init__.py"))
+        and len(_native_collect_artifacts(source)) > 0
+    ):
+        return True
     build_root = os.path.join(source, "build", "pcc-package", "meson-build")
     if not os.path.isdir(build_root):
         return False
@@ -9167,6 +9673,22 @@ def _native_host_eager_meson_build_json(name: str, source: str) -> str:
         report_path,
         "--json",
     ]
+
+    def read_labeled_report():
+        try:
+            with open(report_path, "r", encoding="utf-8") as fh:
+                report = fh.read()
+        except Exception:
+            return None
+        if not _native_json_field_is(report, "build_ownership", '"host"'):
+            return None
+        if not _native_json_field_is(report, "host_assisted", "true"):
+            return None
+        if _native_json_field_is(report, "host_python", "null"):
+            return None
+        if _native_find_from(report, '"host_python"', 0) < 0:
+            return None
+        return report
     shell_command = ""
     i = 0
     while i < len(command):
@@ -9181,35 +9703,41 @@ def _native_host_eager_meson_build_json(name: str, source: str) -> str:
         _bootstrap_subprocess_run(["mkdir", "-p", build_root], check=True)
         _bootstrap_subprocess_run(["/bin/sh", "-c", redirected[0]], check=True)
     except Exception:
-        try:
-            with open(report_path, "r", encoding="utf-8") as fh:
-                return fh.read()
-        except Exception:
-            return (
-                '{"actions": [], "build_backend": "host", '
-                '"diagnostics": [{"code": '
-                '"PCC-PKG-HOST-BUILD-BACKEND-FAILED", "message": '
-                + _json_str(_native_build_log_tail(redirected[1]))
-                + '}], "host_assisted": true, "ok": false, '
-                '"reason": "host_build_backend_failed", "skipped": false}'
-            )
+        labeled = read_labeled_report()
+        if labeled is not None:
+            return labeled
+        return (
+            '{"actions": [], "build_backend": "host", '
+            '"build_mode_requested": "host", "build_ownership": "host", '
+            '"diagnostics": [{"code": '
+            '"PCC-PKG-HOST-BUILD-BACKEND-FAILED", "message": '
+            + _json_str(_native_build_log_tail(redirected[1]))
+            + '}], "host_assisted": true, "host_free_build_claim": false, '
+            '"host_python": '
+            + _json_str(host_python)
+            + ', "ok": false, '
+            '"reason": "host_build_backend_failed", "skipped": false}'
+        )
     finally:
         try:
             _bootstrap_subprocess_run(["rm", "-f", redirected[1]], check=True)
         except Exception:
             pass
-    try:
-        with open(report_path, "r", encoding="utf-8") as fh:
-            return fh.read()
-    except Exception:
-        return (
-            '{"actions": [], "build_backend": "host", '
-            '"diagnostics": [{"code": '
-            '"PCC-PKG-HOST-BUILD-REPORT-MISSING", "message": '
-            '"host build backend did not write its report"}], '
-            '"host_assisted": true, "ok": false, '
-            '"reason": "host_build_report_missing", "skipped": false}'
-        )
+    labeled = read_labeled_report()
+    if labeled is not None:
+        return labeled
+    return (
+        '{"actions": [], "build_backend": "host", '
+        '"build_mode_requested": "host", "build_ownership": "host", '
+        '"diagnostics": [{"code": '
+        '"PCC-PKG-HOST-BUILD-PROVENANCE-MISSING", "message": '
+        '"host build backend did not write complete ownership provenance"}], '
+        '"host_assisted": true, "host_free_build_claim": false, '
+        '"host_python": '
+        + _json_str(host_python)
+        + ', "ok": false, '
+        '"reason": "host_build_provenance_missing", "skipped": false}'
+    )
 
 
 def _native_install_manifest_json(
@@ -9220,6 +9748,8 @@ def _native_install_manifest_json(
     abi: str,
     index_urls=None,
     resolved_from_override=None,
+    build_mode: str = "owned",
+    force: bool = False,
 ) -> str:
     if index_urls is None:
         index_urls = []
@@ -9251,12 +9781,47 @@ def _native_install_manifest_json(
     target = target_dir or _pcc_default_package_site()
     cache_root = cache_dir or _pcc_default_package_cache()
     cache_record = os.path.abspath(os.path.join(cache_root, name))
+    artifact_sha256 = ""
+    if source is not None and os.path.isfile(source):
+        artifact_sha256 = _native_owned_file_sha256(source)
+    if not force:
+        satisfied = _native_already_satisfied_manifest_json(
+            os.path.abspath(target), name, artifact_sha256, abi
+        )
+        if satisfied is not None:
+            return satisfied
     prepared_source = [source, None]
     try:
         prepared_source = _native_prepare_install_source_tree(source, cache_root, name)
         install_source = prepared_source[0]
-        build_report = _native_build_install_source_json(name, install_source, abi)
+        build_report = _native_build_install_source_json(
+            name, install_source, abi, build_mode
+        )
         build_ok = _native_find_from(build_report, '"ok": false', 0) < 0
+        if not build_ok:
+            # Do not publish an unbuilt source tree after the owned build-tool
+            # boundary rejects it (or after an explicit host build fails).
+            # Returning the labeled build report is enough for both CLI
+            # surfaces to fail; site/cache must remain untouched.
+            _native_cleanup_prepared_source(prepared_source[1])
+            out = "{"
+            out += '"abi_mode": ' + _json_str(abi)
+            out += ', "build_mode_requested": ' + _json_str(build_mode)
+            out += ', "build_report": ' + build_report
+            out += ', "diagnostics": []'
+            out += ', "import_attempted": false'
+            out += ', "import_success": null'
+            out += ', "install_native_package_claim": false'
+            out += ', "install_success": false'
+            out += ', "linkage_native_package_claim": false'
+            out += ', "name": ' + _json_str(name)
+            out += ', "native_package_claim": false'
+            out += ', "ok": false'
+            out += ', "resolved_from": ' + _json_str_or_null(resolved_from)
+            out += ', "source_path": ' + _json_str_or_null(source)
+            out += ', "spec": ' + _json_str(spec)
+            out += "}"
+            return out
         install_root = _native_install_importable_payload(
             install_source, os.path.abspath(target), name
         )
@@ -9309,6 +9874,10 @@ def _native_install_manifest_json(
         manifest_path = os.path.join(install_root, "pcc-package.json")
         manifest = "{"
         manifest += '"abi_mode": ' + _json_str(abi)
+        manifest += ', "artifact_sha256": ' + _json_str_or_null(
+            None if artifact_sha256 == "" else artifact_sha256
+        )
+        manifest += ', "build_mode_requested": ' + _json_str(build_mode)
         manifest += ', "capability_profile": ' + _native_capability_profile_json(
             abi, native_artifact_count > 0, links_libpython, uses_cpython_abi
         )
@@ -9324,7 +9893,10 @@ def _native_install_manifest_json(
         manifest += ', "import_success": null'
         manifest += ', "install_native_package_claim": false'
         manifest += ', "install_success": ' + ("true" if install_ok else "false")
+        manifest += ', "install_action": "installed"'
         manifest += ', "installed_path": ' + _json_str(install_root)
+        manifest += ', "installed_payload": ' + _json_str(install_root)
+        manifest += ', "installed_payloads": [' + _json_str(install_root) + "]"
         manifest += ', "index_urls": ' + _json_str_list(index_urls)
         manifest += ', "link_libpython_edges": ' + _json_str_list(link_edges)
         manifest += ', "linkage_native_package_claim": ' + (
@@ -9385,6 +9957,10 @@ def _native_install_manifest_json(
         )
     out = "{"
     out += '"abi_mode": ' + _json_str(abi)
+    out += ', "artifact_sha256": ' + _json_str_or_null(
+        None if artifact_sha256 == "" else artifact_sha256
+    )
+    out += ', "build_mode_requested": ' + _json_str(build_mode)
     out += ', "capability_profile": ' + _native_capability_profile_json(
         abi, native_artifact_count > 0, links_libpython, uses_cpython_abi
     )
@@ -9400,7 +9976,10 @@ def _native_install_manifest_json(
     out += ', "import_success": null'
     out += ', "install_native_package_claim": false'
     out += ', "install_success": ' + ("true" if install_ok else "false")
+    out += ', "install_action": "installed"'
     out += ', "installed_path": ' + _json_str(install_root)
+    out += ', "installed_payload": ' + _json_str(install_root)
+    out += ', "installed_payloads": [' + _json_str(install_root) + "]"
     out += ', "index_urls": ' + _json_str_list(index_urls)
     out += ', "link_libpython_edges": ' + _json_str_list(link_edges)
     out += ', "linkage_native_package_claim": ' + (
@@ -9444,6 +10023,8 @@ def _run_native_package_install_from_pcc1(module_args) -> int:
     index_urls = []
     no_index = False
     abi = "pcc-native"
+    build_mode = "owned"
+    force = False
     i = 0
     while i < len(module_args):
         arg = module_args[i]
@@ -9493,16 +10074,40 @@ def _run_native_package_install_from_pcc1(module_args) -> int:
             i += 1
         elif arg.startswith("--abi="):
             abi = arg.split("=", 1)[1]
+        elif arg == "--build":
+            if i + 1 >= len(module_args):
+                _write_text("Error: --build requires a value", err=True)
+                return 2
+            build_mode = module_args[i + 1]
+            i += 1
+        elif arg.startswith("--build="):
+            build_mode = arg.split("=", 1)[1]
+        elif arg == "--force":
+            force = True
         elif arg != "--json" and not arg.startswith("-"):
             spec = arg
         i += 1
     if spec == "":
         _write_text('{"error": "missing package spec", "ok": false}')
         return 2
+    if not (build_mode == "owned" or build_mode == "host"):
+        _write_text(
+            '{"diagnostic": "PCC-PKG-BUILD-MODE-INVALID", '
+            '"error": "PCC-PKG-BUILD-MODE-INVALID", "ok": false}'
+        )
+        return 2
     if no_index:
         index_urls = []
     result = _native_install_manifest_json(
-        spec, target_dir, cache_dir, find_links, abi, index_urls
+        spec,
+        target_dir,
+        cache_dir,
+        find_links,
+        abi,
+        index_urls,
+        None,
+        build_mode,
+        force,
     )
     _write_text(result)
     return 2 if _native_find_from(result, '"ok": false', 0) >= 0 else 0
@@ -9594,55 +10199,20 @@ def _run_compiled_python_module_from_pcc1(module_name: str, module_args) -> int:
     if src is None:
         _write_text("Error: " + str(err), err=True)
         return 1
-    root = os.environ.get("TMPDIR") or "/tmp"
-    scratch = os.path.join(root, "pcc1-module-" + str(os.getpid()))
-    try:
-        _bootstrap_subprocess_run(["mkdir", "-p", scratch], check=True)
-    except Exception:
-        _write_text(
-            "Error: pcc1 module runner could not create scratch directory", err=True
-        )
-        return 1
-    tag = _sanitize_tag(module_name)
-    exe = os.path.join(scratch, tag + ".out")
-    try:
-        observability = ObservabilityOptions(
-            diagnostic_format="text",
-            profile_json=None,
-            explain_fallback=False,
-            phase="python-module",
-            entry="pcc1 -m",
-        )
-    except ValueError:
-        _write_text(
-            "Error: pcc1 module runner failed to configure diagnostics", err=True
-        )
-        return 1
-    formatted_error = _observed_compile_python(
-        src,
-        exe,
-        options=observability,
-        metadata={"emit_llvm": False, "output_path": exe, "module": module_name},
-        verbose=False,
-        emit_llvm_only=False,
-        libpython_mode="off",
-        ir_scaffold_mode="on",
-        backend="self",
-        python_library=False,
-    )
-    if formatted_error is not None:
-        return 1
-    cmd = [exe]
+    forwarded = [src]
     i = 0
     while i < len(module_args):
-        cmd.append(module_args[i])
+        forwarded.append(module_args[i])
         i += 1
-    try:
-        _bootstrap_subprocess_run(cmd, check=True)
-    except Exception:
-        _write_text("Error: pcc1 compiled module run failed", err=True)
-        return 1
-    return 0
+    # Reuse the script compiler/runner so module execution gets the same
+    # content-addressed run cache, exact exit-status handling, and artifact
+    # publication contract.  The validated startup envelope preserves the
+    # module-visible argv[0] while the physical cache path remains executable.
+    return _bootstrap_cli_main_impl(
+        forwarded,
+        _logical_argv0=src,
+        _execution_mode="module",
+    )
 
 
 def _run_python_module_from_pcc1(argv) -> int:
@@ -9651,6 +10221,14 @@ def _run_python_module_from_pcc1(argv) -> int:
         return 2
     module_name = argv[1]
     module_args = _copy_seq(argv[2:])
+    unsupported = _unsupported_tooling_module(module_name)
+    if unsupported is not None:
+        _write_text(
+            "Error: " + unsupported[0] + ": " + unsupported[1]
+            + "; pcc1 did not invoke CPython",
+            err=True,
+        )
+        return 2
     if module_name in ("pip", "pip3"):
         return _run_native_pip_shim_from_pcc1(module_args)
     if module_name == "pcc.package.pip_shim":
@@ -10436,10 +11014,17 @@ def parse_bootstrap_cli_args(argv=None):
     diagnostic_format = "text"
     profile_json = None
     explain_fallback = False
+    program_args = []
 
     i = 0
     while i < len(argv):
         arg = argv[i]
+        if path is not None and arg == "--":
+            i += 1
+            while i < len(argv):
+                program_args.append(argv[i])
+                i += 1
+            break
         if arg in ("-h", "--help"):
             return None, 0, None
         if arg in ("-v", "--verbose"):
@@ -10554,12 +11139,29 @@ def parse_bootstrap_cli_args(argv=None):
             output_path = argv[i + 1]
             i += 2
             continue
+        if arg == "--":
+            if i + 1 >= len(argv):
+                return None, 2, "-- requires a Python input path"
+            path = argv[i + 1]
+            i += 2
+            while i < len(argv):
+                program_args.append(argv[i])
+                i += 1
+            break
         if arg.startswith("-"):
-            return None, 2, f"unknown option: {arg}"
+            if path is None:
+                return None, 2, f"unknown option: {arg}"
+            while i < len(argv):
+                program_args.append(argv[i])
+                i += 1
+            break
         if path is None:
             path = arg
         else:
-            return None, 2, "bootstrap entry does not support program args"
+            while i < len(argv):
+                program_args.append(argv[i])
+                i += 1
+            break
         i += 1
 
     import os as _os
@@ -10580,6 +11182,7 @@ def parse_bootstrap_cli_args(argv=None):
             python_library,
             ir_scaffold,
             backend,
+            program_args,
             diagnostic_format,
             profile_json,
             explain_fallback,
@@ -10589,11 +11192,47 @@ def parse_bootstrap_cli_args(argv=None):
     )
 
 
-def _bootstrap_cli_main_impl(argv=None) -> int:
+def _bootstrap_cli_main_impl(
+    argv=None, _logical_argv0=None, _execution_mode="script"
+) -> int:
     if argv is None:
         raw_argv = _normalized_sys_argv()
     else:
         raw_argv = _copy_seq(argv)
+    if len(raw_argv) == 1 and raw_argv[0] == "--tooling-capabilities":
+        _write_text(python_tooling_capabilities_json())
+        return 0
+    if len(raw_argv) == 0:
+        _write_text(
+            "Error: PCC-CPY-UNSUPPORTED-L3-TOOLING-INTERACTIVE-REPL: "
+            "interactive REPL execution is not yet owned by pcc1; "
+            "use `pcc1 -` for stdin source",
+            err=True,
+        )
+        return 2
+    if raw_argv[0] == "-c":
+        if len(raw_argv) < 2:
+            _write_text("Error: -c requires a command", err=True)
+            return 2
+        applied_defaults = apply_locked_environment_resource_defaults()
+        restarted = _restart_with_locked_environment_defaults(
+            raw_argv,
+            applied_defaults,
+        )
+        if restarted is not None:
+            return restarted
+        return _run_inline_python_request("command", raw_argv[1], raw_argv[2:])
+    if raw_argv[0] == "-":
+        applied_defaults = apply_locked_environment_resource_defaults()
+        restarted = _restart_with_locked_environment_defaults(
+            raw_argv,
+            applied_defaults,
+        )
+        if restarted is not None:
+            return restarted
+        return _run_inline_python_request(
+            "stdin", _read_python_stdin_source(), raw_argv[1:]
+        )
     if len(raw_argv) > 0 and raw_argv[0] == "env":
         if len(raw_argv) not in (2, 3) or raw_argv[1] != "info":
             _write_text("Error: expected `pcc1 env info [--json]`", err=True)
@@ -10683,6 +11322,7 @@ def _bootstrap_cli_main_impl(argv=None) -> int:
         python_library,
         ir_scaffold,
         backend,
+        program_args,
         diagnostic_format,
         profile_json,
         explain_fallback,
@@ -10697,6 +11337,7 @@ def _bootstrap_cli_main_impl(argv=None) -> int:
     python_library = True if python_library else False
     ir_scaffold = None if ir_scaffold is None else (ir_scaffold or "") + ""
     backend = None if backend is None else (backend or "") + ""
+    logical_argv0 = path if _logical_argv0 is None else str(_logical_argv0)
 
     try:
         python_libpython, ir_scaffold, backend = _resolve_pcc1_python_modes(
@@ -10751,7 +11392,12 @@ def _bootstrap_cli_main_impl(argv=None) -> int:
         )
         if cache_path is not None and os.path.isfile(cache_path):
             try:
-                _bootstrap_subprocess_run([cache_path], check=True)
+                _bootstrap_subprocess_run(
+                    _python_program_command(
+                        cache_path, _execution_mode, logical_argv0, program_args
+                    ),
+                    check=True,
+                )
                 return 0
             except subprocess.CalledProcessError as exc:
                 return exc.returncode
@@ -10794,7 +11440,12 @@ def _bootstrap_cli_main_impl(argv=None) -> int:
             except Exception:
                 cache_path = exe_path
             try:
-                _bootstrap_subprocess_run([cache_path], check=True)
+                _bootstrap_subprocess_run(
+                    _python_program_command(
+                        cache_path, _execution_mode, logical_argv0, program_args
+                    ),
+                    check=True,
+                )
                 return 0
             except subprocess.CalledProcessError as exc:
                 return exc.returncode
@@ -10825,8 +11476,19 @@ def _bootstrap_cli_main_impl(argv=None) -> int:
             )
             if formatted_error is not None:
                 return 1
-            _bootstrap_subprocess_run([exe_path], check=True)
-            return 0
+            try:
+                _bootstrap_subprocess_run(
+                    _python_program_command(
+                        exe_path, _execution_mode, logical_argv0, program_args
+                    ),
+                    check=True,
+                )
+                return 0
+            except subprocess.CalledProcessError as exc:
+                return exc.returncode
+            except Exception:
+                _write_text("Error: pcc1 compiled program run failed", err=True)
+                return 1
         finally:
             _remove_bootstrap_run_tempdir(td)
 

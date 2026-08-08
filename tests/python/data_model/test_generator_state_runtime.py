@@ -35,6 +35,12 @@ def test_generator_next_send_finish_and_stop_value_native(
                 return py_gen_finish(gen, py_int_from_i64(99));
             }
 
+            static PyObject *silent_resume(PyObject *gen, PyObject *frame) {
+                (void)gen;
+                (void)frame;
+                return NULL;
+            }
+
             int main(void) {
                 PyObject *frame = py_tuple_new(0);
                 PyObject *gen = py_gen_new((void *)resume, frame);
@@ -59,6 +65,12 @@ def test_generator_next_send_finish_and_stop_value_native(
                 PyObject *d = py_gen_next(gen);
                 if (d != NULL) return 8;
                 if (!py_exc_matches(py_current_exception(), (PyObject *)py_exc_builtin_class(PY_EXC_STOPITERATION))) return 9;
+                py_clear_exception();
+
+                PyObject *silent = py_gen_new((void *)silent_resume, frame);
+                if (py_gen_next(silent) != NULL || !py_err_occurred()) return 10;
+                py_clear_exception();
+                if (py_gen_new(NULL, frame) != NULL || !py_err_occurred()) return 11;
                 py_clear_exception();
 
                 printf("generator-ok\\n");
@@ -96,3 +108,39 @@ def test_generator_finish_symbols_are_wired():
     assert '@c_abi_export("py_gen_finish")' in py_src
     assert "PyObject *py_gen_finish(PyObject *gen, PyObject *value);" in header
     assert '"py_gen_finish": (_PYOBJ, [_PYOBJ, _PYOBJ], False)' in abi
+
+
+def test_generator_resume_boundaries_attribute_silent_null_results():
+    c_src = Path("pcc/py_runtime/src/py_gen.c").read_text(encoding="utf-8")
+    py_src = Path("pcc/py_runtime/py/py_gen.py").read_text(encoding="utf-8")
+
+    messages = (
+        "generator construction received a NULL resume thunk or frame",
+        "generator construction could not allocate generator state",
+        "generator finish could not allocate StopIteration",
+        "generator resume returned NULL without StopIteration or an exception",
+        "coroutine send returned NULL without setting an exception",
+        "generator send returned NULL without StopIteration or an exception",
+        "generator throw returned NULL without setting an exception",
+        "generator close resume returned NULL without setting an exception",
+    )
+    for source in (c_src, py_src):
+        assert "py_runtime_error_if_unset" in source
+        for message in messages:
+            assert message in source
+
+    for source, resume, guard in (
+        (
+            c_src,
+            "g->resume(gen, frame)",
+            "generator resume returned NULL without StopIteration or an exception",
+        ),
+        (
+            py_src,
+            "call_ptr2(resume, gen, frame)",
+            "generator resume returned NULL without StopIteration or an exception",
+        ),
+    ):
+        resume_pos = source.index(resume)
+        guard_pos = source.index(guard, resume_pos)
+        assert resume_pos < guard_pos

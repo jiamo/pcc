@@ -13,6 +13,7 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -250,19 +251,36 @@ PyObject *py_os_getcwd_str(void) {
     return py_str_new(p, n);
 }
 
-/* `sys.path` — closed-world minimal: a list with cwd as the only
- * entry. CPython's sys.path is much richer (site-packages, PYTHONPATH,
- * etc.) but those entries need the import-machinery boot sequence;
- * pcc's closed-world programs don't import at runtime, so a single
- * cwd entry is sufficient for ``sys.path[0]`` / ``len(sys.path)``
- * style probes. */
+/* `sys.path` — closed-world minimal, but preserve CPython's path[0]
+ * contract for the owned entry modes.  Runtime package/import paths are
+ * compiled into the closed-world artifact and are not published here. */
 PyObject *py_sys_path_list(void) {
-    PyObject *cwd = py_os_getcwd_str();
-    if (cwd == NULL) {
-        cwd = py_str_new("", 0);
+    PyObject *path0 = NULL;
+    int32_t mode = py_program_mode();
+    if (mode == 3 || mode == 4) {
+        path0 = py_str_new("", 0);
+    } else if (mode == 1) {
+        const char *raw = py_program_argv(0);
+        const char *resolved = raw != NULL ? py_path_realpath(raw) : NULL;
+        if (resolved != NULL) {
+            const char *slash = strrchr(resolved, '/');
+            if (slash != NULL) {
+                int64_t length = slash == resolved
+                    ? 1
+                    : (int64_t)(slash - resolved);
+                path0 = py_str_new(resolved, length);
+            }
+        }
+    }
+    if (path0 == NULL) {
+        path0 = py_os_getcwd_str();
+    }
+    if (path0 == NULL) {
+        path0 = py_str_new("", 0);
     }
     PyObject *lst = py_list_new(0);
-    py_list_append(lst, cwd);
+    py_list_append(lst, path0);
+    py_decref(path0);
     return lst;
 }
 

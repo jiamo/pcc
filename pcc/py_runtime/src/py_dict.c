@@ -52,15 +52,7 @@
 static int  py_dict_rehash(PyDictObject *d, int64_t new_capacity);
 
 static int py_dict_pointer_can_have_header(PyObject *obj) {
-    uintptr_t bits = (uintptr_t)obj;
-    if (obj == NULL) return 0;
-    if (PY_IS_TAGGED_INT(obj)) return 0;
-    if (bits < 0x1000u) return 0;
-    if ((bits & 0x7u) != 0u) return 0;
-#if UINTPTR_MAX > 0xffffffffu
-    if ((bits >> 48) != 0u) return 0;
-#endif
-    return 1;
+    return pcc_gc_pointer_is_managed(obj) != 0;
 }
 
 static int py_object_is_dict(PyObject *obj) {
@@ -310,6 +302,7 @@ void py_dict_set(PyObject *dict, PyObject *key, PyObject *value) {
     PyDictObject *d = (PyDictObject *)dict;
 
     int64_t hash = py_obj_hash(key);
+    if (py_err_occurred()) return;
     int64_t slot, ix;
     py_dict_lookup(d, hash, key, &slot, &ix);
     if (ix >= 0) {
@@ -331,6 +324,7 @@ PyObject *py_dict_get(PyObject *dict, PyObject *key) {
     PyDictObject *d = (PyDictObject *)dict;
 
     int64_t hash = py_obj_hash(key);
+    if (py_err_occurred()) return NULL;
     int64_t slot, ix;
     py_dict_lookup(d, hash, key, &slot, &ix);
     if (ix < 0) return NULL;
@@ -343,6 +337,7 @@ PyObject *py_dict_get(PyObject *dict, PyObject *key) {
 PyObject *py_dict_get_default(PyObject *dict, PyObject *key, PyObject *def) {
     PyObject *v = py_dict_get(dict, key);
     if (v != NULL) return v;
+    if (py_err_occurred()) return NULL;
     py_incref(def);
     return def;
 }
@@ -353,6 +348,7 @@ PyObject *py_dict_get_default(PyObject *dict, PyObject *key, PyObject *def) {
 PyObject *py_dict_getitem(PyObject *dict, PyObject *key) {
     PyObject *v = py_dict_get(dict, key);
     if (v == NULL) {
+        if (py_err_occurred()) return NULL;
         PyObject *exc = py_exc_new_with_value(PY_EXC_KEYERROR, key);
         py_raise(exc);
         if (exc) py_decref(exc);
@@ -368,28 +364,51 @@ PyObject *py_dict_fromkeys(PyObject *iterable, PyObject *value) {
     PyObject *d = py_dict_new();
     if (d == NULL) return NULL;
     PyObject *it = py_obj_iter(iterable);
-    if (it != NULL) {
-        for (;;) {
-            PyObject *k = py_obj_next(it);
-            if (k == NULL) {
-                if (py_err_occurred()) {
-                    PyObject *cur = py_current_exception();
-                    PyObject *stop = py_exc_builtin_class(PY_EXC_STOPITERATION);
-                    if (py_exc_matches(cur, stop)) py_clear_exception();
-                }
-                break;
-            }
-            py_dict_set(d, k, value);
-            py_decref(k);
-        }
-        py_decref(it);
+    if (it == NULL) {
+        py_runtime_error_if_unset(
+            "py_obj_iter",
+            "dict.fromkeys could not create an iterator"
+        );
+        py_decref(d);
+        return NULL;
     }
+    for (;;) {
+        PyObject *k = py_obj_next(it);
+        if (k == NULL) {
+            if (py_err_occurred()) {
+                PyObject *cur = py_current_exception();
+                PyObject *stop = py_exc_builtin_class(PY_EXC_STOPITERATION);
+                if (py_exc_matches(cur, stop)) {
+                    py_clear_exception();
+                    break;
+                }
+            } else {
+                py_runtime_error_if_unset(
+                    "py_obj_next",
+                    "dict.fromkeys iterator returned NULL without an exception"
+                );
+            }
+            py_decref(it);
+            py_decref(d);
+            return NULL;
+        }
+        py_dict_set(d, k, value);
+        if (py_err_occurred()) {
+            py_decref(k);
+            py_decref(it);
+            py_decref(d);
+            return NULL;
+        }
+        py_decref(k);
+    }
+    py_decref(it);
     return d;
 }
 
 PyObject *py_dict_pop(PyObject *dict, PyObject *key) {
     PyObject *v = py_dict_get(dict, key);
     if (v == NULL) {
+        if (py_err_occurred()) return NULL;
         PyObject *exc = py_exc_new_with_value(PY_EXC_KEYERROR, key);
         py_raise(exc);
         if (exc) py_decref(exc);
@@ -431,6 +450,7 @@ int64_t py_dict_contains(PyObject *dict, PyObject *key) {
     if (!py_object_is_dict(dict) || key == NULL) return 0;
     PyDictObject *d = (PyDictObject *)dict;
     int64_t hash = py_obj_hash(key);
+    if (py_err_occurred()) return 0;
     int64_t slot, ix;
     py_dict_lookup(d, hash, key, &slot, &ix);
     return ix >= 0 ? 1 : 0;
@@ -440,6 +460,7 @@ int64_t py_dict_del(PyObject *dict, PyObject *key) {
     if (!py_object_is_dict(dict) || key == NULL) return -1;
     PyDictObject *d = (PyDictObject *)dict;
     int64_t hash = py_obj_hash(key);
+    if (py_err_occurred()) return -1;
     int64_t slot, ix;
     py_dict_lookup(d, hash, key, &slot, &ix);
     if (ix < 0) return -1;

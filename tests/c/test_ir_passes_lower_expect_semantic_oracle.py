@@ -10,10 +10,14 @@ import pytest
 from pcc.dependency_verdict import probe_executable_dependency
 from pcc.ir_passes.lower_expect import lower_expect_text
 from pcc.ir_passes.parity import run_upstream_opt
+from pcc.passes.llvm_text_pipeline import find_opt_binary
 
 
 ORACLE_MODE = "host llvmlite-MCJIT behavior + independent LLVM opt lower-expect"
-OPT_VERDICT = probe_executable_dependency("opt")
+OPT_VERDICT = probe_executable_dependency(
+    "opt",
+    resolver=lambda _name: find_opt_binary(),
+)
 
 EXPECT_IR = """
 declare i32 @llvm.expect.i32(i32, i32)
@@ -47,7 +51,11 @@ def test_lower_expect_matches_original_and_independent_llvm_opt_behavior():
         pytest.fail(OPT_VERDICT.skip_reason())
     pcc_ir, changed = lower_expect_text(EXPECT_IR)
     assert changed is True
-    upstream = run_upstream_opt(EXPECT_IR, "lower-expect")
+    upstream = run_upstream_opt(
+        EXPECT_IR,
+        "lower-expect",
+        opt_path=OPT_VERDICT.resolved_path,
+    )
     assert upstream.returncode == 0, upstream.stderr
 
     values = (-257, -1, 0, 1, 7, 255, 256, 1024, 2**31 - 1, -(2**31))

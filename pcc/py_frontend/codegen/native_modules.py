@@ -19,6 +19,7 @@ from ..py_ast import (
     If,
     Import,
     ImportFrom,
+    IntType,
     IntLit,
     Lambda,
     Name,
@@ -32,6 +33,11 @@ from ..py_ast import (
     With,
 )
 from . import marshal
+from .generator_lowering import emit_generator_may_park_call
+from .vthread_effect_analysis import (
+    vthread_proven_suspension_module_alias,
+    vthread_proven_value_alias,
+)
 
 _I1 = ir.IntType(1)
 _I8 = ir.IntType(8)
@@ -117,14 +123,54 @@ def _string_constant_value(name: str) -> Optional[str]:
     return None
 
 
+_VIRTUAL_THREAD_CONSTANTS = {
+    "OUTCOME_PENDING": 0,
+    "OUTCOME_RETURNED": 1,
+    "OUTCOME_RAISED": 2,
+    "OUTCOME_CANCELLED": 3,
+    "RECV_VALUE": 1,
+    "RECV_SENDER_CLOSED": 2,
+    "RECV_RECEIVER_CLOSED": 3,
+    "SELECT_LEFT": 0,
+    "SELECT_RIGHT": 1,
+}
+
+
 def _is_virtual_thread_export(name: str) -> bool:
     return (
-        name == "spawn"
+        name in _VIRTUAL_THREAD_CONSTANTS
+        or name == "spawn"
+        or name == "call"
+        or name == "join"
+        or name == "cancel"
+        or name == "mpsc"
+        or name == "oneshot"
+        or name == "sender_clone"
+        or name == "send"
+        or name == "recv"
+        or name == "close_sender"
+        or name == "close_receiver"
+        or name == "select2"
         or name == "run"
         or name == "run_until_idle"
         or name == "carrier_pool_start"
         or name == "carrier_pool_stop"
+        or name == "io_backend"
+        or name == "current"
+        or name == "yield_now"
+        or name == "sleep_current"
+        or name == "block_current_on_fd"
+        or name == "readable"
+        or name == "writable"
+        or name == "tcp_listen"
+        or name == "tcp_accept"
+        or name == "tcp_connect"
+        or name == "tcp_recv"
+        or name == "tcp_send_all"
+        or name == "tcp_close"
         or name == "result"
+        or name == "exception"
+        or name == "outcome"
         or name == "state"
         or name == "sleep"
         or name == "block_on_fd"
@@ -147,8 +193,33 @@ class NativeModuleAliasMixin:
         *,
         box_int_abi: bool,
     ) -> ir.Type:
+        # ``may_park`` is a source-level effect, not a semantic return type.
+        # Its definition is lowered through the native generator ABI and thus
+        # always returns the child continuation pointer, including source
+        # functions annotated ``-> None``.
+        if bool(info.get("may_park", False)):
+            return _CSTR
+        # The schema-carried ``returns_none`` bool survives the export round
+        # trip even where type descriptors degrade to ("dyn",) under the
+        # self-hosted compiler (encode_type's isinstance chain sees foreign
+        # node identity, so ``-> None`` encodes as dyn; see
+        # pipeline._export_returns_none and the class_gen method plans, which
+        # already consume the bool). A dyn-shaped return here declares this
+        # extern as returning a pointer against a ``ret void`` definition,
+        # and the caller then roots/increfs whatever the callee left in x0
+        # (pcc1-built pcc2 GC4 graph-lock deadlock).
+        if "returns_none" in info and bool(info["returns_none"]):
+            return _VOID
         ret_ty = decode_type(info["return_ty"])
-        if isinstance(ret_ty, NoneType):
+        # Match by stable type name as well as identity: under pcc1 self-host
+        # the decoded ``NoneType`` can come from a separately compiled copy of
+        # the types module, so ``isinstance`` sees a foreign class identity for
+        # a semantically identical None (same boundary that
+        # user_function_decl_lowering._is_none_return documents). Identity-only
+        # matching declared a ``-> None`` sibling as returning a pointer while
+        # its definition emitted ``ret void``; the caller then rooted and
+        # increfed whatever the callee left in x0.
+        if isinstance(ret_ty, NoneType) or getattr(ret_ty, "name", "") == "None":
             return _VOID
         if ret_ty is None:
             ret_ty = DynType(name="dyn")
@@ -182,6 +253,17 @@ class NativeModuleAliasMixin:
         if ident in self.env:
             return None
         alias = self._native_builtin_module_aliases.get(ident)
+        current_fd = getattr(self, "current_func_def", None)
+        if (
+            alias == "pcc.virtual_thread"
+            and current_fd is not None
+            and not vthread_proven_suspension_module_alias(
+                self.ast_module,
+                current_fd,
+                ident,
+            )
+        ):
+            return None
         if alias is not None:
             return alias
         if ident in self._module_globals:
@@ -192,6 +274,17 @@ class NativeModuleAliasMixin:
         if ident in self.env:
             return None
         alias = self._native_builtin_value_aliases.get(ident)
+        if alias is not None and alias.startswith("pcc.virtual_thread."):
+            current_fd = getattr(self, "current_func_def", None)
+            if current_fd is not None:
+                export_name = alias.rsplit(".", 1)[1]
+                if not vthread_proven_value_alias(
+                    self.ast_module,
+                    current_fd,
+                    ident,
+                    export_name,
+                ):
+                    return None
         if alias is not None:
             return alias
         if ident in self._module_globals:
@@ -207,9 +300,15 @@ class NativeModuleAliasMixin:
             isinstance(expr, Attr)
             and isinstance(expr.obj, Name)
             and self._native_builtin_module_for_name(expr.obj.ident) == "pcc"
-            and expr.name == "valueclass"
+            and expr.name
+            in (
+                "valueclass",
+                "i64_buffer",
+                "guarded_i64_dot",
+                "guarded_loop_counter",
+            )
         ):
-            return "pcc.valueclass"
+            return "pcc." + expr.name
         if (
             isinstance(expr, Attr)
             and isinstance(expr.obj, Name)
@@ -300,6 +399,17 @@ class NativeModuleAliasMixin:
         if (
             isinstance(expr, Attr)
             and isinstance(expr.obj, Name)
+            and self._native_builtin_module_for_name(expr.obj.ident) == "os"
+            and expr.name
+            in (
+                "_pcc_sha256_file_hex",
+                "_pcc_sha256_file_hex_bounded",
+            )
+        ):
+            return "os." + expr.name
+        if (
+            isinstance(expr, Attr)
+            and isinstance(expr.obj, Name)
             and self._native_builtin_module_for_name(expr.obj.ident) == "time"
             and expr.name in ("monotonic", "perf_counter", "time", "strftime")
         ):
@@ -359,10 +469,6 @@ class NativeModuleAliasMixin:
             return self._emit_native_os_urandom_call(args, kwargs)
         if builtin_value == "textwrap.dedent":
             return self._emit_native_textwrap_dedent_call(args, kwargs)
-        if builtin_value == "importlib.reload":
-            if kwargs or len(args) != 1:
-                return None
-            return self._emit_as_object(args[0])
         if builtin_value in (
             "copy.copy",
             "copy.deepcopy",
@@ -466,13 +572,6 @@ class NativeModuleAliasMixin:
             )
         if module_name == "contextvars" and attr.name == "ContextVar":
             return self._emit_native_contextvar_new(expr.args, expr.kwargs)
-        if module_name == "importlib":
-            if attr.name == "import_module" and len(expr.args) == 1 and not expr.kwargs:
-                return self._emit_native_importlib_import_module(expr)
-            if attr.name == "reload" and len(expr.args) == 1 and not expr.kwargs:
-                module = self._native_module_name_for_object_expr(expr.args[0])
-                if module is not None:
-                    return self._emit_native_module_placeholder(module)
         if module_name == "textwrap" and attr.name == "dedent":
             return self._emit_native_textwrap_dedent_call(expr.args, expr.kwargs)
         if module_name == "traceback" and attr.name in ("format_exc", "print_exc"):
@@ -487,7 +586,6 @@ class NativeModuleAliasMixin:
         return module_name in (
             "math",
             "sys",
-            "importlib",
         )
 
     def _is_native_dynamic_module(self, module_name: str) -> bool:
@@ -505,12 +603,19 @@ class NativeModuleAliasMixin:
                 "inf",
                 "nan",
                 "floor",
+                "copysign",
                 "sqrt",
                 "pow",
                 "__dict__",
             )
         if module_name == "pcc":
-            return attr_name in ("valueclass", "__dict__")
+            return attr_name in (
+                "valueclass",
+                "i64_buffer",
+                "guarded_i64_dot",
+                "guarded_loop_counter",
+                "__dict__",
+            )
         if module_name == "codecs":
             return attr_name in _CODECS_BOM_CONSTANTS
         if module_name == "sys":
@@ -579,6 +684,16 @@ class NativeModuleAliasMixin:
             return self._emit_native_module_constant(
                 {"value_kind": "bool", "value": False},
             )
+        if (
+            module_name == "pcc.virtual_thread"
+            and attr_name in _VIRTUAL_THREAD_CONSTANTS
+        ):
+            return self._emit_native_module_constant(
+                {
+                    "value_kind": "int",
+                    "value": _VIRTUAL_THREAD_CONSTANTS[attr_name],
+                },
+            )
         if module_name == "codecs" and attr_name in _CODECS_BOM_CONSTANTS:
             return self._emit_native_module_constant(
                 {"value_kind": "bytes", "value": _CODECS_BOM_CONSTANTS[attr_name]},
@@ -589,7 +704,7 @@ class NativeModuleAliasMixin:
             )
         if module_name == "sys" and attr_name == "maxsize":
             return self._emit_native_module_constant(
-                {"value_kind": "int", "value": 0x7FFFFFFFFFFFFFFF},
+                {"value_kind": "int", "value": ((0x7FFFFFFF << 32) | 0xFFFFFFFF)},
             )
         if module_name == "sys" and attr_name == "byteorder":
             # All currently supported pcc execution targets are little-endian;
@@ -619,19 +734,6 @@ class NativeModuleAliasMixin:
         if module_dict is not None:
             return module_dict
         return self._emit_str_literal(module_name)
-
-    def _emit_native_importlib_import_module(self, expr: Call) -> Optional[ir.Value]:
-        arg = expr.args[0]
-        if not isinstance(arg, StrLit):
-            return None
-        if self._is_native_dynamic_module(arg.value):
-            return self._emit_native_module_placeholder(arg.value)
-        self._emit_builtin_exception_and_branch(
-            "ImportError",
-            f"No module named {arg.value!r}",
-            expr.span,
-        )
-        return ir.Constant(_CSTR, None)
 
     def _emit_native_functools_partial_call(self, args, kwargs):
         if len(args) < 1:
@@ -1123,7 +1225,14 @@ class NativeModuleAliasMixin:
             )
         if import_module == "pcc":
             return all(
-                attr_name in ("valueclass",) for attr_name, _as_name in stmt.names
+                attr_name
+                in (
+                    "valueclass",
+                    "i64_buffer",
+                    "guarded_i64_dot",
+                    "guarded_loop_counter",
+                )
+                for attr_name, _as_name in stmt.names
             )
         if import_module == "re":
             return all(
@@ -1136,8 +1245,6 @@ class NativeModuleAliasMixin:
             )
         if import_module == "textwrap":
             return all(attr_name == "dedent" for attr_name, _as_name in stmt.names)
-        if import_module == "importlib":
-            return all(attr_name == "reload" for attr_name, _as_name in stmt.names)
         if import_module == "traceback":
             return all(
                 attr_name in ("format_exc", "print_exc")
@@ -1324,7 +1431,16 @@ class NativeModuleAliasMixin:
                 continue
             if (
                 attr_name
-                in ("floor", "ceil", "sqrt", "trunc", "gcd", "factorial", "isqrt")
+                in (
+                    "floor",
+                    "ceil",
+                    "copysign",
+                    "sqrt",
+                    "trunc",
+                    "gcd",
+                    "factorial",
+                    "isqrt",
+                )
                 and import_module == "math"
             ):
                 self._register_native_builtin_value_alias(
@@ -1342,6 +1458,16 @@ class NativeModuleAliasMixin:
                 self._register_native_builtin_value_alias(
                     local_name,
                     "pcc.valueclass",
+                )
+                continue
+            if (
+                attr_name
+                in ("i64_buffer", "guarded_i64_dot", "guarded_loop_counter")
+                and import_module == "pcc"
+            ):
+                self._register_native_builtin_value_alias(
+                    local_name,
+                    "pcc." + attr_name,
                 )
                 continue
             if (
@@ -1373,12 +1499,6 @@ class NativeModuleAliasMixin:
                 self._register_native_builtin_value_alias(
                     local_name,
                     "textwrap.dedent",
-                )
-                continue
-            if attr_name == "reload" and import_module == "importlib":
-                self._register_native_builtin_value_alias(
-                    local_name,
-                    "importlib.reload",
                 )
                 continue
             if attr_name in _CODECS_BOM_CONSTANTS and import_module == "codecs":
@@ -1461,10 +1581,20 @@ class NativeModuleAliasMixin:
             if import_module == "pcc.virtual_thread" and _is_virtual_thread_export(
                 attr_name
             ):
-                self._register_native_builtin_value_alias(
-                    local_name,
-                    "pcc.virtual_thread." + attr_name,
-                )
+                if attr_name in _VIRTUAL_THREAD_CONSTANTS:
+                    self._register_native_module_constant(
+                        local_name,
+                        {
+                            "kind": "constant",
+                            "value_kind": "int",
+                            "value": _VIRTUAL_THREAD_CONSTANTS[attr_name],
+                        },
+                    )
+                else:
+                    self._register_native_builtin_value_alias(
+                        local_name,
+                        "pcc.virtual_thread." + attr_name,
+                    )
                 continue
             if attr_name == "contextmanager" and import_module == "contextlib":
                 self._register_native_builtin_value_alias(
@@ -1570,6 +1700,8 @@ class NativeModuleAliasMixin:
                 local_name,
                 info,
             )
+            if bool(info.get("may_park", False)):
+                self._generator_func_names.add(local_name)
             identity_decorators = self._cross_module_identity_decorators
             if info.get("identity_decorator"):
                 identity_decorators[local_name] = True
@@ -1814,6 +1946,54 @@ class NativeModuleAliasMixin:
             ):
                 if (
                     self.current_func_def is None
+                    and info.get("kind") == "module_global"
+                ):
+                    value_ty = decode_type(
+                        info.get("value_ty", ("dyn",))
+                    ) or DynType(name="dyn")
+                    provider_boxes_int = bool(
+                        info.get("box_int_abi", self._should_box_python_ints())
+                    )
+                    if self._is_object(value_ty) or (
+                        isinstance(value_ty, IntType) and provider_boxes_int
+                    ):
+                        source_ir_ty = _CSTR
+                    else:
+                        source_ir_ty = self._storage_ir_type(value_ty)
+                    source_symbol = self._module_global_symbol_name(
+                        info.get("owning_module", src_module),
+                        info.get("export_name", attr_name),
+                    )
+                    source_gv = self.module.globals.get(source_symbol)
+                    if not isinstance(source_gv, ir.GlobalVariable):
+                        source_gv = ir.GlobalVariable(
+                            self.module,
+                            source_ir_ty,
+                            name=source_symbol,
+                        )
+                        source_gv.linkage = "external"
+                    local_gv, local_ty = self._module_globals[local_name]
+                    if not self._ir_type_matches(
+                        local_gv.value_type,
+                        source_gv.value_type,
+                    ):
+                        raise NotImplementedError(
+                            "cross-module global representation mismatch for "
+                            + src_module
+                            + "."
+                            + attr_name
+                        )
+                    imported_value = self.builder.load(
+                        source_gv,
+                        name=self._fresh("native.import.global." + local_name),
+                    )
+                    self._store_module_global_root_value(
+                        local_gv,
+                        imported_value,
+                        declared_ty=local_ty,
+                    )
+                if (
+                    self.current_func_def is None
                     and info.get("kind") != "typing_metadata"
                 ):
                     # A statically bound direct-call/class/constant import is
@@ -1869,7 +2049,12 @@ class NativeModuleAliasMixin:
         ``docs/investigations/python-native-module-alias-module-global-attr-attribute-error.md``.
         """
         value_ty = decode_type(info.get("value_ty", ("dyn",))) or DynType(name="dyn")
-        if self._is_object(value_ty):
+        provider_boxes_int = bool(
+            info.get("box_int_abi", self._should_box_python_ints())
+        )
+        if self._is_object(value_ty) or (
+            isinstance(value_ty, IntType) and provider_boxes_int
+        ):
             ir_ty = _CSTR
         else:
             ir_ty = self._storage_ir_type(value_ty)
@@ -1893,7 +2078,12 @@ class NativeModuleAliasMixin:
         info: dict,
     ) -> None:
         value_ty = decode_type(info.get("value_ty", ("dyn",))) or DynType(name="dyn")
-        if self._is_object(value_ty):
+        provider_boxes_int = bool(
+            info.get("box_int_abi", self._should_box_python_ints())
+        )
+        if self._is_object(value_ty) or (
+            isinstance(value_ty, IntType) and provider_boxes_int
+        ):
             ir_ty = _CSTR
         else:
             ir_ty = self._storage_ir_type(value_ty)
@@ -1904,7 +2094,14 @@ class NativeModuleAliasMixin:
             gv.linkage = "external"
         else:
             gv = existing
-        self._module_globals[local_name] = (gv, value_ty)
+        local_gv, _local_ty = self._ensure_module_global_name(local_name, value_ty)
+        if not self._ir_type_matches(local_gv.value_type, ir_ty):
+            raise NotImplementedError(
+                "cross-module global representation mismatch for "
+                + owning_module
+                + "."
+                + attr_name
+            )
 
     def _register_native_module_alias(
         self,
@@ -1925,7 +2122,7 @@ class NativeModuleAliasMixin:
         local_name: str,
         module_name: str,
     ) -> None:
-        """Track ``x = importlib.import_module("native_sibling")``.
+        """Track ``x = __import__("native_sibling")``.
 
         Unlike ``_native_module_aliases``, this binding represents a value
         produced by the dynamic import API, not a source-level ``import mod``
@@ -2145,26 +2342,14 @@ class NativeModuleAliasMixin:
             return parts
         return None
 
-    def _native_importlib_literal_module(self, expr: Expr) -> Optional[str]:
-        """Return the native module named by a literal dynamic import call."""
+    def _native_literal_dunder_import_module(self, expr: Expr) -> Optional[str]:
+        """Return the native module named by literal one-arg ``__import__``."""
         if not isinstance(expr, Call) or expr.kwargs or len(expr.args) != 1:
             return None
         if isinstance(expr.func, Name) and expr.func.ident == "__import__":
             arg = expr.args[0]
             if isinstance(arg, StrLit) and self._is_native_dynamic_module(arg.value):
                 return arg.value
-            return None
-        if not isinstance(expr.func, Attr) or not isinstance(expr.func.obj, Name):
-            return None
-        if self._native_builtin_module_for_name(expr.func.obj.ident) != "importlib":
-            return None
-        if expr.func.name == "import_module":
-            arg = expr.args[0]
-            if isinstance(arg, StrLit) and self._is_native_dynamic_module(arg.value):
-                return arg.value
-            return None
-        if expr.func.name == "reload":
-            return self._native_module_name_for_object_expr(expr.args[0])
         return None
 
     def _native_module_name_for_object_expr(self, expr: Expr) -> Optional[str]:
@@ -2177,7 +2362,7 @@ class NativeModuleAliasMixin:
                 return module_name
             return self._native_builtin_module_for_name(expr.ident)
         if isinstance(expr, Call):
-            return self._native_importlib_literal_module(expr)
+            return self._native_literal_dunder_import_module(expr)
         if (
             isinstance(expr, Subscript)
             and isinstance(expr.obj, Attr)
@@ -2226,7 +2411,12 @@ class NativeModuleAliasMixin:
             value_ty = decode_type(info.get("value_ty", ("dyn",))) or DynType(
                 name="dyn"
             )
-            if self._is_object(value_ty):
+            provider_boxes_int = bool(
+                info.get("box_int_abi", self._should_box_python_ints())
+            )
+            if self._is_object(value_ty) or (
+                isinstance(value_ty, IntType) and provider_boxes_int
+            ):
                 ir_ty = _CSTR
             else:
                 ir_ty = self._storage_ir_type(value_ty)
@@ -2653,6 +2843,13 @@ class NativeModuleAliasMixin:
 
     def _emit_native_module_constant(self, info: dict) -> ir.Value:
         value_kind = info.get("value_kind", info.get("kind"))
+        if self._freestanding_module:
+            if value_kind == "int" and type(info.get("value")) is int:
+                return ir.Constant(_I64, int(info["value"]))
+            raise NotImplementedError(
+                "freestanding compile-time scaffolds only support exact "
+                "integer constants"
+            )
         if value_kind == "str":
             return self._emit_str_literal(str(info.get("value", "")))
         if value_kind == "bytes":
@@ -2661,11 +2858,18 @@ class NativeModuleAliasMixin:
                 raw = raw.encode("latin-1")
             return self._emit_bytes_literal(bytes(raw))
         if value_kind == "int":
-            return self.builder.call(
-                self.runtime["py_int_from_i64"],
-                [ir.Constant(_I64, int(info.get("value", 0)))],
-                name=self._fresh("native.const.int"),
-            )
+            constant = int(info.get("value", 0))
+            # Same treatment an ordinary int literal gets: a small value
+            # materializes as a tagged constant instead of a call, so no
+            # allocation and no GC barriers.  Scaffold constants are almost
+            # all struct offsets and type tags, used as `load_i64(obj,
+            # SOME_OFFSET)` — the object form is then immediately unboxed to
+            # satisfy an i64 parameter.  Recording the literal lets that
+            # unboxing fold too, leaving a compile-time integer where two
+            # runtime calls used to be.
+            boxed = self._emit_int_literal_object(constant)
+            marshal.note_boxed_i64_constant(boxed, constant)
+            return boxed
         if value_kind == "bool":
             return self.builder.call(
                 self.runtime["py_bool_from_bit"],
@@ -3106,8 +3310,9 @@ class NativeModuleAliasMixin:
                 "positional arguments"
             )
 
-        cls_ptr = self.builder.load(
-            info.global_var, name=self._fresh(f".cls.{class_name}.field")
+        cls_ptr = self.class_lowering._load_class_object(
+            info,
+            f".cls.{class_name}.field",
         )
         inst = self.builder.call(
             self.runtime["py_instance_new"],
@@ -3280,12 +3485,67 @@ class NativeModuleAliasMixin:
             self._cross_module_func_defs[bind_name] = self._extern_info_to_funcdef(
                 bind_name, info
             )
+            if bool(info.get("may_park", False)):
+                self._generator_func_names.add(bind_name)
             identity_decorators = self._cross_module_identity_decorators
             if info.get("identity_decorator"):
                 identity_decorators[bind_name] = True
             else:
                 identity_decorators.pop(bind_name, None)
         return fn
+
+    def _emit_compiled_module_object_call(
+        self,
+        module_name: str,
+        attr: Attr,
+        expr: Call,
+    ) -> ir.Value:
+        """Call an export through its already-published native module object.
+
+        This preserves Python call binding when a direct cross-module ABI call
+        cannot supply omitted defaults.  The compiled function object's native
+        signature binder owns those defaults, so this remains no-libpython.
+        """
+        module_name_ptr = self._ptr_to_cstr(
+            self._cstr_global(
+                module_name,
+                f".pcc.compiled.call.module.{module_name}",
+            )
+        )
+        callable_obj = self.builder.call(
+            self.runtime["py_module_attr_get"],
+            [module_name_ptr, self._attr_name_ptr(attr.name)],
+            name=self._fresh(f"compiled.module.callable.{attr.name}"),
+        )
+        self._emit_attribute_error_if_null(
+            callable_obj,
+            attr.name,
+            attr.span,
+        )
+        kwdict_unpack = self._split_starstar_kwargs_unpack(expr.args)
+        arg_exprs = expr.args
+        kwargs_expr = None
+        if kwdict_unpack is not None:
+            arg_exprs, kwargs_expr = kwdict_unpack
+        args_owned = not self._is_starred_unpack(arg_exprs)
+        args_tuple = self._emit_dynamic_call_args_tuple(arg_exprs)
+        kwargs_obj = self._emit_dynamic_call_kwargs_object(
+            expr.kwargs,
+            kwargs_expr,
+            expr.span,
+        )
+        result = self.builder.call(
+            self.runtime["py_obj_call"],
+            [callable_obj, args_tuple, kwargs_obj],
+            name=self._fresh(f"compiled.module.call.{attr.name}"),
+        )
+        if args_owned:
+            self._gc_release(args_tuple)
+        if expr.kwargs or kwargs_expr is not None:
+            self._gc_release(kwargs_obj)
+        self._gc_release(callable_obj)
+        self._emit_post_call_err_check(expr.span)
+        return result
 
     def _maybe_emit_native_module_alias_call(self, expr: Call) -> Optional[ir.Value]:
         """Lower ``submod.fn(...)`` when ``submod`` was imported from a
@@ -3303,46 +3563,11 @@ class NativeModuleAliasMixin:
                     module_name = self._native_module_object_for_name(attr.obj.ident)
             if module_name is None:
                 return None
-            module_name_ptr = self._ptr_to_cstr(
-                self._cstr_global(
-                    module_name,
-                    f".pcc.compiled.call.module.{module_name}",
-                )
+            return self._emit_compiled_module_object_call(
+                module_name,
+                attr,
+                expr,
             )
-            callable_obj = self.builder.call(
-                self.runtime["py_module_attr_get"],
-                [module_name_ptr, self._attr_name_ptr(attr.name)],
-                name=self._fresh(f"compiled.module.callable.{attr.name}"),
-            )
-            self._emit_attribute_error_if_null(
-                callable_obj,
-                attr.name,
-                attr.span,
-            )
-            kwdict_unpack = self._split_starstar_kwargs_unpack(expr.args)
-            arg_exprs = expr.args
-            kwargs_expr = None
-            if kwdict_unpack is not None:
-                arg_exprs, kwargs_expr = kwdict_unpack
-            args_owned = not self._is_starred_unpack(arg_exprs)
-            args_tuple = self._emit_dynamic_call_args_tuple(arg_exprs)
-            kwargs_obj = self._emit_dynamic_call_kwargs_object(
-                expr.kwargs,
-                kwargs_expr,
-                expr.span,
-            )
-            result = self.builder.call(
-                self.runtime["py_obj_call"],
-                [callable_obj, args_tuple, kwargs_obj],
-                name=self._fresh(f"compiled.module.call.{attr.name}"),
-            )
-            if args_owned:
-                self._gc_release(args_tuple)
-            if expr.kwargs or kwargs_expr is not None:
-                self._gc_release(kwargs_obj)
-            self._gc_release(callable_obj)
-            self._emit_post_call_err_check(expr.span)
-            return result
         module_name, info = export
         kind = info.get("kind")
         if kind == "function":
@@ -3390,10 +3615,28 @@ class NativeModuleAliasMixin:
                 ast_func_def.args,
             ):
                 # Cross-module default expressions live in the callee's
-                # module scope. The direct-native extern path cannot safely
-                # inline them in the caller, so fall back to the existing
-                # CPython-backed module binding for these calls.
-                return None
+                # module scope.  Invoke the published pcc-native function
+                # object so its signature binder supplies them.  Falling
+                # through here used to import the same compiled module via
+                # CPython and broke strict no-libpython mode.
+                return self._emit_compiled_module_object_call(
+                    module_name,
+                    attr,
+                    expr,
+                )
+            if (
+                bool(info.get("may_park", False))
+                and len(getattr(self, "_generator_ctx_stack", ())) > 0
+            ):
+                effect_name = module_name + "." + attr.name
+                return emit_generator_may_park_call(
+                    self,
+                    expr,
+                    effect_name,
+                    fn=fn,
+                    ast_func_def=ast_func_def,
+                    effect_proven=True,
+                )
             if ast_func_def.is_async:
                 return self._emit_async_user_function_call(
                     attr.name,

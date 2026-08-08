@@ -89,6 +89,7 @@ class CrossModuleClassInferenceTests(unittest.TestCase):
             recursive_stdlib=True,
         )
         r = subprocess.run([exe], capture_output=True, text=True, timeout=20)
+        self._last_run_stderr = r.stderr
         ir_text = ""
         if os.path.isfile(ir_out):
             with open(ir_out, "r", encoding="utf-8") as fh:
@@ -157,6 +158,66 @@ class CrossModuleClassInferenceTests(unittest.TestCase):
         self.assertEqual(stdout, "ok\n")
         self._assert_no_cpy_dispatch(ir_text, "Gap 1 module-qualified")
 
+    def test_mixin_self_scalar_augassign_uses_receiver_field_layout(self):
+        """A mixin method's ``self.field += value`` must use the concrete
+        receiver's inferred field layout, just like ordinary attribute loads
+        and stores.  Dynamic getattr cannot see the composed self-host class's
+        fixed field slot and used to turn ``_tmp_counter += 1`` into
+        ``py_obj_inplace_op(NULL, 1, add)`` inside pcc1.
+        """
+        stdout, code, ir_text = self._compile_multi(
+            {
+                "ops.py": """
+                class OpsMixin:
+                    def bump(self) -> int:
+                        self.count += 1
+                        return self.count
+                """,
+                "main.py": """
+                from ops import OpsMixin
+
+                class Counter(OpsMixin):
+                    count: int
+
+                    def __init__(self) -> None:
+                        self.count = 0
+
+                def main() -> None:
+                    counter = Counter()
+                    print(counter.bump())
+                    print(counter.bump())
+
+                main()
+                """,
+            },
+            entry_module="main",
+        )
+        self.assertEqual(
+            code,
+            0,
+            f"binary exited {code}, stdout={stdout!r}, "
+            f"stderr={getattr(self, '_last_run_stderr', '')!r}",
+        )
+        self.assertEqual(stdout, "1\n2\n")
+        bump_match = re.search(
+            r"(?m)^define\b[^\n]*OpsMixin[^\n]*bump[^\n]*\{$",
+            ir_text,
+        )
+        self.assertIsNotNone(
+            bump_match,
+            "emitted IR is missing the OpsMixin.bump definition",
+        )
+        bump_start = bump_match.start()
+        bump_end = ir_text.index("\n}", bump_start)
+        bump_ir = ir_text[bump_start:bump_end]
+        self.assertIn("@py_instance_get_field", bump_ir)
+        self.assertNotIn(
+            "@py_obj_getattr",
+            bump_ir,
+            "typed mixin self-field augassign must not use dynamic getattr",
+        )
+        self._assert_no_cpy_dispatch(ir_text, "mixin self scalar augassign")
+
     def test_module_qualified_module_global_value(self):
         stdout, code, ir_text = self._compile_multi(
             {
@@ -177,6 +238,146 @@ class CrossModuleClassInferenceTests(unittest.TestCase):
         self.assertEqual(code, 0, f"binary exited {code}, stdout={stdout!r}")
         self.assertEqual(stdout, "2\n")
         self._assert_no_cpy_dispatch(ir_text, "module-qualified module global")
+
+    def test_unannotated_cross_module_method_keeps_object_return_abi(self):
+        stdout, code, ir_text = self._compile_multi(
+            {
+                "lib.py": """
+                class Registry:
+                    def __init__(self, value: str) -> None:
+                        self.value = value
+
+                    def get(self):
+                        return self.value
+
+                    def touch(self):
+                        self.value = "changed"
+                """,
+                "main.py": """
+                from lib import Registry
+
+                def main() -> None:
+                    registry = Registry("kept")
+                    print(registry.get())
+                    print(registry.touch() is None)
+                    print(registry.get())
+
+                main()
+                """,
+            },
+            entry_module="main",
+        )
+        self.assertEqual(
+            code,
+            0,
+            f"binary exited {code}, stdout={stdout!r}, "
+            f"stderr={getattr(self, '_last_run_stderr', '')!r}",
+        )
+        self.assertEqual(stdout, "kept\nTrue\nchanged\n")
+        get_match = re.search(
+            r"(?m)^define\s+ptr\s+@[^\n]*Registry[^\n]*get[^\n]*\{$",
+            ir_text,
+        )
+        self.assertIsNotNone(
+            get_match,
+            "an unannotated method definition must use the dynamic pointer ABI",
+        )
+        touch_match = re.search(
+            r"(?m)^define\s+ptr\s+@[^\n]*Registry[^\n]*touch[^\n]*\{$",
+            ir_text,
+        )
+        self.assertIsNotNone(
+            touch_match,
+            "unannotated implicit fallthrough must return the Python None object",
+        )
+        self._assert_no_cpy_dispatch(ir_text, "unannotated cross-module method")
+
+    def test_unannotated_cross_module_function_keeps_object_return_abi(self):
+        stdout, code, ir_text = self._compile_multi(
+            {
+                "lib.py": """
+                def identity(value):
+                    return value
+                """,
+                "main.py": """
+                from lib import identity
+
+                def main() -> None:
+                    print(identity("function-value"))
+
+                main()
+                """,
+            },
+            entry_module="main",
+        )
+        self.assertEqual(
+            code,
+            0,
+            f"binary exited {code}, stdout={stdout!r}, "
+            f"stderr={getattr(self, '_last_run_stderr', '')!r}",
+        )
+        self.assertEqual(stdout, "function-value\n")
+        identity_match = re.search(
+            r"(?m)^define\s+ptr\s+@[^\n]*identity[^\n]*\{$",
+            ir_text,
+        )
+        self.assertIsNotNone(
+            identity_match,
+            "an unannotated function definition must use the dynamic pointer ABI",
+        )
+        self._assert_no_cpy_dispatch(ir_text, "unannotated cross-module function")
+
+    def test_constructor_initialized_cross_module_field_keeps_receiver_type(self):
+        stdout, code, ir_text = self._compile_multi(
+            {
+                "lib.py": """
+                class Store:
+                    def __init__(self, path: str) -> None:
+                        self.path = path
+
+                class Context:
+                    def __init__(self) -> None:
+                        self.store = Store("durable.jsonl")
+
+                    def get(self, name: str):
+                        return self.store
+
+                class Kernel:
+                    def __init__(self) -> None:
+                        self.context = Context()
+                """,
+                "main.py": """
+                from lib import Kernel, Store
+
+                class Runtime:
+                    def __init__(self) -> None:
+                        self.kernel = Kernel()
+
+                    def resolve(self) -> Store:
+                        return self.kernel.context.get("sessionStore")
+
+                def main() -> None:
+                    print(Runtime().resolve().path)
+
+                main()
+                """,
+            },
+            entry_module="main",
+        )
+        self.assertEqual(
+            code,
+            0,
+            f"binary exited {code}, stdout={stdout!r}, "
+            f"stderr={getattr(self, '_last_run_stderr', '')!r}",
+        )
+        self.assertEqual(stdout, "durable.jsonl\n")
+        self.assertIsNone(
+            re.search(r"\bcall\s+[^\n]*@py_dict_get_default\b", ir_text),
+            "a typed user Context.get call must not lower as dict.get",
+        )
+        self._assert_no_cpy_dispatch(
+            ir_text, "constructor-initialized cross-module field"
+        )
 
     # -- Gap 2 ----------------------------------------------------------
 

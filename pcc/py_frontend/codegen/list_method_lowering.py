@@ -24,6 +24,7 @@ from ..py_ast import (
     UnaryOp,
 )
 from . import marshal
+from .freestanding_abi_constants import PY_TYPE_LIST
 
 _I1 = ir.IntType(1)
 _I32 = ir.IntType(32)
@@ -146,7 +147,7 @@ class ListMethodLoweringMixin:
             if expr.args:
                 return None
             if sort_key_spec is not None:
-                self._emit_list_insertion_sort_by_key(recv, sort_key_spec)
+                self._emit_list_sort_by_key(recv, sort_key_spec)
                 if sort_reverse_const:
                     self.builder.call(self.runtime["py_list_reverse"], [recv])
                 return self._emit_none_literal()
@@ -235,11 +236,13 @@ class ListMethodLoweringMixin:
                 idx_val = self._emit_expr_as_i64(expr.args[0])
             else:
                 return None
-            return self.builder.call(
+            popped = self.builder.call(
                 self.runtime["py_list_pop"],
                 [recv, idx_val],
                 name=self._fresh("dyn.list.pop"),
             )
+            self._emit_post_call_err_check(getattr(expr, "span", None))
+            return popped
 
         if name == "remove":
             if len(expr.args) != 1:
@@ -391,7 +394,7 @@ class ListMethodLoweringMixin:
         is_list = self.builder.icmp_signed(
             "==",
             tag,
-            ir.Constant(_I64, 5),
+            ir.Constant(_I64, PY_TYPE_LIST),
             name=self._fresh("dyn.list.recv.is_list"),
         )
 
@@ -475,7 +478,7 @@ class ListMethodLoweringMixin:
             # sort in place, then optionally reverse. Unsupported key callables
             # and non-constant reverse were already bounced by the kwargs guard.
             if sort_key_spec is not None:
-                self._emit_list_insertion_sort_by_key(recv, sort_key_spec)
+                self._emit_list_sort_by_key(recv, sort_key_spec)
                 if sort_reverse_const:
                     self.builder.call(
                         self.runtime["py_list_reverse"],
@@ -597,6 +600,7 @@ class ListMethodLoweringMixin:
                 [recv, idx_val],
                 name=self._fresh("list.pop"),
             )
+            self._emit_post_call_err_check(getattr(expr, "span", None))
             if not isinstance(list_ty.elem, DynType):
                 return marshal.marshal_from_object(
                     self.builder,
@@ -1020,15 +1024,146 @@ class ListMethodLoweringMixin:
             name=self._fresh("sorted.key.copy"),
         )
         self.builder.call(self.runtime["py_list_extend"], [new_list, src_obj])
-        self._emit_list_insertion_sort_by_key(new_list, key_spec)
+        self._emit_list_sort_by_key(new_list, key_spec)
         if reverse_const:
             self.builder.call(self.runtime["py_list_reverse"], [new_list])
         return new_list
 
+    def _emit_list_sort_by_key(self, recv, key_spec):
+        """Sort ``recv`` by ``key_spec`` in ``O(n log n)`` comparisons.
+
+        Emits a Schwartzian transform: build ``(key(elem), index, elem)``
+        tuples, hand them to ``py_obj_sorted`` — the runtime's bottom-up stable
+        merge sort — and write the third field back. Tuple comparison is
+        lexicographic, so ordering is by key with the original index breaking
+        ties, which is exactly the stable order the insertion-sort path below
+        produced.
+
+        This replaces that insertion sort on the hot path.  Insertion sort costs
+        ``n**2 / 2`` comparisons and evaluates the key TWICE per comparison, so
+        a 354-element sort ran ~124000 key calls; stack-map planning does 12186
+        such sorts for one oversized module, i.e. ~1.5 billion key calls.  The
+        transform needs ``n`` key calls plus ~``n log n`` tuple comparisons.
+        Measured under pcc1 on that shape: **13787 ms -> 260 ms**, identical
+        output.  (The runtime's keyless `py_obj_sorted` had the same fix applied
+        for the same reason; see its comment about insertion sort dominating
+        codegen-worker profiles.)
+        """
+        fn = self.current_function
+        n_val = self.builder.call(
+            self.runtime["py_list_len"], [recv], name=self._fresh("sortkey.n")
+        )
+        pairs = self.builder.call(
+            self.runtime["py_list_new"], [n_val], name=self._fresh("sortkey.pairs")
+        )
+        # ---- build pass: pairs[i] = (key(recv[i]), i, recv[i])
+        bi_slot = self._alloca_in_entry(_I64, name="sortkey.bi.addr")
+        self.builder.store(ir.Constant(_I64, 0), bi_slot)
+        bcond = fn.append_basic_block(name=self._fresh("sortkey.bcond"))
+        bbody = fn.append_basic_block(name=self._fresh("sortkey.bbody"))
+        bdone = fn.append_basic_block(name=self._fresh("sortkey.bdone"))
+        self.builder.branch(bcond)
+        self.builder.position_at_end(bcond)
+        bi = self.builder.load(bi_slot, name=self._fresh("sortkey.bi"))
+        self.builder.cbranch(
+            self.builder.icmp_signed("<", bi, n_val, name=self._fresh("sortkey.bcmp")),
+            bbody,
+            bdone,
+        )
+        self.builder.position_at_end(bbody)
+        bi_cur = self.builder.load(bi_slot, name=self._fresh("sortkey.bi.cur"))
+        elem = self.builder.call(
+            self.runtime["py_list_get"],
+            [recv, bi_cur],
+            name=self._fresh("sortkey.elem"),
+        )
+        key_val = self._emit_key_of(elem, key_spec)
+        idx_obj = self.builder.call(
+            self.runtime["py_int_from_i64"],
+            [bi_cur],
+            name=self._fresh("sortkey.idx"),
+        )
+        triple = self.builder.call(
+            self.runtime["py_tuple_new"],
+            [ir.Constant(_I64, 3)],
+            name=self._fresh("sortkey.triple"),
+        )
+        self.builder.call(
+            self.runtime["py_tuple_set_item"],
+            [triple, ir.Constant(_I64, 0), key_val],
+        )
+        self.builder.call(
+            self.runtime["py_tuple_set_item"],
+            [triple, ir.Constant(_I64, 1), idx_obj],
+        )
+        self.builder.call(
+            self.runtime["py_tuple_set_item"],
+            [triple, ir.Constant(_I64, 2), elem],
+        )
+        # append, not set: py_list_new(n) makes a length-0 list with capacity n,
+        # so an indexed store would be out of range and silently drop every
+        # element.  py_list_append and py_tuple_set_item both take their own
+        # reference, so the four locals built here are all released.
+        self.builder.call(self.runtime["py_list_append"], [pairs, triple])
+        self._gc_release(triple)
+        self._gc_release(idx_obj)
+        self._gc_release(key_val)
+        self._gc_release(elem)
+        self.builder.store(
+            self.builder.add(bi_cur, ir.Constant(_I64, 1), name=self._fresh("sortkey.bnext")),
+            bi_slot,
+        )
+        self.builder.branch(bcond)
+        self.builder.position_at_end(bdone)
+        ordered = self.builder.call(
+            self.runtime["py_obj_sorted"], [pairs], name=self._fresh("sortkey.ordered")
+        )
+        # ---- write-back pass: recv[i] = ordered[i][2]
+        wi_slot = self._alloca_in_entry(_I64, name="sortkey.wi.addr")
+        self.builder.store(ir.Constant(_I64, 0), wi_slot)
+        wcond = fn.append_basic_block(name=self._fresh("sortkey.wcond"))
+        wbody = fn.append_basic_block(name=self._fresh("sortkey.wbody"))
+        wdone = fn.append_basic_block(name=self._fresh("sortkey.wdone"))
+        self.builder.branch(wcond)
+        self.builder.position_at_end(wcond)
+        wi = self.builder.load(wi_slot, name=self._fresh("sortkey.wi"))
+        self.builder.cbranch(
+            self.builder.icmp_signed("<", wi, n_val, name=self._fresh("sortkey.wcmp")),
+            wbody,
+            wdone,
+        )
+        self.builder.position_at_end(wbody)
+        wi_cur = self.builder.load(wi_slot, name=self._fresh("sortkey.wi.cur"))
+        got = self.builder.call(
+            self.runtime["py_list_get"],
+            [ordered, wi_cur],
+            name=self._fresh("sortkey.got"),
+        )
+        elem_back = self.builder.call(
+            self.runtime["py_tuple_get_known"],
+            [got, ir.Constant(_I64, 2)],
+            name=self._fresh("sortkey.back"),
+        )
+        self.builder.call(self.runtime["py_list_set"], [recv, wi_cur, elem_back])
+        self._gc_release(elem_back)
+        self._gc_release(got)
+        self.builder.store(
+            self.builder.add(wi_cur, ir.Constant(_I64, 1), name=self._fresh("sortkey.wnext")),
+            wi_slot,
+        )
+        self.builder.branch(wcond)
+        self.builder.position_at_end(wdone)
+        self._gc_release(ordered)
+        self._gc_release(pairs)
+
     def _emit_list_insertion_sort_by_key(self, recv, key_spec):
         """In-place insertion sort of list ``recv`` ordering by
         ``py_obj_lt(key(elem), key(prev))``. Mirrors
-        _emit_list_sort_with_dunder_lt's CFG, swapping the per-pair compare."""
+        _emit_list_sort_with_dunder_lt's CFG, swapping the per-pair compare.
+
+        Superseded on the hot path by :meth:`_emit_list_sort_by_key`; kept
+        because it needs no temporaries and remains the reference for the
+        stable ordering that method must reproduce."""
         fn = self.current_function
         n_val = self.builder.call(
             self.runtime["py_list_len"], [recv], name=self._fresh("sortkey.len")

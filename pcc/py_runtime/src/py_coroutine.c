@@ -25,6 +25,17 @@ typedef struct {
     int32_t done;
 } PyCoroutineObject;
 
+static PyObject *coroutine_require_result(
+    PyObject *result,
+    const char *helper_name,
+    const char *message
+) {
+    if (result == NULL) {
+        py_runtime_error_if_unset(helper_name, message);
+    }
+    return result;
+}
+
 PyObject *py_coroutine_class(void) {
     static PyObject *cls = NULL;
     if (cls != NULL) return cls;
@@ -46,7 +57,13 @@ PyObject *py_coroutine_new_native(
     PyCoroutineObject *c = (PyCoroutineObject *)pcc_gc_alloc(
         (int64_t)sizeof(PyCoroutineObject), PY_TYPE_COROUTINE, 0
     );
-    if (c == NULL) return NULL;
+    if (c == NULL) {
+        return coroutine_require_result(
+            NULL,
+            "pcc_gc_alloc",
+            "coroutine construction could not allocate coroutine state"
+        );
+    }
     c->name = name;
     c->entry = (PyNativeFuncEntry)entry;
     c->captures = NULL;
@@ -58,12 +75,22 @@ PyObject *py_coroutine_new_native(
     int made_captures = captures_tuple == NULL;
     PyObject *captures = made_captures ? py_tuple_new(0) : captures_tuple;
     if (captures == NULL) {
+        coroutine_require_result(
+            NULL,
+            "py_tuple_new",
+            "coroutine construction could not allocate captures tuple"
+        );
         pcc_gc_release((PyObject *)c);
         return NULL;
     }
     int made_args = args_tuple == NULL;
     PyObject *args = made_args ? py_tuple_new(0) : args_tuple;
     if (args == NULL) {
+        coroutine_require_result(
+            NULL,
+            "py_tuple_new",
+            "coroutine construction could not allocate arguments tuple"
+        );
         if (made_captures) py_decref(captures);
         pcc_gc_release((PyObject *)c);
         return NULL;
@@ -109,7 +136,11 @@ PyObject *py_coroutine_run(PyObject *coro) {
         PyObject *args = pcc_gc_load_ptr((PyObject *)c, &c->args);
         result = c->entry(captures, args);
         if (result == NULL) {
-            return NULL;
+            return coroutine_require_result(
+                NULL,
+                c->name != NULL ? c->name : "coroutine entry",
+                "coroutine entry returned NULL without setting an exception"
+            );
         }
     } else {
         py_incref(result);
@@ -152,7 +183,13 @@ PyObject *py_coroutine_close(PyObject *coro) {
 }
 
 static PyObject *await_iterator(PyObject *it) {
-    if (it == NULL) return NULL;
+    if (it == NULL) {
+        return coroutine_require_result(
+            NULL,
+            "await_iterator",
+            "await iterator received NULL iterator"
+        );
+    }
     while (1) {
         PyObject *item = py_obj_next(it);
         if (item != NULL) {
@@ -175,7 +212,13 @@ static PyObject *await_iterator(PyObject *it) {
 }
 
 PyObject *py_await(PyObject *awaitable) {
-    if (awaitable == NULL) return NULL;
+    if (awaitable == NULL) {
+        return coroutine_require_result(
+            NULL,
+            "py_await",
+            "py_await received NULL awaitable"
+        );
+    }
     if (!PY_IS_TAGGED_INT(awaitable) && py_type_of(awaitable) == PY_TYPE_COROUTINE) {
         return py_coroutine_run(awaitable);
     }
@@ -185,8 +228,23 @@ PyObject *py_await(PyObject *awaitable) {
     PyObject *method = py_obj_getattr(awaitable, "__await__");
     if (method != NULL) {
         PyObject *args = py_tuple_new(0);
+        if (args == NULL) {
+            coroutine_require_result(
+                NULL,
+                "py_tuple_new",
+                "__await__ could not allocate its argument tuple"
+            );
+            py_decref(method);
+            return NULL;
+        }
         PyObject *iter = py_obj_call(method, args, py_None);
+        coroutine_require_result(
+            iter,
+            "__await__",
+            "__await__ returned NULL without setting an exception"
+        );
         py_decref(args);
+        py_decref(method);
         if (iter == NULL) return NULL;
         PyObject *result = await_iterator(iter);
         py_decref(iter);

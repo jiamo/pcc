@@ -13,6 +13,26 @@ PyStrObject layout (from py_internal.h):
 """
 
 from pcc.extern import extern, c_abi_export, c_ptr, c_int32, c_int64, c_void
+from pcc.py_runtime.py.py_abi_constants import (
+    PYBYTESOBJECT_BYTE_LEN_OFFSET,
+    PYBYTESOBJECT_DATA_OFFSET,
+    PYLISTOBJECT_ITEMS_OFFSET,
+    PYLISTOBJECT_LENGTH_OFFSET,
+    PYOBJECTHEADER_TYPE_TAG_OFFSET,
+    PYSTROBJECT_BYTE_LEN_OFFSET,
+    PYSTROBJECT_CP_LEN_OFFSET,
+    PYSTROBJECT_DATA_OFFSET,
+    PYSTROBJECT_HASH_OFFSET,
+    PYSTROBJECT_SIZE,
+    PYTUPLEOBJECT_ITEMS_OFFSET,
+    PYTUPLEOBJECT_LEN_OFFSET,
+    PY_TYPE_BYTEARRAY,
+    PY_TYPE_BYTES,
+    PY_TYPE_INT,
+    PY_TYPE_LIST,
+    PY_TYPE_STR,
+    PY_TYPE_TUPLE,
+)
 from pcc.unsafe import (
     cstr,
     free,
@@ -76,13 +96,13 @@ def _str_alloc(byte_len: int):
         return null()
     if byte_len > 9223372036854775807 - 41:
         return null()
-    s = pcc_gc_alloc(40 + byte_len + 1, 4, 0)
+    s = pcc_gc_alloc(PYSTROBJECT_SIZE + byte_len + 1, PY_TYPE_STR, 0)
     if ptr_is_null(s) != 0:
         return null()
-    store_i64(s, 16, byte_len)  # byte_len
-    store_i64(s, 24, -1)  # cp_len
-    store_i64(s, 32, -1)  # hash
-    store_i8(s, 40 + byte_len, 0)  # NUL terminator
+    store_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET, byte_len)  # byte_len
+    store_i64(s, PYSTROBJECT_CP_LEN_OFFSET, -1)  # cp_len
+    store_i64(s, PYSTROBJECT_HASH_OFFSET, -1)  # hash
+    store_i8(s, PYSTROBJECT_DATA_OFFSET + byte_len, 0)  # NUL terminator
     return s
 
 
@@ -160,53 +180,53 @@ def _byte_rfind(hay, hay_len: int, need, need_len: int) -> int:
 def _stringlike_data(o):
     if ptr_is_null(o) != 0:
         return null()
-    tag: int = load_i32(o, 8)
-    if tag == 4:
-        return ptr_add(o, 40)
-    if tag == 17 or tag == 18:
-        return ptr_add(o, 24)
+    tag: int = load_i32(o, PYOBJECTHEADER_TYPE_TAG_OFFSET)
+    if tag == PY_TYPE_STR:
+        return ptr_add(o, PYSTROBJECT_DATA_OFFSET)
+    if tag == PY_TYPE_BYTES or tag == PY_TYPE_BYTEARRAY:
+        return ptr_add(o, PYBYTESOBJECT_DATA_OFFSET)
     return null()
 
 
 def _stringlike_len(o) -> int:
     if ptr_is_null(o) != 0:
         return 0
-    tag: int = load_i32(o, 8)
-    if tag == 4 or tag == 17 or tag == 18:
-        return load_i64(o, 16)
+    tag: int = load_i32(o, PYOBJECTHEADER_TYPE_TAG_OFFSET)
+    if tag == PY_TYPE_STR or tag == PY_TYPE_BYTES or tag == PY_TYPE_BYTEARRAY:
+        return load_i64(o, PYBYTESOBJECT_BYTE_LEN_OFFSET)
     return 0
 
 
 def _byte_offset_to_cp_offset(s, byte_off: int) -> int:
     if byte_off <= 0:
         return 0
-    n: int = load_i64(s, 16)
+    n: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
     if byte_off >= n:
         byte_off = n
-    return _utf8_codepoint_count(ptr_add(s, 40), byte_off)
+    return _utf8_codepoint_count(ptr_add(s, PYSTROBJECT_DATA_OFFSET), byte_off)
 
 
 def _str_cp_len(s) -> int:
-    cp: int = load_i64(s, 24)
+    cp: int = load_i64(s, PYSTROBJECT_CP_LEN_OFFSET)
     if cp < 0:
-        cp = _utf8_codepoint_count(ptr_add(s, 40), load_i64(s, 16))
-        store_i64(s, 24, cp)
+        cp = _utf8_codepoint_count(ptr_add(s, PYSTROBJECT_DATA_OFFSET), load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET))
+        store_i64(s, PYSTROBJECT_CP_LEN_OFFSET, cp)
     return cp
 
 
 def _utf8_byte_offset_for_codepoint(s, cp_idx: int) -> int:
     if cp_idx <= 0:
         return 0
-    byte_len: int = load_i64(s, 16)
+    byte_len: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
     # Once _str_cp_len has proved an ASCII-only string, codepoint
     # offsets are byte offsets. The parser/lexer index source text by
     # position; without this fast path each s[i] rescans from byte 0.
-    cached_cp_len: int = load_i64(s, 24)
+    cached_cp_len: int = load_i64(s, PYSTROBJECT_CP_LEN_OFFSET)
     if cached_cp_len == byte_len:
         if cp_idx >= byte_len:
             return byte_len
         return cp_idx
-    data = ptr_add(s, 40)
+    data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
     seen: int = 0
     i: int = 0
     while i < byte_len:
@@ -220,12 +240,12 @@ def _utf8_byte_offset_for_codepoint(s, cp_idx: int) -> int:
 
 
 def _utf8_codepoint_byte_len(s, byte_off: int) -> int:
-    byte_len: int = load_i64(s, 16)
+    byte_len: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
     if byte_off < 0:
         return 0
     if byte_off >= byte_len:
         return 0
-    b: int = load_i8(ptr_add(s, 40), byte_off) & 0xFF
+    b: int = load_i8(ptr_add(s, PYSTROBJECT_DATA_OFFSET), byte_off) & 0xFF
     if (b & 128) == 0:
         return 1
     if (b & 224) == 192:
@@ -268,14 +288,14 @@ def _str_from_range(data, n: int):
     if ptr_is_null(out) != 0:
         return null()
     if n > 0:
-        memmove(ptr_add(out, 40), data, n)
+        memmove(ptr_add(out, PYSTROBJECT_DATA_OFFSET), data, n)
     return out
 
 
 def _type_of(obj) -> int:
     if is_tagged_int(obj) != 0:
-        return 2
-    return load_i32(obj, 8)
+        return PY_TYPE_INT
+    return load_i32(obj, PYOBJECTHEADER_TYPE_TAG_OFFSET)
 
 
 def _int_or_default(obj, default_value: int) -> int:
@@ -283,7 +303,7 @@ def _int_or_default(obj, default_value: int) -> int:
         return default_value
     if ptr_eq(obj, global_load_ptr("py_None")) != 0:
         return default_value
-    if _type_of(obj) == 2:
+    if _type_of(obj) == PY_TYPE_INT:
         return py_int_value_i64(obj)
     return default_value
 
@@ -292,24 +312,24 @@ def _int_or_default(obj, default_value: int) -> int:
 def py_str_byte_len(s) -> int:
     if ptr_is_null(s) != 0:
         return 0
-    return load_i64(s, 16)
+    return load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
 
 
 @c_abi_export("py_str_utf8")
 def py_str_utf8(s):
     if ptr_is_null(s) != 0:
         return null()
-    return ptr_add(s, 40)
+    return ptr_add(s, PYSTROBJECT_DATA_OFFSET)
 
 
 @c_abi_export("py_str_len")
 def py_str_len(s) -> int:
     if ptr_is_null(s) != 0:
         return 0
-    cp: int = load_i64(s, 24)
+    cp: int = load_i64(s, PYSTROBJECT_CP_LEN_OFFSET)
     if cp < 0:
-        cp = _utf8_codepoint_count(ptr_add(s, 40), load_i64(s, 16))
-        store_i64(s, 24, cp)
+        cp = _utf8_codepoint_count(ptr_add(s, PYSTROBJECT_DATA_OFFSET), load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET))
+        store_i64(s, PYSTROBJECT_CP_LEN_OFFSET, cp)
     return cp
 
 
@@ -321,13 +341,13 @@ def py_str_ord(s) -> int:
 
 
 def _utf8_ord_at_byte(s, byte_off: int) -> int:
-    byte_len: int = load_i64(s, 16)
+    byte_len: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
     if byte_off < 0:
         return -1
     if byte_off >= byte_len:
         return -1
     remaining: int = byte_len - byte_off
-    data = ptr_add(ptr_add(s, 40), byte_off)
+    data = ptr_add(ptr_add(s, PYSTROBJECT_DATA_OFFSET), byte_off)
     b0: int = load_i8(data, 0) & 255
     if b0 < 128:
         return b0
@@ -361,8 +381,8 @@ def py_str_ord_at_i64(s, idx: int) -> int:
     real: int = _normalise_index(idx, cp_len)
     if real < 0:
         return -1
-    if load_i64(s, 24) == load_i64(s, 16):
-        return load_i8(ptr_add(s, 40), real) & 255
+    if load_i64(s, PYSTROBJECT_CP_LEN_OFFSET) == load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET):
+        return load_i8(ptr_add(s, PYSTROBJECT_DATA_OFFSET), real) & 255
     bo: int = _utf8_byte_offset_for_codepoint(s, real)
     return _utf8_ord_at_byte(s, bo)
 
@@ -371,35 +391,35 @@ def py_str_ord_at_i64(s, idx: int) -> int:
 def py_str_byte_at_i64(s, idx: int) -> int:
     if ptr_is_null(s) != 0:
         return -1
-    byte_len: int = load_i64(s, 16)
+    byte_len: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
     if idx < 0:
         return -1
     if idx >= byte_len:
         return -1
-    return load_i8(ptr_add(s, 40), idx) & 255
+    return load_i8(ptr_add(s, PYSTROBJECT_DATA_OFFSET), idx) & 255
 
 
 @c_abi_export("py_str_utf8_encode")
 def py_str_utf8_encode(s):
     if ptr_is_null(s) != 0:
         return py_bytes_new(null(), 0)
-    byte_len: int = load_i64(s, 16)
+    byte_len: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
     if byte_len <= 0:
         return py_bytes_new(null(), 0)
-    return py_bytes_new(ptr_add(s, 40), byte_len)
+    return py_bytes_new(ptr_add(s, PYSTROBJECT_DATA_OFFSET), byte_len)
 
 
 @c_abi_export("py_str_latin1_encode")
 def py_str_latin1_encode(s):
     if ptr_is_null(s) != 0:
         return py_bytes_new(null(), 0)
-    byte_len: int = load_i64(s, 16)
+    byte_len: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
     if byte_len <= 0:
         return py_bytes_new(null(), 0)
     buf = malloc(byte_len)
     if ptr_is_null(buf):
         return null()
-    raw = ptr_add(s, 40)
+    raw = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
     i: int = 0
     out: int = 0
     while i < byte_len:
@@ -455,7 +475,7 @@ def py_str_latin1_encode(s):
 def py_str_byte_slice_i64(s, lo: int, hi: int):
     if ptr_is_null(s) != 0:
         return null()
-    byte_len: int = load_i64(s, 16)
+    byte_len: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
     if lo < 0:
         lo = 0
     if hi < lo:
@@ -464,10 +484,10 @@ def py_str_byte_slice_i64(s, lo: int, hi: int):
         lo = byte_len
     if hi > byte_len:
         hi = byte_len
-    out = _str_from_range(ptr_add(ptr_add(s, 40), lo), hi - lo)
+    out = _str_from_range(ptr_add(ptr_add(s, PYSTROBJECT_DATA_OFFSET), lo), hi - lo)
     if ptr_is_null(out) == 0:
-        if load_i64(s, 24) == byte_len:
-            store_i64(out, 24, load_i64(out, 16))
+        if load_i64(s, PYSTROBJECT_CP_LEN_OFFSET) == byte_len:
+            store_i64(out, PYSTROBJECT_CP_LEN_OFFSET, load_i64(out, PYSTROBJECT_BYTE_LEN_OFFSET))
     return out
 
 
@@ -485,7 +505,7 @@ def py_chr_from_i64(codepoint: int):
     out = _str_alloc(4)
     if ptr_is_null(out) != 0:
         return null()
-    data = ptr_add(out, 40)
+    data = ptr_add(out, PYSTROBJECT_DATA_OFFSET)
     if codepoint <= 127:
         store_i8(data, 0, codepoint)
         length = 1
@@ -504,7 +524,7 @@ def py_chr_from_i64(codepoint: int):
         store_i8(data, 2, 128 | ((codepoint >> 6) & 63))
         store_i8(data, 3, 128 | (codepoint & 63))
         length = 4
-    store_i64(out, 16, length)
+    store_i64(out, PYSTROBJECT_BYTE_LEN_OFFSET, length)
     store_i8(data, length, 0)
     return out
 
@@ -517,14 +537,14 @@ def py_str_eq(a, b) -> int:
         return 0
     if ptr_is_null(b) != 0:
         return 0
-    la: int = load_i64(a, 16)
-    lb: int = load_i64(b, 16)
+    la: int = load_i64(a, PYSTROBJECT_BYTE_LEN_OFFSET)
+    lb: int = load_i64(b, PYSTROBJECT_BYTE_LEN_OFFSET)
     if la != lb:
         return 0
     if la == 0:
         return 1
-    da = ptr_add(a, 40)
-    db = ptr_add(b, 40)
+    da = ptr_add(a, PYSTROBJECT_DATA_OFFSET)
+    db = ptr_add(b, PYSTROBJECT_DATA_OFFSET)
     return _bytes_eq(da, db, la)
 
 
@@ -534,9 +554,9 @@ def py_str_contains(s, sub) -> int:
         return 0
     if ptr_is_null(sub) != 0:
         return 0
-    sn: int = load_i64(s, 16)
-    pn: int = load_i64(sub, 16)
-    bo: int = _byte_find(ptr_add(s, 40), sn, ptr_add(sub, 40), pn)
+    sn: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
+    pn: int = load_i64(sub, PYSTROBJECT_BYTE_LEN_OFFSET)
+    bo: int = _byte_find(ptr_add(s, PYSTROBJECT_DATA_OFFSET), sn, ptr_add(sub, PYSTROBJECT_DATA_OFFSET), pn)
     if bo < 0:
         return 0
     return 1
@@ -548,9 +568,9 @@ def py_str_find(s, sub) -> int:
         return -1
     if ptr_is_null(sub) != 0:
         return -1
-    sn: int = load_i64(s, 16)
-    pn: int = load_i64(sub, 16)
-    bo: int = _byte_find(ptr_add(s, 40), sn, ptr_add(sub, 40), pn)
+    sn: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
+    pn: int = load_i64(sub, PYSTROBJECT_BYTE_LEN_OFFSET)
+    bo: int = _byte_find(ptr_add(s, PYSTROBJECT_DATA_OFFSET), sn, ptr_add(sub, PYSTROBJECT_DATA_OFFSET), pn)
     if bo < 0:
         return -1
     return _byte_offset_to_cp_offset(s, bo)
@@ -562,9 +582,9 @@ def py_str_rfind(s, sub) -> int:
         return -1
     if ptr_is_null(sub) != 0:
         return -1
-    sn: int = load_i64(s, 16)
-    pn: int = load_i64(sub, 16)
-    bo: int = _byte_rfind(ptr_add(s, 40), sn, ptr_add(sub, 40), pn)
+    sn: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
+    pn: int = load_i64(sub, PYSTROBJECT_BYTE_LEN_OFFSET)
+    bo: int = _byte_rfind(ptr_add(s, PYSTROBJECT_DATA_OFFSET), sn, ptr_add(sub, PYSTROBJECT_DATA_OFFSET), pn)
     if bo < 0:
         return -1
     return _byte_offset_to_cp_offset(s, bo)
@@ -606,9 +626,9 @@ def py_str_find_range(s, sub, start: int, end: int) -> int:
         end_byte: int = _utf8_byte_offset_for_codepoint(s, e)
         win_len: int = end_byte - start_byte
         if win_len >= 0:
-            pn: int = load_i64(sub, 16)
+            pn: int = load_i64(sub, PYSTROBJECT_BYTE_LEN_OFFSET)
             bo: int = _byte_find(
-                ptr_add(s, 40 + start_byte), win_len, ptr_add(sub, 40), pn
+                ptr_add(s, PYSTROBJECT_DATA_OFFSET + start_byte), win_len, ptr_add(sub, PYSTROBJECT_DATA_OFFSET), pn
             )
             if bo >= 0:
                 result = _byte_offset_to_cp_offset(s, start_byte + bo)
@@ -646,9 +666,9 @@ def py_str_rfind_range(s, sub, start: int, end: int) -> int:
         end_byte: int = _utf8_byte_offset_for_codepoint(s, e)
         win_len: int = end_byte - start_byte
         if win_len >= 0:
-            pn: int = load_i64(sub, 16)
+            pn: int = load_i64(sub, PYSTROBJECT_BYTE_LEN_OFFSET)
             bo: int = _byte_rfind(
-                ptr_add(s, 40 + start_byte), win_len, ptr_add(sub, 40), pn
+                ptr_add(s, PYSTROBJECT_DATA_OFFSET + start_byte), win_len, ptr_add(sub, PYSTROBJECT_DATA_OFFSET), pn
             )
             if bo >= 0:
                 result = _byte_offset_to_cp_offset(s, start_byte + bo)
@@ -661,7 +681,7 @@ def py_str_startswith(s, prefix) -> int:
         return 0
     if ptr_is_null(prefix) != 0:
         return 0
-    if load_i32(prefix, 8) == 7:
+    if load_i32(prefix, PYOBJECTHEADER_TYPE_TAG_OFFSET) == PY_TYPE_TUPLE:
         n: int = py_tuple_len(prefix)
         i: int = 0
         while i < n:
@@ -691,7 +711,7 @@ def py_str_endswith(s, suffix) -> int:
         return 0
     if ptr_is_null(suffix) != 0:
         return 0
-    if load_i32(suffix, 8) == 7:
+    if load_i32(suffix, PYOBJECTHEADER_TYPE_TAG_OFFSET) == PY_TYPE_TUPLE:
         n: int = py_tuple_len(suffix)
         i: int = 0
         while i < n:
@@ -720,10 +740,10 @@ def py_str_endswith(s, suffix) -> int:
 def py_str_isdigit(s) -> int:
     if ptr_is_null(s) != 0:
         return 0
-    n: int = load_i64(s, 16)
+    n: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
     if n == 0:
         return 0
-    data = ptr_add(s, 40)
+    data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
     i: int = 0
     while i < n:
         c: int = load_i8(data, i) & 0xFF
@@ -739,10 +759,10 @@ def py_str_isdigit(s) -> int:
 def py_str_isalpha(s) -> int:
     if ptr_is_null(s) != 0:
         return 0
-    n: int = load_i64(s, 16)
+    n: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
     if n == 0:
         return 0
-    data = ptr_add(s, 40)
+    data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
     i: int = 0
     while i < n:
         c: int = load_i8(data, i) & 0xFF
@@ -764,10 +784,10 @@ def py_str_isalpha(s) -> int:
 def py_str_isspace(s) -> int:
     if ptr_is_null(s) != 0:
         return 0
-    n: int = load_i64(s, 16)
+    n: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
     if n == 0:
         return 0
-    data = ptr_add(s, 40)
+    data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
     i: int = 0
     while i < n:
         c: int = load_i8(data, i) & 0xFF
@@ -795,10 +815,10 @@ def py_str_isspace(s) -> int:
 def py_str_isalnum(s) -> int:
     if ptr_is_null(s) != 0:
         return 0
-    n: int = load_i64(s, 16)
+    n: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
     if n == 0:
         return 0
-    data = ptr_add(s, 40)
+    data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
     i: int = 0
     while i < n:
         c: int = load_i8(data, i) & 0xFF
@@ -827,8 +847,8 @@ def py_str_isupper(s) -> int:
     # py_str_accessors.c.
     if ptr_is_null(s) != 0:
         return 0
-    n: int = load_i64(s, 16)
-    data = ptr_add(s, 40)
+    n: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
+    data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
     has_upper: int = 0
     i: int = 0
     while i < n:
@@ -845,8 +865,8 @@ def py_str_isupper(s) -> int:
 def py_str_islower(s) -> int:
     if ptr_is_null(s) != 0:
         return 0
-    n: int = load_i64(s, 16)
-    data = ptr_add(s, 40)
+    n: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
+    data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
     has_lower: int = 0
     i: int = 0
     while i < n:
@@ -865,8 +885,8 @@ def py_str_isascii(s) -> int:
     # semantics. Mirrors py_str_isascii in py_str_accessors.c.
     if ptr_is_null(s) != 0:
         return 0
-    n: int = load_i64(s, 16)
-    data = ptr_add(s, 40)
+    n: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
+    data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
     i: int = 0
     while i < n:
         c: int = load_i8(data, i) & 0xFF
@@ -883,10 +903,10 @@ def py_str_isidentifier(s) -> int:
     # ASCII-only input. Mirrors py_str_isidentifier in py_str_accessors.c.
     if ptr_is_null(s) != 0:
         return 0
-    n: int = load_i64(s, 16)
+    n: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
     if n == 0:
         return 0
-    data = ptr_add(s, 40)
+    data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
     i: int = 0
     while i < n:
         c: int = load_i8(data, i) & 0xFF
@@ -918,8 +938,8 @@ def py_str_isprintable(s) -> int:
     # py_str_accessors.c.
     if ptr_is_null(s) != 0:
         return 0
-    n: int = load_i64(s, 16)
-    data = ptr_add(s, 40)
+    n: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
+    data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
     i: int = 0
     while i < n:
         c: int = load_i8(data, i) & 0xFF
@@ -953,8 +973,8 @@ def py_str_istitle(s) -> int:
     # py_str_accessors.c.
     if ptr_is_null(s) != 0:
         return 0
-    n: int = load_i64(s, 16)
-    data = ptr_add(s, 40)
+    n: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
+    data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
     cased: int = 0
     prev_cased: int = 0
     i: int = 0
@@ -1028,8 +1048,8 @@ def py_str_rindex_of_range(s, sub, start: int, end: int) -> int:
 def py_textwrap_dedent(s):
     if ptr_is_null(s) != 0:
         return null()
-    n: int = load_i64(s, 16)
-    data = ptr_add(s, 40)
+    n: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
+    data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
     margin_start: int = -1
     margin_len: int = 0
     start: int = 0
@@ -1080,7 +1100,7 @@ def py_textwrap_dedent(s):
     result = _str_alloc(n)
     if ptr_is_null(result) != 0:
         return null()
-    out = ptr_add(result, 40)
+    out = ptr_add(result, PYSTROBJECT_DATA_OFFSET)
     out_len: int = 0
     start = 0
     while start < n:
@@ -1114,9 +1134,9 @@ def py_textwrap_dedent(s):
             memmove(ptr_add(out, out_len), ptr_add(data, body_end), ending_len)
             out_len = out_len + ending_len
         start = next_pos
-    store_i64(result, 16, out_len)
-    store_i64(result, 24, -1)
-    store_i64(result, 32, -1)
+    store_i64(result, PYSTROBJECT_BYTE_LEN_OFFSET, out_len)
+    store_i64(result, PYSTROBJECT_CP_LEN_OFFSET, -1)
+    store_i64(result, PYSTROBJECT_HASH_OFFSET, -1)
     store_i8(result, 40 + out_len, 0)
     return result
 
@@ -1125,8 +1145,8 @@ def py_textwrap_dedent(s):
 def py_str_strip(s):
     if ptr_is_null(s) != 0:
         return null()
-    n: int = load_i64(s, 16)
-    data = ptr_add(s, 40)
+    n: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
+    data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
     lo: int = 0
     hi: int = n
     done: int = 0
@@ -1150,8 +1170,8 @@ def py_str_strip(s):
 def py_str_lstrip(s):
     if ptr_is_null(s) != 0:
         return null()
-    n: int = load_i64(s, 16)
-    data = ptr_add(s, 40)
+    n: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
+    data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
     lo: int = 0
     hi: int = n
     done: int = 0
@@ -1168,8 +1188,8 @@ def py_str_lstrip(s):
 def py_str_rstrip(s):
     if ptr_is_null(s) != 0:
         return null()
-    n: int = load_i64(s, 16)
-    data = ptr_add(s, 40)
+    n: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
+    data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
     lo: int = 0
     hi: int = n
     done: int = 0
@@ -1196,10 +1216,10 @@ def _byte_in_chars(c: int, chars_data, n: int) -> int:
 def py_str_strip_chars(s, chars):
     if ptr_is_null(s) != 0:
         return null()
-    n: int = load_i64(s, 16)
-    data = ptr_add(s, 40)
-    cn: int = load_i64(chars, 16)
-    cdata = ptr_add(chars, 40)
+    n: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
+    data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
+    cn: int = load_i64(chars, PYSTROBJECT_BYTE_LEN_OFFSET)
+    cdata = ptr_add(chars, PYSTROBJECT_DATA_OFFSET)
     lo: int = 0
     hi: int = n
     done: int = 0
@@ -1223,10 +1243,10 @@ def py_str_strip_chars(s, chars):
 def py_str_lstrip_chars(s, chars):
     if ptr_is_null(s) != 0:
         return null()
-    n: int = load_i64(s, 16)
-    data = ptr_add(s, 40)
-    cn: int = load_i64(chars, 16)
-    cdata = ptr_add(chars, 40)
+    n: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
+    data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
+    cn: int = load_i64(chars, PYSTROBJECT_BYTE_LEN_OFFSET)
+    cdata = ptr_add(chars, PYSTROBJECT_DATA_OFFSET)
     lo: int = 0
     hi: int = n
     done: int = 0
@@ -1243,10 +1263,10 @@ def py_str_lstrip_chars(s, chars):
 def py_str_rstrip_chars(s, chars):
     if ptr_is_null(s) != 0:
         return null()
-    n: int = load_i64(s, 16)
-    data = ptr_add(s, 40)
-    cn: int = load_i64(chars, 16)
-    cdata = ptr_add(chars, 40)
+    n: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
+    data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
+    cn: int = load_i64(chars, PYSTROBJECT_BYTE_LEN_OFFSET)
+    cdata = ptr_add(chars, PYSTROBJECT_DATA_OFFSET)
     lo: int = 0
     hi: int = n
     done: int = 0
@@ -1263,12 +1283,12 @@ def py_str_rstrip_chars(s, chars):
 def py_str_upper(s):
     if ptr_is_null(s) != 0:
         return null()
-    n: int = load_i64(s, 16)
+    n: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
     out = _str_alloc(n)
     if ptr_is_null(out) != 0:
         return null()
-    src = ptr_add(s, 40)
-    dst = ptr_add(out, 40)
+    src = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
+    dst = ptr_add(out, PYSTROBJECT_DATA_OFFSET)
     i: int = 0
     while i < n:
         c: int = load_i8(src, i) & 0xFF
@@ -1277,8 +1297,8 @@ def py_str_upper(s):
                 c = c - 32  # 'a'-'A' = 32
         store_i8(dst, i, c)
         i = i + 1
-    cp: int = load_i64(s, 24)
-    store_i64(out, 24, cp)
+    cp: int = load_i64(s, PYSTROBJECT_CP_LEN_OFFSET)
+    store_i64(out, PYSTROBJECT_CP_LEN_OFFSET, cp)
     return out
 
 
@@ -1286,12 +1306,12 @@ def py_str_upper(s):
 def py_str_lower(s):
     if ptr_is_null(s) != 0:
         return null()
-    n: int = load_i64(s, 16)
+    n: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
     out = _str_alloc(n)
     if ptr_is_null(out) != 0:
         return null()
-    src = ptr_add(s, 40)
-    dst = ptr_add(out, 40)
+    src = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
+    dst = ptr_add(out, PYSTROBJECT_DATA_OFFSET)
     i: int = 0
     while i < n:
         c: int = load_i8(src, i) & 0xFF
@@ -1300,8 +1320,8 @@ def py_str_lower(s):
                 c = c + 32  # 'a'-'A' = 32
         store_i8(dst, i, c)
         i = i + 1
-    cp: int = load_i64(s, 24)
-    store_i64(out, 24, cp)
+    cp: int = load_i64(s, PYSTROBJECT_CP_LEN_OFFSET)
+    store_i64(out, PYSTROBJECT_CP_LEN_OFFSET, cp)
     return out
 
 
@@ -1309,12 +1329,12 @@ def py_str_lower(s):
 def py_str_capitalize(s):
     if ptr_is_null(s) != 0:
         return null()
-    n: int = load_i64(s, 16)
+    n: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
     out = _str_alloc(n)
     if ptr_is_null(out) != 0:
         return null()
-    src = ptr_add(s, 40)
-    dst = ptr_add(out, 40)
+    src = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
+    dst = ptr_add(out, PYSTROBJECT_DATA_OFFSET)
     i: int = 0
     while i < n:
         c: int = load_i8(src, i) & 0xFF
@@ -1328,8 +1348,8 @@ def py_str_capitalize(s):
                     c = c + 32
         store_i8(dst, i, c)
         i = i + 1
-    cp: int = load_i64(s, 24)
-    store_i64(out, 24, cp)
+    cp: int = load_i64(s, PYSTROBJECT_CP_LEN_OFFSET)
+    store_i64(out, PYSTROBJECT_CP_LEN_OFFSET, cp)
     return out
 
 
@@ -1338,12 +1358,12 @@ def py_str_swapcase(s):
     # ASCII swapcase, mirrors py_str_accessors.c::py_str_swapcase.
     if ptr_is_null(s) != 0:
         return null()
-    n: int = load_i64(s, 16)
+    n: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
     out = _str_alloc(n)
     if ptr_is_null(out) != 0:
         return null()
-    src = ptr_add(s, 40)
-    dst = ptr_add(out, 40)
+    src = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
+    dst = ptr_add(out, PYSTROBJECT_DATA_OFFSET)
     i: int = 0
     while i < n:
         c: int = load_i8(src, i) & 0xFF
@@ -1356,8 +1376,8 @@ def py_str_swapcase(s):
                     c = c + 32  # A-Z -> lower
         store_i8(dst, i, c)
         i = i + 1
-    cp: int = load_i64(s, 24)
-    store_i64(out, 24, cp)
+    cp: int = load_i64(s, PYSTROBJECT_CP_LEN_OFFSET)
+    store_i64(out, PYSTROBJECT_CP_LEN_OFFSET, cp)
     return out
 
 
@@ -1366,12 +1386,12 @@ def py_str_title(s):
     # ASCII titlecase, mirrors py_str_accessors.c::py_str_title.
     if ptr_is_null(s) != 0:
         return null()
-    n: int = load_i64(s, 16)
+    n: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
     out = _str_alloc(n)
     if ptr_is_null(out) != 0:
         return null()
-    src = ptr_add(s, 40)
-    dst = ptr_add(out, 40)
+    src = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
+    dst = ptr_add(out, PYSTROBJECT_DATA_OFFSET)
     prev_alpha: int = 0
     i: int = 0
     while i < n:
@@ -1395,8 +1415,8 @@ def py_str_title(s):
         store_i8(dst, i, c)
         prev_alpha = is_alpha
         i = i + 1
-    cp: int = load_i64(s, 24)
-    store_i64(out, 24, cp)
+    cp: int = load_i64(s, PYSTROBJECT_CP_LEN_OFFSET)
+    store_i64(out, PYSTROBJECT_CP_LEN_OFFSET, cp)
     return out
 
 
@@ -1419,14 +1439,14 @@ def py_str_concat(a, b):
         b = pcc_gc_note_relocation_read(b)
     tag_a: int = _type_of(a)
     tag_b: int = _type_of(b)
-    if tag_a != 4:
+    if tag_a != PY_TYPE_STR:
         pcc_debug_bad_str_concat(a, b, tag_a, tag_b)
         return null()
-    if tag_b != 4:
+    if tag_b != PY_TYPE_STR:
         pcc_debug_bad_str_concat(a, b, tag_a, tag_b)
         return null()
-    la: int = load_i64(a, 16)
-    lb: int = load_i64(b, 16)
+    la: int = load_i64(a, PYSTROBJECT_BYTE_LEN_OFFSET)
+    lb: int = load_i64(b, PYSTROBJECT_BYTE_LEN_OFFSET)
     if la < 0:
         pcc_debug_bad_str_concat(a, b, tag_a, tag_b)
         return null()
@@ -1437,8 +1457,8 @@ def py_str_concat(a, b):
         pcc_debug_bad_str_concat(a, b, tag_a, tag_b)
         return null()
     total: int = la + lb
-    cp_a: int = load_i64(a, 24)
-    cp_b: int = load_i64(b, 24)
+    cp_a: int = load_i64(a, PYSTROBJECT_CP_LEN_OFFSET)
+    cp_b: int = load_i64(b, PYSTROBJECT_CP_LEN_OFFSET)
     cp_len: int = -1
     if cp_a >= 0 and cp_b >= 0:
         cp_len = cp_a + cp_b
@@ -1448,25 +1468,25 @@ def py_str_concat(a, b):
         if ptr_is_null(tmp) != 0:
             return null()
         if la > 0:
-            memmove(tmp, ptr_add(a, 40), la)
+            memmove(tmp, ptr_add(a, PYSTROBJECT_DATA_OFFSET), la)
         if lb > 0:
-            memmove(ptr_add(tmp, la), ptr_add(b, 40), lb)
+            memmove(ptr_add(tmp, la), ptr_add(b, PYSTROBJECT_DATA_OFFSET), lb)
     out = _str_alloc(total)
     if ptr_is_null(out) != 0:
         if ptr_is_null(tmp) == 0:
             free(tmp)
         return null()
-    out_data = ptr_add(out, 40)
+    out_data = ptr_add(out, PYSTROBJECT_DATA_OFFSET)
     if moving_inputs and total > 0:
         memmove(out_data, tmp, total)
         free(tmp)
     else:
         if la > 0:
-            memmove(out_data, ptr_add(a, 40), la)
+            memmove(out_data, ptr_add(a, PYSTROBJECT_DATA_OFFSET), la)
         if lb > 0:
-            memmove(ptr_add(out_data, la), ptr_add(b, 40), lb)
+            memmove(ptr_add(out_data, la), ptr_add(b, PYSTROBJECT_DATA_OFFSET), lb)
     if cp_len >= 0:
-        store_i64(out, 24, cp_len)
+        store_i64(out, PYSTROBJECT_CP_LEN_OFFSET, cp_len)
     return out
 
 
@@ -1475,7 +1495,7 @@ def py_str_repeat(s, n):
     if ptr_is_null(s) != 0:
         return null()
     count: int = _int_or_default(n, 0)
-    byte_len: int = load_i64(s, 16)
+    byte_len: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
     if count <= 0:
         return py_str_new(null(), 0)
     if byte_len == 0:
@@ -1486,15 +1506,15 @@ def py_str_repeat(s, n):
     out = _str_alloc(total)
     if ptr_is_null(out) != 0:
         return null()
-    src = ptr_add(s, 40)
-    dst = ptr_add(out, 40)
+    src = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
+    dst = ptr_add(out, PYSTROBJECT_DATA_OFFSET)
     i: int = 0
     while i < count:
         memmove(ptr_add(dst, i * byte_len), src, byte_len)
         i = i + 1
-    cp: int = load_i64(s, 24)
+    cp: int = load_i64(s, PYSTROBJECT_CP_LEN_OFFSET)
     if cp >= 0:
-        store_i64(out, 24, cp * count)
+        store_i64(out, PYSTROBJECT_CP_LEN_OFFSET, cp * count)
     return out
 
 
@@ -1510,9 +1530,9 @@ def py_str_index(s, idx_obj):
         return null()
     bo: int = _utf8_byte_offset_for_codepoint(s, real)
     w: int = _utf8_codepoint_byte_len(s, bo)
-    out = _str_from_range(ptr_add(ptr_add(s, 40), bo), w)
+    out = _str_from_range(ptr_add(ptr_add(s, PYSTROBJECT_DATA_OFFSET), bo), w)
     if ptr_is_null(out) == 0:
-        store_i64(out, 24, 1)
+        store_i64(out, PYSTROBJECT_CP_LEN_OFFSET, 1)
     return out
 
 
@@ -1547,13 +1567,13 @@ def py_str_count_range(s, sub, start, end) -> int:
     if hi < lo:
         return 0
 
-    pn: int = load_i64(sub, 16)
+    pn: int = load_i64(sub, PYSTROBJECT_BYTE_LEN_OFFSET)
     if pn == 0:
         return hi - lo + 1
     byte_lo: int = _utf8_byte_offset_for_codepoint(s, lo)
     byte_hi: int = _utf8_byte_offset_for_codepoint(s, hi)
-    sdata = ptr_add(s, 40)
-    pdata = ptr_add(sub, 40)
+    sdata = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
+    pdata = ptr_add(sub, PYSTROBJECT_DATA_OFFSET)
     count: int = 0
     i: int = byte_lo
     while i + pn <= byte_hi:
@@ -1578,12 +1598,12 @@ def py_str_count_range(s, sub, start, end) -> int:
 def py_str_hash(s) -> int:
     if ptr_is_null(s) != 0:
         return 0
-    cached: int = load_i64(s, 32)
+    cached: int = load_i64(s, PYSTROBJECT_HASH_OFFSET)
     if cached != -1:
         return cached
     h: int = -3750763034362895579
-    data = ptr_add(s, 40)
-    n: int = load_i64(s, 16)
+    data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
+    n: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
     i: int = 0
     while i < n:
         b: int = load_i8(data, i) & 0xFF
@@ -1592,7 +1612,7 @@ def py_str_hash(s) -> int:
         i = i + 1
     if h == -1:
         h = -2
-    store_i64(s, 32, h)
+    store_i64(s, PYSTROBJECT_HASH_OFFSET, h)
     return h
 
 
@@ -1612,8 +1632,8 @@ def _str_splitlines_impl(s, keepends: int):
     out = py_list_new(4)
     if ptr_is_null(out) != 0:
         return null()
-    data = ptr_add(s, 40)
-    byte_len: int = load_i64(s, 16)
+    data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
+    byte_len: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
     start: int = 0
     i: int = 0
     while i < byte_len:
@@ -1658,8 +1678,8 @@ def _str_split_whitespace(s):
     out = py_list_new(4)
     if ptr_is_null(out) != 0:
         return null()
-    data = ptr_add(s, 40)
-    byte_len: int = load_i64(s, 16)
+    data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
+    byte_len: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
     i: int = 0
     while i < byte_len:
         while i < byte_len and _is_ascii_ws(load_i8(data, i) & 0xFF) != 0:
@@ -1678,7 +1698,7 @@ def _fill_byte_count(pad: int, fillobj) -> int:
     # Total bytes for `pad` fill codepoints (fill default ' ' is 1 byte).
     if ptr_is_null(fillobj) != 0:
         return pad
-    return pad * load_i64(fillobj, 16)
+    return pad * load_i64(fillobj, PYSTROBJECT_BYTE_LEN_OFFSET)
 
 
 def _fill_pad(buf, pos: int, pad: int, fillobj) -> int:
@@ -1690,8 +1710,8 @@ def _fill_pad(buf, pos: int, pad: int, fillobj) -> int:
             pos = pos + 1
             p = p + 1
         return pos
-    fill_bytes: int = load_i64(fillobj, 16)
-    fill_data = ptr_add(fillobj, 40)
+    fill_bytes: int = load_i64(fillobj, PYSTROBJECT_BYTE_LEN_OFFSET)
+    fill_data = ptr_add(fillobj, PYSTROBJECT_DATA_OFFSET)
     q: int = 0
     while q < pad:
         b: int = 0
@@ -1710,8 +1730,8 @@ def py_str_rjust(s, width: int, fillobj):
         py_incref(s)
         return s
     pad: int = width - n
-    s_bytes: int = load_i64(s, 16)
-    s_data = ptr_add(s, 40)
+    s_bytes: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
+    s_data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
     pad_bytes: int = _fill_byte_count(pad, fillobj)
     buf = py_mem_alloc(s_bytes + pad_bytes + 1)
     if ptr_is_null(buf) != 0:
@@ -1734,8 +1754,8 @@ def py_str_ljust(s, width: int, fillobj):
         py_incref(s)
         return s
     pad: int = width - n
-    s_bytes: int = load_i64(s, 16)
-    s_data = ptr_add(s, 40)
+    s_bytes: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
+    s_data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
     pad_bytes: int = _fill_byte_count(pad, fillobj)
     buf = py_mem_alloc(s_bytes + pad_bytes + 1)
     if ptr_is_null(buf) != 0:
@@ -1768,8 +1788,8 @@ def _re_escape_is_special(c: int) -> int:
 def py_re_escape(s):
     if ptr_is_null(s) != 0:
         return null()
-    data = ptr_add(s, 40)
-    byte_len: int = load_i64(s, 16)
+    data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
+    byte_len: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
     buf = py_mem_alloc(byte_len * 2 + 1)
     if ptr_is_null(buf) != 0:
         return null()
@@ -1797,10 +1817,10 @@ def py_str_rsplit_maxsplit(s, sep, maxsplit: int):
         return null()
     if maxsplit < 0:
         return py_str_split(s, sep)
-    data = ptr_add(s, 40)
-    byte_len: int = load_i64(s, 16)
-    sep_data = ptr_add(sep, 40)
-    sep_len: int = load_i64(sep, 16)
+    data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
+    byte_len: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
+    sep_data = ptr_add(sep, PYSTROBJECT_DATA_OFFSET)
+    sep_len: int = load_i64(sep, PYSTROBJECT_BYTE_LEN_OFFSET)
     if sep_len == 0:
         return py_list_new(0)
     if maxsplit == 0:
@@ -1852,8 +1872,8 @@ def py_str_center(s, width: int, fillobj):
     marg: int = width - n
     left: int = marg // 2 + (marg & width & 1)  # CPython center split
     right: int = marg - left
-    s_bytes: int = load_i64(s, 16)
-    s_data = ptr_add(s, 40)
+    s_bytes: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
+    s_data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
     pad_l: int = _fill_byte_count(left, fillobj)
     pad_r: int = _fill_byte_count(right, fillobj)
     buf = py_mem_alloc(s_bytes + pad_l + pad_r + 1)
@@ -1879,8 +1899,8 @@ def py_str_zfill(s, width: int):
         py_incref(s)
         return s
     pad: int = width - n
-    s_bytes: int = load_i64(s, 16)
-    s_data = ptr_add(s, 40)
+    s_bytes: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
+    s_data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
     sign: int = 0
     if s_bytes > 0:
         c0: int = load_i8(s_data, 0) & 0xFF
@@ -1916,8 +1936,8 @@ def py_str_expandtabs(s, tabsize: int):
     # py_str_accessors.c (ASCII/byte-oriented column tracking).
     if ptr_is_null(s) != 0:
         return null()
-    s_bytes: int = load_i64(s, 16)
-    s_data = ptr_add(s, 40)
+    s_bytes: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
+    s_data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
     mult: int = 1
     if tabsize > 1:
         mult = tabsize
@@ -1960,8 +1980,8 @@ def py_str_translate(s, table):
     # then fill). Mirrors py_str_translate in py_str_accessors.c (byte/ASCII).
     if ptr_is_null(s) != 0:
         return null()
-    byte_len: int = load_i64(s, 16)
-    data = ptr_add(s, 40)
+    byte_len: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
+    data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
     none = global_load_ptr("py_None")
     out_len: int = 0
     i: int = 0
@@ -1974,8 +1994,8 @@ def py_str_translate(s, table):
             out_len = out_len + 1
         elif ptr_eq(val, none) != 0:
             py_decref(val)
-        elif _type_of(val) == 4:  # PY_TYPE_STR
-            out_len = out_len + load_i64(val, 16)
+        elif _type_of(val) == PY_TYPE_STR:  # PY_TYPE_STR
+            out_len = out_len + load_i64(val, PYSTROBJECT_BYTE_LEN_OFFSET)
             py_decref(val)
         else:
             out_len = out_len + 1
@@ -1996,9 +2016,9 @@ def py_str_translate(s, table):
             pos = pos + 1
         elif ptr_eq(val2, none) != 0:
             py_decref(val2)
-        elif _type_of(val2) == 4:  # PY_TYPE_STR
-            vlen: int = load_i64(val2, 16)
-            vdata = ptr_add(val2, 40)
+        elif _type_of(val2) == PY_TYPE_STR:  # PY_TYPE_STR
+            vlen: int = load_i64(val2, PYSTROBJECT_BYTE_LEN_OFFSET)
+            vdata = ptr_add(val2, PYSTROBJECT_DATA_OFFSET)
             j: int = 0
             while j < vlen:
                 store_i8(buf, pos, load_i8(vdata, j))
@@ -2022,8 +2042,8 @@ def py_str_maketrans(x, y):
     # str.maketrans(x, y) -> {ord(x[i]): ord(y[i])} for the 2-arg form (equal
     # length). Mirrors py_str_maketrans in py_str_accessors.c. py_dict_set
     # increfs key+value, so the fresh ints are decref'd after.
-    xlen: int = load_i64(x, 16)
-    ylen: int = load_i64(y, 16)
+    xlen: int = load_i64(x, PYSTROBJECT_BYTE_LEN_OFFSET)
+    ylen: int = load_i64(y, PYSTROBJECT_BYTE_LEN_OFFSET)
     if xlen != ylen:
         py_raise(
             py_exc_new(
@@ -2031,8 +2051,8 @@ def py_str_maketrans(x, y):
             )
         )
         return null()
-    xdata = ptr_add(x, 40)
-    ydata = ptr_add(y, 40)
+    xdata = ptr_add(x, PYSTROBJECT_DATA_OFFSET)
+    ydata = ptr_add(y, PYSTROBJECT_DATA_OFFSET)
     d = py_dict_new()
     if ptr_is_null(d) != 0:
         return null()
@@ -2051,10 +2071,10 @@ def py_str_maketrans(x, y):
 def py_str_removeprefix(s, prefix):
     if ptr_is_null(s) != 0:
         return null()
-    data = ptr_add(s, 40)
-    byte_len: int = load_i64(s, 16)
-    p_data = ptr_add(prefix, 40)
-    p_len: int = load_i64(prefix, 16)
+    data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
+    byte_len: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
+    p_data = ptr_add(prefix, PYSTROBJECT_DATA_OFFSET)
+    p_len: int = load_i64(prefix, PYSTROBJECT_BYTE_LEN_OFFSET)
     if p_len > 0 and p_len <= byte_len and _bytes_eq(data, p_data, p_len) != 0:
         return _str_from_range(ptr_add(data, p_len), byte_len - p_len)
     py_incref(s)
@@ -2065,10 +2085,10 @@ def py_str_removeprefix(s, prefix):
 def py_str_removesuffix(s, suffix):
     if ptr_is_null(s) != 0:
         return null()
-    data = ptr_add(s, 40)
-    byte_len: int = load_i64(s, 16)
-    suf_data = ptr_add(suffix, 40)
-    suf_len: int = load_i64(suffix, 16)
+    data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
+    byte_len: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
+    suf_data = ptr_add(suffix, PYSTROBJECT_DATA_OFFSET)
+    suf_len: int = load_i64(suffix, PYSTROBJECT_BYTE_LEN_OFFSET)
     if (
         suf_len > 0
         and suf_len <= byte_len
@@ -2085,10 +2105,10 @@ def py_str_partition(s, sep):
     # Byte-level: sep boundaries fall on codepoint boundaries for valid UTF-8.
     if ptr_is_null(s) != 0:
         return null()
-    data = ptr_add(s, 40)
-    byte_len: int = load_i64(s, 16)
-    sep_data = ptr_add(sep, 40)
-    sep_len: int = load_i64(sep, 16)
+    data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
+    byte_len: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
+    sep_data = ptr_add(sep, PYSTROBJECT_DATA_OFFSET)
+    sep_len: int = load_i64(sep, PYSTROBJECT_BYTE_LEN_OFFSET)
     found: int = -1
     if sep_len > 0:
         i: int = 0
@@ -2130,10 +2150,10 @@ def py_str_rpartition(s, sep):
     # py_str_rpartition in py_str_accessors.c. No break: loop while found < 0.
     if ptr_is_null(s) != 0:
         return null()
-    data = ptr_add(s, 40)
-    byte_len: int = load_i64(s, 16)
-    sep_data = ptr_add(sep, 40)
-    sep_len: int = load_i64(sep, 16)
+    data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
+    byte_len: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
+    sep_data = ptr_add(sep, PYSTROBJECT_DATA_OFFSET)
+    sep_len: int = load_i64(sep, PYSTROBJECT_BYTE_LEN_OFFSET)
     found: int = -1
     if sep_len > 0 and sep_len <= byte_len:
         i: int = byte_len - sep_len
@@ -2172,7 +2192,7 @@ def py_str_rpartition(s, sep):
 def py_str_split(s, sep):
     if ptr_is_null(s) != 0:
         return null()
-    if _type_of(s) != 4:
+    if _type_of(s) != PY_TYPE_STR:
         # dyn-receiver .split fast path can reach non-str objects
         # (e.g. re.Pattern); dispatch generically instead of casting.
         # getattr + call (not py_obj_call_method1, which prepends the
@@ -2195,10 +2215,10 @@ def py_str_split(s, sep):
     if _is_none_or_null(sep) != 0:
         return _str_split_whitespace(s)
 
-    data = ptr_add(s, 40)
-    byte_len: int = load_i64(s, 16)
-    sep_data = ptr_add(sep, 40)
-    sep_len: int = load_i64(sep, 16)
+    data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
+    byte_len: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
+    sep_data = ptr_add(sep, PYSTROBJECT_DATA_OFFSET)
+    sep_len: int = load_i64(sep, PYSTROBJECT_BYTE_LEN_OFFSET)
     if sep_len == 0:
         return py_list_new(0)
 
@@ -2234,8 +2254,8 @@ def _str_split_whitespace_maxsplit(s, maxsplit: int):
     out = py_list_new(4)
     if ptr_is_null(out) != 0:
         return null()
-    data = ptr_add(s, 40)
-    byte_len: int = load_i64(s, 16)
+    data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
+    byte_len: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
     i: int = 0
     splits: int = 0
     while i < byte_len:
@@ -2260,7 +2280,7 @@ def _str_split_whitespace_maxsplit(s, maxsplit: int):
 def py_str_split_maxsplit(s, sep, maxsplit: int):
     if ptr_is_null(s) != 0:
         return null()
-    if _type_of(s) != 4:
+    if _type_of(s) != PY_TYPE_STR:
         # generic dispatch for non-str receivers (see py_str_split)
         method = py_obj_getattr(s, cstr("split"))
         if ptr_is_null(method) != 0:
@@ -2289,10 +2309,10 @@ def py_str_split_maxsplit(s, sep, maxsplit: int):
     if _is_none_or_null(sep) != 0:
         return _str_split_whitespace_maxsplit(s, maxsplit)
 
-    data = ptr_add(s, 40)
-    byte_len: int = load_i64(s, 16)
-    sep_data = ptr_add(sep, 40)
-    sep_len: int = load_i64(sep, 16)
+    data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
+    byte_len: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
+    sep_data = ptr_add(sep, PYSTROBJECT_DATA_OFFSET)
+    sep_len: int = load_i64(sep, PYSTROBJECT_BYTE_LEN_OFFSET)
     if sep_len == 0:
         return py_list_new(0)
 
@@ -2332,22 +2352,24 @@ def py_str_join(sep, lst):
         return null()
     sep = pcc_gc_note_relocation_read(sep)
     lst = pcc_gc_note_relocation_read(lst)
-    if _type_of(sep) != 4:
+    if _type_of(sep) != PY_TYPE_STR:
         return null()
     sequence_tag: int = _type_of(lst)
-    if sequence_tag != 5 and sequence_tag != 7:
+    if sequence_tag != PY_TYPE_LIST and sequence_tag != PY_TYPE_TUPLE:
         return null()
-    length: int = load_i64(lst, 16)
+    length: int = load_i64(lst, PYLISTOBJECT_LENGTH_OFFSET)
+    if sequence_tag == PY_TYPE_TUPLE:
+        length = load_i64(lst, PYTUPLEOBJECT_LEN_OFFSET)
     if length == 0:
         return py_str_new(null(), 0)
 
-    sep_len: int = load_i64(sep, 16)
+    sep_len: int = load_i64(sep, PYSTROBJECT_BYTE_LEN_OFFSET)
     if sep_len < 0:
         return null()
-    if sequence_tag == 5:
-        items = load_ptr(lst, 32)
+    if sequence_tag == PY_TYPE_LIST:
+        items = load_ptr(lst, PYLISTOBJECT_ITEMS_OFFSET)
     else:
-        items = ptr_add(lst, 24)
+        items = ptr_add(lst, PYTUPLEOBJECT_ITEMS_OFFSET)
     total: int = 0
     i: int = 0
     while i < length:
@@ -2355,13 +2377,13 @@ def py_str_join(sep, lst):
         if ptr_is_null(e) != 0:
             return null()
         tag: int = _type_of(e)
-        if tag != 4:
+        if tag != PY_TYPE_STR:
             return null()
         if i > 0:
             if total > 9223372036854775807 - sep_len:
                 return null()
             total = total + sep_len
-        elem_len: int = load_i64(e, 16)
+        elem_len: int = load_i64(e, PYSTROBJECT_BYTE_LEN_OFFSET)
         if elem_len < 0:
             return null()
         if total > 9223372036854775807 - elem_len:
@@ -2377,12 +2399,12 @@ def py_str_join(sep, lst):
     # pre-allocation object or list-items pointers while copying the payload.
     sep = pcc_gc_note_relocation_read(sep)
     lst = pcc_gc_note_relocation_read(lst)
-    if sequence_tag == 5:
-        items = load_ptr(lst, 32)
+    if sequence_tag == PY_TYPE_LIST:
+        items = load_ptr(lst, PYLISTOBJECT_ITEMS_OFFSET)
     else:
-        items = ptr_add(lst, 24)
-    out_data = ptr_add(out, 40)
-    sep_data = ptr_add(sep, 40)
+        items = ptr_add(lst, PYTUPLEOBJECT_ITEMS_OFFSET)
+    out_data = ptr_add(out, PYSTROBJECT_DATA_OFFSET)
+    sep_data = ptr_add(sep, PYSTROBJECT_DATA_OFFSET)
     off: int = 0
     i = 0
     while i < length:
@@ -2390,9 +2412,9 @@ def py_str_join(sep, lst):
         if i > 0 and sep_len > 0:
             memmove(ptr_add(out_data, off), sep_data, sep_len)
             off = off + sep_len
-        elem_len = load_i64(e, 16)
+        elem_len = load_i64(e, PYSTROBJECT_BYTE_LEN_OFFSET)
         if elem_len > 0:
-            memmove(ptr_add(out_data, off), ptr_add(e, 40), elem_len)
+            memmove(ptr_add(out_data, off), ptr_add(e, PYSTROBJECT_DATA_OFFSET), elem_len)
             off = off + elem_len
         i = i + 1
     return out
@@ -2406,12 +2428,12 @@ def _py_str_replace_impl(s, old, new_value, maxreplace: int):
     if ptr_is_null(new_value) != 0:
         return null()
 
-    data = ptr_add(s, 40)
-    old_data = ptr_add(old, 40)
-    new_data = ptr_add(new_value, 40)
-    s_len: int = load_i64(s, 16)
-    old_len: int = load_i64(old, 16)
-    new_len: int = load_i64(new_value, 16)
+    data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
+    old_data = ptr_add(old, PYSTROBJECT_DATA_OFFSET)
+    new_data = ptr_add(new_value, PYSTROBJECT_DATA_OFFSET)
+    s_len: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
+    old_len: int = load_i64(old, PYSTROBJECT_BYTE_LEN_OFFSET)
+    new_len: int = load_i64(new_value, PYSTROBJECT_BYTE_LEN_OFFSET)
 
     if old_len == 0:
         return py_str_new(data, s_len)
@@ -2445,7 +2467,7 @@ def _py_str_replace_impl(s, old, new_value, maxreplace: int):
     out = _str_alloc(total)
     if ptr_is_null(out) != 0:
         return null()
-    dst = ptr_add(out, 40)
+    dst = ptr_add(out, PYSTROBJECT_DATA_OFFSET)
 
     read: int = 0
     write: int = 0

@@ -9,6 +9,7 @@ from typing import Optional
 
 from pcc.llvm_capi.compat import ir
 
+from .self_module_contracts import IR_SCAFFOLD_CONTRACT, module_has_contract
 from ..py_ast import (
     Attr,
     BoolLit,
@@ -27,6 +28,7 @@ from ..py_ast import (
 
 
 _I1 = ir.IntType(1)
+_I32 = ir.IntType(32)
 _I64 = ir.IntType(64)
 _DOUBLE = ir.DoubleType()
 _VOID = ir.VoidType()
@@ -119,6 +121,8 @@ _IR_BUILDER_METHODS = frozenset(
         "mul",
         "sdiv",
         "srem",
+        "udiv",
+        "urem",
         # bitwise / logical
         "and_",
         "or_",
@@ -164,6 +168,9 @@ _IR_BUILDER_METHODS = frozenset(
         "fence",
         "atomic_rmw",
         "cmpxchg",
+        "load_atomic",
+        "store_atomic",
+        "syscall6",
         # generic
         "call",
         "call4_i32",
@@ -250,6 +257,8 @@ _IR_SCAFFOLD_SIMPLE_METHODS: dict = {
     "mul": ("ptr", 2),
     "sdiv": ("ptr", 2),
     "srem": ("ptr", 2),
+    "udiv": ("ptr", 2),
+    "urem": ("ptr", 2),
     "and_": ("ptr", 2),
     "or_": ("ptr", 2),
     "xor": ("ptr", 2),
@@ -273,6 +282,9 @@ _IR_SCAFFOLD_SIMPLE_METHODS: dict = {
     "fcmp_unordered": ("ptr", 3),
     "atomic_rmw": ("ptr", 4),
     "cmpxchg": ("ptr", 5),
+    "load_atomic": ("ptr", 3),
+    "store_atomic": ("void", 4),
+    "syscall6": ("ptr", 7),
     "invoke": ("ptr", 4),
     # Type method — receiver may be any ir.X type instance; routed
     # via _IR_UNAMBIGUOUS_METHODS with bespoke flexible-arity handler.
@@ -300,6 +312,8 @@ _IR_SCAFFOLD_METHOD_OPTIONAL_PARAMS: dict = {
     "mul": ("name",),
     "sdiv": ("name",),
     "srem": ("name",),
+    "udiv": ("name",),
+    "urem": ("name",),
     "and_": ("name",),
     "or_": ("name",),
     "xor": ("name",),
@@ -323,6 +337,8 @@ _IR_SCAFFOLD_METHOD_OPTIONAL_PARAMS: dict = {
     "fcmp_unordered": ("name",),
     "atomic_rmw": ("name",),
     "cmpxchg": ("name",),
+    "load_atomic": ("name", "typ"),
+    "syscall6": ("name",),
     "invoke": ("name",),
 }
 
@@ -423,6 +439,8 @@ _IR_SCAFFOLD_METHOD_IMPL: frozenset = frozenset(
         "mul",
         "sdiv",
         "srem",
+        "udiv",
+        "urem",
         "and_",
         "or_",
         "xor",
@@ -446,6 +464,9 @@ _IR_SCAFFOLD_METHOD_IMPL: frozenset = frozenset(
         "fcmp_unordered",
         "atomic_rmw",
         "cmpxchg",
+        "load_atomic",
+        "store_atomic",
+        "syscall6",
         "invoke",
         "as_pointer",
         "call",
@@ -1092,9 +1113,10 @@ class IrScaffoldLoweringMixin:
 
     def _scaffold_to_handle(self, expr: Expr) -> ir.Value:
         """Lower ``expr`` to an opaque ``i8*`` handle for scaffold
-        extern calls. Lowers via the regular ``_emit_expr`` then
-        bitcasts/inttoptrs the result to ``i8*`` regardless of source
-        type.
+        extern calls. Object-backed values pass through as pointers;
+        native bools are boxed because scaffold helpers consume Python
+        truth values, not raw integer bit patterns. Other native scalar
+        handles retain the established bit-preserving representation.
 
         Different source types reach the C runtime as different opaque
         pointers — the C side treats them as black boxes (the runtime
@@ -1105,6 +1127,27 @@ class IrScaffoldLoweringMixin:
         if isinstance(ty, ir.PointerType):
             return self.builder.bitcast(value, _CSTR)
         if isinstance(ty, ir.IntType):
+            expr_ty = getattr(expr, "ty", None)
+            if isinstance(expr_ty, BoolType):
+                if ty.width == 32:
+                    bit = value
+                elif ty.width < 32:
+                    bit = self.builder.zext(
+                        value,
+                        _I32,
+                        name=self._fresh("scaffold.bool.i32"),
+                    )
+                else:
+                    bit = self.builder.trunc(
+                        value,
+                        _I32,
+                        name=self._fresh("scaffold.bool.i32"),
+                    )
+                return self.builder.call(
+                    self.runtime["py_bool_from_bit"],
+                    [bit],
+                    name=self._fresh("scaffold.bool.box"),
+                )
             return self.builder.inttoptr(value, _CSTR)
         if isinstance(ty, ir.DoubleType):
             # Bitcast double → i64 (same bit width), then inttoptr to
@@ -1141,6 +1184,23 @@ class IrScaffoldLoweringMixin:
     # not synthetic placeholders.
     _IR_BUILDER_SYMBOL_PREFIX = "user_pcc_llvm_capi_ir_IRBuilder_"
     _IR_TOPLEVEL_SYMBOL_PREFIX = "user_pcc_llvm_capi_ir_"
+
+    # Required-arg positions (0-based, receiver excluded) that are
+    # native i64 in the real pcc-compiled callee (`align: int`). The
+    # all-ptr handle convention would box these into a tagged pointer
+    # while the cross-module declaration says i64 — ill-typed IR that
+    # clang rejects (the self backend tolerated it, which hid this).
+    _IR_SCAFFOLD_METHOD_I64_PARAMS = {
+        "load_atomic": (2,),
+        "store_atomic": (3,),
+    }
+
+    # Required-arg positions whose compiled Python callee accepts an object
+    # that may be a Python ``int``.  Raw-int compiler modules otherwise turn
+    # lane zero into a NULL opaque handle via ``inttoptr``.
+    _IR_SCAFFOLD_METHOD_PY_INT_PARAMS = {
+        "extract_value": (1,),
+    }
 
     def _emit_scaffold_simple(
         self,
@@ -1198,23 +1258,49 @@ class IrScaffoldLoweringMixin:
             )
 
         receiver = self._scaffold_to_handle(expr.func.obj)
-        lowered_args = [self._scaffold_to_handle(a) for a in required_args]
+        i64_params = self._IR_SCAFFOLD_METHOD_I64_PARAMS.get(method, ())
+        python_int_params = self._IR_SCAFFOLD_METHOD_PY_INT_PARAMS.get(method, ())
+        lowered_args = []
+        param_tys = [_CSTR]
+        for idx, a in enumerate(required_args):
+            if idx in i64_params:
+                lowered_args.append(self._emit_expr_as_i64(a))
+                param_tys.append(_I64)
+            elif idx in python_int_params and (
+                isinstance(a, IntLit)
+                or isinstance(getattr(a, "ty", None), IntType)
+                or getattr(getattr(a, "ty", None), "name", "") == "int"
+            ):
+                raw_int = self._emit_expr_as_i64(a)
+                lowered_args.append(
+                    self.builder.call(
+                        self.runtime["py_int_from_i64"],
+                        [raw_int],
+                        name=self._fresh("scaffold.int.box"),
+                    )
+                )
+                param_tys.append(_CSTR)
+            else:
+                lowered_args.append(self._scaffold_to_handle(a))
+                param_tys.append(_CSTR)
         for param in optional_params:
             val = optional_values.get(param)
             if val is None:
                 if param == "name":
                     lowered_args.append(self._emit_literal_str(""))
+                    param_tys.append(_CSTR)
                     continue
-                if param in ("align", "syncscope"):
+                if param in ("align", "syncscope", "typ"):
                     lowered_args.append(self._emit_none_literal())
+                    param_tys.append(_CSTR)
                     continue
                 raise ScaffoldUnsupportedError(
                     f"builder.{method} has no scaffold default for " f"{param!r}"
                 )
             lowered_args.append(self._scaffold_to_handle(val))
+            param_tys.append(_CSTR)
 
         ret_ty = _VOID if return_kind == "void" else _CSTR
-        param_tys = [_CSTR] * (1 + len(lowered_args))
         extern_name = self._IR_BUILDER_SYMBOL_PREFIX + method
         fn = self._declare_external_function(extern_name, ret_ty, param_tys)
         if return_kind == "void":
@@ -1696,27 +1782,41 @@ class IrScaffoldLoweringMixin:
                 f"ir.LiteralStructType expects (elements_list,); got "
                 f"{len(expr.args)}"
             )
-        elem_exprs = self._scaffold_unfold_list_literal(
-            expr.args[0],
-            "ir.LiteralStructType elements",
-        )
-        elem_handles = [self._scaffold_to_handle(e) for e in elem_exprs]
-        n = len(elem_handles)
+        if _is_scaffold_list_or_tuple(expr.args[0]):
+            elem_exprs = self._scaffold_unfold_list_literal(
+                expr.args[0],
+                "ir.LiteralStructType elements",
+            )
+            elem_handles = [self._scaffold_to_handle(e) for e in elem_exprs]
+            n = len(elem_handles)
+            extern = self._declare_external_function(
+                f"{self._IR_TOPLEVEL_SYMBOL_PREFIX}LiteralStructType___init__"
+                f"{n}",
+                _CSTR,
+                [_CSTR] * n,
+            )
+            return self.builder.call(
+                extern,
+                elem_handles,
+                name=self._fresh("scaffold.LiteralStructType"),
+            )
+        # Dynamic element list (runtime-built, e.g. a variadic global-def
+        # intrinsic delegating to a helper). The list is constructed by the
+        # caller; this is the struct analogue of ``builder.call_dyn``.
+        list_handle = self._scaffold_to_handle(expr.args[0])
         extern = self._declare_external_function(
-            f"{self._IR_TOPLEVEL_SYMBOL_PREFIX}LiteralStructType___init__" f"{n}",
+            f"{self._IR_TOPLEVEL_SYMBOL_PREFIX}LiteralStructType_dyn",
             _CSTR,
-            [_CSTR] * n,
+            [_CSTR],
         )
         return self.builder.call(
             extern,
-            elem_handles,
-            name=self._fresh("scaffold.LiteralStructType"),
+            [list_handle],
+            name=self._fresh("scaffold.LiteralStructType_dyn"),
         )
 
     def _ir_scaffold_enabled(self) -> bool:
         return (
             self.ir_scaffold_mode == "on"
-            or self.ast_module.name == "pcc.py_frontend.codegen.runtime_abi"
-            or self.ast_module.name == "pcc.py_frontend.codegen.layer1"
-            or self.ast_module.name == "pcc.py_frontend.codegen.class_gen"
+            or module_has_contract(self.ast_module.name, IR_SCAFFOLD_CONTRACT)
         )

@@ -1,0 +1,64 @@
+{
+  "schema": "pcc.darwin-python-runtime-libsystem-boundary.v1",
+  "mode": "darwin-arm64-self-no-libpython-pcc-runtime",
+  "claim": "Exact named libSystem ABI boundary for a representative object/container, GC and native-extension final executable; this is not a zero-libc claim.",
+  "dylibs": [
+    "/usr/lib/libSystem.B.dylib"
+  ],
+  "link_map_system_owners": [
+    "libSystem.tbd",
+    "libdyld.tbd",
+    "libm.tbd",
+    "libsystem_c.tbd",
+    "libsystem_kernel.tbd"
+  ],
+  "link_map_system_symbols_by_owner": {
+    "libSystem.tbd": [],
+    "libdyld.tbd": [
+      "_dlclose.got",
+      "_dlerror.got",
+      "_dlopen.got",
+      "_dlsym.got",
+      "_environ.got"
+    ],
+    "libm.tbd": [],
+    "libsystem_c.tbd": [
+      "_clock_gettime.got",
+      "_getcwd.got",
+      "_nanosleep.got",
+      "_waitpid.got"
+    ],
+    "libsystem_kernel.tbd": [
+      "___error.got",
+      "__exit.got",
+      "_access.got",
+      "_close.got",
+      "_getpid.got",
+      "_kevent.got",
+      "_kill.got",
+      "_kqueue.got",
+      "_lseek.got",
+      "_mkdir.got",
+      "_mmap.got",
+      "_munmap.got",
+      "_open.got",
+      "_pipe.got",
+      "_poll.got",
+      "_posix_spawn.got",
+      "_posix_spawn_file_actions_addclose.got",
+      "_posix_spawn_file_actions_adddup2.got",
+      "_posix_spawn_file_actions_addopen.got",
+      "_posix_spawn_file_actions_destroy.got",
+      "_posix_spawn_file_actions_init.got",
+      "_posix_spawnattr_destroy.got",
+      "_posix_spawnattr_init.got",
+      "_posix_spawnattr_setflags.got",
+      "_posix_spawnattr_setpgroup.got",
+      "_read.got",
+      "_readlink.got",
+      "_stat.got",
+      "_unlinkat.got",
+      "_write.got"
+    ]
+  }
+}

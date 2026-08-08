@@ -10,6 +10,7 @@ from .self_backend_aarch64_darwin_branch_protection import (
     prologue_sign_return_address,
 )
 from .self_backend_aarch64_darwin_calls import emit_fixed_stack_arg_load
+from .self_backend_aarch64_darwin_regalloc import allocate_aarch64_block_registers
 from .self_backend_aarch64_darwin_regs import emit_stack_adjust
 from .self_backend_aarch64_darwin_slots import copy_address_to_slot, store_reg_to_slot, store_value_regs_to_slot
 from .self_backend_aarch64_darwin_symbols import asm_symbol
@@ -21,6 +22,10 @@ def emit_function_prologue(
     func: ParsedFunction,
     module_symbols: PreparedModuleSymbols,
 ) -> list[str]:
+    # Target-specific preparation belongs immediately before target emission.
+    # The allocator is conservative and leaves every preassigned stack slot in
+    # place, so an unsupported shape remains byte-for-byte on the spill path.
+    allocate_aarch64_block_registers(func)
     symbol = asm_symbol(func.name, module_symbols)
     lines = ["", ".p2align 2"]
     if func.is_global:

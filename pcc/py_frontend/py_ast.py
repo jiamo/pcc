@@ -225,6 +225,11 @@ class Call(Expr):
     func: Expr
     args: tuple[Expr, ...]
     kwargs: tuple[tuple[str, Expr], ...] = ()
+    # Source order across the separately stored positional/starred and
+    # keyword operands.  Each entry is ("arg" | "kw", index).  The native
+    # parser retains this order, while splitting args/kwargs without this
+    # metadata loses cases such as ``f(**m(), x=g())``.
+    operand_order: tuple[tuple[str, int], ...] = ()
 
 
 @dataclass(frozen=True)

@@ -14,11 +14,18 @@ detail) is β4.3 polish — tracked by ``test_llvm_capi_ir_text_parity``
 """
 from __future__ import annotations
 
+import subprocess
+import sys
+import re
+
 import llvmlite.binding as llvm
 import llvmlite.ir as llvmlite_ir
 import pytest
 
 from pcc.llvm_capi import ir as pcc_ir
+from pcc.evaluater.c_evaluator import (
+    _compile_preprocessed_translation_unit_artifact,
+)
 
 llvm.initialize_native_target()
 
@@ -28,6 +35,60 @@ def _parse_verify(text: str):
     mod = llvm.parse_assembly(text)
     mod.verify()
     return mod
+
+
+def test_native_ir_builder_emits_verifiable_c_debug_metadata(tmp_path) -> None:
+    artifact = _compile_preprocessed_translation_unit_artifact(
+        "debug_probe.c",
+        "int add(int a, int b) { return a + b; }\n"
+        "int main(void) { return add(1, 2) != 3; }\n",
+        emit_debug=True,
+    )
+    ir_text = artifact["ir_text"]
+    _parse_verify(ir_text)
+    assert "!DICompileUnit(" in ir_text
+    assert "!DISubprogram(" in ir_text
+    assert "!llvm.dbg.cu = !{" in ir_text
+    assert "!llvm.module.flags = !{" in ir_text
+    assert "!dbg !" in ir_text
+    compile_unit_match = re.search(
+        r"!llvm\.dbg\.cu = !\{\s*!(\d+)\s*\}", ir_text
+    )
+    assert compile_unit_match is not None
+    assert re.search(
+        rf"^!{compile_unit_match.group(1)} = distinct !DICompileUnit\(",
+        ir_text,
+        re.MULTILINE,
+    )
+    call_lines = [line for line in ir_text.splitlines() if " call " in line]
+    assert call_lines
+    assert all("!dbg !" in line for line in call_lines)
+
+    llvm_path = tmp_path / "debug_probe.ll"
+    object_path = tmp_path / "debug_probe.o"
+    llvm_path.write_text(ir_text, encoding="utf-8")
+    compiled = subprocess.run(
+        ["clang", "-c", str(llvm_path), "-o", str(object_path)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert compiled.returncode == 0, compiled.stdout + compiled.stderr
+    assert "invalid debug" not in compiled.stderr.lower()
+    debug_command = (
+        ["dwarfdump", "--debug-info", str(object_path)]
+        if sys.platform == "darwin"
+        else ["readelf", "--debug-dump=info", str(object_path)]
+    )
+    debug_dump = subprocess.run(
+        debug_command,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert debug_dump.returncode == 0, debug_dump.stdout + debug_dump.stderr
+    assert "DW_TAG_compile_unit" in debug_dump.stdout
+    assert "DW_TAG_subprogram" in debug_dump.stdout
 
 
 def _diff(a: str, b: str) -> str:
@@ -116,11 +177,13 @@ def test_scaffold_function_type_dynamic_false_is_not_vararg():
     fty_fixed_arity_false = pcc_ir.FunctionType___init__1_dyn_va(
         void, i64, False,
     )
+    fty_three = pcc_ir.FunctionType___init__3(void, i64, i64, i64)
 
     assert str(fty_false) == "void (i64)"
     assert str(fty_none) == "void (i64)"
     assert str(fty_fixed_arity_false) == "void (i64)"
     assert str(fty_true) == "void (i64, ...)"
+    assert str(fty_three) == "void (i64, i64, i64)"
 
 
 def test_function_initializes_value_runtime_fields():
@@ -182,6 +245,36 @@ def test_branch_and_phi():
         phi.add_incoming(ir_mod.Constant(i32, 1), then_b)
         phi.add_incoming(ir_mod.Constant(i32, 2), else_b)
         b.ret(phi)
+        return m
+
+    _check_parity(lambda: _build(llvmlite_ir), lambda: _build(pcc_ir))
+
+
+def test_phi_backedge_added_after_builder_moves_blocks():
+    def _build(ir_mod):
+        m = ir_mod.Module("t")
+        i32 = ir_mod.IntType(32)
+        fty = ir_mod.FunctionType(i32, [])
+        fn = ir_mod.Function(m, fty, name="count")
+        entry = fn.append_basic_block("entry")
+        loop = fn.append_basic_block("loop")
+        body = fn.append_basic_block("body")
+        done = fn.append_basic_block("done")
+        b = ir_mod.IRBuilder(entry)
+        b.branch(loop)
+        b.position_at_end(loop)
+        index = b.phi(i32, name="index")
+        index.add_incoming(ir_mod.Constant(i32, 0), entry)
+        keep_going = b.icmp_signed("<", index, ir_mod.Constant(i32, 4))
+        b.cbranch(keep_going, body, done)
+        b.position_at_end(body)
+        next_index = b.add(index, ir_mod.Constant(i32, 1), name="next")
+        b.branch(loop)
+        # This is the ordinary loop-construction order: the backedge value is
+        # unavailable while the builder is still positioned in the phi block.
+        index.add_incoming(next_index, body)
+        b.position_at_end(done)
+        b.ret(index)
         return m
 
     _check_parity(lambda: _build(llvmlite_ir), lambda: _build(pcc_ir))
@@ -282,6 +375,18 @@ def test_global_variable():
         gv = ir_mod.GlobalVariable(m, i32, name="counter")
         gv.initializer = ir_mod.Constant(i32, 0)
         gv.linkage = "internal"
+        return m
+
+    _check_parity(lambda: _build(llvmlite_ir), lambda: _build(pcc_ir))
+
+
+def test_thread_local_global_variable():
+    def _build(ir_mod):
+        m = ir_mod.Module("t")
+        i32 = ir_mod.IntType(32)
+        gv = ir_mod.GlobalVariable(m, i32, name="counter")
+        gv.initializer = ir_mod.Constant(i32, 7)
+        gv.storage_class = "thread_local"
         return m
 
     _check_parity(lambda: _build(llvmlite_ir), lambda: _build(pcc_ir))

@@ -15,6 +15,7 @@ from .acquire import (
 )
 from .inspect import inspect_package
 from .install import (
+    BUILD_MODES,
     _default_cache_dir,
     _resolve_spec_with_origin,
     install_package,
@@ -32,6 +33,7 @@ def _parse_install_args(args: list[str]) -> dict[str, object]:
     index_urls: list[str] = []
     no_index = False
     acquire_mode = "auto"
+    build_mode = "owned"
     target_python = None
     packages: list[str] = []
     report_path = None
@@ -54,6 +56,17 @@ def _parse_install_args(args: list[str]) -> dict[str, object]:
             i += 1
         elif arg.startswith("--acquire="):
             acquire_mode = arg.split("=", 1)[1]
+        elif arg == "--build":
+            if i + 1 >= len(args):
+                return {
+                    "ok": False,
+                    "command": command,
+                    "error": "--build requires a value",
+                }
+            build_mode = args[i + 1]
+            i += 1
+        elif arg.startswith("--build="):
+            build_mode = arg.split("=", 1)[1]
         elif arg in ("--python-version", "--target-python"):
             if i + 1 >= len(args):
                 return {
@@ -146,6 +159,13 @@ def _parse_install_args(args: list[str]) -> dict[str, object]:
             "command": command,
             "error": "PCC-PKG-ACQUIRE-MODE-INVALID",
         }
+    if build_mode not in BUILD_MODES:
+        return {
+            "ok": False,
+            "command": command,
+            "error": "PCC-PKG-BUILD-MODE-INVALID",
+            "diagnostic": "PCC-PKG-BUILD-MODE-INVALID",
+        }
     if no_index:
         acquire_mode = "offline"
     try:
@@ -167,6 +187,7 @@ def _parse_install_args(args: list[str]) -> dict[str, object]:
         "index_urls": [] if no_index else index_urls,
         "no_index": no_index,
         "acquire_mode": acquire_mode,
+        "build_mode": build_mode,
         "target_python": target_python,
         "report_path": report_path,
         "abi": abi,
@@ -223,6 +244,7 @@ def pip_dry_run_plan(args: list[str]) -> dict[str, object]:
         "index_urls": index_urls,
         "no_index": bool(parsed["no_index"]),
         "acquire_mode_requested": parsed["acquire_mode"],
+        "build_mode_requested": parsed["build_mode"],
         "target_python": parsed["target_python"],
         "abi": abi,
         "report_path": parsed["report_path"],
@@ -245,6 +267,7 @@ def pip_install_plan(args: list[str]) -> dict[str, object]:
     abi = str(parsed["abi"])
     packages = list(parsed["packages"])  # type: ignore[arg-type]
     acquire_mode = str(parsed["acquire_mode"])
+    build_mode = str(parsed["build_mode"])
     cache = (
         Path(str(cache_dir)).expanduser().resolve()
         if cache_dir is not None
@@ -296,6 +319,7 @@ def pip_install_plan(args: list[str]) -> dict[str, object]:
             "no_index": bool(parsed["no_index"]),
             "abi": abi,
             "acquire_mode_requested": acquire_mode,
+            "build_mode_requested": build_mode,
             "target_python": parsed["target_python"],
             "acquisitions": acquisitions,
             "installs": [],
@@ -335,6 +359,7 @@ def pip_install_plan(args: list[str]) -> dict[str, object]:
                 index_urls=(),
                 abi=abi,
                 build_source=True,
+                build_mode=build_mode,
                 resolved_from_override=origin_override,
             )
         )
@@ -349,6 +374,7 @@ def pip_install_plan(args: list[str]) -> dict[str, object]:
         "no_index": bool(parsed["no_index"]),
         "abi": abi,
         "acquire_mode_requested": acquire_mode,
+        "build_mode_requested": build_mode,
         "target_python": parsed["target_python"],
         "acquisitions": acquisitions,
         "report_path": parsed["report_path"],

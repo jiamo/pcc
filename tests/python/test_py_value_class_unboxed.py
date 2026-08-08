@@ -36,6 +36,31 @@ def test_valueclass_local_scalar_payload_avoids_instance_allocation():
     assert "extractvalue" in ir_text
 
 
+def test_eight_field_valueclass_keeps_aggregate_projection():
+    ir_text = _generate_ir(textwrap.dedent("""
+            import pcc
+
+            @pcc.valueclass
+            class Octet:
+                a: int
+                b: int
+                c: int
+                d: int
+                e: int
+                f: int
+                g: int
+                h: int
+
+            value = Octet(1, 2, 3, 4, 5, 6, 7, 8)
+            result = value.a + value.h
+            print(result)
+            """))
+
+    assert not re.search(r"\bcall\b[^\n]*@py_instance_new\b", ir_text)
+    assert "{ i64, i64, i64, i64, i64, i64, i64, i64 }" in ir_text
+    assert "extractvalue" in ir_text
+
+
 def test_valueclass_hot_loop_zero_allocation_oracle_and_escape_semantics(tmp_path):
     from pcc.py_frontend.pipeline import compile_python
 

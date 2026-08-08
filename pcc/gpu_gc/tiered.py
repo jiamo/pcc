@@ -165,9 +165,10 @@ class BlockDirectory:
         """Drop one reference to an entry; remove it when refcount hits 0."""
         entry = self._entries.get(digest)
         if entry is None:
-            return
-        if entry.refcount > 0:
-            entry.refcount -= 1
+            raise DirectoryError(f"cannot release unknown block {digest!r}")
+        if entry.refcount <= 0:
+            raise DirectoryError(f"refcount underflow releasing block {digest!r}")
+        entry.refcount -= 1
         if entry.refcount == 0:
             self._entries.pop(digest, None)
 

@@ -14,14 +14,36 @@ Layout mirrors py_tuple.c exactly:
 
 Offsets: 0 refcount, 8 type_tag, 12 flags, 16 len, 24 items[0...]
 
-Layout constants are inlined as integer literals in each function to
-avoid pcc's module-level-constant lowering (which requires a main()
-init function that conflicts with library linkage).
+Layout constants are imported from the generated ABI module.  Closed-world
+native constant exports keep these as compile-time values in library objects;
+there is no module-init dependency.
 """
 from pcc.extern import extern, c_abi_export, c_ptr, c_int32, c_int64, c_void
+from pcc.py_runtime.py.py_abi_constants import (
+    PYLISTOBJECT_ITEMS_OFFSET,
+    PYOBJECTHEADER_FLAGS_OFFSET,
+    PYOBJECTHEADER_TYPE_TAG_OFFSET,
+    PYTUPLEOBJECT_ITEMS_OFFSET,
+    PYTUPLEOBJECT_LEN_OFFSET,
+    PYTUPLEOBJECT_SIZE,
+    PY_FLAG_GC_TRACKED,
+    PY_TYPE_CLASS,
+    PY_TYPE_COROUTINE,
+    PY_TYPE_DICT,
+    PY_TYPE_EXC,
+    PY_TYPE_FUNC,
+    PY_TYPE_GEN,
+    PY_TYPE_INSTANCE,
+    PY_TYPE_ITER,
+    PY_TYPE_LIST,
+    PY_TYPE_MEMORYVIEW,
+    PY_TYPE_SET,
+    PY_TYPE_TUPLE,
+    PY_TYPE_USER,
+    PY_TYPE_WEAKREF,
+)
 from pcc.unsafe import (
     cstr,
-    getenv,
     global_addr,
     is_tagged_int,
     load_i32,
@@ -32,9 +54,11 @@ from pcc.unsafe import (
     null,
     ptr_add,
     ptr_is_null,
+    ptr_to_int,
     store_i32,
     store_i64,
     store_ptr,
+    stack_alloc,
     untag_int,
 )
 
@@ -45,7 +69,9 @@ py_list_len       = extern("py_list_len",      (c_ptr,),                        
 py_list_get       = extern("py_list_get",      (c_ptr, c_int64),                     c_ptr)
 py_obj_len        = extern("py_obj_len",       (c_ptr,),                             c_int64)
 py_obj_getitem_i64 = extern("py_obj_getitem_i64", (c_ptr, c_int64),                  c_ptr)
+py_obj_eq         = extern("py_obj_eq",        (c_ptr, c_ptr),                       c_int64)
 py_int_value_i64  = extern("py_int_value_i64", (c_ptr,),                             c_int64)
+py_int_to_i64     = extern("py_int_to_i64",    (c_ptr, c_ptr),                      c_int64)
 py_err_occurred   = extern("py_err_occurred",  (),                                   c_int64)
 py_gc_track       = extern("py_gc_track",       (c_ptr,),                             c_void)
 py_exc_new        = extern("py_exc_new",        (c_int64, c_ptr),                     c_ptr)
@@ -54,6 +80,7 @@ pcc_gc_store_ptr  = extern("pcc_gc_store_ptr",  (c_ptr, c_ptr, c_ptr),          
 pcc_gc_load_ptr   = extern("pcc_gc_load_ptr",   (c_ptr, c_ptr),                       c_ptr)
 pcc_gc_alloc      = extern("pcc_gc_alloc",      (c_int64, c_int32, c_int32),          c_ptr)
 _pcc_debug_bad_incref = extern("pcc_debug_bad_incref", (c_ptr, c_int32), c_void)
+getenv = extern("pcc_platform_getenv", (c_ptr,), c_ptr)
 
 
 def _debug_bad_container(o, code: int) -> None:
@@ -61,25 +88,19 @@ def _debug_bad_container(o, code: int) -> None:
         _pcc_debug_bad_incref(o, code)
 
 
+pcc_gc_pointer_is_managed = extern(
+    "pcc_gc_pointer_is_managed", (c_ptr,), c_int64
+)
+
+
 def _ptr_can_have_header(o) -> bool:
-    if ptr_is_null(o) != 0:
-        return False
-    if is_tagged_int(o) != 0:
-        return False
-    bits: int = untag_int(o)
-    if bits < 2048:
-        return False
-    if (bits & 3) != 0:
-        return False
-    if bits >= 140737488355328:
-        return False
-    return True
+    return pcc_gc_pointer_is_managed(o) != 0
 
 
 def _ptr_is_tuple(o) -> bool:
     if not _ptr_can_have_header(o):
         return False
-    return load_i32(o, 8) == 7
+    return load_i32(o, PYOBJECTHEADER_TYPE_TAG_OFFSET) == PY_TYPE_TUPLE
 
 
 def _tuple_is_sane(tuple_ptr, code: int) -> bool:
@@ -88,7 +109,7 @@ def _tuple_is_sane(tuple_ptr, code: int) -> bool:
     if not _ptr_is_tuple(tuple_ptr):
         _debug_bad_container(tuple_ptr, code)
         return False
-    length: int = load_i64(tuple_ptr, 16)
+    length: int = load_i64(tuple_ptr, PYTUPLEOBJECT_LEN_OFFSET)
     if length < 0:
         _debug_bad_container(tuple_ptr, code)
         return False
@@ -110,20 +131,20 @@ def _tuple_item_can_participate_in_cycle(item, depth: int = 0) -> int:
     if depth > 64:
         return 0
 
-    tag: int = load_i32(item, 8)
-    if tag >= 100:
+    tag: int = load_i32(item, PYOBJECTHEADER_TYPE_TAG_OFFSET)
+    if tag >= PY_TYPE_USER:
         return 1
-    if tag == 5 or tag == 6 or tag == 8 or tag == 9:
+    if tag == PY_TYPE_LIST or tag == PY_TYPE_DICT or tag == PY_TYPE_SET or tag == PY_TYPE_FUNC:
         return 1
-    if tag == 10 or tag == 11 or tag == 12 or tag == 14 or tag == 15:
+    if tag == PY_TYPE_CLASS or tag == PY_TYPE_INSTANCE or tag == PY_TYPE_EXC or tag == PY_TYPE_ITER or tag == PY_TYPE_GEN:
         return 1
-    if tag == 20 or tag == 19 or tag == 21:
+    if tag == PY_TYPE_COROUTINE or tag == PY_TYPE_MEMORYVIEW or tag == PY_TYPE_WEAKREF:
         return 1
-    if tag == 7:
-        length: int = load_i64(item, 16)
+    if tag == PY_TYPE_TUPLE:
+        length: int = load_i64(item, PYTUPLEOBJECT_LEN_OFFSET)
         i: int = 0
         while i < length:
-            child = pcc_gc_load_ptr(item, ptr_add(item, 24 + i * 8))
+            child = pcc_gc_load_ptr(item, ptr_add(item, PYTUPLEOBJECT_ITEMS_OFFSET + i * 8))
             if _tuple_item_can_participate_in_cycle(child, depth + 1) != 0:
                 return 1
             i = i + 1
@@ -138,13 +159,13 @@ def py_tuple_new(n: int):
     if n > 134217728:
         _debug_bad_container(null(), -130)
         return null()
-    bytes_total: int = 24 + n * 8          # OFFSET_ITEMS + n * SIZEOF_PTR
-    t = pcc_gc_alloc(bytes_total, 7, 0)
+    bytes_total: int = PYTUPLEOBJECT_SIZE + n * 8          # OFFSET_ITEMS + n * SIZEOF_PTR
+    t = pcc_gc_alloc(bytes_total, PY_TYPE_TUPLE, 0)
     if ptr_is_null(t):
         return null()
-    store_i64(t, 16, n)             # len = n
+    store_i64(t, PYTUPLEOBJECT_LEN_OFFSET, n)             # len = n
     if n > 0:
-        items_ptr = ptr_add(t, 24)
+        items_ptr = ptr_add(t, PYTUPLEOBJECT_ITEMS_OFFSET)
         memset(items_ptr, 0, n * 8)
     return t
 
@@ -176,11 +197,11 @@ def py_tuple_from_splat(seq):
     if not _ptr_can_have_header(seq):
         return null()
 
-    tag: int = load_i32(seq, 8)
+    tag: int = load_i32(seq, PYOBJECTHEADER_TYPE_TAG_OFFSET)
     n: int = -1
-    if tag == 7:
-        n = load_i64(seq, 16)
-    elif tag == 5:
+    if tag == PY_TYPE_TUPLE:
+        n = load_i64(seq, PYTUPLEOBJECT_LEN_OFFSET)
+    elif tag == PY_TYPE_LIST:
         n = py_list_len(seq)
     else:
         n = py_obj_len(seq)
@@ -195,14 +216,14 @@ def py_tuple_from_splat(seq):
         return null()
 
     i: int = 0
-    if tag == 7:
+    if tag == PY_TYPE_TUPLE:
         while i < n:
-            v = pcc_gc_load_ptr(seq, ptr_add(seq, 24 + i * 8))
+            v = pcc_gc_load_ptr(seq, ptr_add(seq, PYTUPLEOBJECT_ITEMS_OFFSET + i * 8))
             py_tuple_set_item(out, i, v)
             i = i + 1
         return out
-    if tag == 5:
-        items = load_ptr(seq, 32)
+    if tag == PY_TYPE_LIST:
+        items = load_ptr(seq, PYLISTOBJECT_ITEMS_OFFSET)
         while i < n:
             v = pcc_gc_load_ptr(seq, ptr_add(items, i * 8))
             py_tuple_set_item(out, i, v)
@@ -225,10 +246,10 @@ def py_tuple_from_splat(seq):
 def py_tuple_set_item(tuple_ptr, i: int, item) -> None:
     if ptr_is_null(tuple_ptr) != 0:
         return
-    tuple_len: int = load_i64(tuple_ptr, 16)
+    tuple_len: int = load_i64(tuple_ptr, PYTUPLEOBJECT_LEN_OFFSET)
     if i < 0 or i >= tuple_len:
         return
-    slot_offset: int = 24 + i * 8
+    slot_offset: int = PYTUPLEOBJECT_ITEMS_OFFSET + i * 8
     slot = ptr_add(tuple_ptr, slot_offset)
     if (
         load_i32(global_addr("pcc_gc_config_initialized"), 0) != 0
@@ -239,8 +260,8 @@ def py_tuple_set_item(tuple_ptr, i: int, item) -> None:
     else:
         pcc_gc_store_ptr(tuple_ptr, slot, item)
     if _tuple_item_can_participate_in_cycle(item) != 0:
-        flags = load_i32(tuple_ptr, 12)
-        if (flags & 2) == 0:
+        flags = load_i32(tuple_ptr, PYOBJECTHEADER_FLAGS_OFFSET)
+        if (flags & PY_FLAG_GC_TRACKED) == 0:
             py_gc_track(tuple_ptr)
 
 
@@ -248,14 +269,14 @@ def py_tuple_set_item(tuple_ptr, i: int, item) -> None:
 def py_tuple_get(tuple_ptr, i: int):
     if ptr_is_null(tuple_ptr) != 0:
         return null()
-    tuple_len: int = load_i64(tuple_ptr, 16)
+    tuple_len: int = load_i64(tuple_ptr, PYTUPLEOBJECT_LEN_OFFSET)
     if i < 0:
         i = i + tuple_len
     if i < 0 or i >= tuple_len:
         # Non-raising: internal callers rely on the silent-NULL contract.
         # User-level t[i] subscripts route to py_tuple_getitem, which raises.
         return null()
-    slot_offset: int = 24 + i * 8
+    slot_offset: int = PYTUPLEOBJECT_ITEMS_OFFSET + i * 8
     v = pcc_gc_load_ptr(tuple_ptr, ptr_add(tuple_ptr, slot_offset))
     py_incref(v)
     return v
@@ -267,12 +288,12 @@ def py_tuple_get_known(tuple_ptr, i: int):
     # Keep py_tuple_get's owned-ref result but skip its defensive shape checks.
     if ptr_is_null(tuple_ptr) != 0:
         return null()
-    tuple_len: int = load_i64(tuple_ptr, 16)
+    tuple_len: int = load_i64(tuple_ptr, PYTUPLEOBJECT_LEN_OFFSET)
     if i < 0:
         i = i + tuple_len
     if i < 0 or i >= tuple_len:
         return null()
-    slot_offset: int = 24 + i * 8
+    slot_offset: int = PYTUPLEOBJECT_ITEMS_OFFSET + i * 8
     v = pcc_gc_load_ptr(tuple_ptr, ptr_add(tuple_ptr, slot_offset))
     py_incref(v)
     return v
@@ -285,13 +306,13 @@ def py_tuple_getitem(tuple_ptr, i: int):
     # stays non-raising for other callers. Negative indices normalize.
     if ptr_is_null(tuple_ptr) != 0:
         return null()
-    tuple_len: int = load_i64(tuple_ptr, 16)
+    tuple_len: int = load_i64(tuple_ptr, PYTUPLEOBJECT_LEN_OFFSET)
     if i < 0:
         i = i + tuple_len
     if i < 0 or i >= tuple_len:
         py_raise(py_exc_new(5, cstr("tuple index out of range")))  # PY_EXC_INDEXERROR
         return null()
-    slot_offset: int = 24 + i * 8
+    slot_offset: int = PYTUPLEOBJECT_ITEMS_OFFSET + i * 8
     v = pcc_gc_load_ptr(tuple_ptr, ptr_add(tuple_ptr, slot_offset))
     py_incref(v)
     return v
@@ -301,7 +322,79 @@ def py_tuple_getitem(tuple_ptr, i: int):
 def py_tuple_len(tuple_ptr) -> int:
     if ptr_is_null(tuple_ptr) != 0:
         return 0
-    return load_i64(tuple_ptr, 16)
+    return load_i64(tuple_ptr, PYTUPLEOBJECT_LEN_OFFSET)
+
+
+@c_abi_export("py_tuple_count")
+def py_tuple_count(tuple_ptr, item) -> int:
+    if ptr_is_null(tuple_ptr) != 0:
+        return 0
+    length: int = py_tuple_len(tuple_ptr)
+    count: int = 0
+    i: int = 0
+    while i < length:
+        element = py_tuple_get(tuple_ptr, i)
+        equal: int = py_obj_eq(element, item)
+        py_decref(element)
+        if equal != 0:
+            count = count + 1
+        i = i + 1
+    return count
+
+
+@c_abi_export("py_tuple_index")
+def py_tuple_index(tuple_ptr, item) -> int:
+    if ptr_is_null(tuple_ptr) == 0:
+        length: int = py_tuple_len(tuple_ptr)
+        i: int = 0
+        while i < length:
+            element = py_tuple_get(tuple_ptr, i)
+            equal: int = py_obj_eq(element, item)
+            py_decref(element)
+            if equal != 0:
+                return i
+            i = i + 1
+    py_raise(py_exc_new(2, cstr("tuple.index(x): x not in tuple")))
+    return -1
+
+
+@c_abi_export("py_tuple_index_range")
+def py_tuple_index_range(tuple_ptr, item, start, stop) -> int:
+    if ptr_is_null(tuple_ptr) == 0:
+        length: int = py_tuple_len(tuple_ptr)
+        overflow = stack_alloc(4)
+        lo: int = 0
+        if ptr_is_null(start) == 0:
+            store_i32(overflow, 0, 0)
+            lo = py_int_to_i64(start, overflow)
+            if load_i32(overflow, 0) != 0:
+                lo = 0
+        hi: int = length
+        if ptr_is_null(stop) == 0:
+            store_i32(overflow, 0, 0)
+            hi = py_int_to_i64(stop, overflow)
+            if load_i32(overflow, 0) != 0:
+                hi = length
+        if lo < 0:
+            lo = lo + length
+            if lo < 0:
+                lo = 0
+        if hi < 0:
+            hi = hi + length
+            if hi < 0:
+                hi = 0
+        if hi > length:
+            hi = length
+        i: int = lo
+        while i < hi:
+            element = py_tuple_get(tuple_ptr, i)
+            equal: int = py_obj_eq(element, item)
+            py_decref(element)
+            if equal != 0:
+                return i
+            i = i + 1
+    py_raise(py_exc_new(2, cstr("tuple.index(x): x not in tuple")))
+    return -1
 
 
 @c_abi_export("py_tuple_concat")
@@ -310,17 +403,17 @@ def py_tuple_concat(a, b):
         return null()
     if not _tuple_is_sane(b, -136):
         return null()
-    la: int = load_i64(a, 16)
-    lb: int = load_i64(b, 16)
+    la: int = load_i64(a, PYTUPLEOBJECT_LEN_OFFSET)
+    lb: int = load_i64(b, PYTUPLEOBJECT_LEN_OFFSET)
     out = py_tuple_new(la + lb)
     i: int = 0
     while i < la:
-        v = pcc_gc_load_ptr(a, ptr_add(a, 24 + i * 8))
+        v = pcc_gc_load_ptr(a, ptr_add(a, PYTUPLEOBJECT_ITEMS_OFFSET + i * 8))
         py_tuple_set_item(out, i, v)
         i = i + 1
     j: int = 0
     while j < lb:
-        v = pcc_gc_load_ptr(b, ptr_add(b, 24 + j * 8))
+        v = pcc_gc_load_ptr(b, ptr_add(b, PYTUPLEOBJECT_ITEMS_OFFSET + j * 8))
         py_tuple_set_item(out, la + j, v)
         j = j + 1
     return out
@@ -330,7 +423,7 @@ def py_tuple_concat(a, b):
 def py_tuple_repeat(tuple_ptr, count: int):
     if not _tuple_is_sane(tuple_ptr, -137):
         return null()
-    length: int = load_i64(tuple_ptr, 16)
+    length: int = load_i64(tuple_ptr, PYTUPLEOBJECT_LEN_OFFSET)
     repeats: int = count
     if repeats < 0:
         repeats = 0
@@ -342,7 +435,7 @@ def py_tuple_repeat(tuple_ptr, count: int):
     while k < repeats:
         i: int = 0
         while i < length:
-            v = pcc_gc_load_ptr(tuple_ptr, ptr_add(tuple_ptr, 24 + i * 8))
+            v = pcc_gc_load_ptr(tuple_ptr, ptr_add(tuple_ptr, PYTUPLEOBJECT_ITEMS_OFFSET + i * 8))
             py_tuple_set_item(out, dst, v)
             dst = dst + 1
             i = i + 1

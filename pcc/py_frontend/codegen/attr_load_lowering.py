@@ -465,7 +465,7 @@ class AttrLoadLoweringMixin:
             name=self._fresh(result_name),
         )
         self._gc_release(captures)
-        self.builder.call(self.runtime["pcc_gc_pin"], [created])
+        self._gc_pin(created)
         self.builder.store(created, cache_gv)
         create_exit = self.builder._block
         self.builder.branch(done_bb)

@@ -1,7 +1,7 @@
 """Decorator helper lowering for Layer-1 Python codegen."""
 from __future__ import annotations
 
-from ..py_ast import Assign, Attr, Call, Name, StrLit
+from ..py_ast import Assign, Attr, Call, Name, StrLit, TupleExpr
 
 
 _NOOP_DECORATOR_QUALIFIED = frozenset(
@@ -70,9 +70,7 @@ class DecoratorLoweringMixin:
         return None
 
     def _decorator_c_abi_export_symbol(self, dec) -> str | None:
-        """If ``dec`` is ``@c_abi_export("sym")`` or
-        ``@pcc.extern.c_abi_export("sym")``, return the literal symbol
-        string. Else None."""
+        """Return the literal symbol from a C-ABI export decorator."""
         if not isinstance(dec, Call):
             return None
         try:
@@ -81,9 +79,26 @@ class DecoratorLoweringMixin:
         except AttributeError:
             return None
         qn = self._decorator_qualname(func)
-        if qn not in ("c_abi_export", "pcc.extern.c_abi_export", "extern.c_abi_export"):
+        if qn not in (
+            "c_abi_export",
+            "pcc.extern.c_abi_export",
+            "extern.c_abi_export",
+            "c_abi_variadic_export",
+            "pcc.extern.c_abi_variadic_export",
+            "extern.c_abi_variadic_export",
+            "c_abi_typed_export",
+            "pcc.extern.c_abi_typed_export",
+            "extern.c_abi_typed_export",
+        ):
             return None
-        if len(args) != 1:
+        if qn in (
+            "c_abi_typed_export",
+            "pcc.extern.c_abi_typed_export",
+            "extern.c_abi_typed_export",
+        ):
+            if len(args) != 3:
+                return None
+        elif len(args) != 1:
             return None
         arg = args[0]
         if not isinstance(arg, StrLit):
@@ -92,6 +107,55 @@ class DecoratorLoweringMixin:
             return arg.value
         except AttributeError:
             return None
+
+    def _decorator_c_abi_typed_signature(self, dec):
+        """Return ``(result, args)`` from a typed export decorator."""
+        if not isinstance(dec, Call):
+            return None
+        try:
+            func = dec.func
+            args = dec.args
+        except AttributeError:
+            return None
+        qn = self._decorator_qualname(func)
+        if qn not in (
+            "c_abi_typed_export",
+            "pcc.extern.c_abi_typed_export",
+            "extern.c_abi_typed_export",
+        ) or len(args) != 3:
+            return None
+        result_expr = args[1]
+        arg_exprs = args[2]
+        if not isinstance(result_expr, StrLit) or not isinstance(
+            arg_exprs, TupleExpr
+        ):
+            return None
+        names: list[str] = []
+        for expr in arg_exprs.elems:
+            if not isinstance(expr, StrLit):
+                return None
+            names.append(expr.value)
+        return (result_expr.value, tuple(names))
+
+    def _decorator_is_c_abi_variadic_export(self, dec) -> bool:
+        if not isinstance(dec, Call):
+            return False
+        try:
+            func = dec.func
+            args = dec.args
+        except AttributeError:
+            return False
+        qn = self._decorator_qualname(func)
+        return (
+            qn
+            in (
+                "c_abi_variadic_export",
+                "pcc.extern.c_abi_variadic_export",
+                "extern.c_abi_variadic_export",
+            )
+            and len(args) == 1
+            and isinstance(args[0], StrLit)
+        )
 
     def _decorator_qualname(self, dec):
         """Return a dotted identifier for a decorator expression or

@@ -4,9 +4,8 @@ float.fromhex is a builtin-type classmethod that previously routed through the
 libpython fallback (PCC-PY-COMPILE-001 under --python-libpython=off; the
 generated IR still called py_cpy_*). Added a native branch
 (unary_call_lowering._maybe_emit_builtin_type_method, next to the bytes.fromhex
-arm) plus a C-only runtime helper py_float_fromhex (py_float_fromhex.c,
-OBJ_PY_CC_HELPERS pattern — one impl linked into both the C-runtime and the
-pcc-Python port tiers, no separate port).
+arm) plus a runtime helper py_float_fromhex (the production pcc-Python owner is
+py_obj_stubs.py; py_float_fromhex.c remains the host-C/pcc-C oracle).
 
 The helper mirrors CPython Objects/floatobject.c::float_fromhex exactly: a
 hexadecimal floating-point grammar with an OPTIONAL 0x prefix and a binary
@@ -61,9 +60,14 @@ def test_float_fromhex_values_no_libpython(tmp_path):
         "    print(float.fromhex('-nan'))\n"                       # nan
         "    print(float.fromhex('1.5'))\n"                        # 1.3125 (hex!)
         "    print(float.fromhex('0x1.921fb54442d18p+1'))\n"       # 3.141592653589793
+        "    print(float.fromhex('0x0.0000000000001p-1022'))\n"    # min subnormal
+        "    print(float.fromhex('0x1.00000000000008p0'))\n"       # half-even down
+        "    print(float.fromhex('0x1.000000000000081p0'))\n"      # above tie
+        "    print(float.fromhex('0x0.00000000000008p-1022'))\n"   # underflow tie
+        "    print(float.fromhex('-0x0p0'))\n"                     # signed zero
         "main()\n",
     )
-    assert out.split("\n")[:10] == [
+    assert out.split("\n")[:15] == [
         "12.0",
         "1.0",
         "1024.0",
@@ -74,6 +78,11 @@ def test_float_fromhex_values_no_libpython(tmp_path):
         "nan",
         "1.3125",
         "3.141592653589793",
+        "5e-324",
+        "1.0",
+        "1.0000000000000002",
+        "0.0",
+        "-0.0",
     ], out
 
 

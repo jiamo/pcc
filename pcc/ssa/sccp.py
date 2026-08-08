@@ -5,6 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 
+from pcc.codegen.c_integer_fold_contract import (
+    FOLD_CONSTANT,
+    fold_c_integer_binary as _fold_c_integer_binary,
+    fold_c_integer_unary as _fold_c_integer_unary,
+)
+
 from .ir import (
     SSABinaryOp,
     SSABlock,
@@ -99,24 +105,24 @@ class SSASCCPResult:
 class SSASCCPAnalyzer:
     """Run SCCP on the minimal bootstrap SSA representation."""
 
-    # Ordered comparisons (<, <=, >, >=) are excluded because their
-    # result depends on signedness, which the SSA layer does not track.
-    # Arithmetic ops (+, -, *, /, %) are excluded because unsigned
-    # overflow wraps differently from Python's signed semantics —
-    # EXCEPT when both operands are literal constants AND the folded
-    # result fits in a signed 32-bit range. In that narrow case, the
-    # result is deterministic (no wrap concern) and is used by
-    # downstream branch-pruning to kill always-dead `if (4-4)` arms.
-    _SAFE_BINARY_OPS = frozenset({
-        "==", "!=",
-        "&&", "||",
-    })
-    _SAFE_ARITH_OPS_FOR_CONSTANTS = frozenset({
-        "+", "-", "*", "/", "%", "&", "|", "^", "<<", ">>",
-    })
-    _SAFE_UNARY_OPS = frozenset({"+", "-", "!"})
-    _SIGNED_INT32_MIN = -(1 << 31)
-    _SIGNED_INT32_MAX = (1 << 31) - 1
+    # Supported pcc C targets are LP64. Unknown spellings deliberately remain
+    # overdefined instead of inheriting Python's unbounded integer semantics.
+    _INTEGER_TYPE_CONTRACTS = {
+        "_Bool": (1, False),
+        "char": (8, False),
+        "signed char": (8, False),
+        "unsigned char": (8, True),
+        "short": (16, False),
+        "unsigned short": (16, True),
+        "int": (32, False),
+        "unsigned int": (32, True),
+        "long": (64, False),
+        "unsigned long": (64, True),
+        "long long": (64, False),
+        "unsigned long long": (64, True),
+        "__int128": (128, False),
+        "unsigned __int128": (128, True),
+    }
 
     def analyze(self, func: SSAFunction) -> SSASCCPResult:
         result = SSASCCPResult(function_name=func.name)
@@ -267,21 +273,12 @@ class SSASCCPAnalyzer:
 
         assert left.constant is not None
         assert right.constant is not None
-        folded = self._fold_binary(instr.op, left.constant, right.constant)
+        folded = self._fold_binary(instr, left.constant, right.constant)
         if folded is None:
             return SSALatticeValue.overdefined()
-        op_is_always_safe = instr.op in self._SAFE_BINARY_OPS
-        op_safe_for_constants = (
-            instr.op in self._SAFE_ARITH_OPS_FOR_CONSTANTS
-            and self._SIGNED_INT32_MIN <= folded <= self._SIGNED_INT32_MAX
-        )
         return SSALatticeValue.constant_value(
             folded,
-            is_safe=(
-                left.is_safe
-                and right.is_safe
-                and (op_is_always_safe or op_safe_for_constants)
-            ),
+            is_safe=left.is_safe and right.is_safe,
         )
 
     def _evaluate_unary(
@@ -296,12 +293,12 @@ class SSASCCPAnalyzer:
             return SSALatticeValue.unknown()
 
         assert operand.constant is not None
-        folded = self._fold_unary(instr.op, operand.constant)
+        folded = self._fold_unary(instr, operand.constant)
         if folded is None:
             return SSALatticeValue.overdefined()
         return SSALatticeValue.constant_value(
             folded,
-            is_safe=operand.is_safe and instr.op in self._SAFE_UNARY_OPS,
+            is_safe=operand.is_safe,
         )
 
     def _evaluate_cast(
@@ -312,10 +309,15 @@ class SSASCCPAnalyzer:
         operand = self._value_state(instr.operand, result)
         if operand.kind != LatticeKind.CONSTANT or operand.constant is None:
             return operand
-        return SSALatticeValue.constant_value(
-            operand.constant,
-            is_safe=operand.is_safe,
+        contract = self._integer_type_contract(instr.type_name)
+        if contract is None:
+            return SSALatticeValue.overdefined()
+        status, folded = _fold_c_integer_unary(
+            "+", contract[0], contract[1], operand.constant
         )
+        if status != FOLD_CONSTANT:
+            return SSALatticeValue.overdefined()
+        return SSALatticeValue.constant_value(folded, is_safe=operand.is_safe)
 
     def _value_state(
         self,
@@ -324,61 +326,112 @@ class SSASCCPAnalyzer:
     ) -> SSALatticeValue:
         return result.lattice_for(value)
 
-    @staticmethod
-    def _fold_binary(op: str, left: int, right: int) -> int | None:
-        if op == "+":
-            return left + right
-        if op == "-":
-            return left - right
-        if op == "*":
-            return left * right
-        if op == "/":
-            if right == 0:
-                return None
-            return int(left / right)
-        if op == "%":
-            if right == 0:
-                return None
-            return left % right
-        if op == "<<":
-            return left << right
-        if op == ">>":
-            return left >> right
-        if op == "&":
-            return left & right
-        if op == "|":
-            return left | right
-        if op == "^":
-            return left ^ right
-        if op == "==":
-            return int(left == right)
-        if op == "!=":
-            return int(left != right)
-        if op == "<":
-            return int(left < right)
-        if op == "<=":
-            return int(left <= right)
-        if op == ">":
-            return int(left > right)
-        if op == ">=":
-            return int(left >= right)
-        if op == "&&":
+    @classmethod
+    def _fold_binary(
+        cls, instr: SSABinaryOp, left: int, right: int
+    ) -> int | None:
+        if instr.op == "&&":
             return int(bool(left) and bool(right))
-        if op == "||":
+        if instr.op == "||":
             return int(bool(left) or bool(right))
-        return None
+
+        if instr.op in {"==", "!=", "<", "<=", ">", ">="}:
+            contract = cls._usual_integer_contract(
+                getattr(instr.left, "type_name", ""),
+                getattr(instr.right, "type_name", ""),
+            )
+        elif instr.op in {"<<", ">>"}:
+            contract = cls._promoted_integer_contract(
+                getattr(instr.left, "type_name", "")
+            )
+        else:
+            contract = cls._integer_type_contract(instr.type_name)
+        if contract is None:
+            return None
+        status, folded = _fold_c_integer_binary(
+            instr.op, contract[0], contract[1], left, right
+        )
+        return folded if status == FOLD_CONSTANT else None
+
+    @classmethod
+    def _fold_unary(cls, instr: SSAUnaryOp, operand: int) -> int | None:
+        if instr.op == "!":
+            return int(not operand)
+        contract = cls._promoted_integer_contract(instr.type_name)
+        if contract is None:
+            return None
+        status, folded = _fold_c_integer_unary(
+            instr.op, contract[0], contract[1], operand
+        )
+        return folded if status == FOLD_CONSTANT else None
+
+    @classmethod
+    def _integer_type_contract(cls, type_name: str) -> tuple[int, bool] | None:
+        normalized = cls._normalize_integer_type_name(type_name)
+        return cls._INTEGER_TYPE_CONTRACTS.get(normalized)
+
+    @classmethod
+    def _promoted_integer_contract(cls, type_name: str) -> tuple[int, bool] | None:
+        contract = cls._integer_type_contract(type_name)
+        if contract is None:
+            return None
+        width, is_unsigned = contract
+        if width < 32:
+            return 32, False
+        return width, is_unsigned
+
+    @classmethod
+    def _usual_integer_contract(
+        cls, left_type_name: str, right_type_name: str
+    ) -> tuple[int, bool] | None:
+        left = cls._promoted_integer_contract(left_type_name)
+        right = cls._promoted_integer_contract(right_type_name)
+        if left is None or right is None:
+            return None
+        left_width, left_unsigned = left
+        right_width, right_unsigned = right
+        if left_unsigned == right_unsigned:
+            return max(left_width, right_width), left_unsigned
+        unsigned_width = left_width if left_unsigned else right_width
+        signed_width = right_width if left_unsigned else left_width
+        if unsigned_width >= signed_width:
+            return unsigned_width, True
+        # A wider signed type represents every value of the narrower unsigned
+        # type on the supported two's-complement LP64 targets.
+        return signed_width, False
 
     @staticmethod
-    def _fold_unary(op: str, operand: int) -> int | None:
-        if op == "+":
-            return operand
-        if op == "-":
-            return -operand
-        if op == "!":
-            return int(not operand)
-        if op == "~":
-            return ~operand
-        return None
+    def _normalize_integer_type_name(type_name: str) -> str:
+        tokens = [
+            token
+            for token in type_name.split()
+            if token not in {"const", "volatile", "restrict", "register"}
+        ]
+        if not tokens:
+            return ""
+        if "signed" in tokens and len(tokens) > 1:
+            tokens.remove("signed")
+        joined = " ".join(tokens)
+        aliases = {
+            "signed": "int",
+            "unsigned": "unsigned int",
+            "int unsigned": "unsigned int",
+            "short int": "short",
+            "int short": "short",
+            "unsigned short int": "unsigned short",
+            "short unsigned": "unsigned short",
+            "short unsigned int": "unsigned short",
+            "long int": "long",
+            "int long": "long",
+            "unsigned long int": "unsigned long",
+            "long unsigned": "unsigned long",
+            "long unsigned int": "unsigned long",
+            "long long int": "long long",
+            "unsigned long long int": "unsigned long long",
+            "long long unsigned": "unsigned long long",
+            "long long unsigned int": "unsigned long long",
+        }
+        return aliases.get(joined, joined)
 
     @staticmethod
     def _mark_reachable(result: SSASCCPResult, block_name: str) -> bool:

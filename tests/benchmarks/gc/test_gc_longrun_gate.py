@@ -8,6 +8,9 @@ from scripts.run_gc_longrun_gate import (
 )
 
 
+GC4_RETAINED_ZPAGE_GAP_LIMIT = 504_992
+
+
 def test_production_rounds_require_explicit_manual_gate(monkeypatch):
     monkeypatch.delenv("PCC_GC_LONGRUN", raising=False)
     assert not manual_gate_enabled()
@@ -47,3 +50,13 @@ def test_small_source_bound_gc0_to_gc4_manifest(tmp_path, monkeypatch):
         assert result["samples_total"] == 3
         assert result["samples_persisted"] == 3
         assert len(result["samples"]) == 3
+
+    # Keep the production row's byte-pinned GC4 bound in the source-bound
+    # churn smoke as well as the manual 100k-round manifests.  This is the
+    # unmodified public span-minus-live metric: the final live dict and its
+    # registered entries payload remain counted.
+    gc4 = next(result for result in manifest["results"] if result["backend"] == 4)
+    assert (
+        gc4["summary"]["zpage_retained_gap_bytes"]
+        <= GC4_RETAINED_ZPAGE_GAP_LIMIT
+    )

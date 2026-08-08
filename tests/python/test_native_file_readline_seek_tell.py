@@ -166,6 +166,38 @@ def test_native_file_readline_binary_round_trip(tmp_path):
     _run_native_vs_python3(tmp_path, program, "native_file_readline_bin_rt")
 
 
+def test_native_file_iteration_round_trip(tmp_path):
+    data = tmp_path / "native-file-iteration.txt"
+    program = textwrap.dedent(
+        f"""
+        PATH = {str(data)!r}
+
+        def main() -> None:
+            f = open(PATH, "w")
+            f.write("alpha\\n\\nomega")
+            f.close()
+
+            text_file = open(PATH, "r")
+            print(iter(text_file) is text_file)
+            for line in text_file:
+                print("text", len(line))
+            print(text_file.readline() == "")
+            text_file.close()
+
+            binary_file = open(PATH, "rb")
+            print(iter(binary_file) is binary_file)
+            for line in binary_file:
+                print("binary", len(line))
+            print(binary_file.readline() == b"")
+            binary_file.close()
+
+        if __name__ == "__main__":
+            main()
+        """
+    ).lstrip()
+    _run_native_vs_python3(tmp_path, program, "native_file_iteration_rt")
+
+
 def test_native_file_closed_raises_valueerror_round_trip(tmp_path):
     data = tmp_path / "native-file-closed.txt"
     program = textwrap.dedent(

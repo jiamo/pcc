@@ -144,13 +144,13 @@ _FRONTEND_INDEPENDENT_TARGETS = {
     "tests/python/test_gc_backend_concurrent.py",
 }
 # These cases each spawn a full inner `pytest` that compiles + runs a GC suite
-# (some multi-core). Under the default `-n auto`, many of them ran at once and
-# oversubscribed the CPU, so an inner compile/run that finishes in ~100s solo
-# blew the old 240s subprocess timeout (and the threaded concurrent-collection
-# inner test even failed under starvation). Each `_iter_cases` param is now
-# pinned to a per-GC-backend xdist_group so `--dist=loadgroup` caps concurrent
-# heavy cases at one-per-backend; the timeouts keep generous headroom for the
-# residual contention with the rest of the suite.
+# (some multi-core). A distinct xdist group per GC backend allowed every group
+# to occupy a worker at once; together with the runtime oracle, that starved
+# normally-fast inner compiles past their 240s/300s subprocess timeouts. Keep
+# two frontend-shaped heavy lanes instead. The LLVM lane owns complete target
+# sets while the self lane owns reduced target sets plus the runtime oracle, so
+# `--dist=loadgroup` retains useful overlap without launching one nested pytest
+# per GC backend concurrently.
 _SUBPROCESS_TIMEOUT_SECONDS = 240
 _SLOW_SUBPROCESS_TIMEOUT_SECONDS = 300
 
@@ -221,7 +221,7 @@ def _iter_cases():
                 # One inner pytest owns the complete frontend/GC slice. This
                 # keeps module caches alive and avoids dozens of repeated
                 # pytest startup/teardown cycles.
-                marks=pytest.mark.xdist_group(name=f"gc_meta_{gc_backend}"),
+                marks=pytest.mark.xdist_group(name=f"pcc_heavy_{frontend_backend}"),
                 # Keep the public node id independent of batch membership so
                 # exact task-board gates cannot silently select zero tests when
                 # a target is added, removed, or consolidated.

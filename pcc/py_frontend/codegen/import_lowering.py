@@ -425,7 +425,11 @@ class ImportLoweringMixin:
             [mod_ptr],
             name=self._fresh(f"cpy.import.{module_name.replace('.', '_')}"),
         )
-        return self._mark_cpy_value(mod_val)
+        # PyImport_ImportModule returns a new reference.  This helper is used
+        # for ephemeral builtin-module expressions (persistent import bindings
+        # are emitted through the separate module-global paths below), so the
+        # expression consumer must eventually release it.
+        return self._mark_owned_cpy_value(mod_val)
 
     def _native_extension_name_uses_cpython_abi(self, path: str) -> bool:
         lower = os.path.basename(path).lower()
@@ -751,7 +755,6 @@ class ImportLoweringMixin:
                 "fileinput",
                 "shutil",
                 "shlex",
-                "sysconfig",
                 "math",
                 "json",
                 "re",
@@ -764,7 +767,6 @@ class ImportLoweringMixin:
                 "threading",
                 "pcc.virtual_thread",
                 "pcc",
-                "importlib",
                 "inspect",
                 "contextlib",
                 "contextvars",
@@ -782,12 +784,21 @@ class ImportLoweringMixin:
                 continue
             if native_table is not None and mod_name in native_table:
                 # Native sibling: initialize it at the import statement, then
-                # register the static alias. ``module.X`` access still goes
-                # through ``_native_module_alias_export_info``.
+                # register the static alias.  An unaliased dotted import binds
+                # the top-level package, not the leaf (``import a.b`` binds
+                # ``a``).  The deep dotted lookup below still resolves
+                # ``a.b.X`` against the leaf's export table.  Keeping the root
+                # binding also means a later ``import a.b`` cannot erase
+                # exports already available as ``a.X``.
                 if mod_name in getattr(self, "_sibling_module_inits", ()):
                     self._emit_compiled_module_ensure_initialized(mod_name)
                 local_name = as_name or mod_name.split(".")[0]
-                self._register_native_module_alias(local_name, mod_name)
+                alias_module = mod_name
+                if as_name is None and "." in mod_name:
+                    top_module = mod_name.split(".")[0]
+                    if top_module in native_table:
+                        alias_module = top_module
+                self._register_native_module_alias(local_name, alias_module)
                 continue
             if mod_name in getattr(self, "_sibling_module_inits", ()):
                 local_name = as_name or mod_name.split(".")[0]

@@ -10,6 +10,7 @@ from ..py_ast import (
     ClassType,
     DictType,
     DynType,
+    Expr,
     FloatType,
     FuncType,
     IntType,
@@ -40,17 +41,48 @@ def _is_none_type_for_cpython_bridge(ty: Type) -> bool:
 
 class CpyBridgeLoweringMixin:
     def _mark_cpy_value(self, value: ir.Value) -> ir.Value:
+        # A CPython object is always carried as ``PyObject *`` at this ABI.
+        # Call-result analysis is deliberately conservative and can identify
+        # a helper body such as ``return hasattr(...)`` as CPython-shaped even
+        # when the helper's declared/native return lane is ``i1``.  Never let
+        # that source-level heuristic retag a scalar SSA value: downstream
+        # truthiness/refcount lowering would otherwise pass the scalar to
+        # ``py_cpy_*`` pointer APIs and grow the self-host fallback closure.
+        if not isinstance(value.type, ir.PointerType):
+            return value
         self._cpy_values.add(value)
         return value
 
+    def _mark_owned_cpy_value(self, value: ir.Value) -> ir.Value:
+        """Tag a CPython-domain SSA value carrying one new reference."""
+        if not isinstance(value.type, ir.PointerType):
+            return value
+        self._cpy_values.add(value)
+        self._owned_cpy_values.add(value)
+        return value
+
+    def _cpy_value_is_owned(self, value: ir.Value) -> bool:
+        return value in self._owned_cpy_values
+
+    def _forget_owned_cpy_value(self, value: ir.Value) -> None:
+        """Record that a new reference was released or transferred."""
+        self._owned_cpy_values.discard(value)
+
     def _emit_cpy_attr(self, obj_val: ir.Value, name: str) -> ir.Value:
+        self._guard_cpy_value_not_null(obj_val)
         attr_ptr = self._ptr_to_cstr(self._cstr_global(name, f".cpy.attr.{name}"))
         val = self.builder.call(
             self.runtime["py_cpy_getattr"],
             [obj_val, attr_ptr],
             name=self._fresh(f"cpy.get.{name}"),
         )
-        return self._mark_cpy_value(val)
+        # The getattr result is a new reference and retains any receiver state
+        # it needs.  Consume only a fresh expression receiver here; imported
+        # module globals and CPython locals remain borrowed.
+        if self._cpy_value_is_owned(obj_val):
+            self.builder.call(self.runtime["py_cpy_decref"], [obj_val])
+            self._forget_owned_cpy_value(obj_val)
+        return self._mark_owned_cpy_value(val)
 
     def _load_cpython_builtin(self, name: str) -> ir.Value:
         import os
@@ -96,6 +128,7 @@ class CpyBridgeLoweringMixin:
             [self._ptr_to_cstr(mod_name_gv)],
             name=self._fresh("cpy.builtins"),
         )
+        self._guard_cpy_value_not_null(mod_val)
         attr_gv = self._cstr_global(
             name,
             f".cpy.builtin.{name}",
@@ -105,7 +138,62 @@ class CpyBridgeLoweringMixin:
             [mod_val, self._ptr_to_cstr(attr_gv)],
             name=self._fresh(f"cpy.builtin.{name}"),
         )
-        return self._mark_cpy_value(fn_val)
+        self.builder.call(self.runtime["py_cpy_decref"], [mod_val])
+        return self._mark_owned_cpy_value(fn_val)
+
+    def _load_cpython_builtin_with_cleanup(
+        self,
+        name: str,
+        live_owned: tuple[ir.Value, ...],
+        pinned_pcc: tuple[tuple[ir.Value, bool], ...] = (),
+    ) -> ir.Value:
+        """Load a builtin while chaining failure through live-ref cleanup."""
+        if not live_owned and not pinned_pcc:
+            return self._load_cpython_builtin(name)
+        previous_cleanup = getattr(self, "_cpy_operand_cleanup_block", None)
+        target = previous_cleanup
+        if target is None:
+            target = self._ensure_fn_err_exit()
+        cleanup = self._make_cpy_operand_cleanup_block(
+            live_owned,
+            (),
+            target,
+            "cpy.builtin.cleanup",
+            pinned_pcc,
+        )
+        self._cpy_operand_cleanup_block = cleanup
+        try:
+            return self._load_cpython_builtin(name)
+        finally:
+            self._cpy_operand_cleanup_block = previous_cleanup
+
+    def _emit_cpy_attr_with_cleanup(
+        self,
+        obj_val: ir.Value,
+        attr_name: str,
+        live_owned: tuple[ir.Value, ...],
+        rooted_pcc: tuple[tuple[ir.Value, ir.Value], ...] = (),
+        pinned_pcc: tuple[tuple[ir.Value, bool], ...] = (),
+    ) -> ir.Value:
+        """Load a CPython attribute while unwinding surrounding temporaries."""
+        if not live_owned and not rooted_pcc and not pinned_pcc:
+            return self._emit_cpy_attr(obj_val, attr_name)
+        previous_cleanup = getattr(self, "_cpy_operand_cleanup_block", None)
+        target = previous_cleanup
+        if target is None:
+            target = self._ensure_fn_err_exit()
+        cleanup = self._make_cpy_operand_cleanup_block(
+            live_owned,
+            rooted_pcc,
+            target,
+            "cpy.attr.cleanup",
+            pinned_pcc,
+        )
+        self._cpy_operand_cleanup_block = cleanup
+        try:
+            return self._emit_cpy_attr(obj_val, attr_name)
+        finally:
+            self._cpy_operand_cleanup_block = previous_cleanup
 
     def _emit_value_as_pcc_object_or_bridge(
         self,
@@ -114,14 +202,39 @@ class CpyBridgeLoweringMixin:
         name_hint: str,
         *,
         consume_valueclass_payload_fields: bool = False,
+        cpy_owned_on_error: tuple[ir.Value, ...] = (),
+        rooted_pcc_on_error: tuple[tuple[ir.Value, ir.Value], ...] = (),
+        pinned_pcc_on_error: tuple[tuple[ir.Value, bool], ...] = (),
+        pcc_release_on_error: tuple[ir.Value, ...] = (),
     ) -> ir.Value:
         if value in self._cpy_values:
+            value_owned = self._cpy_value_is_owned(value)
+            cleanup_owned = list(cpy_owned_on_error)
+            if value_owned and not any(item is value for item in cleanup_owned):
+                cleanup_owned.append(value)
+            cleanup_owned_tuple = tuple(cleanup_owned)
+            self._guard_cpy_value_not_null(
+                value,
+                cleanup_owned_tuple,
+                rooted_pcc_on_error,
+                pinned_pcc_on_error,
+                pcc_release_on_error,
+            )
             bridged = self.builder.call(
                 self.runtime["py_cpy_to_pcc_obj"],
                 [value],
                 name=self._fresh(name_hint),
             )
-            self.builder.call(self.runtime["py_cpy_decref"], [value])
+            self._guard_cpy_value_not_null(
+                bridged,
+                cleanup_owned_tuple,
+                rooted_pcc_on_error,
+                pinned_pcc_on_error,
+                pcc_release_on_error,
+            )
+            if value_owned:
+                self.builder.call(self.runtime["py_cpy_decref"], [value])
+                self._forget_owned_cpy_value(value)
             return bridged
         boxed_valueclass = self._emit_valueclass_payload_to_object(
             value,
@@ -186,7 +299,22 @@ class CpyBridgeLoweringMixin:
                 True,
             )
         if v in getattr(self, "_cpy_values", ()):
-            return v, False
+            return v, self._cpy_value_is_owned(v)
+        if isinstance(ty, (IntType, BoolType)) and isinstance(
+            v.type,
+            ir.PointerType,
+        ):
+            # Exact Python integers live in a pcc bignum object.  Converting
+            # through py_int_to_i64 would silently truncate the semantic int;
+            # let the universal object bridge preserve arbitrary precision.
+            return (
+                self.builder.call(
+                    self.runtime["py_cpy_from_pcc_obj"],
+                    [v],
+                    name=self._fresh("cpy.from_pcc_int"),
+                ),
+                True,
+            )
         if isinstance(ty, IntType) or isinstance(ty, BoolType):
             i64 = self._to_int64(v, ty)
             return (
@@ -326,3 +454,57 @@ class CpyBridgeLoweringMixin:
         raise NotImplementedError(
             f"Layer 1 cannot marshal {type(ty).__name__} to CPython yet"
         )
+
+    def _marshal_to_cpython_consuming_source(
+        self,
+        value: ir.Value,
+        value_ty: Type,
+        source_expr: Expr,
+        cpy_owned_on_error: tuple[ir.Value, ...] = (),
+        rooted_pcc_on_error: tuple[tuple[ir.Value, ir.Value], ...] = (),
+        pinned_pcc_on_error: tuple[tuple[ir.Value, bool], ...] = (),
+        pcc_release_on_error: tuple[ir.Value, ...] = (),
+    ) -> tuple[ir.Value, bool]:
+        """Bridge a value and consume only a provably fresh pcc source.
+
+        ``py_cpy_from_pcc_*`` creates an independent CPython reference; it
+        does not steal the pcc object it walks.  Fresh expression results must
+        therefore stay pinned during conversion and be released on both the
+        NULL and success edges.  Borrowed locals/globals are pinned only: a
+        moving collector updates their root slot, not an already-loaded SSA
+        pointer, but the bridge must not consume their reference.
+
+        Literal builders that pre-pin several operands deliberately keep using
+        ``_marshal_to_cpython`` directly so their batch cleanup owns the source
+        lifetime instead of this single-expression contract.
+        """
+        source_pinned = (
+            isinstance(value.type, ir.PointerType)
+            and value not in getattr(self, "_cpy_values", ())
+            and not isinstance(value_ty, FuncType)
+        )
+        source_owned = (
+            source_pinned
+            and self._pcc_pointer_source_is_owned(source_expr)
+        )
+        if source_pinned:
+            self._gc_pin(value)
+        cpy_value, cpy_owned = self._marshal_to_cpython(value, value_ty)
+        if not source_pinned:
+            return cpy_value, cpy_owned
+        if cpy_value is value:
+            # A passthrough does not create an independent reference, so keep
+            # the original ownership for the caller to consume.
+            self._gc_unpin(value)
+            return cpy_value, source_owned
+        self._guard_cpy_value_not_null(
+            cpy_value,
+            cpy_owned_on_error,
+            rooted_pcc_on_error,
+            pinned_pcc_on_error + ((value, source_owned),),
+            pcc_release_on_error,
+        )
+        self._gc_unpin(value)
+        if source_owned:
+            self._gc_release(value)
+        return cpy_value, cpy_owned

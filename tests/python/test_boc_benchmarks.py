@@ -15,6 +15,9 @@ the single-threaded baseline ``benchmarks/python/boc_ring_serial.py`` and assert
 speedup floor — that's the headline parallelism number BoCPy reports
 "near-linear" for. We require >= 1.5x as a noise-tolerant floor: high enough
 to reject serialized execution, low enough to tolerate noisy CI hosts.
+That wall-clock proof is selected only by ``PCC_RUN_BOC_SPEEDUP=1`` on a
+quiet multicore host. The default suite still compiles and runs the parallel
+ring and checks its invariant without making a performance claim.
 
 The binaries link an isolated ``PCC_WITH_THREADS=1`` runtime fixture; the
 repository's shared runtime archive is never replaced or deleted.
@@ -28,6 +31,8 @@ from pathlib import Path
 
 import pytest
 
+
+pytestmark = pytest.mark.xdist_group(name="pcc_heavy_llvm")
 
 REPO = Path(__file__).absolute().parents[2]
 RING_PARALLEL = REPO / "benchmarks" / "python" / "boc_ring.py"
@@ -78,6 +83,20 @@ def _run_min(exe: Path, runs: int = 3, timeout: float = 60.0) -> tuple[float, st
     return best, best_out
 
 
+def test_boc_ring_correctness(tmp_path, threaded_runtime):
+    src = tmp_path / RING_PARALLEL.name
+    shutil.copyfile(RING_PARALLEL, src)
+    exe = tmp_path / "ring.out"
+
+    _compile(src, exe)
+    _, out = _run_min(exe, runs=1)
+
+    assert "PASS" in out, (
+        f"ring parallel did not PASS — sum invariant broken.\noutput:\n{out}"
+    )
+
+
+@pytest.mark.pcc_gate(env="PCC_RUN_BOC_SPEEDUP")
 def test_boc_ring_correctness_and_speedup(tmp_path, threaded_runtime):
     parallel_src = tmp_path / RING_PARALLEL.name
     serial_src = tmp_path / RING_SERIAL.name

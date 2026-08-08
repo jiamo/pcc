@@ -10,6 +10,9 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 RUNTIME_SOURCE = ROOT / "pcc" / "py_runtime" / "src" / "pcc_metal_runtime.c"
+PORT_SOURCE = (
+    ROOT / "pcc" / "py_runtime" / "py" / "freestanding_metal_runtime.py"
+)
 RUNTIME_HEADER = ROOT / "pcc" / "py_runtime" / "include" / "py_runtime.h"
 RUNTIME_MAKEFILE = ROOT / "pcc" / "py_runtime" / "Makefile"
 RUNTIME_INCLUDE = ROOT / "pcc" / "py_runtime" / "include"
@@ -170,11 +173,12 @@ def _build_fake_bridge(tmp_path: Path) -> tuple[Path, list[str]]:
     return bridge, driver_extra
 
 
-def test_metal_runtime_c_shim_is_archived_and_declared() -> None:
+def test_metal_runtime_c_oracle_and_python_archive_route_are_declared() -> None:
     makefile = RUNTIME_MAKEFILE.read_text(encoding="utf-8")
     assert "$(SRCDIR)/pcc_metal_runtime.c" in makefile
     assert "PCC_CC_ONLY_SRCS = py_os_rss py_os_heap py_io_waitset pcc_metal_runtime" in makefile
-    assert "$(OBJDIR_PY)/pcc_metal_runtime.o:" in makefile
+    assert "freestanding_metal_runtime" in makefile
+    assert "$(OBJDIR_PY)/pcc_metal_runtime.o:" not in makefile
     header = RUNTIME_HEADER.read_text(encoding="utf-8")
     assert "pcc_metal_source_runtime_call_prebuilt" in header
     assert "pcc_metal_metallib_runtime_call_prebuilt" in header
@@ -184,6 +188,45 @@ def test_metal_runtime_c_shim_is_archived_and_declared() -> None:
     assert "ctypes" not in source
     assert "py_cpy" not in source
     assert "PyObject" not in source
+
+
+def test_metal_runtime_python_port_emits_through_self_backend(tmp_path: Path) -> None:
+    from pcc.backend.self_backend_dispatch import emit_self_asm
+    from pcc.py_frontend.pipeline import compile_python
+
+    llvm_ir = tmp_path / "freestanding_metal_runtime.ll"
+    assembly = tmp_path / "freestanding_metal_runtime.s"
+    obj = tmp_path / "freestanding_metal_runtime.o"
+    compile_python(
+        str(PORT_SOURCE),
+        str(llvm_ir),
+        emit_llvm_only=True,
+        libpython_mode="off",
+        python_library=True,
+    )
+    assembly.write_text(
+        emit_self_asm(llvm_ir.read_text(encoding="utf-8")),
+        encoding="utf-8",
+    )
+    _compile([_cc(), "-c", str(assembly), "-o", str(obj)])
+    symbols = subprocess.run(
+        ["nm", "-g", str(obj)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert symbols.returncode == 0, symbols.stdout + symbols.stderr
+    decorated = "_" if sys.platform == "darwin" else ""
+    for symbol in (
+        "pcc_metal_source_runtime_call_prebuilt",
+        "pcc_metal_metallib_runtime_call_prebuilt",
+        "pcc_metal_buffer_runtime_create_prebuilt",
+        "pcc_metal_buffer_runtime_release_prebuilt",
+    ):
+        assert any(
+            line.endswith(" T " + decorated + symbol)
+            for line in symbols.stdout.splitlines()
+        )
 
 
 def test_metal_runtime_c_shim_calls_prebuilt_bridge_without_python(tmp_path: Path) -> None:
@@ -422,6 +465,11 @@ def test_no_libpython_pcc_program_calls_metal_runtime_c_shim(tmp_path: Path) -> 
                 (c_ptr, c_ptr, c_ptr, c_uint64, c_ptr, c_uint64, c_ptr, c_ptr, c_uint64, c_int32),
                 c_int64,
             )
+            pcc_metallib_call = extern(
+                "pcc_metal_metallib_runtime_call_prebuilt",
+                (c_ptr, c_ptr, c_ptr, c_ptr, c_uint64, c_ptr, c_ptr, c_uint64, c_int32),
+                c_int64,
+            )
             pcc_buffer_create = extern(
                 "pcc_metal_buffer_runtime_create_prebuilt",
                 (c_ptr, c_uint64, c_ptr),
@@ -505,6 +553,20 @@ def test_no_libpython_pcc_program_calls_metal_runtime_c_shim(tmp_path: Path) -> 
                     cstr("pcc_fake_source_bridge"),
                     cstr({json.dumps(source_literal)}),
                     {len(source_literal)},
+                    buffers,
+                    1,
+                    scalar_payload,
+                    scalar_offsets,
+                    3,
+                    1,
+                )
+                if rc != 0:
+                    print(rc)
+                    return
+                rc = pcc_metallib_call(
+                    runtime,
+                    cstr("pcc_fake_metallib_bridge"),
+                    cstr("/tmp/fake.metallib"),
                     buffers,
                     1,
                     scalar_payload,

@@ -40,9 +40,11 @@
 |---|---|
 | [pcc/py_runtime/include/py_runtime.h](../../pcc/py_runtime/include/py_runtime.h) | 公共头:对象头、类型标签、`PCC_GC_KIND_*` |
 | [pcc/py_runtime/src/py_internal.h](../../pcc/py_runtime/src/py_internal.h) | 运行时内部布局(如 `PyClassObject`) |
-| `pcc/py_runtime/src/*.c` | C 运行时(对象、GC、线程、异常…) |
-| [pcc/py_runtime/src/py_gc_backend.c](../../pcc/py_runtime/src/py_gc_backend.c) | 五 GC 后端实现 |
-| `pcc/py_runtime/py/*.py` | pcc-Python 运行时端口(C 的镜像;自托管用) |
+| `pcc/py_runtime/src/*.c` | 过渡/host-C 实现与差分 oracle;最终生产 pcc-Python 归档不以其为成员来源 |
+| [pcc/py_runtime/Makefile](../../pcc/py_runtime/Makefile) | `PY_MODULES`、`FREESTANDING_PY_MODULES`、provenance 与生产归档组装 |
+| `pcc/py_runtime/py/py_*.py` | semantic pcc-Python:对象、容器、异常、C-API 等运行时语义 |
+| `pcc/py_runtime/py/freestanding_*.py` | freestanding pcc-Python:分配器、线程、平台、libc-like substrate 与五 GC 政策 |
+| [pcc/py_runtime/py/freestanding_gc_object_slots.py](../../pcc/py_runtime/py/freestanding_gc_object_slots.py) | 生产对象槽统一访问契约 |
 | [pcc/extern/](../../pcc/extern)、[pcc/unsafe/](../../pcc/unsafe) | Python→C extern 声明;编译器识别的内建 |
 | [docs/refs_docs/gc-research/](../../docs/refs_docs/gc-research) | 五 GC 的参照实现(Lua、Go、OCaml、ZGC、CPython) |
 
@@ -67,14 +69,27 @@
 | 路径 | 角色 |
 |---|---|
 | [pcc/package/](../../pcc/package)、[pcc/capi_abi.py](../../pcc/capi_abi.py)、[pcc/capi_surface.py](../../pcc/capi_surface.py) | 包路径与 C-API 面 |
-| [pcc/py_runtime/src/py_capi_shim.c](../../pcc/py_runtime/src/py_capi_shim.c)、`py_extension_loader.c`、`py_cpy_handle.c` | C-API shim、扩展装载、CpyHandle |
+| `pcc/py_runtime/py/py_capi_*_runtime.py`、`py_extension_loader_runtime.py` | 生产 pcc-Python C-API ABI 与扩展装载 owners |
+| [pcc/py_runtime/src/py_capi_shim.c](../../pcc/py_runtime/src/py_capi_shim.c)、`py_extension_loader.c` | host-C oracle/过渡实现,不是生产 pcc-Python 归档 owner |
+
+## GUI 与应用执行(第 20 章)
+
+| 路径 | 角色 |
+|---|---|
+| [pcc/py_runtime/gui_declarative_contract_v1.json](../../pcc/py_runtime/gui_declarative_contract_v1.json) | 声明式 GUI v1 记录、状态机、容量与错误 ABI |
+| [pcc/py_runtime/py/pcc_gui_kit.py](../../pcc/py_runtime/py/pcc_gui_kit.py) | canonical 可回收组合树 kernel、布局、clip、hit path、render walk |
+| `pcc/py_runtime/py/pcc_gui_{components,scheduler,events}.py` | keyed atomic commit、state lanes、listener/effect 生命周期 |
+| `pcc/py_runtime/py/pcc_gui_{style,commands,app_lifecycle}.py` | utility compiler/cache、managed command resolver、无 WebView run lifecycle |
+| [projects/mac_diff_app/](../../projects/mac_diff_app) | 双栏 diff 声明式 canary 与 AppKit/Metal 边界 |
+| [docs/design/gui-declarative-absorption.md](../../docs/design/gui-declarative-absorption.md) | React/Tailwind/Tauri 机制吸收边界、非声明与任务路线 |
 
 ## 方法论文档(第 18 章)
 
 | 路径 | 角色 |
 |---|---|
 | [AGENTS.md](../../AGENTS.md) | 仓库规则与北极星(Project Intent) |
-| [codex-goal-prompt.md](../../codex-goal-prompt.md) | 目标契约与工作协议(§0.10 声明卫生表) |
+| [docs/goal/goal-prompt.md](../../docs/goal/goal-prompt.md) | 目标契约与工作协议(§0.10 声明卫生表) |
+| [docs/goal/task-board.yaml](../../docs/goal/task-board.yaml) | 结构化任务执行队列(`scripts/goal_state.py next` 选任务) |
 | [docs/current-goal-state.md](../../docs/current-goal-state.md) | 当前目标审计与路由 |
 | [docs/debugging-playbook.md](../../docs/debugging-playbook.md) | 调试手册(12 技法) |
 | [docs/investigation-workflow.md](../../docs/investigation-workflow.md) | 调查工作流(三模式与模板) |

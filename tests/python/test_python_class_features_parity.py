@@ -70,6 +70,40 @@ def test_class_basic_construction(tmp_path, monkeypatch):
     assert _run(exe).strip().splitlines() == ["3 4", "25"]
 
 
+def test_unhinted_receiver_uses_runtime_method_when_names_are_ambiguous(
+    tmp_path, monkeypatch
+):
+    src = tmp_path / "ambiguous_method_receiver.py"
+    exe = tmp_path / "ambiguous_method_receiver.out"
+    src.write_text(textwrap.dedent("""
+        class Effect:
+            def dispose(self) -> None:
+                print("effect")
+
+        class Context:
+            def dispose(self) -> None:
+                print("context")
+
+        class Fiber:
+            def __init__(self) -> None:
+                self.context = None
+
+        def deactivate(fiber) -> None:
+            scope = fiber.context
+            scope.dispose()
+
+        def main() -> None:
+            fiber = Fiber()
+            fiber.context = Context()
+            deactivate(fiber)
+
+        if __name__ == "__main__":
+            main()
+        """).lstrip(), encoding="utf-8")
+    _compile(monkeypatch, src, exe)
+    assert _run(exe).strip() == "context"
+
+
 def test_class_inheritance_super(tmp_path, monkeypatch):
     src = tmp_path / "class_inherit.py"
     exe = tmp_path / "class_inherit.out"

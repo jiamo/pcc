@@ -9,7 +9,7 @@ kernel subset ACCEPTS it (maps to a pcc Kernel IR construct) or REJECTS it
 Accepted subset (research report §适合先原生化的子集):
     kernel / tensor / buffer / shared / fragment / local
     parallel / serial / vectorized / pipelined
-    copy / copy_async / fill / gemm / reduce
+    copy / copy_async / fill / gemm / bounded static reduce_sum
     layout annotation / launch binding / barrier / fence
 
 Explicitly out of scope: CuTeDSL, Hopper/Blackwell/TMA intrinsics, full runtime.
@@ -90,7 +90,16 @@ _MATRIX: dict[str, ConstructInfo] = {info.tilelang_name: info for info in (
     _ok("gemm", "KernelOp('gemm')", "tile gemm via primitive dispatch"),
     _ok("clear", "KernelOp('fill', value=0)", "zero/fill primitive"),
     _ok("fill", "KernelOp('fill')", "fill primitive"),
+    _ok(
+        "reduce_sum",
+        "KernelOp('reduce', reduction='sum')",
+        "bounded static contiguous last-dimension row reduction; pcc source subset only",
+    ),
     # --- rejected: out of scope for the first slice ---
+    _no("reduce_max", "max reduction is not yet lowered by the pcc Metal source path"),
+    _no("reduce_min", "min reduction is not yet lowered by the pcc Metal source path"),
+    _no("reduce_abssum", "absolute-sum reduction is not yet lowered by the pcc Metal source path"),
+    _no("reduce_absmax", "absolute-max reduction is not yet lowered by the pcc Metal source path"),
     _no("alloc_tmem", "Blackwell tensor-memory; out of scope"),
     _no("alloc_tcgen", "tcgen05 tensor-core-gen; CUDA-only, out of scope"),
     _no("alloc_wgmma", "Hopper wgmma descriptor; CUDA-only, out of scope"),

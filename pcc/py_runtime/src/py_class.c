@@ -18,9 +18,9 @@
  *     codegen emits it as a module-init side effect and stores a pointer
  *     in a global). Freeing a class is still supported for completeness.
  *
- *   * Instances carry either PY_TYPE_INSTANCE or a class-specific
- *     PY_TYPE_USER + N tag. The codegen can choose either; py_instance_*
- *     and py_obj_ops functions check for both tags.
+ *   * Instances carry either PY_TYPE_INSTANCE or a class-specific tag at
+ *     PY_TYPE_USER_CLASS_START or above. Tags between PY_TYPE_USER and that
+ *     boundary are descriptor layouts and must not enter py_instance_*.
  *
  *   * Method dispatch is linear over (methods[] of mro[0..n_mro-1]).
  *     Classes have small method tables so this is faster than a dict
@@ -58,7 +58,7 @@ extern int32_t py_inst_field_cache_epoch3;
 /* ---- Forward decls (for dispatch from py_obj.c) ----------------------- */
 
 /* py_obj.c already dispatches on type_tag via a switch; we hook
- * PY_TYPE_CLASS / PY_TYPE_INSTANCE / PY_TYPE_USER+ through the
+ * PY_TYPE_CLASS / PY_TYPE_INSTANCE / allocated user-class tags through the
  * "generic" path. Exposing dedicated deallocators here lets us centralize
  * the cleanup. */
 
@@ -77,15 +77,7 @@ static PyClassObject *object_root(void);
 /* ---- Helpers ---------------------------------------------------------- */
 
 static int pointer_can_have_header(void *ptr) {
-    uintptr_t bits = (uintptr_t)ptr;
-    if (ptr == NULL) return 0;
-    if ((bits & 1u) != 0u) return 0;
-    if (bits < 0x1000u) return 0;
-    if ((bits & 0x7u) != 0u) return 0;
-#if UINTPTR_MAX > 0xffffffffu
-    if ((bits >> 48) != 0u) return 0;
-#endif
-    return 1;
+    return pcc_gc_pointer_is_managed((PyObject *)ptr) != 0;
 }
 
 static int class_pointer_is_class(PyClassObject *cls) {
@@ -96,13 +88,24 @@ static int class_pointer_is_class(PyClassObject *cls) {
 static int instance_pointer_is_instance(PyInstanceObject *inst) {
     if (!pointer_can_have_header((void *)inst)) return 0;
     int32_t tag = py_header((PyObject *)inst)->type_tag;
-    if (tag != PY_TYPE_INSTANCE && tag < PY_TYPE_USER) return 0;
+    if (tag != PY_TYPE_INSTANCE && tag < PY_TYPE_USER_CLASS_START) return 0;
     PyClassObject *cls = (PyClassObject *)pcc_gc_load_ptr(
         (PyObject *)inst,
         (PyObject **)&inst->cls
     );
     if (cls == NULL) return 0;
     return class_pointer_is_class(cls);
+}
+
+static PyObject *class_require_result(
+    PyObject *result,
+    const char *helper_name,
+    const char *message
+) {
+    if (result == NULL) {
+        py_runtime_error_if_unset(helper_name, message);
+    }
+    return result;
 }
 
 static void class_note_borrowed_metadata_slot_store(
@@ -121,16 +124,31 @@ static PyObject *class_call_binary_method(
         && !PY_IS_TAGGED_INT(func)
         && py_type_of(func) == PY_TYPE_FUNC) {
         PyObject *args = py_tuple_new(2);
-        if (args == NULL) return NULL;
+        if (args == NULL) {
+            return class_require_result(
+                NULL,
+                "py_tuple_new",
+                "class callback argument tuple allocation failed"
+            );
+        }
         py_tuple_set_item(args, 0, self);
         py_tuple_set_item(args, 1, arg);
         PyObject *out = py_func_call(func, args);
+        class_require_result(
+            out,
+            "class callback",
+            "class callback returned NULL without setting an exception"
+        );
         py_decref(args);
         return out;
     }
     typedef PyObject *(*BinaryMethod)(PyObject *, PyObject *);
     BinaryMethod meth = (BinaryMethod)(uintptr_t)func;
-    return meth(self, arg);
+    return class_require_result(
+        meth(self, arg),
+        "class callback",
+        "class callback returned NULL without setting an exception"
+    );
 }
 
 static PyObject *class_call_ternary_method(
@@ -144,25 +162,51 @@ static PyObject *class_call_ternary_method(
         && !PY_IS_TAGGED_INT(func)
         && py_type_of(func) == PY_TYPE_FUNC) {
         PyObject *args = py_tuple_new(3);
-        if (args == NULL) return NULL;
+        if (args == NULL) {
+            return class_require_result(
+                NULL,
+                "py_tuple_new",
+                "class callback argument tuple allocation failed"
+            );
+        }
         py_tuple_set_item(args, 0, self);
         py_tuple_set_item(args, 1, arg0);
         py_tuple_set_item(args, 2, arg1);
         PyObject *out = py_func_call(func, args);
+        class_require_result(
+            out,
+            "class callback",
+            "class callback returned NULL without setting an exception"
+        );
         py_decref(args);
         return out;
     }
     typedef PyObject *(*TernaryMethod)(PyObject *, PyObject *, PyObject *);
     TernaryMethod meth = (TernaryMethod)(uintptr_t)func;
-    return meth(self, arg0, arg1);
+    return class_require_result(
+        meth(self, arg0, arg1),
+        "class callback",
+        "class callback returned NULL without setting an exception"
+    );
 }
 
 static PyObject *class_call_unary_callable(PyObject *func, PyObject *arg) {
     if (func == NULL) return NULL;
     PyObject *args = py_tuple_new(1);
-    if (args == NULL) return NULL;
+    if (args == NULL) {
+        return class_require_result(
+            NULL,
+            "py_tuple_new",
+            "class callback argument tuple allocation failed"
+        );
+    }
     py_tuple_set_item(args, 0, arg);
     PyObject *out = py_obj_call(func, args, py_None);
+    class_require_result(
+        out,
+        "class callback",
+        "class callback returned NULL without setting an exception"
+    );
     py_decref(args);
     return out;
 }
@@ -174,10 +218,21 @@ static PyObject *class_call_binary_callable(
 ) {
     if (func == NULL) return NULL;
     PyObject *args = py_tuple_new(2);
-    if (args == NULL) return NULL;
+    if (args == NULL) {
+        return class_require_result(
+            NULL,
+            "py_tuple_new",
+            "class callback argument tuple allocation failed"
+        );
+    }
     py_tuple_set_item(args, 0, arg0);
     py_tuple_set_item(args, 1, arg1);
     PyObject *out = py_obj_call(func, args, py_None);
+    class_require_result(
+        out,
+        "class callback",
+        "class callback returned NULL without setting an exception"
+    );
     py_decref(args);
     return out;
 }
@@ -493,17 +548,27 @@ void py_class_set_metaclass(PyClassObject *cls, PyClassObject *metaclass) {
 static PyClassObject *object_root(void) {
     static PyClassObject *root = NULL;
     if (root != NULL) return root;
+    PyClassObject **mro =
+        (PyClassObject **)malloc(sizeof(PyClassObject *));
+    if (mro == NULL) return NULL;
+    /* `root` is cached in a process-global raw pointer, not a relocation-
+     * updated GC root slot.  Keep its address stable while still publishing
+     * exact managed-pointer provenance. */
     PyClassObject *r = (PyClassObject *)calloc(1, sizeof(PyClassObject));
-    if (!r) return NULL;
+    if (!r) { free(mro); return NULL; }
     r->h.refcount = 1;
     r->h.type_tag = PY_TYPE_CLASS;
-    r->h.flags    = PY_FLAG_IMMORTAL;
+    r->h.flags = PY_FLAG_IMMORTAL | PY_FLAG_GC_MALLOC_ALLOC;
+    if (pcc_gc_pointer_register((PyObject *)r) < 0) {
+        free(r);
+        free(mro);
+        return NULL;
+    }
     r->name       = "object";
     r->n_bases    = 0;
     r->bases      = NULL;
     r->n_mro      = 1;
-    r->mro        = (PyClassObject **)malloc(sizeof(PyClassObject *));
-    if (!r->mro) { free(r); return NULL; }
+    r->mro        = mro;
     r->mro[0]     = r;
     r->n_fields   = 0;
     r->field_names = NULL;
@@ -810,7 +875,7 @@ PyObject *py_obj_vars(PyObject *o) {
         return NULL;
     }
     int32_t tag = py_header(o)->type_tag;
-    if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER) {
+    if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER_CLASS_START) {
         return py_instance_vars((PyInstanceObject *)o);
     }
     PyObject *dict = py_obj_getattr_default(o, "__dict__");
@@ -1172,7 +1237,7 @@ static PyInstanceObject *dataclass_copy_instance(PyObject *obj,
                                                  PyClassObject **cls_out) {
     if (!pointer_can_have_header((void *)obj)) return NULL;
     int32_t tag = py_header(obj)->type_tag;
-    if (tag != PY_TYPE_INSTANCE && tag < PY_TYPE_USER) return NULL;
+    if (tag != PY_TYPE_INSTANCE && tag < PY_TYPE_USER_CLASS_START) return NULL;
 
     PyInstanceObject *src = (PyInstanceObject *)obj;
     if (!instance_pointer_is_instance(src)) return NULL;
@@ -1262,7 +1327,7 @@ int64_t py_isinstance(PyObject *obj, PyClassObject *cls) {
          * Without this isinstance(ValueError('x'), ValueError) was False. */
         return py_exc_matches(obj, (PyObject *)cls) ? 1 : 0;
     }
-    if (tag != PY_TYPE_INSTANCE && tag < PY_TYPE_USER) return 0;
+    if (tag != PY_TYPE_INSTANCE && tag < PY_TYPE_USER_CLASS_START) return 0;
     PyInstanceObject *inst = (PyInstanceObject *)obj;
     if (!instance_pointer_is_instance(inst)) return 0;
     PyClassObject *c = (PyClassObject *)pcc_gc_load_ptr(
@@ -1348,6 +1413,30 @@ void py_class_dealloc(PyObject *o) {
     free(c->mro);
     free(c->methods);
     free((void *)c->field_names);
+    pcc_gc_free_object_memory(o);
+}
+
+static void descriptor_release_slot(PyObject *owner, PyObject **slot) {
+    PyObject *value = pcc_gc_load_ptr(owner, slot);
+    *slot = NULL;
+    if (value != NULL) py_decref(value);
+}
+
+void py_descriptor_dealloc(PyObject *o) {
+    if (!o) return;
+    int32_t tag = py_header(o)->type_tag;
+    if (tag == PY_TYPE_PROPERTY) {
+        PyPropertyObject *property = (PyPropertyObject *)o;
+        descriptor_release_slot(o, &property->fget);
+        descriptor_release_slot(o, &property->fset);
+        descriptor_release_slot(o, &property->fdel);
+    } else if (tag == PY_TYPE_CLASSMETHOD) {
+        PyClassMethodObject *method = (PyClassMethodObject *)o;
+        descriptor_release_slot(o, &method->func);
+    } else if (tag == PY_TYPE_STATICMETHOD) {
+        PyStaticMethodObject *method = (PyStaticMethodObject *)o;
+        descriptor_release_slot(o, &method->func);
+    }
     pcc_gc_free_object_memory(o);
 }
 

@@ -95,6 +95,9 @@ from pcc.kernel_ir.tilelang_compat import (
     is_accepted,
 )
 from pcc.kernel_ir.tilelang_import import (
+    TILELANG_REDUCE_SUM_REFERENCE_COMMIT,
+    TILELANG_REDUCE_SUM_REFERENCE_PATH,
+    TILELANG_REDUCE_SUM_REFERENCE_SHA256,
     TILELANG_WGMMA_LAYOUT_REFERENCE_COMMIT,
     TILELANG_WGMMA_LAYOUT_REFERENCE_PATH,
     TILELANG_WGMMA_LAYOUT_REFERENCE_SHA256,
@@ -115,6 +118,7 @@ from pcc.kernel_ir.cpu_reference import (
     KernelCpuReferenceError,
     execute_static_fill_reference,
     execute_static_indexed_reference,
+    execute_static_row_reduce_sum_reference,
     execute_sparse_tiled_gemm_sp_reference,
     execute_scalar_tiled_gemm_reference,
 )

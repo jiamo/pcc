@@ -23,12 +23,16 @@ static int64_t py_gc_index_used = 0;
 
 static uint64_t py_gc_index_hash_ptr(const void *p) {
     /* Heap/object pointers are at least 8-byte aligned and usually arrive
-     * from contiguous arenas or zpages. Mix address bits into the low mask
-     * bits without paying two 64-bit multiplies on every GC index operation. */
+     * from contiguous arenas or zpages. The previous shift-xor mix left
+     * consecutive addresses in consecutive slots, which is the worst case
+     * for linear probing (primary clustering: bootstrap-scale bursts of
+     * bump-allocated objects formed giant contiguous runs and find_slot
+     * dominated GC3/GC4 profiles). One Fibonacci multiply breaks the
+     * consecutive-key pattern; keep in bit-exact sync with
+     * pcc_gc_index_py_hash_ptr in py/freestanding_gc_index_table.py. */
     uint64_t v = (uint64_t)(uintptr_t)p >> 3;
-    v ^= v >> 17;
-    v ^= v >> 33;
-    return v;
+    v *= 0x9E3779B97F4A7C15ull;
+    return v ^ (v >> 32);
 }
 
 static int64_t py_gc_index_next_pow2(int64_t n) {
@@ -59,19 +63,22 @@ static int64_t pcc_gc_index_find_slot(
     void *key,
     int *found
 ) {
+    /* Backward-shift deletion keeps probe chains gap-free, so slot state
+     * is only EMPTY or FULL: churn workloads no longer accumulate
+     * tombstones that force same-capacity rehashes (calloc+memset
+     * dominated the GC4 longrun profile) or lengthen probe runs. Keep in
+     * lockstep with pcc_gc_index_py_find_slot in
+     * py/freestanding_gc_index_table.py. */
     uint64_t h = py_gc_index_hash_ptr(key);
     int64_t mask = cap - 1;
     int64_t idx = (int64_t)(h & (uint64_t)mask);
-    int64_t first_deleted = -1;
     for (;;) {
         uint8_t state = slots[idx].state;
         if (state == PCC_GC_INDEX_SLOT_EMPTY) {
             *found = 0;
-            return first_deleted >= 0 ? first_deleted : idx;
+            return idx;
         }
-        if (state == PCC_GC_INDEX_SLOT_DELETED) {
-            if (first_deleted < 0) first_deleted = idx;
-        } else if (slots[idx].key == key) {
+        if (slots[idx].key == key) {
             *found = 1;
             return idx;
         }
@@ -122,16 +129,40 @@ static void *pcc_gc_index_remove_slot(
     PccGcIndexSlot *slots,
     int64_t cap,
     int64_t *count,
+    int64_t *used,
     void *key
 ) {
     int found = 0;
     int64_t idx = pcc_gc_index_find_slot(slots, cap, key, &found);
     if (!found) return NULL;
     void *node = slots[idx].node;
-    slots[idx].key = NULL;
-    slots[idx].node = NULL;
-    slots[idx].state = PCC_GC_INDEX_SLOT_DELETED;
+    /* Backward-shift deletion: close the probe-chain gap instead of
+     * writing a tombstone. An entry at ``probe`` (home slot ``home``) may
+     * fill the hole iff its home lies cyclically outside (hole, probe],
+     * i.e. (probe - home) mod cap >= (probe - hole) mod cap. Loop cost is
+     * the probe-run length past the hole (short at <=50% load with the
+     * Fibonacci hash). No engine caller iterates slots across removes, so
+     * moving entries here is safe for every index instance. Keep in
+     * lockstep with pcc_gc_index_py_remove. */
+    int64_t mask = cap - 1;
+    int64_t hole = idx;
+    int64_t probe = idx;
+    for (;;) {
+        probe = (probe + 1) & mask;
+        if (slots[probe].state != PCC_GC_INDEX_SLOT_FULL) break;
+        int64_t home = (int64_t)(
+            py_gc_index_hash_ptr(slots[probe].key) & (uint64_t)mask
+        );
+        if (((probe - home) & mask) >= ((probe - hole) & mask)) {
+            slots[hole] = slots[probe];
+            hole = probe;
+        }
+    }
+    slots[hole].key = NULL;
+    slots[hole].node = NULL;
+    slots[hole].state = PCC_GC_INDEX_SLOT_EMPTY;
     (*count)--;
+    (*used)--;
     return node;
 }
 
@@ -206,6 +237,7 @@ PyGcNode *py_gc_index_remove(PyObject *obj) {
         py_gc_index_slots,
         py_gc_index_cap,
         &py_gc_index_count,
+        &py_gc_index_used,
         obj
     );
 }
@@ -490,6 +522,7 @@ static void *pcc_gc_ptr_index_remove(PccGcPtrIndex *index, PyObject *obj) {
         index->slots,
         index->cap,
         &index->count,
+        &index->used,
         obj
     );
 }
@@ -500,6 +533,7 @@ static void *pcc_gc_ptr_index_remove_raw(PccGcPtrIndex *index, void *key) {
         index->slots,
         index->cap,
         &index->count,
+        &index->used,
         key
     );
 }
@@ -530,6 +564,147 @@ static PccGcPtrIndex pcc_gc_zpage_owner_index = {
 static PccGcPtrIndex pcc_gc_zpage_page_index = {
     NULL, 0, 0, 0
 };
+
+/* Exact provenance for managed objects that intentionally do not have a
+ * PccGcObjectNode: backend-0 objects, backend-3/4 graph leaves, and the small
+ * number of runtime-owned objects constructed outside pcc_gc_alloc.  This is
+ * a key-only set rather than another pointer->node table so the provenance
+ * contract does not add a 24-byte slot to every refcount-mode object.
+ *
+ * Access is serialized by the GC graph lock in py_gc_backend.c.  Lookups only
+ * compare pointer VALUES; they never dereference a candidate pointer. */
+static void **pcc_gc_managed_pointer_slots = NULL;
+static int64_t pcc_gc_managed_pointer_cap = 0;
+static int64_t pcc_gc_managed_pointer_count = 0;
+
+static int64_t pcc_gc_managed_pointer_find_slot(
+    void **slots,
+    int64_t cap,
+    void *key,
+    int *found
+) {
+    int64_t mask = cap - 1;
+    int64_t index = (int64_t)(
+        py_gc_index_hash_ptr(key) & (uint64_t)mask
+    );
+    for (;;) {
+        void *candidate = slots[index];
+        if (candidate == NULL) {
+            *found = 0;
+            return index;
+        }
+        if (candidate == key) {
+            *found = 1;
+            return index;
+        }
+        index = (index + 1) & mask;
+    }
+}
+
+static int pcc_gc_managed_pointer_rehash(int64_t requested_cap) {
+    int64_t new_cap = py_gc_index_next_pow2(requested_cap);
+    void **new_slots = (void **)calloc((size_t)new_cap, sizeof(void *));
+    if (new_slots == NULL) return -1;
+    for (int64_t i = 0; i < pcc_gc_managed_pointer_cap; i++) {
+        void *key = pcc_gc_managed_pointer_slots[i];
+        if (key == NULL) continue;
+        int found = 0;
+        int64_t index = pcc_gc_managed_pointer_find_slot(
+            new_slots, new_cap, key, &found
+        );
+        new_slots[index] = key;
+    }
+    free(pcc_gc_managed_pointer_slots);
+    pcc_gc_managed_pointer_slots = new_slots;
+    pcc_gc_managed_pointer_cap = new_cap;
+    return 0;
+}
+
+int64_t pcc_gc_managed_pointer_index_contains(PyObject *obj) {
+    if (
+        pcc_gc_managed_pointer_slots == NULL
+        || obj == NULL
+        || PY_IS_TAGGED_INT(obj)
+    ) {
+        return 0;
+    }
+    int found = 0;
+    (void)pcc_gc_managed_pointer_find_slot(
+        pcc_gc_managed_pointer_slots,
+        pcc_gc_managed_pointer_cap,
+        obj,
+        &found
+    );
+    return found ? 1 : 0;
+}
+
+int64_t pcc_gc_managed_pointer_index_insert(PyObject *obj) {
+    if (obj == NULL || PY_IS_TAGGED_INT(obj)) return -1;
+    if (pcc_gc_managed_pointer_slots == NULL) {
+        if (pcc_gc_managed_pointer_rehash(256) != 0) return -1;
+    }
+    int found = 0;
+    int64_t index = pcc_gc_managed_pointer_find_slot(
+        pcc_gc_managed_pointer_slots,
+        pcc_gc_managed_pointer_cap,
+        obj,
+        &found
+    );
+    if (found) return 0;
+    if (pcc_gc_managed_pointer_count + 1 > pcc_gc_managed_pointer_cap / 2) {
+        if (
+            pcc_gc_managed_pointer_rehash(
+                pcc_gc_managed_pointer_cap * 2
+            ) != 0
+        ) {
+            return -1;
+        }
+        index = pcc_gc_managed_pointer_find_slot(
+            pcc_gc_managed_pointer_slots,
+            pcc_gc_managed_pointer_cap,
+            obj,
+            &found
+        );
+    }
+    pcc_gc_managed_pointer_slots[index] = obj;
+    pcc_gc_managed_pointer_count++;
+    return 1;
+}
+
+int64_t pcc_gc_managed_pointer_index_remove(PyObject *obj) {
+    if (
+        pcc_gc_managed_pointer_slots == NULL
+        || obj == NULL
+        || PY_IS_TAGGED_INT(obj)
+    ) {
+        return 0;
+    }
+    int found = 0;
+    int64_t hole = pcc_gc_managed_pointer_find_slot(
+        pcc_gc_managed_pointer_slots,
+        pcc_gc_managed_pointer_cap,
+        obj,
+        &found
+    );
+    if (!found) return 0;
+    int64_t mask = pcc_gc_managed_pointer_cap - 1;
+    int64_t probe = hole;
+    for (;;) {
+        probe = (probe + 1) & mask;
+        void *key = pcc_gc_managed_pointer_slots[probe];
+        if (key == NULL) break;
+        int64_t home = (int64_t)(
+            py_gc_index_hash_ptr(key) & (uint64_t)mask
+        );
+        if (((probe - home) & mask) >= ((probe - hole) & mask)) {
+            pcc_gc_managed_pointer_slots[hole] = key;
+            hole = probe;
+        }
+    }
+    pcc_gc_managed_pointer_slots[hole] = NULL;
+    pcc_gc_managed_pointer_count--;
+    return 1;
+}
 
 void *pcc_gc_forwarding_index_find(PyObject *obj) {
     return pcc_gc_ptr_index_find(&pcc_gc_forwarding_index, obj);
@@ -736,6 +911,7 @@ void *pcc_gc_object_index_remove(PyObject *obj) {
         pcc_gc_object_index_slots,
         pcc_gc_object_index_cap,
         &pcc_gc_object_index_count,
+        &pcc_gc_object_index_used,
         obj
     );
 }

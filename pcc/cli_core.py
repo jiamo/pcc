@@ -43,6 +43,8 @@ Options:
   --separate-tus            Compile directory inputs as separate translation units.
   --jobs N                  Parallel jobs for multi-input or system-link modes.
   --system-link             Link and run via the host C compiler.
+  --freestanding-libc       For C, link supported libc ABI to the shared
+                            pcc-Python archive (implies --system-link).
   --no-cache                Disable the translation-unit compile cache.
   --cache-dir PATH          Override the on-disk compile cache directory.
   --sources-from-make GOAL  Collect project sources from `make -nB GOAL`.
@@ -143,64 +145,14 @@ def _seed_package_site_for_python_entry(src_path: str) -> None:
         os.environ["PCC_PACKAGE_SITE"] = _path_list_sep().join(roots)
 
 
-def _fnv1a_update_u64(value: int, text: str) -> int:
-    h = value & 0xFFFFFFFFFFFFFFFF
-    data = str(text or "")
-    i = 0
-    while i < len(data):
-        h ^= ord(data[i]) & 0xFF
-        h = (h * 1099511628211) & 0xFFFFFFFFFFFFFFFF
-        i += 1
-    return h
-
-
-def _fnv1a_update_bytes_u64(value: int, data) -> int:
-    h = value & 0xFFFFFFFFFFFFFFFF
-    i = 0
-    while i < len(data):
-        h ^= data[i] & 0xFF
-        h = (h * 1099511628211) & 0xFFFFFFFFFFFFFFFF
-        i += 1
-    return h
-
-
-def _iter_py_sources_under(root: str):
-    root = os.path.abspath(root)
-    out = []
-    if os.path.isfile(root):
-        if root.endswith(".py"):
-            out.append(root)
-        return out
-    if not os.path.isdir(root):
-        return out
-    stack = [root]
-    while stack:
-        cur = stack.pop()
-        try:
-            names = sorted(os.listdir(cur))
-        except OSError:
-            names = []
-        for name in names:
-            if name in (
-                ".git",
-                ".hg",
-                ".mypy_cache",
-                ".pytest_cache",
-                ".ruff_cache",
-                "__pycache__",
-                "build",
-                "dist",
-                ".venv",
-                "venv",
-            ):
-                continue
-            full = os.path.join(cur, name)
-            if os.path.isdir(full):
-                stack.append(full)
-            elif name.endswith(".py"):
-                out.append(os.path.abspath(full))
-    out.sort()
-    return out
+# FNV-1a hashing and the .py source walk live in one place so the host
+# CLI and the bootstrap CLI cannot drift apart on run-cache keys
+# (AUD-P2-CLI-SHARED-HELPER-DUPLICATION).
+from pcc.cli_shared_paths import (
+    _fnv1a_update_bytes_u64,
+    _fnv1a_update_u64,
+    _iter_py_sources_under,
+)
 
 
 def _python_run_cache_key(
@@ -211,6 +163,7 @@ def _python_run_cache_key(
     ir_scaffold: str,
     backend: str,
     gpu_backend,
+    link_args=(),
 ):
     roots = _inferred_package_site_roots(src_path)
     _append_unique_path(roots, src_path)
@@ -226,6 +179,9 @@ def _python_run_cache_key(
         sys.platform,
     ):
         h = _fnv1a_update_u64(h, part)
+        h = _fnv1a_update_u64(h, "\0")
+    for link_arg in _copy_seq(link_args):
+        h = _fnv1a_update_u64(h, "link-arg:" + str(link_arg))
         h = _fnv1a_update_u64(h, "\0")
     seen = []
     for root in roots:
@@ -262,6 +218,7 @@ def _python_run_cache_path(
     ir_scaffold: str,
     backend: str,
     gpu_backend,
+    link_args=(),
 ):
     if str(os.environ.get("PCC_DISABLE_PY_RUN_CACHE", "")).strip() in (
         "1",
@@ -283,6 +240,7 @@ def _python_run_cache_path(
         ir_scaffold=ir_scaffold,
         backend=backend,
         gpu_backend=gpu_backend,
+        link_args=link_args,
     )
     tag = os.path.basename(src_path)
     if tag.endswith(".py"):
@@ -619,6 +577,7 @@ def parse_cli_args(argv=None):
     jobs = 8
     jobs_was_explicit = False
     system_link = False
+    freestanding_libc = False
     no_cache = False
     cache_dir = None
     sources_from_make = None
@@ -663,6 +622,10 @@ def parse_cli_args(argv=None):
             continue
         if arg == "--system-link":
             system_link = True
+            i += 1
+            continue
+        if arg == "--freestanding-libc":
+            freestanding_libc = True
             i += 1
             continue
         if arg == "--no-cache":
@@ -976,6 +939,7 @@ def parse_cli_args(argv=None):
             jobs,
             jobs_was_explicit,
             system_link,
+            freestanding_libc,
             no_cache,
             cache_dir,
             sources_from_make,
@@ -1045,10 +1009,13 @@ def _execute_python_path(
     path,
     emit_llvm,
     output_path,
+    target_triple,
+    backend,
     python_libpython,
     python_library,
     ir_scaffold,
     gpu_backend,
+    link_args,
     verbose,
     prog_args,
 ):
@@ -1089,6 +1056,9 @@ def _execute_python_path(
                 python_library=compile_python_library,
                 ir_scaffold_mode=compile_ir_scaffold_mode,
                 gpu_backend=compile_gpu_backend,
+                target_triple=target_triple,
+                backend=backend,
+                link_args=_copy_seq(link_args),
             )
         except ObservedCompileError as exc:
             raise PyPipelineError(exc.formatted) from exc
@@ -1145,6 +1115,7 @@ def _execute_python_path(
         ir_scaffold=ir_scaffold,
         backend=backend,
         gpu_backend=gpu_backend,
+        link_args=link_args,
     )
     if cache_path and os.path.isfile(cache_path):
         try:
@@ -1223,6 +1194,7 @@ def execute_cli(
     jobs=8,
     jobs_was_explicit=False,
     system_link=False,
+    freestanding_libc=False,
     no_cache=False,
     cache_dir=None,
     sources_from_make=None,
@@ -1270,14 +1242,23 @@ def execute_cli(
         return 1
 
     if isinstance(path, str) and path.endswith(".py"):
+        if freestanding_libc:
+            _write_text(
+                "Error: --freestanding-libc is only valid for C inputs",
+                err=True,
+            )
+            return 1
         return _execute_python_path(
             path=path,
             emit_llvm=emit_llvm,
             output_path=output_path,
+            target_triple=target_triple,
+            backend=backend,
             python_libpython=python_libpython,
             python_library=python_library,
             ir_scaffold=ir_scaffold,
             gpu_backend=gpu_backend,
+            link_args=link_args,
             verbose=verbose,
             prog_args=prog_args,
         )
@@ -1288,6 +1269,16 @@ def execute_cli(
             err=True,
         )
         return 1
+
+    if freestanding_libc and (emit_obj or emit_asm or emit_llvm):
+        _write_text(
+            "Error: --freestanding-libc requires a final link/run, not an emit-only mode",
+            err=True,
+        )
+        return 1
+
+    if freestanding_libc:
+        system_link = True
 
     use_multi_input = separate_tus or bool(dependencies)
 
@@ -1372,6 +1363,21 @@ def execute_cli(
             allow_unimplemented_backend=allow_unimplemented_backend,
         )
         with _temporary_env(pass_env):
+            effective_link_args = _copy_seq(link_args)
+            if freestanding_libc:
+                runtime_cc = str(os.environ.get("PCC_RUNTIME_CC", "") or "")
+                runtime_high = str(
+                    os.environ.get("PCC_RUNTIME_HIGH", "") or ""
+                )
+                if runtime_cc.strip().lower() in ("cc", "c", "host"):
+                    raise RuntimeError(
+                        "--freestanding-libc requires PCC_RUNTIME_CC=pcc"
+                    )
+                if runtime_high.strip().lower() in ("cc", "c"):
+                    raise RuntimeError(
+                        "--freestanding-libc requires PCC_RUNTIME_HIGH=py"
+                    )
+
             if emit_mode:
                 if use_multi_input:
                     compiled_units = pcc.compile_translation_units(
@@ -1420,9 +1426,10 @@ def execute_cli(
                         jobs=jobs,
                         include_dirs=include_dirs,
                         cpp_args=merged_cpp_args,
-                        link_args=_copy_seq(link_args),
+                        link_args=effective_link_args,
                         use_compile_cache=not no_cache,
                         cache_dir=cache_dir,
+                        freestanding_libc=freestanding_libc,
                     )
                     ret = run.returncode
                     if run.stdout:
@@ -1513,6 +1520,7 @@ def _cli_main_impl(argv=None) -> int:
         jobs_raw,
         jobs_was_explicit_raw,
         system_link_raw,
+        freestanding_libc_raw,
         no_cache_raw,
         cache_dir_raw,
         sources_from_make_raw,
@@ -1545,6 +1553,12 @@ def _cli_main_impl(argv=None) -> int:
         prog_args.append((prog_args_raw[i] or "") + "")
         i += 1
     if path.endswith(".py"):
+        if freestanding_libc_raw:
+            _write_text(
+                "Error: --freestanding-libc is only valid for C inputs",
+                err=True,
+            )
+            return 1
         if not os.path.isfile(path):
             _write_text("Error: input file not found: " + path, err=True)
             return 1
@@ -1589,6 +1603,8 @@ def _cli_main_impl(argv=None) -> int:
                     ir_scaffold_mode=compile_ir_scaffold_mode,
                     backend=compile_backend,
                     gpu_backend=compile_gpu_backend,
+                    target_triple=target_triple_raw,
+                    link_args=_copy_seq(link_args_raw),
                 )
             except ObservedCompileError as exc:
                 raise PyPipelineError(exc.formatted) from exc
@@ -1645,6 +1661,7 @@ def _cli_main_impl(argv=None) -> int:
             ir_scaffold=ir_scaffold_raw,
             backend=backend_raw,
             gpu_backend=gpu_backend_raw,
+            link_args=link_args_raw,
         )
         if cache_path and os.path.isfile(cache_path):
             try:
@@ -1718,6 +1735,7 @@ def _cli_main_impl(argv=None) -> int:
     jobs = _normalize_cli_int(jobs_raw)
     jobs_was_explicit = _normalize_cli_flag(jobs_was_explicit_raw)
     system_link = _normalize_cli_flag(system_link_raw)
+    freestanding_libc = _normalize_cli_flag(freestanding_libc_raw)
     no_cache = _normalize_cli_flag(no_cache_raw)
     llvmdump = _normalize_cli_flag(llvmdump_raw)
     emit_debug = _normalize_cli_flag(emit_debug_raw)
@@ -1748,6 +1766,7 @@ def _cli_main_impl(argv=None) -> int:
         jobs=jobs,
         jobs_was_explicit=jobs_was_explicit,
         system_link=system_link,
+        freestanding_libc=freestanding_libc,
         no_cache=no_cache,
         cache_dir=cache_dir,
         sources_from_make=sources_from_make,

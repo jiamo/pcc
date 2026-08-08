@@ -20,82 +20,171 @@ Historical startup ledger:
 ## Active milestone
 
 - Milestone: `M5`
-- Tasks in milestone: `149`
-- `BLOCKED`: `2`
-- `CLAIM_RISK`: `1`
-- `DONE_STRONG`: `91`
-- `DONE_WEAK`: `2`
-- `IN_PROGRESS`: `2`
-- `TODO_READY`: `51`
-- Next dependency-ready task: `PERF-P0-SELF-BOOTSTRAP-PHASE-REUSE`
-- Next title: Eliminate repeated GC-invariant work from self-host compiler stages
-- Next open boundary: Measure isolated pcc1-to-pcc2 phase costs and artifact identity, then remove or content-address reuse of repeated parse, discovery, type/export, IR-pass, and self-object work wherever the cache key proves it independent of GC runtime policy. Keep GC-specific runtime, ABI, link, fixed-point, and behavior gates distinct; do not reduce tests, loosen semantics, or increase timeouts as the optimization.
+- Tasks in milestone: `304`
+- `DONE_STRONG`: `156`
+- `DONE_WEAK`: `85`
+- `IN_PROGRESS`: `4`
+- `TODO_NEEDS_DESIGN`: `5`
+- `TODO_READY`: `54`
+- Next dependency-ready task: `HARNESS-P0-NATIVE-GUI-SHELL`
+- Next title: Open the DeepSeek Harness application shell with the PCC declarative native GUI
+- Next open boundary: The default no-argument surface is now a PCC native window and its command path completes a deterministic logged turn through the assembled runtime. The painted surface is still a fixed 1280x800 mock: absolute pixel coordinates, literal click rectangles, canned submit text and canned assistant text, no window-size input and no keyboard path (audit: docs/goal/evidence/2026-08-14-harness-gui-upstream-gap-audit.md). Add live persisted session switching and tool-event rendering, and do not promote this row while HARNESS-P0-GUI-WINDOW-VIEWPORT or HARNESS-P0-GUI-TEXT-INPUT-IME is open, because a same-viewport screenshot of a fixed-geometry mock is not the required comparison.
 
 ## Active task table
 
-`DONE_STRONG` rows (91) are omitted here to keep the
+`DONE_STRONG` rows (156) are omitted here to keep the
 startup state compact; the full ledger is `docs/goal/task-board.yaml`.
 
 | Rank | ID | Status | Depends on | Evidence |
 |---:|---|---|---|---|
-| 99 | `PERF-P0-SELF-BOOTSTRAP-PHASE-REUSE` | `IN_PROGRESS` | TEST-P0-COLD-SELF-HOST-WARMUP-BUDGET, PERF-P0-SELF-BACKEND-BOUNDED-WORKER-POOL, TEST-P0-FULL-GC-MEMORY-BUDGET | - |
-| 100 | `PKG-P1-UV-LOCKED-NATIVE-SYNC` | `IN_PROGRESS` | PKG-P0-UV-PROJECT-ENVIRONMENT | - |
-| 101 | `PERF-P1-COMPILER-DESIGN-REFERENCE-AUDIT` | `TODO_READY` | PERF-P0-SELF-BOOTSTRAP-PHASE-REUSE | - |
-| 110 | `PKG-P1-RUNTIME-PROFILE-ENVIRONMENT-INVARIANCE` | `TODO_READY` | PKG-P0-FIRST-CLASS-PACKAGE-ENVIRONMENT | - |
-| 1000 | `ARCH-P2-C-CODEGEN-DECOMPOSE` | `TODO_READY` | - | pcc/codegen/c_codegen.py |
-| 1000 | `ARCH-P2-PCC1-PYTEST-EXTRACT` | `TODO_READY` | - | pcc/cli_bootstrap.py |
-| 1000 | `ARCH-P2-PIPELINE-DECOMPOSE` | `TODO_READY` | - | pcc/py_frontend/pipeline.py |
-| 1000 | `ARCH-P2-PORT-ABI-AUTOGEN` | `TODO_READY` | - | tests/python/test_runtime_layout_contract.py |
-| 1000 | `ARCH-P2-SELF-IR-PARSER-STRUCTURE` | `TODO_READY` | - | pcc/backend/self_backend_parse.py |
-| 1000 | `ARCH-P3-GC-DISPATCH-EVAL` | `TODO_READY` | - | pcc/py_runtime/src/py_gc_backend.c |
-| 1000 | `ARCH-P3-LAYER1-STATE-PROTOCOL` | `TODO_READY` | - | pcc/py_frontend/codegen/layer1_mixins.py |
-| 1000 | `ARCH-P3-TYPE-PREDICATE-INVENTORY` | `TODO_READY` | - | pcc/py_frontend/type_infer.py |
-| 1000 | `AUD-P2-CLI-SHARED-HELPER-DUPLICATION` | `TODO_READY` | - | docs/goal/evidence/2026-07-23-bad-smell-audit-triage.md |
-| 1000 | `AUD-P2-DEAD-ROADMAP-MODULE-INVENTORY` | `CLAIM_RISK` | - | docs/goal/evidence/2026-07-09-claude-structural-audit-triage.md |
-| 1000 | `AUD-P2-SELF-MODULE-SPECIAL-CASES-IN-CODEGEN` | `TODO_READY` | - | docs/goal/evidence/2026-07-23-bad-smell-audit-triage.md |
-| 1000 | `BUG-P1-PY-LIST-TODO-RAISE-PLACEHOLDERS` | `TODO_READY` | - | docs/goal/evidence/2026-07-23-bad-smell-audit-triage.md |
-| 1000 | `DIST-P1-MULTI-MAC-TRANSPORT-E2E` | `BLOCKED` | DIST-P0-TRANSPORT-COLLECTIVE-OWNER | docs/goal/evidence/2026-07-17-dist-multi-mac-owner-blocked.md |
-| 1000 | `DIST-P1-THROUGHPUT-SCALING` | `BLOCKED` | DIST-P0-TRANSPORT-COLLECTIVE-OWNER, DIST-P1-MULTI-MAC-TRANSPORT-E2E | docs/design/pcc-dist-runtime.md |
-| 1000 | `LIBC-P1-IMPORT-RATCHET` | `DONE_WEAK` | - | tests/libc_import_baseline.json |
-| 1000 | `LIBC-P1-PCC-RUNTIME-ARCHIVE` | `TODO_READY` | - | tests/python/test_py_runtime_pcc_emit.py |
-| 1000 | `LIBC-P1-PRIMITIVES` | `TODO_READY` | - | pcc/unsafe/__init__.py |
-| 1000 | `LIBC-P2-ALLOCATOR` | `TODO_READY` | LIBC-P1-PRIMITIVES | tests/libc_import_baseline.json |
-| 1000 | `LIBC-P2-MEM-STR` | `TODO_READY` | - | tests/libc_import_baseline.json |
-| 1000 | `LIBC-P2-SDK-STRUCT-HELPERS` | `TODO_READY` | LIBC-P1-PCC-RUNTIME-ARCHIVE | tests/python/test_py_runtime_pcc_emit.py |
-| 1000 | `LIBC-P2-STDIO-SUBSET` | `TODO_READY` | LIBC-P1-PRIMITIVES | tests/libc_import_baseline.json |
-| 1000 | `LIBC-P2-THIN-WRAPPERS` | `TODO_READY` | LIBC-P1-PRIMITIVES | tests/libc_import_baseline.json |
-| 1000 | `LIBC-P3-HARD-SINGLETONS` | `TODO_READY` | - | tests/libc_import_baseline.json |
-| 1000 | `LIBC-P3-LINUX-ZERO-LIBC-TRACER` | `TODO_READY` | LIBC-P1-PRIMITIVES | tests/libc_import_baseline.json |
-| 1000 | `LINK-P1-MACHO-CODESIGN` | `TODO_READY` | LINK-P1-MACHO-LINK-DYLD | pcc/py_frontend/pipeline.py |
-| 1000 | `LINK-P1-MACHO-LINK-DYLD` | `TODO_READY` | LINK-P1-MACHO-LINK-STATIC | pcc/py_frontend/pipeline.py |
-| 1000 | `LINK-P1-MACHO-LINK-STATIC` | `TODO_READY` | LINK-P1-MACHO-OBJ-FULL | pcc/py_frontend/pipeline.py |
-| 1000 | `LINK-P1-MACHO-LINK-SWITCH` | `TODO_READY` | LINK-P1-MACHO-CODESIGN | tests/python/test_bootstrap_gate_baseline.py |
-| 1000 | `LINK-P1-MACHO-OBJ-FULL` | `TODO_READY` | LINK-P1-MACHO-OBJ-RELOC | pcc/backend/self_backend_emit.py |
-| 1000 | `LINK-P1-MACHO-OBJ-MINIMAL` | `TODO_READY` | LINK-P1-MACHO-SPEC | pcc/backend/self_backend_emit.py |
-| 1000 | `LINK-P1-MACHO-OBJ-RELOC` | `TODO_READY` | LINK-P1-MACHO-OBJ-MINIMAL | pcc/backend/self_backend_emit.py |
-| 1000 | `LINK-P1-MACHO-OBJ-SWITCH` | `TODO_READY` | LINK-P1-MACHO-OBJ-FULL | pcc/py_frontend/pipeline.py |
-| 1000 | `LINK-P1-MACHO-SPEC` | `TODO_READY` | - | pcc/backend/self_backend_emit.py |
-| 1000 | `LINK-P2-INCREMENTAL` | `TODO_READY` | LINK-P1-MACHO-LINK-SWITCH | pcc/backend/self_backend_cache_identity.py |
-| 1000 | `LINK-P2-NATIVE-OBJ-FASTPATH` | `TODO_READY` | LINK-P1-MACHO-LINK-SWITCH | pcc/backend/self_backend_emit.py |
-| 1000 | `LINK-P3-ELF-LINUX` | `TODO_READY` | LINK-P1-MACHO-LINK-SWITCH | tests/integration/test_self_backend_x86_64_linux.py |
-| 1000 | `LINK-P3-PARALLEL` | `TODO_READY` | LINK-P1-MACHO-LINK-SWITCH, LIBC-P1-PRIMITIVES | pcc/py_runtime/src/pcc_threads.c |
-| 1000 | `LINK-P3-SEMANTIC-LAYOUT` | `TODO_READY` | LINK-P1-MACHO-LINK-SWITCH | pcc/py_frontend/pipeline.py |
-| 1000 | `PERF-P1-FRAME-POOL` | `TODO_READY` | - | docs/investigations/gc-frame-index-entry-pool-perf.md |
-| 1000 | `PERF-P1-INT-READMIT` | `TODO_READY` | - | tests/python/test_py_typed_int_unboxed.py |
-| 1000 | `PERF-P1-REGALLOC` | `TODO_READY` | - | pcc/backend/self_backend_aarch64_darwin_slots.py |
-| 1000 | `PERF-P1-TIERING` | `TODO_READY` | - | docs/plans/all-pass-llvm-ir-1to1-master-plan.md |
-| 1000 | `PERF-P2-COLD-PATHS` | `TODO_READY` | - | pcc/backend/self_backend_aarch64_darwin_flow.py |
-| 1000 | `PERF-P2-LDP-STP` | `TODO_READY` | PERF-P1-REGALLOC | pcc/backend/self_backend_target_passes.py |
-| 1000 | `PERF-P2-LOOKUP` | `TODO_READY` | - | pcc/py_runtime/src/py_class.c |
-| 1000 | `PERF-P2-MADD-FOLD` | `TODO_READY` | PERF-P1-REGALLOC | pcc/backend/self_backend_aarch64_darwin_addr.py |
-| 1000 | `PERF-P2-PASS-WIRE` | `TODO_READY` | PERF-P1-TIERING | pcc/py_frontend/ir_pass_pipeline.py |
-| 1000 | `PERF-P3-BUMP` | `TODO_READY` | - | benchmarks/run_gc_advantage_matrix.py |
-| 1000 | `PERF-P3-PASS-CLOSURE` | `TODO_READY` | PERF-P2-PASS-WIRE | docs/plans/all-pass-llvm-ir-1to1-master-plan.md |
-| 1000 | `PERF-P3-RC-ELISION` | `TODO_READY` | - | pcc/py_frontend/codegen/ownership_lowering.py |
-| 1000 | `PERF-P3-SIMD` | `TODO_READY` | PERF-P2-LDP-STP, PERF-P2-MADD-FOLD | pcc/ir_passes/slp_vectorizer.py |
-| 1000 | `PKG-P2-REINSTALL-FASTPATH` | `TODO_READY` | - | docs/investigations/pcc1-pip-numpy-owned-acquire-60s-timeout.md |
-| 1000 | `TEST-P1-NO-SKIP-DOCTRINE-REMAINING-FAMILIES` | `DONE_WEAK` | - | docs/goal/evidence/2026-07-24-no-skip-doctrine-full-conversion.md |
-| 1000 | `TEST-P2-REMOVE-LEGACY-PATH-SHIM` | `TODO_READY` | - | docs/investigations/tests-conftest-legacy-path-shim-false-repo-root.md |
+| 3 | `HARNESS-P0-NATIVE-GUI-SHELL` | `IN_PROGRESS` | HARNESS-P0-NATIVE-CORE, HARNESS-P0-CURRENT-PCC1 | projects/harness/migration/commits/0001-assembled-runtime-current-pcc1.md |
+| 4 | `HARNESS-P0-GUI-FILLS-AND-CAPTURE-TRUTH` | `TODO_READY` | HARNESS-P0-NATIVE-GUI-SHELL | docs/goal/evidence/2026-08-14-harness-gui-upstream-gap-audit.md |
+| 5 | `CPY-P0-CURRENT-HEAD-RELEASE-FIXED-POINT` | `TODO_READY` | CPY-P0-REPLACEMENT-CONTRACT, LIBC-P3-FREESTANDING-RUNTIME-CLOSURE, LIBC-P0-RUNTIME-ARCHIVE-BUNDLE-INTEGRITY, S-P1-SELF-LINK-LINK-ARG-HONESTY, GOAL-P1-HEAD-TRUTH-FIVE-GC-SELECTION, PY-P0-HOST-PCC-PCC1-TEST-PARITY | docs/design/pcc-cpython-replacement-roadmap.md |
+| 5 | `HARNESS-P0-GUI-WINDOW-VIEWPORT` | `TODO_READY` | HARNESS-P0-NATIVE-GUI-SHELL, HARNESS-P0-GUI-FILLS-AND-CAPTURE-TRUTH | docs/goal/evidence/2026-08-14-harness-gui-upstream-gap-audit.md |
+| 6 | `CPY-P0-LANGUAGE-SEMANTIC-COMPATIBILITY` | `TODO_READY` | CPY-P0-REPLACEMENT-CONTRACT, PY-P0-FOR-TARGET-REPRESENTATION-JOIN, PY-P0-THREADED-EXCEPTION-TLS-ISOLATION, PY-P1-FREESTANDING-RAW-INT-CONTRACT | docs/goal/evidence/2026-08-14-cpython-language-matrix-source.md |
+| 6 | `HARNESS-P0-GUI-TEXT-INPUT-IME` | `TODO_READY` | HARNESS-P0-NATIVE-GUI-SHELL, HARNESS-P0-GUI-WINDOW-VIEWPORT | docs/goal/evidence/2026-08-14-harness-gui-upstream-gap-audit.md |
+| 7 | `CPY-P0-HOSTLESS-RUNTIME-BUILD` | `TODO_READY` | CPY-P0-REPLACEMENT-CONTRACT, LIBC-P3-FREESTANDING-RUNTIME-CLOSURE, LIBC-P0-RUNTIME-ARCHIVE-BUNDLE-INTEGRITY, PKG-P0-BUILD-WITHOUT-HOST-PYTHON, STDLIB-P1-BUILD-TOOL-CLOSURE, FALLBACK-P1-PIPELINE-SUBPROCESS-KWARGS-RESOLUTION | docs/goal/evidence/2026-08-14-hostless-runtime-wheel-receipt.md |
+| 8 | `CPY-P0-GENERIC-PACKAGE-ABI` | `TODO_READY` | CPY-P0-REPLACEMENT-CONTRACT, B-P0-PKG, PKG-P0-NUMPY-IMPORT-RESTORE-ON-FREESTANDING-CAPI, BUG-P1-NUMPY-DYN-REACHABILITY-SELFBACKEND-LINK-GAP, LIBC-P1-VARIADIC-CALL-ABI-AUDIT | docs/goal/evidence/2026-08-14-generic-package-abi-matrix-source.md |
+| 9 | `CPY-P0-PYTHON-USER-TOOLING` | `TODO_READY` | CPY-P0-REPLACEMENT-CONTRACT, CPY-P0-LANGUAGE-SEMANTIC-COMPATIBILITY, CPY-P0-HOSTLESS-RUNTIME-BUILD | docs/goal/evidence/2026-08-14-python-user-tooling-source.md |
+| 10 | `CPY-P0-TIER1-PURE-PYTHON-SERVICE-REPLACEMENT` | `TODO_READY` | CPY-P0-CURRENT-HEAD-RELEASE-FIXED-POINT, CPY-P0-LANGUAGE-SEMANTIC-COMPATIBILITY, CPY-P0-HOSTLESS-RUNTIME-BUILD, CPY-P0-GENERIC-PACKAGE-ABI, CPY-P0-PYTHON-USER-TOOLING | docs/goal/evidence/2026-08-14-tier1-pproxy-service-source.md |
+| 10 | `HARNESS-P1-PLUGIN-EFFECT-KERNEL` | `IN_PROGRESS` | HARNESS-P0-CURRENT-PCC1 | projects/harness/migration/commits/0001-assembled-runtime-current-pcc1.md |
+| 10 | `LIBC-P3-FREESTANDING-RUNTIME-CLOSURE` | `DONE_WEAK` | LIBC-P1-FREESTANDING-MEM-STR, LIBC-P2-ALLOCATOR, LIBC-P2-THIN-WRAPPERS, LIBC-P2-STDIO-SUBSET, LIBC-P2-FREESTANDING-GC, LIBC-P2-C-FRONTEND-FREESTANDING-LIBC, LIBC-P3-LINUX-ZERO-LIBC-TRACER | docs/goal/evidence/2026-08-13-freestanding-runtime-closure.md |
+| 10 | `PY-P0-IEEE-SUBNORMAL-BIT-CONVERSION` | `DONE_WEAK` | - | docs/goal/evidence/2026-08-14-ieee-subnormal-focused.md |
+| 11 | `CPY-P0-TIER2-SCIENTIFIC-BUILD-ECOSYSTEM-REPLACEMENT` | `TODO_READY` | CPY-P0-TIER1-PURE-PYTHON-SERVICE-REPLACEMENT, CPY-P0-GENERIC-PACKAGE-ABI, PKG-P0-NUMPY-IMPORT-RESTORE-ON-FREESTANDING-CAPI, STDLIB-P1-ZLIB-COMPRESSION-CLOSURE, STDLIB-P2-ARCHIVE-COMPAT-SUITE, STDLIB-P2-COMPRESS-LARGE-FILE-STREAMING, STDLIB-P1-COMPRESS-WRITE-STREAMING | docs/goal/evidence/2026-08-14-tier2-scientific-build-source.md |
+| 11 | `HARNESS-P1-SESSION-EVENT-COMPAT` | `TODO_READY` | HARNESS-P0-NATIVE-CORE, HARNESS-P1-PLUGIN-EFFECT-KERNEL | projects/harness/migration/commits/0001-assembled-runtime-current-pcc1.md |
+| 12 | `CPY-P0-TIER3-PYTHON3-DROPIN-REPLACEMENT` | `TODO_NEEDS_DESIGN` | CPY-P0-TIER2-SCIENTIFIC-BUILD-ECOSYSTEM-REPLACEMENT, CPY-P0-PYTHON-USER-TOOLING | docs/design/pcc-cpython-replacement-roadmap.md |
+| 12 | `HARNESS-P1-PCC-SQLITE-DURABILITY` | `TODO_READY` | HARNESS-P0-CURRENT-PCC1 | projects/harness/ARCHITECTURE.md |
+| 12 | `LIBC-P0-RUNTIME-ARCHIVE-BUNDLE-INTEGRITY` | `DONE_WEAK` | LIBC-P3-FREESTANDING-RUNTIME-CLOSURE | docs/goal/evidence/2026-08-14-runtime-archive-bundle-contract.md |
+| 12 | `PY-P0-MUTABLE-BUILTIN-HASHABILITY` | `DONE_WEAK` | - | docs/goal/evidence/2026-08-14-mutable-builtin-hashability.md |
+| 12 | `V-P1-VALUECLASS-ARITY-PROJECTION` | `DONE_WEAK` | V-P1-VAL | docs/goal/evidence/2026-08-14-valueclass-arity-projection.md |
+| 13 | `PY-P1-FRONTEND-TYPE-TAG-AUTOGEN` | `DONE_WEAK` | - | docs/goal/evidence/2026-08-14-frontend-type-tag-autogen.md |
+| 13 | `S-P1-SELF-LINK-LINK-ARG-HONESTY` | `DONE_WEAK` | - | docs/goal/evidence/2026-08-14-self-link-argument-contract.md |
+| 14 | `LLVM-P1-CROSS-TARGET-INLINE-ASM-CONTRACT` | `DONE_WEAK` | - | docs/goal/evidence/2026-08-14-cross-target-inline-asm-contract.md |
+| 15 | `BUILD-P1-RUNTIME-ARCHIVE-CONCURRENT-PUBLISH` | `DONE_WEAK` | - | docs/goal/evidence/2026-08-14-runtime-archive-concurrent-publish.md |
+| 16 | `LIBC-P1-FREESTANDING-NUMERIC-PARITY` | `DONE_WEAK` | LIBC-P3-FREESTANDING-RUNTIME-CLOSURE | docs/goal/evidence/2026-08-14-freestanding-numeric-focused.md |
+| 17 | `LIBC-P1-FREESTANDING-STDIO-APPEND-POSITION` | `DONE_WEAK` | LIBC-P3-FREESTANDING-RUNTIME-CLOSURE | docs/goal/evidence/2026-08-14-stdio-append-position.md |
+| 18 | `BUILD-P1-BOUNDED-COMPILER-CACHE-RETENTION` | `DONE_WEAK` | - | docs/goal/evidence/2026-08-14-bounded-cache-retention-focused.md |
+| 18 | `GOAL-P1-HEAD-TRUTH-FIVE-GC-SELECTION` | `DONE_WEAK` | - | docs/goal/evidence/2026-08-14-head-truth-selection-contract.md |
+| 19 | `BUILD-P1-HATCH-EDITABLE-ISOLATION-IMPORT` | `DONE_WEAK` | - | docs/goal/evidence/2026-08-14-hatch-isolation-focused.md |
+| 20 | `HARNESS-P1-SESSION-COMPOSITION` | `IN_PROGRESS` | HARNESS-P1-SESSION-EVENT-COMPAT, HARNESS-P1-PCC-SQLITE-DURABILITY | projects/harness/migration/commits/0001-assembled-runtime-current-pcc1.md |
+| 20 | `PY-P0-THREADED-EXCEPTION-TLS-ISOLATION` | `DONE_WEAK` | - | docs/goal/evidence/2026-08-14-threaded-exception-tls-source.md |
+| 21 | `HARNESS-P1-SETTINGS-IDENTITY-CREDENTIALS` | `TODO_READY` | HARNESS-P1-PLUGIN-EFFECT-KERNEL, HARNESS-P1-PCC-SQLITE-DURABILITY | projects/harness/ARCHITECTURE.md |
+| 21 | `S-P0-X86-ELF-TLS-LOWERING` | `DONE_WEAK` | LIBC-P3-FREESTANDING-RUNTIME-CLOSURE | docs/goal/evidence/2026-08-14-x86-elf-tls-focused.md |
+| 22 | `HARNESS-P1-PRESET-BUNDLE-SELF-MOD` | `IN_PROGRESS` | HARNESS-P1-PLUGIN-EFFECT-KERNEL, HARNESS-P1-SETTINGS-IDENTITY-CREDENTIALS, HARNESS-P1-SESSION-COMPOSITION | projects/harness/migration/commits/0001-assembled-runtime-current-pcc1.md |
+| 22 | `PY-P1-CONTEXTUAL-CLASS-METHOD-ARG-TAGGING` | `DONE_WEAK` | - | docs/goal/evidence/2026-08-14-contextual-class-method-abi-focused.md |
+| 23 | `PY-P0-HOST-PCC-PCC1-TEST-PARITY` | `DONE_WEAK` | - | docs/goal/evidence/2026-08-14-host-pcc-pcc1-parity-contract.md |
+| 23 | `PY-P1-FREESTANDING-RAW-INT-CONTRACT` | `DONE_WEAK` | PY-P0-EXACT-INT-BRANCH-REPRESENTATION | docs/goal/evidence/2026-08-13-freestanding-raw-int-contract.md |
+| 24 | `ARCH-P1-MANAGED-POINTER-PROVENANCE` | `DONE_WEAK` | - | docs/goal/evidence/2026-08-13-managed-pointer-provenance.md |
+| 25 | `PY-P1-FUNCTION-LOCAL-CLASS-EXECUTION-ORDER` | `DONE_WEAK` | - | docs/goal/evidence/2026-08-14-function-local-class-execution-order.md |
+| 28 | `HARNESS-P1-PCC-HTTP-VTHREAD` | `TODO_READY` | HARNESS-P0-CURRENT-PCC1 | projects/harness/ARCHITECTURE.md |
+| 29 | `HARNESS-P1-MODEL-PROVIDER-REGISTRY` | `TODO_READY` | HARNESS-P1-PLUGIN-EFFECT-KERNEL, HARNESS-P1-SESSION-EVENT-COMPAT, HARNESS-P1-SETTINGS-IDENTITY-CREDENTIALS | projects/harness/migration/commits/0001-assembled-runtime-current-pcc1.md |
+| 31 | `HARNESS-P1-DEEPSEEK-STREAMING` | `TODO_READY` | HARNESS-P1-MODEL-PROVIDER-REGISTRY, HARNESS-P1-PCC-HTTP-VTHREAD, HARNESS-P1-SESSION-EVENT-COMPAT | projects/harness/ARCHITECTURE.md |
+| 32 | `HARNESS-P1-CONTEXT-COMPACTION-GUARD` | `TODO_READY` | HARNESS-P1-PLUGIN-EFFECT-KERNEL, HARNESS-P1-SESSION-EVENT-COMPAT, HARNESS-P1-MODEL-PROVIDER-REGISTRY | projects/harness/ARCHITECTURE.md |
+| 39 | `HARNESS-P1-INTERACTION-APPROVALS` | `TODO_READY` | HARNESS-P1-PLUGIN-EFFECT-KERNEL, HARNESS-P1-SESSION-EVENT-COMPAT | projects/harness/TASKS.md |
+| 40 | `HARNESS-P1-FS-SHELL-SUBPROCESS` | `TODO_READY` | HARNESS-P1-PLUGIN-EFFECT-KERNEL, HARNESS-P1-SESSION-EVENT-COMPAT | projects/harness/TASKS.md |
+| 41 | `HARNESS-P1-SANDBOX-PERMISSION` | `TODO_READY` | HARNESS-P1-FS-SHELL-SUBPROCESS, HARNESS-P1-INTERACTION-APPROVALS | projects/harness/TASKS.md |
+| 42 | `HARNESS-P1-TERMINAL-LSP` | `TODO_READY` | HARNESS-P1-FS-SHELL-SUBPROCESS | projects/harness/TASKS.md |
+| 43 | `HARNESS-P1-WEB-SEARCH-FETCH` | `TODO_READY` | HARNESS-P1-PCC-HTTP-VTHREAD, HARNESS-P1-PLUGIN-EFFECT-KERNEL | projects/harness/TASKS.md |
+| 44 | `HARNESS-P1-SKILL-CATALOG` | `TODO_READY` | HARNESS-P1-FS-SHELL-SUBPROCESS, HARNESS-P1-PLUGIN-EFFECT-KERNEL | projects/harness/TASKS.md |
+| 45 | `HARNESS-P1-TODO-PLAN` | `TODO_READY` | HARNESS-P1-SESSION-EVENT-COMPAT, HARNESS-P1-INTERACTION-APPROVALS | projects/harness/TASKS.md |
+| 46 | `HARNESS-P1-SUBAGENT-WORKFLOW-JOBS` | `TODO_READY` | HARNESS-P1-CONTEXT-COMPACTION-GUARD, HARNESS-P1-MODEL-PROVIDER-REGISTRY, HARNESS-P1-INTERACTION-APPROVALS | projects/harness/TASKS.md |
+| 47 | `HARNESS-P1-E2B-SANDBOX` | `TODO_READY` | HARNESS-P1-PCC-HTTP-VTHREAD, HARNESS-P1-FS-SHELL-SUBPROCESS, HARNESS-P1-SETTINGS-IDENTITY-CREDENTIALS | projects/harness/TASKS.md |
+| 48 | `HARNESS-P1-CAPABILITY-SEAMS` | `TODO_READY` | HARNESS-P1-SESSION-COMPOSITION, HARNESS-P1-FS-SHELL-SUBPROCESS, HARNESS-P1-SANDBOX-PERMISSION, HARNESS-P1-TERMINAL-LSP, HARNESS-P1-WEB-SEARCH-FETCH, HARNESS-P1-SKILL-CATALOG, HARNESS-P1-INTERACTION-APPROVALS, HARNESS-P1-TODO-PLAN, HARNESS-P1-SUBAGENT-WORKFLOW-JOBS, HARNESS-P1-E2B-SANDBOX | projects/harness/ARCHITECTURE.md |
+| 50 | `HARNESS-P1-API-TYPERT-RPC` | `TODO_READY` | HARNESS-P1-PLUGIN-EFFECT-KERNEL, HARNESS-P1-SESSION-COMPOSITION, HARNESS-P1-MODEL-PROVIDER-REGISTRY, HARNESS-P1-PCC-HTTP-VTHREAD | projects/harness/TASKS.md |
+| 51 | `HARNESS-P1-PYTHON-SDK-PROTOCOL` | `TODO_READY` | HARNESS-P1-API-TYPERT-RPC | projects/harness/TASKS.md |
+| 52 | `HARNESS-P1-ACP-HOOKS-AUTOMATION` | `TODO_READY` | HARNESS-P1-API-TYPERT-RPC, HARNESS-P1-INTERACTION-APPROVALS | projects/harness/TASKS.md |
+| 53 | `HARNESS-P1-CLI-BOOT-EXAMPLES` | `TODO_READY` | HARNESS-P1-PRESET-BUNDLE-SELF-MOD, HARNESS-P1-CAPABILITY-SEAMS, HARNESS-P1-API-TYPERT-RPC, HARNESS-P1-ACP-HOOKS-AUTOMATION | projects/harness/TASKS.md |
+| 58 | `HARNESS-P1-GUI-PAINT-PRIMITIVES` | `TODO_READY` | HARNESS-P0-GUI-FILLS-AND-CAPTURE-TRUTH, HARNESS-P0-GUI-WINDOW-VIEWPORT | docs/goal/evidence/2026-08-14-harness-gui-upstream-gap-audit.md |
+| 59 | `HARNESS-P1-GUI-UPSTREAM-SURFACE-INVENTORY` | `TODO_READY` | HARNESS-P0-MIGRATION-INVENTORY | docs/goal/evidence/2026-08-14-harness-gui-upstream-gap-audit.md |
+| 60 | `HARNESS-P1-GUI-SESSIONS-STREAMING` | `TODO_READY` | HARNESS-P0-NATIVE-GUI-SHELL, HARNESS-P1-DEEPSEEK-STREAMING, HARNESS-P1-SESSION-COMPOSITION | projects/harness/gui/upstream-baseline.json |
+| 61 | `HARNESS-P1-GUI-TOOLS-APPROVALS` | `TODO_READY` | HARNESS-P1-GUI-SESSIONS-STREAMING, HARNESS-P1-CAPABILITY-SEAMS, HARNESS-P1-INTERACTION-APPROVALS | projects/harness/gui/upstream-baseline.json |
+| 62 | `HARNESS-P1-GUI-SETTINGS-PROFILES` | `TODO_READY` | HARNESS-P0-NATIVE-GUI-SHELL, HARNESS-P1-SETTINGS-IDENTITY-CREDENTIALS, HARNESS-P1-PRESET-BUNDLE-SELF-MOD | projects/harness/gui/upstream-baseline.json |
+| 63 | `HARNESS-P1-UI-PARITY-ACCESSIBILITY` | `TODO_READY` | HARNESS-P0-GUI-FILLS-AND-CAPTURE-TRUTH, HARNESS-P0-GUI-WINDOW-VIEWPORT, HARNESS-P0-GUI-TEXT-INPUT-IME, HARNESS-P1-GUI-PAINT-PRIMITIVES, HARNESS-P1-GUI-UPSTREAM-SURFACE-INVENTORY, HARNESS-P1-GUI-SESSIONS-STREAMING, HARNESS-P1-GUI-TOOLS-APPROVALS, HARNESS-P1-GUI-SETTINGS-PROFILES | projects/harness/gui/upstream-baseline.json |
+| 70 | `HARNESS-P1-SNAPSHOT-E2E-CONFORMANCE` | `TODO_READY` | HARNESS-P1-CLI-BOOT-EXAMPLES, HARNESS-P1-GUI-TOOLS-APPROVALS, HARNESS-P1-PYTHON-SDK-PROTOCOL | projects/harness/TASKS.md |
+| 71 | `HARNESS-P2-PERFORMANCE-SOAK` | `TODO_READY` | HARNESS-P1-SNAPSHOT-E2E-CONFORMANCE, HARNESS-P1-UI-PARITY-ACCESSIBILITY | projects/harness/TASKS.md |
+| 72 | `HARNESS-P1-PACKAGING-RELEASE` | `TODO_READY` | HARNESS-P1-SNAPSHOT-E2E-CONFORMANCE, HARNESS-P2-PERFORMANCE-SOAK | projects/harness/TASKS.md |
+| 73 | `HARNESS-P1-DOCS-OPERATIONS` | `TODO_READY` | HARNESS-P1-CLI-BOOT-EXAMPLES, HARNESS-P1-GUI-SETTINGS-PROFILES | projects/harness/TASKS.md |
+| 80 | `HARNESS-P1-UPSTREAM-CONVERGENCE` | `TODO_READY` | HARNESS-P0-MIGRATION-INVENTORY, HARNESS-P0-NATIVE-GUI-SHELL | projects/harness/migration/upstream.json |
+| 81 | `HARNESS-P1-UPSTREAM-WATCH-AUTOMATION` | `TODO_READY` | HARNESS-P1-UPSTREAM-CONVERGENCE, HARNESS-P0-MIGRATION-LEDGER-GATE | projects/harness/migration/upstream.json |
+| 90 | `HARNESS-P1-FULL-PORT-EXIT` | `TODO_READY` | HARNESS-P1-UPSTREAM-CONVERGENCE, HARNESS-P1-UPSTREAM-WATCH-AUTOMATION, HARNESS-P1-PACKAGING-RELEASE, HARNESS-P1-DOCS-OPERATIONS, HARNESS-P1-UI-PARITY-ACCESSIBILITY, HARNESS-P1-CAPABILITY-SEAMS, HARNESS-P1-API-TYPERT-RPC, HARNESS-P1-PYTHON-SDK-PROTOCOL, HARNESS-P1-ACP-HOOKS-AUTOMATION, HARNESS-P1-CONTEXT-COMPACTION-GUARD | projects/harness/TASKS.md |
+| 95 | `PKG-P0-BUILD-WITHOUT-HOST-PYTHON` | `DONE_WEAK` | - | docs/goal/evidence/2026-08-14-package-build-ownership-focused.md |
+| 99 | `PERF-P0-SELF-BOOTSTRAP-PHASE-REUSE` | `DONE_WEAK` | TEST-P0-COLD-SELF-HOST-WARMUP-BUDGET, PERF-P0-SELF-BACKEND-BOUNDED-WORKER-POOL, TEST-P0-FULL-GC-MEMORY-BUDGET | docs/goal/evidence/2026-08-14-self-bootstrap-phase-reuse-focused.md |
+| 100 | `PERF-P1-IMMORTAL-LITERAL-PIN-ELISION` | `DONE_WEAK` | PERF-P0-SELF-BOOTSTRAP-PHASE-REUSE | docs/goal/evidence/2026-08-14-immortal-literal-pin-elision-focused.md |
+| 100 | `PKG-P0-NUMPY-IMPORT-RESTORE-ON-FREESTANDING-CAPI` | `DONE_WEAK` | - | docs/goal/evidence/2026-08-14-owned-package-acquisition-focused.md |
+| 103 | `GPU-P1-TILELANG-STATIC-ROW-REDUCE-SUM` | `DONE_WEAK` | GPU-P1-BROADER-TILELANG-TIRX-PASSES, GPU-P0-METAL-PCC1-LAUNCH-REAL, GPU-P0-METAL-5GC-LIFETIME-REAL | docs/goal/evidence/2026-08-14-tilelang-static-row-reduce-sum.md |
+| 200 | `STDLIB-P1-BUILD-TOOL-CLOSURE` | `DONE_WEAK` | - | docs/goal/evidence/2026-08-14-build-tool-stdlib-focused.md |
+| 210 | `STDLIB-P1-ZLIB-COMPRESSION-CLOSURE` | `DONE_WEAK` | STDLIB-P1-BUILD-TOOL-CLOSURE | docs/goal/evidence/2026-08-14-zlib-compression-source-contract.md |
+| 220 | `STDLIB-P2-ARCHIVE-COMPAT-SUITE` | `DONE_WEAK` | STDLIB-P1-BUILD-TOOL-CLOSURE | docs/goal/evidence/2026-08-14-stdlib-archive-compat-focused.md |
+| 225 | `STDLIB-P1-COMPRESS-WRITE-STREAMING` | `DONE_WEAK` | STDLIB-P1-ZLIB-COMPRESSION-CLOSURE | docs/goal/evidence/2026-08-14-compression-write-streaming-focused.md |
+| 230 | `STDLIB-P2-COMPRESS-LARGE-FILE-STREAMING` | `DONE_WEAK` | STDLIB-P1-ZLIB-COMPRESSION-CLOSURE | docs/goal/evidence/2026-08-14-stdlib-large-compression-focused.md |
+| 250 | `FALLBACK-P1-PIPELINE-SUBPROCESS-KWARGS-RESOLUTION` | `DONE_WEAK` | - | docs/goal/evidence/2026-08-14-fallback-action-classifier-focused.md |
+| 300 | `LIBC-P1-VARIADIC-CALL-ABI-AUDIT` | `DONE_WEAK` | - | docs/goal/evidence/2026-08-14-variadic-call-abi-focused.md |
+| 917 | `BUG-P1-NUMPY-DYN-REACHABILITY-SELFBACKEND-LINK-GAP` | `DONE_WEAK` | - | docs/goal/evidence/2026-08-14-cext-setitem-inplace-focused.md |
+| 1000 | `ARCH-P2-C-CODEGEN-DECOMPOSE` | `DONE_WEAK` | - | docs/goal/evidence/2026-08-14-c-codegen-decompose-focused.md |
+| 1000 | `ARCH-P2-PCC1-PYTEST-EXTRACT` | `DONE_WEAK` | - | docs/goal/evidence/2026-08-14-pcc1-pytest-extract-focused.md |
+| 1000 | `ARCH-P2-PIPELINE-DECOMPOSE` | `DONE_WEAK` | - | docs/goal/evidence/2026-08-14-pipeline-decompose-focused.md |
+| 1000 | `ARCH-P2-PORT-ABI-AUTOGEN` | `DONE_WEAK` | - | docs/goal/evidence/2026-08-14-port-abi-autogen-focused.md |
+| 1000 | `ARCH-P2-SELF-IR-PARSER-STRUCTURE` | `DONE_WEAK` | - | docs/goal/evidence/2026-08-14-self-ir-parser-structure-focused.md |
+| 1000 | `AUD-P2-SELF-MODULE-SPECIAL-CASES-IN-CODEGEN` | `DONE_WEAK` | - | docs/goal/evidence/2026-08-14-self-module-special-cases-focused.md |
+| 1000 | `GC-P1-PC-INDEXED-PRECISE-STACKMAP-ABI` | `DONE_WEAK` | LLVMREF-P1-SELF-IR-VERIFIER | docs/goal/evidence/2026-08-14-precise-stackmap-focused.md |
+| 1000 | `LINK-P1-MACHO-DEFAULT-LINK-ACCEPTANCE` | `DONE_WEAK` | LINK-P1-MACHO-LINK-SWITCH | docs/goal/evidence/2026-08-14-macho-default-link-route-focused.md |
+| 1000 | `LINK-P1-MACHO-LINK-DYLD` | `DONE_WEAK` | LINK-P1-MACHO-LINK-STATIC | docs/goal/evidence/2026-08-14-macho-dyld-focused.md |
+| 1000 | `LINK-P1-MACHO-OBJ-FULL` | `DONE_WEAK` | LINK-P1-MACHO-OBJ-RELOC | docs/goal/evidence/2026-08-14-macho-obj-full-focused.md |
+| 1000 | `LINK-P1-MACHO-OBJ-RELOC` | `DONE_WEAK` | LINK-P1-MACHO-OBJ-MINIMAL | docs/goal/evidence/2026-08-14-macho-obj-relocation-inventory.md |
+| 1000 | `LINK-P1-MACHO-OBJ-SWITCH` | `DONE_WEAK` | LINK-P1-MACHO-OBJ-FULL | docs/goal/evidence/2026-08-14-macho-object-route-focused.md |
+| 1000 | `LINK-P2-INCREMENTAL` | `DONE_WEAK` | LINK-P1-MACHO-LINK-SWITCH | docs/goal/evidence/2026-08-14-incremental-macho-link-focused.md |
+| 1000 | `LINK-P2-NATIVE-OBJ-FASTPATH` | `DONE_WEAK` | LINK-P1-MACHO-LINK-SWITCH | docs/goal/evidence/2026-08-14-native-object-fastpath-focused.md |
+| 1000 | `LINK-P3-ELF-LINUX` | `DONE_WEAK` | LINK-P1-MACHO-LINK-SWITCH | docs/goal/evidence/2026-08-14-elf-linux-owned-link-focused.md |
+| 1000 | `LINK-P3-PARALLEL` | `DONE_WEAK` | LINK-P1-MACHO-LINK-SWITCH, LIBC-P1-PRIMITIVES | docs/goal/evidence/2026-08-14-macho-parallel-link-focused.md |
+| 1000 | `LINK-P3-SEMANTIC-LAYOUT` | `DONE_WEAK` | LINK-P1-MACHO-LINK-SWITCH | docs/goal/evidence/2026-08-14-macho-semantic-layout-focused.md |
+| 1000 | `LLVMREF-P1-SELF-IR-VERIFIER` | `DONE_WEAK` | - | docs/goal/evidence/2026-08-14-self-ir-verifier-focused.md |
+| 1000 | `LLVMREF-P2-COMPILER-RT-BUILTINS` | `DONE_WEAK` | - | docs/goal/evidence/2026-08-14-compiler-rt-builtins-focused.md |
+| 1000 | `LLVMREF-P2-FILECHECK-ASM-ASSERTS` | `DONE_WEAK` | - | docs/goal/evidence/2026-08-14-text-filecheck-focused.md |
+| 1000 | `PERF-P1-FRAME-POOL` | `DONE_WEAK` | - | docs/goal/evidence/2026-08-14-frame-pool-object-closure.md |
+| 1000 | `PERF-P1-GC4-FREESTANDING-LONGRUN` | `DONE_WEAK` | LIBC-P2-FREESTANDING-GC | docs/goal/evidence/2026-08-14-gc4-trashcan-source-contract.md |
+| 1000 | `PERF-P1-INT-READMIT` | `DONE_WEAK` | - | docs/goal/evidence/2026-08-14-bounded-int-readmit-focused.md |
+| 1000 | `PERF-P1-REGALLOC` | `DONE_WEAK` | - | docs/goal/evidence/2026-08-14-aarch64-block-regalloc-focused.md |
+| 1000 | `PERF-P1-TIERING` | `DONE_WEAK` | - | docs/goal/evidence/2026-08-14-bounded-default-pass-tier-focused.md |
+| 1000 | `PERF-P2-COLD-PATHS` | `DONE_WEAK` | - | docs/goal/evidence/2026-08-14-cold-paths-focused.md |
+| 1000 | `PERF-P2-LDP-STP` | `DONE_WEAK` | PERF-P1-REGALLOC | docs/goal/evidence/2026-08-14-ldp-stp-focused.md |
+| 1000 | `PERF-P2-MADD-FOLD` | `DONE_WEAK` | PERF-P1-REGALLOC | docs/goal/evidence/2026-08-14-madd-msub-focused.md |
+| 1000 | `PERF-P2-PASS-WIRE` | `DONE_WEAK` | PERF-P1-TIERING | docs/goal/evidence/2026-08-14-pass-wire-focused.md |
+| 1000 | `PERF-P3-BUMP` | `TODO_NEEDS_DESIGN` | - | docs/investigations/gc-backend3-pcc-py-minor-arena.md |
+| 1000 | `PERF-P3-PASS-CLOSURE` | `TODO_NEEDS_DESIGN` | PERF-P2-PASS-WIRE | tests/python/test_compiled_default_pass_tier.py |
+| 1000 | `PERF-P3-RC-ELISION` | `TODO_NEEDS_DESIGN` | - | docs/goal/evidence/2026-08-14-rc-elision-negative-production-scan.md |
+| 1000 | `PERF-P3-SIMD` | `TODO_NEEDS_DESIGN` | PERF-P2-LDP-STP, PERF-P2-MADD-FOLD | tests/c/test_self_backend_target_passes.py |
+| 1000 | `PKG-P2-REINSTALL-FASTPATH` | `DONE_WEAK` | - | docs/goal/evidence/2026-08-01-package-reinstall-fastpath.md |
+| 1000 | `TEST-P1-NO-SKIP-DOCTRINE-REMAINING-FAMILIES` | `DONE_WEAK` | - | docs/goal/evidence/2026-07-28-integration-empty-params-and-opt-gates.md |
+| 1001 | `PY-P2-SELF-HOST-INT-STRING-CANONICALIZATION` | `DONE_WEAK` | ARCH-P2-PIPELINE-DECOMPOSE | docs/goal/evidence/2026-08-14-self-host-int-string-focused.md |
+| 1020 | `PERF-P1-INCREMENTAL-MODULE-ACTION-DAG` | `DONE_WEAK` | PERF-P0-SELF-BOOTSTRAP-PHASE-REUSE | docs/goal/evidence/2026-08-14-module-action-dag-focused.md |
+| 1030 | `PERF-P1-PASS-ANALYSIS-INVALIDATION` | `DONE_WEAK` | - | docs/goal/evidence/2026-08-14-pass-analysis-invalidation-focused.md |
+| 1040 | `PERF-P1-COMPACT-COMPILER-ARENAS` | `DONE_WEAK` | - | docs/goal/evidence/2026-08-14-compact-instruction-arena-focused.md |
+| 1050 | `PERF-P1-GUARDED-SPECIALIZATION-LOOP-PLAN` | `DONE_WEAK` | PY-P0-EXACT-INT-BRANCH-REPRESENTATION | docs/goal/evidence/2026-08-14-guarded-loop-plan-focused.md |
+| 1060 | `PERF-P2-ESCAPE-SCALAR-MATERIALIZATION` | `DONE_WEAK` | M3-VALUECLASS-ZERO-ALLOC, PERF-P1-GUARDED-SPECIALIZATION-LOOP-PLAN | docs/goal/evidence/2026-08-14-valueclass-escape-materialization-focused.md |
+| 1070 | `PERF-P2-CODE-IDENTIFIED-PGO` | `DONE_WEAK` | PERF-P1-INCREMENTAL-MODULE-ACTION-DAG | docs/goal/evidence/2026-08-14-code-identified-pgo-focused.md |
+| 1110 | `GUI-P2-KERNEL-CANONICAL-MUTATION` | `TODO_READY` | GUI-P2-DECLARATIVE-CONTRACT | docs/design/gui-declarative-absorption.md |
+| 1120 | `GUI-P2-KEYED-RENDER-COMMIT` | `TODO_READY` | GUI-P2-KERNEL-CANONICAL-MUTATION | docs/design/gui-declarative-absorption.md |
+| 1130 | `GUI-P2-STATE-LANE-SCHEDULER` | `TODO_READY` | GUI-P2-KEYED-RENDER-COMMIT | docs/design/gui-declarative-absorption.md |
+| 1140 | `GUI-P2-EVENT-LIFECYCLE` | `TODO_READY` | GUI-P2-STATE-LANE-SCHEDULER | docs/design/gui-declarative-absorption.md |
+| 1150 | `GUI-P2-STYLE-TOKEN-UTILITIES` | `TODO_READY` | GUI-P2-KERNEL-CANONICAL-MUTATION, GUI-P2-KEYED-RENDER-COMMIT, GUI-P2-STATE-LANE-SCHEDULER | docs/design/gui-declarative-absorption.md |
+| 1160 | `GUI-P2-STYLE-CANDIDATE-COMPILER` | `TODO_READY` | GUI-P2-STYLE-TOKEN-UTILITIES | docs/design/gui-declarative-absorption.md |
+| 1170 | `GUI-P2-COMMAND-STATE-BOUNDARY` | `TODO_READY` | GUI-P2-STATE-LANE-SCHEDULER, GUI-P2-EVENT-LIFECYCLE | docs/design/gui-declarative-absorption.md |
+| 1175 | `GUI-P2-APP-RUN-LIFECYCLE` | `TODO_READY` | GUI-P2-EVENT-LIFECYCLE, GUI-P2-COMMAND-STATE-BOUNDARY | docs/design/gui-declarative-absorption.md |
+| 1190 | `GUI-P2-MAC-DIFF-DECLARATIVE-CANARY` | `TODO_READY` | GUI-P2-STATE-LANE-SCHEDULER, GUI-P2-EVENT-LIFECYCLE, GUI-P2-STYLE-CANDIDATE-COMPILER, GUI-P2-COMMAND-STATE-BOUNDARY, GUI-P2-APP-RUN-LIFECYCLE | docs/design/gui-declarative-absorption.md |
+| 1210 | `GATEWAY-P2-VTHREAD-PARK-EFFECT` | `DONE_WEAK` | GATEWAY-P2-REFERENCE-ARCHITECTURE | docs/goal/evidence/2026-08-14-vthread-park-effect-focused.md |
+| 1215 | `RUNTIME-P1-TOKIO-SEQUENTIAL-CORE` | `DONE_WEAK` | GATEWAY-P2-VTHREAD-PARK-EFFECT | docs/goal/evidence/2026-08-14-vthread-sequential-core-focused.md |
+| 1217 | `RUNTIME-P1-TOKIO-SEQUENTIAL-CHANNELS` | `DONE_WEAK` | RUNTIME-P1-TOKIO-SEQUENTIAL-CORE | docs/goal/evidence/2026-08-14-vthread-sequential-channels-focused.md |
+| 1220 | `GATEWAY-P2-PCC1-CARRIER-PARITY` | `DONE_WEAK` | GATEWAY-P2-VTHREAD-PARK-EFFECT | docs/goal/evidence/2026-08-14-gateway-pcc1-carrier-focused.md |
+| 1230 | `GATEWAY-P2-NONBLOCKING-SOCKET-WAITSET` | `DONE_WEAK` | GATEWAY-P2-VTHREAD-PARK-EFFECT | docs/goal/evidence/2026-08-14-gateway-nonblocking-waitset-focused.md |
+| 1235 | `RUNTIME-P1-TOKIO-SEQUENTIAL-NET` | `DONE_WEAK` | RUNTIME-P1-TOKIO-SEQUENTIAL-CHANNELS, GATEWAY-P2-NONBLOCKING-SOCKET-WAITSET | docs/goal/evidence/2026-08-14-tokio-sequential-net-focused.md |
+| 1240 | `GATEWAY-P2-BUFFER-BACKPRESSURE` | `DONE_WEAK` | GATEWAY-P2-NONBLOCKING-SOCKET-WAITSET | docs/goal/evidence/2026-08-14-gateway-buffer-backpressure-focused.md |
+| 1250 | `GATEWAY-P2-HTTP1-CODEC` | `DONE_WEAK` | GATEWAY-P2-BUFFER-BACKPRESSURE | docs/goal/evidence/2026-08-14-gateway-http1-focused.md |
+| 1260 | `GATEWAY-P2-WEB-FRAMEWORK` | `DONE_WEAK` | GATEWAY-P2-HTTP1-CODEC | docs/goal/evidence/2026-08-14-pcc-web-focused.md |
+| 1270 | `GATEWAY-P2-REVERSE-PROXY` | `DONE_WEAK` | GATEWAY-P2-HTTP1-CODEC, GATEWAY-P2-BUFFER-BACKPRESSURE | docs/goal/evidence/2026-08-14-gateway-reverse-proxy-focused.md |
+| 1280 | `GATEWAY-P2-ASYNC-DNS` | `DONE_WEAK` | GATEWAY-P2-REVERSE-PROXY, GATEWAY-P2-NONBLOCKING-SOCKET-WAITSET | docs/goal/evidence/2026-08-14-gateway-async-dns-focused.md |
+| 1290 | `GATEWAY-P2-TLS-PROVIDER` | `DONE_WEAK` | GATEWAY-P2-NONBLOCKING-SOCKET-WAITSET, GATEWAY-P2-BUFFER-BACKPRESSURE, GATEWAY-P2-HTTP1-CODEC | docs/goal/evidence/2026-08-14-gateway-tls-provider-focused.md |
+| 1300 | `GATEWAY-P2-LIFECYCLE-OBSERVABILITY` | `DONE_WEAK` | GATEWAY-P2-PCC1-CARRIER-PARITY, GATEWAY-P2-WEB-FRAMEWORK, GATEWAY-P2-REVERSE-PROXY, GATEWAY-P2-ASYNC-DNS, GATEWAY-P2-TLS-PROVIDER | docs/goal/evidence/2026-08-14-gateway-lifecycle-observability-focused.md |
+| 1310 | `GATEWAY-P2-PCC1-PRODUCT-CANARY` | `TODO_READY` | GATEWAY-P2-LIFECYCLE-OBSERVABILITY | docs/design/pcc-vthread-gateway.md |
 
 ## Checked truth manifest
 

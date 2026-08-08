@@ -204,6 +204,9 @@ def test_external_resource_registry_is_opaque_and_shared_by_both_runtime_paths()
     kernel = (RUNTIME_DIR / "src" / "pcc_gc_external_resource.c").read_text(
         encoding="utf-8"
     )
+    python_kernel = (
+        RUNTIME_DIR / "py" / "freestanding_gc_external_resource.py"
+    ).read_text(encoding="utf-8")
     c_runtime = (RUNTIME_DIR / "src" / "py_obj.c").read_text(encoding="utf-8")
     py_runtime = (RUNTIME_DIR / "py" / "py_obj.py").read_text(encoding="utf-8")
     makefile = (RUNTIME_DIR / "Makefile").read_text(encoding="utf-8")
@@ -215,4 +218,14 @@ def test_external_resource_registry_is_opaque_and_shared_by_both_runtime_paths()
     assert "pcc_metal_buffer_runtime_release_prebuilt" in kernel
     assert c_runtime.count("pcc_gc_external_resource_poll()") >= 2
     assert py_runtime.count("pcc_gc_external_resource_poll()") >= 2
-    assert "OBJ_PY_CC_HELPERS += $(OBJDIR_PY)/pcc_gc_external_resource.o" in makefile
+    assert "freestanding_gc_external_resource" in makefile.split(
+        "FREESTANDING_PY_MODULES =", 1
+    )[1].splitlines()[0]
+    assert "pcc_gc_external_resource" in makefile.split(
+        "PY_REPLACED_C_MODULES =", 1
+    )[1].splitlines()[0]
+    assert "def pcc_gc_external_resource_register(" in python_kernel
+    assert "def pcc_gc_external_resource_poll(" in python_kernel
+    assert "pcc_gc_external_resource.o" not in "\n".join(
+        line for line in makefile.splitlines() if line.startswith("OBJ_PY_CC_HELPERS")
+    )

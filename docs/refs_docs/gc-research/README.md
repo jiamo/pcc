@@ -27,6 +27,12 @@ carrier run loop exists, but production virtual threads still require generated
 suspend/resume lowering, a real carrier pool, and complete blocking
 integration.
 
+Precise native safepoints are another cross-backend concern. See
+`llvm-statepoint/` for the pinned LLVM 20.1.8 `gc.statepoint` / stack-map
+reference, its source-attributed relocation and liveness notes, and the gap
+table against pcc's current frame-root and load/store healing contracts. LLVM
+is treated there as a design oracle, not as pcc's runtime or backend owner.
+
 ## What's in each subdir
 
 ### `python/` — backend #0 reference

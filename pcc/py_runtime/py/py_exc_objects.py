@@ -16,11 +16,14 @@ PyExceptionObject layout (from py_internal.h):
     offset 60   cap_frames        (i32)
     total size: 64 bytes
 
-Constants (inlined per pcc-Python convention):
-    PY_TYPE_CLASS = 10
-    PY_TYPE_EXC   = 12
-    PY_EXC_EXCEPTION = 1
+Public object type tags come from the generated ``py_abi_constants`` module.
+The private exception-table code used here is ``PY_EXC_EXCEPTION``.
 """
+from pcc.py_runtime.py.py_abi_constants import (
+    PY_TYPE_CLASS,
+    PY_TYPE_EXC,
+    PY_TYPE_INT,
+)
 from pcc.extern import extern, c_abi_export, c_int32, c_ptr, c_int64, c_void
 from pcc.unsafe import (
     free,
@@ -54,19 +57,19 @@ pcc_runtime_log_event_code = extern(
 
 def _type_of(obj) -> int:
     if is_tagged_int(obj):
-        return 2       # PY_TYPE_INT
+        return PY_TYPE_INT       # PY_TYPE_INT
     return load_i32(obj, 8)
 
 
 @c_abi_export("py_exc_alloc")
 def py_exc_alloc(cls, msg):
-    e = pcc_gc_alloc(64, 12, 0)   # sizeof(PyExceptionObject)
+    e = pcc_gc_alloc(64, PY_TYPE_EXC, 0)   # sizeof(PyExceptionObject)
     if ptr_is_null(e):
         return null()
     # Header is initialized by pcc_gc_alloc; clear the payload tail.
     memset(ptr_add(e, 16), 0, 48)
     store_i64(e, 0, 1)
-    store_i32(e, 8, 12)
+    store_i32(e, 8, PY_TYPE_EXC)
     if ptr_is_null(cls):
         cls = py_exc_builtin_class(1)   # PY_EXC_EXCEPTION
     pcc_gc_store_ptr(e, ptr_add(e, 16), cls)        # ->exc_class
@@ -118,7 +121,7 @@ def py_exc_new_with_class(cls, msg):
     if ptr_is_null(cls):
         return _default_exc_alloc(msg)
     tag: int = _type_of(cls)
-    if tag != 10:                       # PY_TYPE_CLASS
+    if tag != PY_TYPE_CLASS:                       # PY_TYPE_CLASS
         return _default_exc_alloc(msg)
     out = py_exc_alloc(cls, msg)
     pcc_runtime_log_event_code(6, 9, tag, 0, out)
@@ -129,7 +132,7 @@ def py_exc_new_with_class(cls, msg):
 def py_exc_set_cause(exc, cause) -> None:
     if ptr_is_null(exc):
         return
-    if _type_of(exc) != 12:
+    if _type_of(exc) != PY_TYPE_EXC:
         return
     pcc_gc_store_ptr(exc, ptr_add(exc, 32), cause)      # ->cause
     pcc_runtime_log_event_code(6, 5, 0 if ptr_is_null(cause) else 1, 0, exc)
@@ -139,7 +142,7 @@ def py_exc_set_cause(exc, cause) -> None:
 def py_exc_set_context(exc, context) -> None:
     if ptr_is_null(exc):
         return
-    if _type_of(exc) != 12:
+    if _type_of(exc) != PY_TYPE_EXC:
         return
     pcc_gc_store_ptr(exc, ptr_add(exc, 40), context)      # ->context
     pcc_runtime_log_event_code(6, 6, 0 if ptr_is_null(context) else 1, 0, exc)
@@ -149,7 +152,7 @@ def py_exc_set_context(exc, context) -> None:
 def py_exc_get_message(exc):
     if ptr_is_null(exc):
         return null()
-    if _type_of(exc) != 12:
+    if _type_of(exc) != PY_TYPE_EXC:
         return null()
     return pcc_gc_load_ptr(exc, ptr_add(exc, 24))     # ->message (borrowed)
 
@@ -158,7 +161,7 @@ def py_exc_get_message(exc):
 def py_exc_get_cause(exc):
     if ptr_is_null(exc):
         return null()
-    if _type_of(exc) != 12:
+    if _type_of(exc) != PY_TYPE_EXC:
         return null()
     cause = pcc_gc_load_ptr(exc, ptr_add(exc, 32))
     if ptr_is_null(cause):
@@ -171,7 +174,7 @@ def py_exc_get_cause(exc):
 def py_exc_get_context(exc):
     if ptr_is_null(exc):
         return null()
-    if _type_of(exc) != 12:
+    if _type_of(exc) != PY_TYPE_EXC:
         return null()
     context = pcc_gc_load_ptr(exc, ptr_add(exc, 40))
     if ptr_is_null(context):
@@ -184,7 +187,7 @@ def py_exc_get_context(exc):
 def py_exc_traceback_len(exc) -> int:
     if ptr_is_null(exc):
         return 0
-    if _type_of(exc) != 12:
+    if _type_of(exc) != PY_TYPE_EXC:
         return 0
     return load_i32(exc, 56)
 

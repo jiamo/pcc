@@ -7,6 +7,7 @@ from .self_backend_aarch64_darwin_regs import (
     emit_const_to_reg,
     emit_fp_constant,
 )
+from .self_backend_aarch64_darwin_regalloc import allocated_register_name
 from .self_backend_aarch64_darwin_slots import (
     copy_slot_to_slot,
     emit_slot_base_address,
@@ -17,6 +18,7 @@ from .self_backend_aarch64_darwin_slots import (
 )
 from .self_backend_aarch64_darwin_abi import (
     abi_value_reg_names,
+    aggregate_hfa_members,
     aggregate_reg_chunks,
     reg_name,
 )
@@ -597,13 +599,29 @@ def materialize_value(
     reg_index: int,
     module_symbols: PreparedModuleSymbols,
 ) -> list[str]:
-    regs = abi_value_reg_names(expected_type, reg_index)
-    reg = regs[0] if regs else ""
+    is_aggregate = expected_type.is_array or expected_type.is_struct
+    if is_aggregate:
+        regs = list(abi_value_reg_names(expected_type, reg_index))
+        reg = regs[0] if regs else ""
+    else:
+        regs = []
+        reg = "" if expected_type.is_void else reg_name(expected_type, reg_index)
+    raw_hfa = aggregate_hfa_members(expected_type)
+    hfa = list(raw_hfa) if raw_hfa else None
     if value == "null":
         return [f"  movz {reg}, #0"]
     if value in {"poison", "undef"}:
         if expected_type.is_fp:
             return emit_fp_constant(expected_type, reg, "0.000000e+00")
+        if hfa is not None:
+            return [
+                f"  fmov {'s' if member_type.width <= 32 else 'd'}"
+                f"{reg_index + member_index}, "
+                f"{'wzr' if member_type.width <= 32 else 'xzr'}"
+                for member_index, (member_type, _offset) in enumerate(hfa)
+            ]
+        if not is_aggregate:
+            return [f"  movz {reg}, #0"]
         return [f"  movz {zero_reg}, #0" for zero_reg in regs]
     if value.startswith(_CONSTANT_EXPR_PREFIX):
         if not (expected_type.is_int or expected_type.is_ptr):
@@ -677,6 +695,15 @@ def materialize_value(
     if value == "zeroinitializer":
         if expected_type.is_fp:
             return emit_fp_constant(expected_type, reg, "0.000000e+00")
+        if hfa is not None:
+            return [
+                f"  fmov {'s' if member_type.width <= 32 else 'd'}"
+                f"{reg_index + member_index}, "
+                f"{'wzr' if member_type.width <= 32 else 'xzr'}"
+                for member_index, (member_type, _offset) in enumerate(hfa)
+            ]
+        if not is_aggregate:
+            return [f"  movz {reg}, #0"]
         return [f"  movz {zero_reg}, #0" for zero_reg in regs]
     if value in func.alloca_slots:
         if not expected_type.is_ptr:
@@ -684,6 +711,11 @@ def materialize_value(
                 f"self backend cannot use alloca address {value!r} as non-pointer in {func.name!r}"
             )
         return emit_add_offset(reg, "x29", -func.alloca_slots[value].offset)
+    allocated_reg = allocated_register_name(func, value, expected_type)
+    if allocated_reg is not None:
+        if allocated_reg == reg:
+            return []
+        return [f"  mov {reg}, {allocated_reg}"]
     # Most values use consistent native string hashes.  Take that O(1) path
     # before classifying literals, while reserving the linear false-hash
     # recovery below for values that are not known constants or globals.
@@ -713,6 +745,20 @@ def materialize_value(
                 func, expected_type, value, regs, module_symbols
             )
         lines: list[str] = []
+        if hfa is not None:
+            for member_index, (member_type, member_offset) in enumerate(hfa):
+                prefix = "s" if member_type.width <= 32 else "d"
+                hfa_reg = f"{prefix}{reg_index + member_index}"
+                member_size = member_type.slot_size
+                member_bits = int.from_bytes(
+                    literal_bytes[member_offset : member_offset + member_size],
+                    "little",
+                )
+                int_type = TypeDesc("int", 32 if member_size <= 4 else 64)
+                int_reg = "w12" if member_size <= 4 else "x12"
+                lines.extend(emit_const_to_reg(int_type, int_reg, member_bits))
+                lines.append(f"  fmov {hfa_reg}, {int_reg}")
+            return lines
         offset = 0
         for chunk_reg, chunk_size in zip(regs, aggregate_reg_chunks(expected_type)):
             chunk_value = int.from_bytes(

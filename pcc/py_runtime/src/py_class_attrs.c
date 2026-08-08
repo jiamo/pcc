@@ -1,4 +1,6 @@
-/* Class-level variable storage.
+/* Host-C oracle for class-level variable storage.
+ *
+ * Production libpy_runtime_pcc_py.a owns these ABIs in py/py_class.py.
  *
  * Keep class variables out of PyClassObject's method table.  PyClassObject
  * now carries an owned attrs dict slot so moving collectors can trace and
@@ -21,6 +23,17 @@ typedef struct PccClassAttrsNode {
 } PccClassAttrsNode;
 
 static PccClassAttrsNode *pcc_class_attrs_head = NULL;
+
+static PyObject *pcc_class_attrs_require_result(
+    PyObject *result,
+    const char *helper_name,
+    const char *message
+) {
+    if (result == NULL) {
+        py_runtime_error_if_unset(helper_name, message);
+    }
+    return result;
+}
 
 static int pcc_class_attrs_is_class(PyClassObject *cls) {
     if (cls == NULL) return 0;
@@ -68,6 +81,11 @@ static PyObject *pcc_classmethod_bound_entry(
     int64_t n_args = py_tuple_len(args);
     PyObject *full_args = py_tuple_new(n_args + 1);
     if (full_args == NULL) {
+        pcc_class_attrs_require_result(
+            NULL,
+            "py_tuple_new",
+            "class callback argument tuple allocation failed"
+        );
         py_decref(func);
         py_decref(cls);
         return NULL;
@@ -76,6 +94,11 @@ static PyObject *pcc_classmethod_bound_entry(
     for (int64_t i = 0; i < n_args; i++) {
         PyObject *arg = py_tuple_get(args, i);
         if (arg == NULL) {
+            pcc_class_attrs_require_result(
+                NULL,
+                "py_tuple_get",
+                "class callback argument lookup failed"
+            );
             py_decref(full_args);
             py_decref(func);
             py_decref(cls);
@@ -94,6 +117,11 @@ static PyObject *pcc_classmethod_bound_entry(
     } else {
         out = py_obj_call(func, full_args, py_None);
     }
+    pcc_class_attrs_require_result(
+        out,
+        "class callback",
+        "class callback returned NULL without setting an exception"
+    );
     py_decref(full_args);
     py_decref(func);
     py_decref(cls);
@@ -101,15 +129,7 @@ static PyObject *pcc_classmethod_bound_entry(
 }
 
 static int pcc_class_attrs_pointer_can_have_header(void *ptr) {
-    uintptr_t bits = (uintptr_t)ptr;
-    if (ptr == NULL) return 0;
-    if ((bits & 1u) != 0u) return 0;
-    if (bits < 0x1000u) return 0;
-    if ((bits & 0x7u) != 0u) return 0;
-#if UINTPTR_MAX > 0xffffffffu
-    if ((bits >> 48) != 0u) return 0;
-#endif
-    return 1;
+    return pcc_gc_pointer_is_managed((PyObject *)ptr) != 0;
 }
 
 static int pcc_class_attrs_func_signature_valid(PyObject *sig) {
@@ -339,6 +359,11 @@ static PyObject *pcc_instance_bound_method_entry(
         && py_type_of(func) == PY_TYPE_FUNC) {
         PyObject *full_args = py_tuple_new(n_args + 1);
         if (full_args == NULL) {
+            pcc_class_attrs_require_result(
+                NULL,
+                "py_tuple_new",
+                "class callback argument tuple allocation failed"
+            );
             py_decref(func);
             py_decref(self);
             return NULL;
@@ -347,6 +372,11 @@ static PyObject *pcc_instance_bound_method_entry(
         for (int64_t i = 0; i < n_args; i++) {
             PyObject *arg = py_tuple_get(args, i);
             if (arg == NULL) {
+                pcc_class_attrs_require_result(
+                    NULL,
+                    "py_tuple_get",
+                    "class callback argument lookup failed"
+                );
                 py_decref(full_args);
                 py_decref(func);
                 py_decref(self);
@@ -356,6 +386,11 @@ static PyObject *pcc_instance_bound_method_entry(
             py_decref(arg);
         }
         PyObject *out = pcc_class_attrs_call_pyfunc_bound_args(func, full_args);
+        pcc_class_attrs_require_result(
+            out,
+            "class callback",
+            "class callback returned NULL without setting an exception"
+        );
         py_decref(full_args);
         py_decref(func);
         py_decref(self);
@@ -403,6 +438,11 @@ static PyObject *pcc_instance_bound_method_entry(
         if (arg1 != NULL) py_decref(arg1);
         if (arg2 != NULL) py_decref(arg2);
     }
+    pcc_class_attrs_require_result(
+        out,
+        "class callback",
+        "class callback returned NULL without setting an exception"
+    );
     py_decref(func);
     py_decref(self);
     return out;
@@ -447,17 +487,32 @@ static PyObject *pcc_class_attrs_call_ternary_method(
         && !PY_IS_TAGGED_INT(func)
         && py_type_of(func) == PY_TYPE_FUNC) {
         PyObject *args = py_tuple_new(3);
-        if (args == NULL) return NULL;
+        if (args == NULL) {
+            return pcc_class_attrs_require_result(
+                NULL,
+                "py_tuple_new",
+                "class callback argument tuple allocation failed"
+            );
+        }
         py_tuple_set_item(args, 0, self);
         py_tuple_set_item(args, 1, arg0);
         py_tuple_set_item(args, 2, arg1);
         PyObject *out = py_func_call(func, args);
+        pcc_class_attrs_require_result(
+            out,
+            "class callback",
+            "class callback returned NULL without setting an exception"
+        );
         py_decref(args);
         return out;
     }
     typedef PyObject *(*TernaryMethod)(PyObject *, PyObject *, PyObject *);
     TernaryMethod meth = (TernaryMethod)(uintptr_t)func;
-    return meth(self, arg0, arg1);
+    return pcc_class_attrs_require_result(
+        meth(self, arg0, arg1),
+        "class callback",
+        "class callback returned NULL without setting an exception"
+    );
 }
 
 static PyObject *pcc_class_attrs_call_unary_callable(
@@ -466,9 +521,20 @@ static PyObject *pcc_class_attrs_call_unary_callable(
 ) {
     if (func == NULL) return NULL;
     PyObject *args = py_tuple_new(1);
-    if (args == NULL) return NULL;
+    if (args == NULL) {
+        return pcc_class_attrs_require_result(
+            NULL,
+            "py_tuple_new",
+            "class callback argument tuple allocation failed"
+        );
+    }
     py_tuple_set_item(args, 0, arg0);
     PyObject *out = py_obj_call(func, args, py_None);
+    pcc_class_attrs_require_result(
+        out,
+        "class callback",
+        "class callback returned NULL without setting an exception"
+    );
     py_decref(args);
     return out;
 }
@@ -480,10 +546,21 @@ static PyObject *pcc_class_attrs_call_binary_callable(
 ) {
     if (func == NULL) return NULL;
     PyObject *args = py_tuple_new(2);
-    if (args == NULL) return NULL;
+    if (args == NULL) {
+        return pcc_class_attrs_require_result(
+            NULL,
+            "py_tuple_new",
+            "class callback argument tuple allocation failed"
+        );
+    }
     py_tuple_set_item(args, 0, arg0);
     py_tuple_set_item(args, 1, arg1);
     PyObject *out = py_obj_call(func, args, py_None);
+    pcc_class_attrs_require_result(
+        out,
+        "class callback",
+        "class callback returned NULL without setting an exception"
+    );
     py_decref(args);
     return out;
 }
@@ -498,16 +575,31 @@ static PyObject *pcc_class_attrs_call_binary_method(
         && !PY_IS_TAGGED_INT(func)
         && py_type_of(func) == PY_TYPE_FUNC) {
         PyObject *args = py_tuple_new(2);
-        if (args == NULL) return NULL;
+        if (args == NULL) {
+            return pcc_class_attrs_require_result(
+                NULL,
+                "py_tuple_new",
+                "class callback argument tuple allocation failed"
+            );
+        }
         py_tuple_set_item(args, 0, self);
         py_tuple_set_item(args, 1, arg0);
         PyObject *out = py_func_call(func, args);
+        pcc_class_attrs_require_result(
+            out,
+            "class callback",
+            "class callback returned NULL without setting an exception"
+        );
         py_decref(args);
         return out;
     }
     typedef PyObject *(*BinaryMethod)(PyObject *, PyObject *);
     BinaryMethod meth = (BinaryMethod)(uintptr_t)func;
-    return meth(self, arg0);
+    return pcc_class_attrs_require_result(
+        meth(self, arg0),
+        "class callback",
+        "class callback returned NULL without setting an exception"
+    );
 }
 
 PyObject *py_classmethod_new(PyObject *func) {

@@ -1,0 +1,80 @@
+{
+  "schema": "pcc.gateway.tls-native-provider.v1",
+  "provider_name": "pcc-native-tls-v1",
+  "implementation_id": "pcc-openssl-3-provider-v1",
+  "abi_version": 1,
+  "entry_symbol": "pcc_tls_provider_v1_call",
+  "abi_header": "../include/pcc_tls_provider_v1.h",
+  "source": "openssl_provider.c",
+  "build_entry": "Makefile",
+  "adapter_license": "MIT",
+  "distribution": {
+    "wheel_payload": "reviewed-source-build-inputs-only",
+    "prebuilt_shared_library_bundled": false,
+    "runtime_library_selection": "explicit-absolute-path",
+    "runtime_artifact_digest_authenticated": false
+  },
+  "runtime_artifact_authentication": {
+    "algorithm": "sha256",
+    "expected_digest_source": "listener configuration",
+    "verification_timing": "before dynamic_library_open",
+    "pre_open_path_digest_verified": true,
+    "reader_owner": "freestanding pcc-Python runtime",
+    "stream_buffer_bytes": 32768,
+    "default_max_artifact_bytes": 268435456,
+    "concurrent_path_replacement_closed": false
+  },
+  "crypto_dependency": {
+    "name": "OpenSSL",
+    "minimum_version": "3.0.0",
+    "license": "Apache-2.0",
+    "vendored": false,
+    "runtime_abi_checked": true
+  },
+  "link_boundary": {
+    "libpython": false,
+    "host_python_interpreter": false,
+    "platform_c_abi_and_libc": true,
+    "zero_libc_claim": false
+  },
+  "runtime_prerequisites": {
+    "socket_is_nonblocking": true,
+    "socket_fd_remains_pcc_owned": true,
+    "process_or_socket_owner_suppresses_sigpipe": true
+  },
+  "supported_targets": [
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu"
+  ],
+  "certificate_inputs": {
+    "certificate_chain": "absolute path to a PEM certificate chain",
+    "private_key": "absolute path to an unencrypted PEM private key",
+    "client_ca": "absolute path to PEM trust anchors when mTLS is enabled",
+    "loaded_during_generation_creation": true,
+    "paths_retained_after_load": false
+  },
+  "ownership": {
+    "provider": [
+      "TLS records",
+      "peer authentication",
+      "cryptography",
+      "SSL_CTX and SSL handles"
+    ],
+    "pcc": [
+      "socket lifetime",
+      "nonblocking readiness",
+      "virtual-thread scheduling",
+      "absolute deadlines",
+      "certificate generations",
+      "SNI policy",
+      "HTTP"
+    ]
+  },
+  "forbidden_dependencies": [
+    "libpython",
+    "Python ssl",
+    "asyncio",
+    "provider-owned poll or wait",
+    "provider-owned threads"
+  ]
+}

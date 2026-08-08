@@ -165,14 +165,7 @@ static void pcc_gc_fire_callbacks(const char *phase) {
 }
 
 static int py_pointer_can_have_header(PyObject *o) {
-    uintptr_t p = (uintptr_t)o;
-    if (o == NULL) return 0;
-    if (PY_IS_TAGGED_INT(o)) return 0;
-    if (p < 0x1000u) return 0;
-    if ((p & 0x7u) != 0u) return 0;
-    if (p >= (1ULL << 44) && p < (2ULL << 44)) return 0;
-    if ((p >> 48) != 0u) return 0;
-    return 1;
+    return pcc_gc_pointer_is_managed(o) != 0;
 }
 
 static int py_gc_relocation_candidate(PyObject *o) {
@@ -214,6 +207,7 @@ static void pcc_debug_maybe_abort_bad_decref(PyObject *o) {
         || tag == PY_TYPE_TASK
         || tag == PY_TYPE_CONTINUATION
         || tag == PY_TYPE_VIRTUAL_THREAD
+        || tag == PY_TYPE_VTHREAD_CHANNEL
         || tag >= PY_TYPE_USER) {
         return;
     }
@@ -241,6 +235,7 @@ static int py_type_tag_is_valid(int32_t tag) {
         || tag == PY_TYPE_TASK
         || tag == PY_TYPE_CONTINUATION
         || tag == PY_TYPE_VIRTUAL_THREAD
+        || tag == PY_TYPE_VTHREAD_CHANNEL
         || tag == PY_TYPE_CPY_HANDLE
         || tag >= PY_TYPE_USER
     );
@@ -304,6 +299,12 @@ PyObject *pcc_gc_alloc(int64_t size, int32_t type_tag, int32_t flags) {
     h->type_tag = type_tag;
     h->flags = stored_flags;
     pcc_debug_note_alloc_size(h, size);
+    /* Publish exact provenance before any GC path can observe the object.
+     * Tracking may subsequently transfer ownership to the object index; graph
+     * leaves and backend-0 objects deliberately remain in this exact set. */
+    if (pcc_gc_pointer_register((PyObject *)h) < 0) {
+        return NULL;
+    }
     pcc_gc_note_object_allocated_sized((PyObject *)h, size);
     pcc_obj_runtime_log_event_code(1, 2, size, type_tag, h);
     return (PyObject *)h;
@@ -654,6 +655,17 @@ void pcc_gc_unpin(PyObject *o) {
     pcc_gc_note_pin(-1);
 }
 
+/* Immortalize a process-lifetime singleton: py_incref/py_decref early-return
+ * on PY_FLAG_IMMORTAL, so shared objects stop generating cross-thread
+ * refcount cache-line traffic. Also pins the object so moving backends
+ * (#3/#4) never relocate it. The object is never deallocated afterwards;
+ * the caller owns the decision that its lifetime is the process. */
+void pcc_gc_immortalize(PyObject *o) {
+    if (o == NULL || PY_IS_TAGGED_INT(o)) return;
+    pcc_gc_pin(o);
+    py_header_flags_or(py_header(o), PY_FLAG_IMMORTAL);
+}
+
 extern void pcc_debug_bad_incref(void *o, int32_t tag);
 
 void py_incref(PyObject *o) {
@@ -729,7 +741,7 @@ static int pcc_trash_should_defer(int32_t type_tag) {
      * iteratively via the trash queue instead of recursing. This mirrors the
      * pcc-Python port's _dealloc_should_defer exactly; previously every case
      * fell through to `default` (no per-case return), so these tags wrongly
-     * returned `type_tag >= PY_TYPE_USER` (false) and were dealloc'd
+     * returned the generic user-tag fallback (false) and were dealloc'd
      * recursively in cc mode — a divergence from the deferring port that
      * double-freed a trash node when a list/dict cascade re-entered the
      * drain. */
@@ -746,9 +758,13 @@ static int pcc_trash_should_defer(int32_t type_tag) {
         case PY_TYPE_CONTINUATION:
         case PY_TYPE_TASK:
         case PY_TYPE_VIRTUAL_THREAD:
+        case PY_TYPE_VTHREAD_CHANNEL:
+        case PY_TYPE_PROPERTY:
+        case PY_TYPE_CLASSMETHOD:
+        case PY_TYPE_STATICMETHOD:
             return 1;
         default:
-            return type_tag >= PY_TYPE_USER;
+            return type_tag >= PY_TYPE_USER_CLASS_START;
     }
 }
 
@@ -779,12 +795,16 @@ static void pcc_dealloc_dispatch(PyObject *o, int32_t type_tag) {
         case PY_TYPE_THREAD: py_dealloc_thread_thread(o); break;
         case PY_TYPE_TASK: py_dealloc_task(o); break;
         case PY_TYPE_VIRTUAL_THREAD: py_dealloc_virtual_thread(o); break;
+        case PY_TYPE_VTHREAD_CHANNEL: py_dealloc_vthread_channel(o); break;
         case PY_TYPE_CPY_HANDLE: py_dealloc_cpy_handle(o); break;
+        case PY_TYPE_PROPERTY:
+        case PY_TYPE_CLASSMETHOD:
+        case PY_TYPE_STATICMETHOD: py_descriptor_dealloc(o); break;
         default:
             if (pcc_capi_dealloc_cext_object(o, (int64_t)type_tag) != 0) {
                 break;
             }
-            if (type_tag >= PY_TYPE_USER) {
+            if (type_tag >= PY_TYPE_USER_CLASS_START) {
                 py_instance_dealloc(o);
             } else {
                 py_dealloc_generic(o);
@@ -937,7 +957,10 @@ void py_decref(PyObject *o) {
         pcc_trash_drain();
     }
     pcc_trash_dealloc_depth--;
-    if (delay_zpage_freeing_note) {
+    if (
+        delay_zpage_freeing_note
+        && pcc_gc_pointer_is_managed(o) != 0
+    ) {
         pcc_gc_note_object_freeing(o);
     }
 }

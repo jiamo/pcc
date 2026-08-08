@@ -103,10 +103,12 @@ class ExprHelperLoweringMixin:
                 self.runtime["py_dict_set"],
                 [container, k_obj, v_obj],
             )
+            self._emit_post_call_err_check(getattr(key_expr, "span", None))
             return
         v_obj = self._emit_expr_as_pcc_object(elt_expr)
         fn_name = "py_list_append" if kind == "list" else "py_set_add"
         self.builder.call(self.runtime[fn_name], [container, v_obj])
+        self._emit_post_call_err_check(getattr(elt_expr, "span", None))
 
     def _emit_comprehension_level(
         self,

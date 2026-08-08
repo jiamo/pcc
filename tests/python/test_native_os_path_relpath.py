@@ -2,10 +2,10 @@
 
 ``os.path.relpath(path[, start])`` previously fell back to libpython. The native
 lowering (native_os.py dispatch) wraps BOTH arguments in ``os.path.abspath`` and
-calls a pure component-diff C helper (``py_os_path_relpath`` in py_os_native.c),
-which normalises '.'/'..' while splitting (so it is correct even though the
-native abspath only cwd-prefixes and does not itself run normpath). This runtime
-test verifies the VALUES match CPython on ``--backend self
+calls the pcc-Python component-diff helper in ``py_os_path.py``, which
+normalises '.'/'..' while splitting (so it is correct even though the native
+abspath only cwd-prefixes and does not itself run normpath). This runtime test
+verifies the VALUES match CPython on ``--backend self
 --python-libpython=off`` (a generic B-P0-PKG fallback shrink).
 """
 from __future__ import annotations

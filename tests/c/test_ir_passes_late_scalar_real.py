@@ -1,6 +1,6 @@
 """Parity corpus for LateScalarPass (div-rem-pairs + constmerge)."""
 
-import shutil
+import pytest
 import unittest
 
 from pcc.ir_passes.late_scalar import (
@@ -11,7 +11,9 @@ from pcc.ir_passes.late_scalar import (
 from pcc.ir_passes.parity import assert_ir_parity, run_pcc_ir_pass
 
 
-_OPT = shutil.which("opt")
+from pcc.passes.llvm_text_pipeline import find_opt_binary
+
+_OPT = find_opt_binary()
 
 
 class DivRemPairsTests(unittest.TestCase):
@@ -156,7 +158,7 @@ class PassIntegrationTests(unittest.TestCase):
         self.assertIn("mul i32", out)
 
 
-@unittest.skipUnless(_OPT, "requires opt")
+@pytest.mark.pcc_gate(unavailable=None if _OPT else "matching LLVM opt not installed")
 class UpstreamParityTests(unittest.TestCase):
     def test_divrem_matches_upstream(self):
         ir = """

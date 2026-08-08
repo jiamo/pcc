@@ -27,9 +27,12 @@
  *     poll interest bits onto kqueue filters (``EVFILT_READ`` for ``POLLIN``,
  *     ``EVFILT_WRITE`` for ``POLLOUT``) and reports ``EV_EOF`` as the
  *     always-reported ``POLLHUP`` bit. On non-kqueue platforms this backend is
- *     UNAVAILABLE and ``pcc_io_waitset_kqueue_available()`` returns 0; callers
- *     must fall back to the poll backend. A later runtime slice adds
- *     ``epoll_wait`` on Linux behind the same seam.
+ *     UNAVAILABLE and ``pcc_io_waitset_kqueue_available()`` returns 0.
+ *
+ *   * LINUX EPOLL (``PCC_IO_WAITSET_BACKEND_EPOLL``) - a real bounded
+ *     ``epoll_wait(2)`` notifier. Registrations use ``EPOLLONESHOT`` and a
+ *     generation-bearing data token, so an event queued for a closed fd cannot
+ *     wake a later registration that reuses the same integer descriptor.
  *
  * Semantics mirrored from the oracle (must not be weakened), matching the C
  * poller's ``revents & (events | POLLERR | POLLHUP | POLLNVAL)`` behavior:
@@ -43,11 +46,10 @@
  *   * Ready wins over timeout at the same tick (C treats an expired entry as
  *     ``ready == 1``).
  *
- * Deliberately dependency-free for the poll-fallback structure: no
- * ``PyObject``, no GC, no libpython. It uses only
- * ``<stdint.h>``/``<stdlib.h>``/``<string.h>`` (plus ``<sys/event.h>`` on
- * Darwin for the kqueue backend) so it compiles and tests standalone, exactly
- * like ``py_timer_heap.c``.
+ * Deliberately dependency-free at the Python-runtime layer: no ``PyObject``,
+ * no GC, no libpython. The live backends additionally use the platform kernel
+ * readiness/interrupt APIs (kqueue EVFILT_USER or epoll eventfd), while the
+ * poll structure stays deterministic and syscall-free.
  */
 #ifndef PY_IO_WAITSET_H
 #define PY_IO_WAITSET_H
@@ -74,7 +76,8 @@ extern "C" {
 
 typedef enum PccIoWaitSetBackend {
     PCC_IO_WAITSET_BACKEND_POLL = 0,   /* level-triggered fed-readiness fallback */
-    PCC_IO_WAITSET_BACKEND_KQUEUE = 1  /* real kqueue/kevent (Darwin/BSD only) */
+    PCC_IO_WAITSET_BACKEND_KQUEUE = 1, /* real kqueue/kevent (Darwin/BSD only) */
+    PCC_IO_WAITSET_BACKEND_EPOLL = 2   /* real epoll (Linux only) */
 } PccIoWaitSetBackend;
 
 /* One delivered readiness event (mirrors oracle ReadyEvent). */
@@ -89,8 +92,10 @@ typedef struct PccIoWaitSlot {
     int64_t interest;   /* requested event mask */
     int64_t deadline;   /* logical-clock deadline; <0 == infinite */
     int64_t ready_mask; /* fed readiness (poll fallback) / cached level state */
-    uint8_t edge;       /* edge-triggered (kqueue backend only) */
+    uint8_t edge;       /* edge-triggered on live kqueue/epoll backends */
     uint8_t state;      /* 0 empty, 1 live */
+    uint16_t _padding;
+    uint32_t generation; /* rejects stale events after fd reuse */
 } PccIoWaitSlot;
 
 typedef struct PccIoWaitSet {
@@ -107,8 +112,14 @@ typedef struct PccIoWaitSet {
     int64_t *timeout_buf;
     int64_t timeout_cap;
 
-    /* kqueue backend state (0/-1 on the poll backend). */
+    /* Kernel notifier fd (kqueue/epoll; -1 on the poll backend). */
     int kq_fd;
+    uint32_t next_generation;
+
+    /* epoll's compiler-owned eventfd interrupt channel. kqueue uses an
+     * EVFILT_USER registration on kq_fd instead, so wake_fd stays -1 there. */
+    int wake_fd;
+    uint32_t _wake_padding;
 } PccIoWaitSet;
 
 /* Result of one wait() drain. The arrays alias the waitset's reusable scratch
@@ -120,6 +131,22 @@ typedef struct PccIoWaitResult {
     int64_t timeout_len;
 } PccIoWaitResult;
 
+/* Opaque-to-callers storage for a split live wait. prepare() snapshots all
+ * mutable waitset state while the scheduler lock is held; block() touches
+ * only the stable kernel notifier and this batch; finish() resolves generation
+ * tokens against the current slot table after the scheduler lock is retaken.
+ * Keep this layout in sync with py/freestanding_io_waitset.py (64 bytes). */
+typedef struct PccIoWaitBatch {
+    void *events;
+    int64_t event_capacity;
+    int64_t event_count;
+    int64_t current_now;
+    int64_t effective_deadline;
+    int64_t wait_deadline;
+    int64_t backend;
+    int64_t status;
+} PccIoWaitBatch;
+
 /* Lifecycle. init selects the backend; init with KQUEUE on a non-kqueue
  * platform fails (returns -1) - callers must probe availability first and fall
  * back to POLL. Returns 0 on success, -1 on failure. */
@@ -127,7 +154,7 @@ int pcc_io_waitset_init(PccIoWaitSet *ws, PccIoWaitSetBackend backend);
 void pcc_io_waitset_dispose(PccIoWaitSet *ws);
 
 /* Register fd with an interest mask, deadline (<0 == infinite), and edge flag
- * (edge is honored only by the kqueue backend; the poll fallback is inherently
+ * (edge is honored by live kqueue/epoll; the poll fallback is inherently
  * level-triggered and ignores it, matching the oracle). Re-adding an fd updates
  * its registration. Returns 0 on success, -1 on failure. */
 int pcc_io_waitset_add(
@@ -155,12 +182,46 @@ void pcc_io_waitset_clear_ready(PccIoWaitSet *ws, int64_t fd);
 
 /* Drain ready + timed-out fds for logical clock ``now``. On the poll fallback
  * this rescans registered fds against their fed readiness (level-triggered).
- * On the kqueue backend this issues one kevent(2) with a 0 timeout to collect
- * ready fds, then scans deadlines for timeouts. Delivered/timed-out fds are
+ * On live backends this performs an immediate kevent(2)/epoll_wait(2) collect,
+ * then scans deadlines for timeouts. Delivered/timed-out fds are
  * unregistered (one-shot). Fills *out with arrays aliasing the waitset's
  * reusable scratch (valid until the next call). Returns 0 on success, -1 on
  * failure. */
 int pcc_io_waitset_wait(PccIoWaitSet *ws, int64_t now, PccIoWaitResult *out);
+
+/* Live backends may block until readiness or the earlier of an aggregate fd
+ * deadline and ``wait_deadline``. All deadlines are absolute monotonic
+ * milliseconds; a negative wait_deadline is infinite. EINTR retries recompute
+ * the remaining duration from that absolute deadline. The legacy wait()
+ * above is an immediate observation equivalent to wait_until(ws, now, now). */
+int pcc_io_waitset_wait_until(
+    PccIoWaitSet *ws,
+    int64_t now,
+    int64_t wait_deadline,
+    PccIoWaitResult *out
+);
+
+/* Interrupt one live wait without acquiring scheduler-owned state. Repeated
+ * calls coalesce. POLL has no blocking kernel wait and treats this as a no-op.
+ * Returns 0 on success, -1 on a hard notifier failure. */
+int pcc_io_waitset_interrupt(PccIoWaitSet *ws);
+
+/* Three-phase live wait used by the virtual-thread scheduler to avoid holding
+ * its global mutex across kevent/epoll_wait. prepare and finish require the
+ * caller's waitset-ownership lock; block deliberately runs without it. */
+int pcc_io_waitset_wait_prepare(
+    PccIoWaitSet *ws,
+    int64_t now,
+    int64_t wait_deadline,
+    PccIoWaitBatch *batch
+);
+int pcc_io_waitset_wait_block(PccIoWaitSet *ws, PccIoWaitBatch *batch);
+int pcc_io_waitset_wait_finish(
+    PccIoWaitSet *ws,
+    PccIoWaitBatch *batch,
+    PccIoWaitResult *out
+);
+void pcc_io_waitset_wait_discard(PccIoWaitBatch *batch);
 
 /* ---- platform capability + skip reason (mirrors oracle SkippedReason) ----- */
 
@@ -178,6 +239,14 @@ typedef struct PccIoWaitSetSkip {
 } PccIoWaitSetSkip;
 
 int pcc_io_waitset_real_kqueue_skip(PccIoWaitSetSkip *out);
+
+/* Linux live-epoll capability and its machine-readable skip reason. */
+int pcc_io_waitset_epoll_available(void);
+int pcc_io_waitset_real_epoll_skip(PccIoWaitSetSkip *out);
+
+/* Stable backend reporting used by the pcc1 scheduler and gateway. */
+const char *pcc_io_waitset_backend_label(int64_t backend);
+int64_t pcc_io_waitset_default_backend(void);
 
 #ifdef __cplusplus
 }

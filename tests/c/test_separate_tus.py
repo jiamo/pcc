@@ -6,7 +6,9 @@ from pcc.evaluater.c_evaluator import CEvaluator
 from pcc.project import collect_translation_units
 
 
-PROJECT_DIR = os.path.dirname(os.path.dirname(__file__))
+PROJECT_DIR = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
 LUA_PROJECT_DIR = os.path.join(PROJECT_DIR, "projects", "lua-5.5.0")
 LUA_MATH_TEST = os.path.join(LUA_PROJECT_DIR, "testes", "math.lua")
 LUA_CPP_ARGS = ("-DLUA_USE_JUMPTABLE=0", "-DLUA_NOBUILTIN")

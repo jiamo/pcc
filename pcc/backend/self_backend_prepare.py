@@ -8,6 +8,7 @@ from .self_backend_ir import ParsedFunction
 from .self_backend_module_symbols import PreparedModuleSymbols, prepare_module_symbols
 from .self_backend_parse import parse_self_backend_module
 from .self_backend_stackprep import assign_stack_slots
+from .self_backend_verify import verify_parsed_module
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,7 @@ def prepare_module_for_target(
     aggregate_returned_indirect,
 ) -> PreparedSelfBackendModule:
     module = parse_self_backend_module(ir_text)
+    verify_parsed_module(module)
     globals_ = list(module.globals_)
     functions = list(module.functions)
     prepare_parsed_functions(functions)

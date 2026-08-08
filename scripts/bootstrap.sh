@@ -37,8 +37,16 @@
 #   PCC_BOOTSTRAP_RUNTIME_HIGH=py
 #   PCC_BOOTSTRAP_PYTHON_LIBPYTHON=off
 #   PCC_BOOTSTRAP_PYTHON_IR_PASSES=${PCC_PYTHON_IR_PASSES:-off}
-#   PCC_BOOTSTRAP_PY_FRONTEND_JOBS=${PCC_PY_FRONTEND_JOBS:-auto} for stage2+
-#   PCC_BOOTSTRAP_STAGE1_PY_FRONTEND_JOBS=${PCC_PY_FRONTEND_JOBS:-auto}
+#   PCC_BOOTSTRAP_PY_FRONTEND_JOBS=${PCC_PY_FRONTEND_JOBS:-<ncpu capped at 10>} for stage2+
+#   PCC_BOOTSTRAP_STAGE1_PY_FRONTEND_JOBS=${PCC_PY_FRONTEND_JOBS:-<ncpu capped at 10>}
+#
+# The numeric default (not "auto") is deliberate: the source-lane policy
+# introduced later ("auto" mode) runs oversized modules serially and caps the
+# safe codegen pool at two workers. That memory guard targets package-graph
+# workloads; for the compiler bootstrap the documented policy is 8-10 workers.
+# A numeric override takes the authoritative path and restores that
+# parallelism. Set PCC_BOOTSTRAP_*_PY_FRONTEND_JOBS to override, or
+# PCC_PY_FRONTEND_JOBS=auto to restore the conservative lanes.
 
 set -euo pipefail
 
@@ -49,8 +57,15 @@ BOOTSTRAP_RUNTIME_CC="${PCC_BOOTSTRAP_RUNTIME_CC:-pcc}"
 BOOTSTRAP_RUNTIME_HIGH="${PCC_BOOTSTRAP_RUNTIME_HIGH:-py}"
 BOOTSTRAP_PYTHON_LIBPYTHON="${PCC_BOOTSTRAP_PYTHON_LIBPYTHON:-off}"
 BOOTSTRAP_PYTHON_IR_PASSES="${PCC_BOOTSTRAP_PYTHON_IR_PASSES:-${PCC_PYTHON_IR_PASSES:-off}}"
-BOOTSTRAP_PY_FRONTEND_JOBS="${PCC_BOOTSTRAP_PY_FRONTEND_JOBS:-${PCC_PY_FRONTEND_JOBS:-auto}}"
-BOOTSTRAP_STAGE1_PY_FRONTEND_JOBS="${PCC_BOOTSTRAP_STAGE1_PY_FRONTEND_JOBS:-${PCC_PY_FRONTEND_JOBS:-auto}}"
+# Numeric default restores the documented 8-10 worker bootstrap codegen
+# parallelism (see header note). Min(ncpu, 10) keeps small machines safe.
+_BOOTSTRAP_DEFAULT_JOBS=10
+_BOOTSTRAP_NCPU="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 10)"
+if [[ "${_BOOTSTRAP_NCPU}" =~ ^[0-9]+$ ]] && (( _BOOTSTRAP_NCPU < _BOOTSTRAP_DEFAULT_JOBS )); then
+    _BOOTSTRAP_DEFAULT_JOBS="${_BOOTSTRAP_NCPU}"
+fi
+BOOTSTRAP_PY_FRONTEND_JOBS="${PCC_BOOTSTRAP_PY_FRONTEND_JOBS:-${PCC_PY_FRONTEND_JOBS:-${_BOOTSTRAP_DEFAULT_JOBS}}}"
+BOOTSTRAP_STAGE1_PY_FRONTEND_JOBS="${PCC_BOOTSTRAP_STAGE1_PY_FRONTEND_JOBS:-${PCC_PY_FRONTEND_JOBS:-${_BOOTSTRAP_DEFAULT_JOBS}}}"
 BOOTSTRAP_PROFILE_DIR="${PCC_BOOTSTRAP_PROFILE_DIR:-}"
 BOOTSTRAP_STAGE_EXEC_DELAY="${PCC_BOOTSTRAP_STAGE_EXEC_DELAY:-0.10}"
 
@@ -98,6 +113,27 @@ if [[ $CLEAN -eq 1 ]]; then
 fi
 
 mkdir -p "${OUT_DIR}"
+
+# Content-addressed compiler caches: reuse GC-invariant frontend IR bundles
+# and self-backend objects across equivalent invocations. The caches only
+# activate when the host supplies identity namespaces (a compiled stage
+# binary cannot hash its own implementation sources), so derive them here
+# when the caller has not already namespaced the run (the pytest bootstrap
+# helper sets its own). PCC_SELF_BACKEND_OBJECT_CACHE=0 disables both.
+if [[ -z "${PCC_PY_FRONTEND_IR_CACHE_IDENTITY:-}" || -z "${PCC_SELF_BACKEND_OBJECT_CACHE_IDENTITY:-}" ]]; then
+    if command -v uv >/dev/null 2>&1; then
+        bootstrap_identities="$(cd "${REPO_ROOT}" && env -u LC_ALL uv run python -m pcc.bootstrap_cache_identity 2>/dev/null || true)"
+        frontend_identity="$(printf '%s\n' "${bootstrap_identities}" | sed -n '1p')"
+        object_identity="$(printf '%s\n' "${bootstrap_identities}" | sed -n '2p')"
+        if [[ -n "${frontend_identity}" && -n "${object_identity}" ]]; then
+            export PCC_PY_FRONTEND_IR_CACHE_IDENTITY="${PCC_PY_FRONTEND_IR_CACHE_IDENTITY:-${frontend_identity}}"
+            export PCC_SELF_BACKEND_OBJECT_CACHE_IDENTITY="${PCC_SELF_BACKEND_OBJECT_CACHE_IDENTITY:-${object_identity}}"
+        fi
+    fi
+fi
+# Share one cache namespace with the pytest bootstrap helper so suite
+# provisioning, gate chains, and manual bootstraps reuse each other's work.
+export PCC_SELF_BACKEND_OBJECT_CACHE_DIR="${PCC_SELF_BACKEND_OBJECT_CACHE_DIR:-${REPO_ROOT}/build/bootstrap-pytest-object-cache}"
 
 banner() {
     echo ""

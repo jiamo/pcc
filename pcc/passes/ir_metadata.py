@@ -244,13 +244,31 @@ class FuncAttrPass(IRPass):
             ):
                 attrs_to_add.append("willreturn")
 
-            existing_tail = match.group("tail") or ""
-            existing_attrs = set(existing_tail.split())
+            existing_tail = (match.group("tail") or "").strip()
+            # Function metadata attachments must follow function attributes:
+            # ``... nounwind !dbg !7 {``.  Treat the first attachment as the
+            # start of an opaque suffix so inferred attributes are never
+            # appended after ``!dbg`` (which produces invalid LLVM IR).
+            attachment = re.search(
+                r"(?:^|\s)(?P<metadata>![A-Za-z_][\w.]*\s+!\d+)",
+                existing_tail,
+            )
+            if attachment is None:
+                attribute_tail = existing_tail
+                metadata_tail = ""
+            else:
+                attribute_tail = existing_tail[: attachment.start()].strip()
+                metadata_tail = existing_tail[attachment.start():].strip()
+            existing_attrs = set(attribute_tail.split())
             to_add = [attr for attr in attrs_to_add if attr not in existing_attrs]
             if not to_add:
                 continue
 
-            new_tail = " ".join(part for part in (existing_tail.strip(), *to_add) if part)
+            new_tail = " ".join(
+                part
+                for part in (attribute_tail, *to_add, metadata_tail)
+                if part
+            )
             lines[index] = f"{match.group('prefix')} {new_tail} {{".rstrip().replace("  {", " {")
             count += len(to_add)
 

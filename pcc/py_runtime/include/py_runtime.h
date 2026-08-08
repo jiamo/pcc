@@ -43,14 +43,21 @@ enum {
     PY_TYPE_TASK = 28,
     PY_TYPE_CONTINUATION = 29,
     PY_TYPE_VIRTUAL_THREAD = 30,
+    /* Shared bounded-channel storage and its sender/receiver endpoints.  The
+     * kind field at byte 16 distinguishes the three layouts; every variant
+     * participates in the normal tracked-object and slot-visitor contracts. */
+    PY_TYPE_VTHREAD_CHANNEL = 31,
     /* Owned handle to a foreign CPython object (J2': generator-frame
      * storage for cpy locals). No pcc pointer slots — the foreign ref
-     * is released by the dealloc hook via py_cpy_decref. Tag 32 stays
-     * OUTSIDE the port's 29..31 lifecycle anti-forgery group; the
-     * port validity window widens to <= 32 accordingly. */
+     * is released by the dealloc hook via py_cpy_decref. Tag 32 remains
+     * distinct from the tracked lifecycle objects at tags 29..31. */
     PY_TYPE_CPY_HANDLE = 32,
-    PY_TYPE_VALUEBOX = 200,
-    PY_TYPE_USER    = 100   /* user-defined classes >= this */
+    PY_TYPE_USER = 100,
+    PY_TYPE_PROPERTY = 101,
+    PY_TYPE_CLASSMETHOD = 102,
+    PY_TYPE_STATICMETHOD = 103,
+    PY_TYPE_USER_CLASS_START = 104,
+    PY_TYPE_VALUEBOX = 200
 };
 
 /* Built-in exception tags accepted by py_exc_new / py_exc_builtin_class. */
@@ -107,6 +114,11 @@ typedef struct PyContinuationObject {
  * for the refcount-shaped runtime helpers and should not be treated as the
  * foundational ABI for new code. */
 PyObject *pcc_gc_alloc(int64_t size, int32_t type_tag, int32_t flags);
+/* Exact object provenance.  These functions compare pointer values through
+ * runtime-owned indexes and never inspect an unproven candidate header. */
+int64_t pcc_gc_pointer_is_managed(PyObject *obj);
+int64_t pcc_gc_pointer_register(PyObject *obj);
+int64_t pcc_gc_pointer_unregister(PyObject *obj);
 PyObject *pcc_gc_retain(PyObject *o);
 void      pcc_gc_release(PyObject *o);
 extern int32_t pcc_thread_stop_requested;
@@ -217,10 +229,23 @@ void      pcc_gc_frame_enter(const void *frame_map, PyObject **slots);
 void      pcc_gc_frame_leave(PyObject **slots);
 void      pcc_gc_frame_enter_lifo(const void *frame_map, PyObject **slots);
 void      pcc_gc_frame_leave_lifo(PyObject **slots);
+/* Differential consumer for pcc precise-stackmap v1.  backend3/4 may mark
+ * (mode=1) or rewrite (mode=3) the exact PC record.  backend0/1/2 are no-op;
+ * negative results are fail-closed ABI/PC errors.  Registered slots remain
+ * authoritative until root-identity gates prove equality. */
+int64_t   pcc_gc_consume_precise_stackmap(
+    const void *payload,
+    int64_t payload_size,
+    int64_t program_counter,
+    void *frame_pointer,
+    int64_t expected_arch,
+    int64_t mode
+);
 void      pcc_gc_safepoint(void);
 int64_t   pcc_gc_collect(int32_t reason);
 void      pcc_gc_pin(PyObject *o);
 void      pcc_gc_unpin(PyObject *o);
+void      pcc_gc_immortalize(PyObject *o);
 int64_t   pcc_gc_object_id(PyObject *o);
 void      pcc_gc_reset_relocation_set(void);
 int64_t   pcc_gc_select_relocation_set(int64_t budget);
@@ -517,26 +542,20 @@ enum {
 
 int64_t pcc_threads_enabled(void);
 int64_t pcc_current_thread_id(void);
+void   *pcc_current_native_thread_token(void);
 int64_t pcc_refcount_strategy(void);
 void    pcc_thread_safepoint(void);
 int64_t pcc_stop_the_world(void);
 int64_t pcc_resume_world(void);
 int64_t pcc_runtime_now_us(void);
 int64_t pcc_runtime_monotonic_us(void);
+int64_t pcc_runtime_sleep_ns(int64_t delay_ns);
 void   *pcc_py_gc_minor_current_get(void);
 void    pcc_py_gc_minor_current_set(void *block);
 void   *pcc_py_gc_pending_minor_block_get(void);
 void    pcc_py_gc_pending_minor_block_set(void *block);
 void    pcc_py_gc_minor_graph_lock(void);
 void    pcc_py_gc_minor_graph_unlock(void);
-int32_t pcc_py_atomic_i32_load(void *slot);
-void    pcc_py_atomic_i32_store(void *slot, int32_t value);
-int32_t pcc_py_atomic_i32_add_fetch(void *slot, int32_t delta);
-int64_t pcc_py_atomic_i64_load(void *slot);
-void    pcc_py_atomic_i64_store(void *slot, int64_t value);
-int64_t pcc_py_atomic_i64_add_fetch(void *slot, int64_t delta);
-int64_t pcc_py_atomic_i64_dec_if_positive(void *slot);
-
 /* ---- Native threading module substrate -------------------------------- */
 /* Low-level C ABI backing the Python-visible threading shim. These helpers
  * are deliberately small: user-facing semantics live in pcc.py_stdlib.threading
@@ -620,6 +639,7 @@ PyObject *py_builtin_callable(PyObject *o);
  * detects 0x / 0o / 0b prefixes. Use base 10 for Python's default. */
 PyObject *py_int_from_cstr(const char *s, int base);
 PyObject *py_int_from_cstr_or_raise(const char *s, int base);  /* ValueError on invalid */
+PyObject *py_obj_as_int_object(PyObject *o, int base);  /* int(o[,base]) -> object */
 
 /* ---- Float ------------------------------------------------------------- */
 PyObject *py_float_from_f64(double v);
@@ -678,6 +698,20 @@ PyObject *py_bytes_translate(PyObject *src, PyObject *table);
 PyObject *py_bytes_fromhex(PyObject *text);
 PyObject *py_bytes_replace(PyObject *src, PyObject *old, PyObject *new_value);
 int64_t   py_bytes_len(PyObject *o);
+/* Compiler-owned fixed-length signed-i64 buffer helpers.  The value remains
+ * an exact immutable bytes object; these helpers own its canonical little-
+ * endian layout and the ordered Python-int scalar fallback. */
+PyObject *py_i64_buffer_new(int64_t element_count);
+int64_t   py_i64_buffer_set_item(PyObject *buffer, int64_t index,
+                                 PyObject *value);
+PyObject *py_i64_buffer_get_item(PyObject *buffer, int64_t index);
+const char *py_i64_buffer_data(PyObject *buffer); /* borrowed while pinned */
+int64_t   py_i64_buffer_layout_version(PyObject *buffer);
+int64_t   py_i64_buffer_version(PyObject *buffer);
+PyObject *py_i64_buffer_dot_scalar(PyObject *left, PyObject *right,
+                                   int64_t expected_count);
+int64_t   py_guarded_loop_counter_add(int64_t counter, int64_t delta);
+int64_t   py_guarded_loop_counter_get(int64_t counter);
 int64_t   py_bytes_find(PyObject *src, PyObject *needle);
 int64_t   py_bytes_rfind(PyObject *src, PyObject *needle);
 int64_t   py_bytes_count(PyObject *src, PyObject *needle);
@@ -775,7 +809,7 @@ void      py_list_reverse(PyObject *lst);
 /* ---- Dict -------------------------------------------------------------- */
 PyObject *py_dict_new(void);
 void      py_dict_set(PyObject *d, PyObject *k, PyObject *v);
-PyObject *py_dict_get(PyObject *d, PyObject *k);     /* NULL if missing */
+PyObject *py_dict_get(PyObject *d, PyObject *k);     /* new ref; NULL if missing */
 PyObject *py_dict_getitem(PyObject *d, PyObject *k); /* d[k]; KeyError if missing */
 PyObject *py_dict_fromkeys(PyObject *iterable, PyObject *value);  /* dict.fromkeys */
 PyObject *py_dict_get_default(PyObject *d, PyObject *k, PyObject *def);
@@ -790,9 +824,9 @@ int64_t   py_dict_len(PyObject *d);
 int64_t   py_dict_entries_used(PyObject *d);
 PyObject *py_dict_entry_key_at(PyObject *d, int64_t i);
 PyObject *py_dict_entry_value_at(PyObject *d, int64_t i);
-PyObject *py_dict_keys(PyObject *d);                 /* list */
-PyObject *py_dict_values(PyObject *d);               /* list */
-PyObject *py_dict_items(PyObject *d);                /* list of tuples */
+PyObject *py_dict_keys(PyObject *d);                 /* new list ref */
+PyObject *py_dict_values(PyObject *d);               /* new list ref */
+PyObject *py_dict_items(PyObject *d);                /* new list-of-tuples ref */
 void      py_dict_update(PyObject *dst, PyObject *src);
 
 /* ---- Tuple ------------------------------------------------------------- */
@@ -800,8 +834,8 @@ PyObject *py_tuple_new(int64_t n);
 PyObject *py_tuple_from_list(PyObject *lst);         /* new tuple from list elems */
 PyObject *py_tuple_from_splat(PyObject *seq);        /* new tuple from tuple/list/len+getitem seq */
 void      py_tuple_set_item(PyObject *t, int64_t i, PyObject *item); /* during construction only */
-PyObject *py_tuple_get(PyObject *t, int64_t i);
-PyObject *py_tuple_get_known(PyObject *t, int64_t i);
+PyObject *py_tuple_get(PyObject *t, int64_t i);      /* new ref */
+PyObject *py_tuple_get_known(PyObject *t, int64_t i); /* new ref */
 PyObject *py_tuple_getitem(PyObject *t, int64_t i); /* t[i]; IndexError if OOB */
 int64_t   py_tuple_len(PyObject *t);
 int64_t   py_tuple_count(PyObject *t, PyObject *item);
@@ -825,7 +859,7 @@ void      py_set_difference_update(PyObject *dst, PyObject *other);
 void      py_set_symmetric_difference_update(PyObject *dst, PyObject *other);
 int64_t   py_set_issubset(PyObject *a, PyObject *b);
 int64_t   py_set_issuperset(PyObject *a, PyObject *b);
-PyObject *py_set_items(PyObject *s);                 /* list */
+PyObject *py_set_items(PyObject *s);                 /* new list ref */
 PyObject *py_set_pop(PyObject *s);                   /* set.pop(); KeyError if empty */
 /* Returns 1 if item is in the set, 0 otherwise. Returns int64_t so the
  * pcc-Python port (py_set.py) emits under pcc's default `int` lowering
@@ -1011,10 +1045,13 @@ int64_t   py_obj_is_slice(PyObject *o);
 
 /* ---- Native generator objects ------------------------------------------ */
 PyObject *py_gen_new(void *resume, PyObject *frame);
+void      py_gen_set_may_park(PyObject *gen);
+int64_t   py_gen_is_may_park(PyObject *gen);
 PyObject *py_gen_next(PyObject *gen);
 PyObject *py_gen_send(PyObject *gen, PyObject *value);
 PyObject *py_gen_throw(PyObject *gen, PyObject *exc);
 PyObject *py_gen_close(PyObject *gen);
+int64_t   py_gen_close_preserving_exception(PyObject *gen);
 PyObject *py_gen_take_send(PyObject *gen);
 int64_t   py_gen_state(PyObject *gen);
 void      py_gen_set_state(PyObject *gen, int64_t state);
@@ -1058,15 +1095,60 @@ int64_t   py_virtual_thread_start(PyObject *vthread);
 int64_t   py_virtual_thread_park(PyObject *vthread);
 int64_t   py_virtual_thread_unpark(PyObject *vthread);
 int64_t   py_virtual_thread_sleep(PyObject *vthread, int64_t delay_ms);
+int64_t   py_virtual_thread_cancel(PyObject *vthread);
+int64_t   py_virtual_thread_cancel_requested(PyObject *vthread);
+int64_t   py_virtual_thread_cancel_complete(PyObject *vthread);
 int64_t   py_virtual_thread_cancel_timer(PyObject *vthread);
 int64_t   py_virtual_thread_poll_timers(void);
 int64_t   py_virtual_thread_timer_count(void);
 int64_t   py_virtual_thread_block_on_fd(PyObject *vthread, int64_t fd, int64_t events, int64_t timeout_ms);
 int64_t   py_virtual_thread_poll_io(int64_t timeout_ms);
 int64_t   py_virtual_thread_io_wait_count(void);
+int64_t   py_virtual_thread_io_wait_active(void);
+/* Sequential TCP resource generations are scheduler-owned.  Successful
+ * operation/close begin calls retain the scheduler mutex until the matching
+ * end, making validation plus one nonblocking syscall atomic with close/reuse.
+ * The generation-aware park validates and registers under the same mutex. */
+int64_t   py_virtual_thread_io_resource_register(int64_t fd);
+int64_t   py_virtual_thread_io_resource_generation(int64_t fd);
+int64_t   py_virtual_thread_io_resource_operation_begin(int64_t fd, int64_t generation);
+void      py_virtual_thread_io_resource_operation_end(void);
+int64_t   py_virtual_thread_io_resource_close_begin(int64_t fd);
+int64_t   py_virtual_thread_block_on_fd_generation(PyObject *vthread, int64_t fd, int64_t generation, int64_t events, int64_t timeout_ms);
+/* Sequential nonblocking TCP. Observe status: 0=progress, 1=would-block,
+ * 2=EOF, 3=connected; negative values carry a pending exception. */
+int64_t   py_virtual_thread_tcp_listen(PyObject *host, PyObject *port, int64_t backlog);
+int64_t   py_virtual_thread_tcp_accept_observe(int64_t listener_fd, int64_t generation, int64_t *output_fd);
+int64_t   py_virtual_thread_tcp_register_accepted(int64_t fd);
+int64_t   py_virtual_thread_tcp_connect_start(PyObject *host, PyObject *port, int64_t *output_fd);
+int64_t   py_virtual_thread_tcp_connect_observe(int64_t fd, int64_t generation);
+PyObject *py_virtual_thread_tcp_recv_observe(int64_t fd, int64_t generation, int64_t max_bytes, int64_t *output_status);
+int64_t   py_virtual_thread_tcp_send_observe(int64_t fd, int64_t generation, PyObject *data, int64_t offset, int64_t *output_count);
+int64_t   py_virtual_thread_tcp_close(int64_t fd);
+int64_t   py_virtual_thread_tcp_close_quiet(int64_t fd);
+int64_t   py_virtual_thread_tcp_deadline(int64_t timeout_ms);
+int64_t   py_virtual_thread_tcp_remaining(int64_t deadline_ms);
+int64_t   py_virtual_thread_tcp_raise_timeout(void);
 enum {
     PCC_VTHREAD_IO_BACKEND_POLL = 0,
-    PCC_VTHREAD_IO_BACKEND_KQUEUE = 1
+    PCC_VTHREAD_IO_BACKEND_KQUEUE = 1,
+    PCC_VTHREAD_IO_BACKEND_EPOLL = 2
+};
+enum {
+    PCC_VTHREAD_OUTCOME_PENDING = 0,
+    PCC_VTHREAD_OUTCOME_RETURNED = 1,
+    PCC_VTHREAD_OUTCOME_RAISED = 2,
+    PCC_VTHREAD_OUTCOME_CANCELLED = 3
+};
+enum {
+    PCC_VTHREAD_WAIT_NONE = 0,
+    PCC_VTHREAD_WAIT_TIMER = 1,
+    PCC_VTHREAD_WAIT_IO_READ = 2,
+    PCC_VTHREAD_WAIT_IO_WRITE = 3,
+    PCC_VTHREAD_WAIT_JOIN = 4,
+    PCC_VTHREAD_WAIT_CHANNEL_SEND = 5,
+    PCC_VTHREAD_WAIT_CHANNEL_RECV = 6,
+    PCC_VTHREAD_WAIT_CHANNEL_SELECT2 = 7
 };
 int64_t   py_virtual_thread_io_backend(void);
 int64_t   py_virtual_thread_pin_enter(PyObject *vthread, const char *reason);
@@ -1088,6 +1170,58 @@ enum {
     PCC_VTHREAD_POOL_CACHED = 2
 };
 int64_t   py_virtual_thread_node_pool_stat(int64_t family, int64_t metric);
+
+enum {
+    PCC_VTHREAD_CHANNEL_KIND_CORE = 0,
+    PCC_VTHREAD_CHANNEL_KIND_SENDER = 1,
+    PCC_VTHREAD_CHANNEL_KIND_RECEIVER = 2
+};
+enum {
+    PCC_VTHREAD_CHANNEL_MODE_MPSC = 0,
+    PCC_VTHREAD_CHANNEL_MODE_ONESHOT = 1
+};
+enum {
+    PCC_VTHREAD_CHANNEL_SEND_RECEIVER_CLOSED = 0,
+    PCC_VTHREAD_CHANNEL_SEND_ACCEPTED = 1,
+    PCC_VTHREAD_CHANNEL_SEND_ERROR = -1
+};
+enum {
+    PCC_VTHREAD_CHANNEL_RECV_VALUE = 1,
+    PCC_VTHREAD_CHANNEL_RECV_SENDER_CLOSED = 2,
+    PCC_VTHREAD_CHANNEL_RECV_RECEIVER_CLOSED = 3
+};
+enum {
+    PCC_VTHREAD_CHANNEL_SELECT_LEFT = 0,
+    PCC_VTHREAD_CHANNEL_SELECT_RIGHT = 1
+};
+#define PCC_VTHREAD_CHANNEL_MAX_CAPACITY 1048576LL
+
+/* Tokio-inspired bounded channel ABI.  Constructors return their public
+ * endpoint tuple; endpoint accessors and receive/select result helpers return
+ * ordinary pcc objects.  Begin returns -1 on error, zero when the virtual
+ * thread was parked, and one for an immediate terminal result. */
+PyObject *py_virtual_thread_channel_mpsc(int64_t capacity);
+PyObject *py_virtual_thread_channel_oneshot(void);
+PyObject *py_virtual_thread_channel_sender_clone(PyObject *sender);
+int64_t   py_virtual_thread_channel_send_begin(
+    PyObject *vthread,
+    PyObject *sender,
+    PyObject *value
+);
+int64_t   py_virtual_thread_channel_send_result(PyObject *vthread);
+int64_t   py_virtual_thread_channel_recv_begin(
+    PyObject *vthread,
+    PyObject *receiver
+);
+PyObject *py_virtual_thread_channel_recv_result(PyObject *vthread);
+int64_t   py_virtual_thread_channel_close_sender(PyObject *sender);
+int64_t   py_virtual_thread_channel_close_receiver(PyObject *receiver);
+int64_t   py_virtual_thread_channel_select2_begin(
+    PyObject *vthread,
+    PyObject *receiver0,
+    PyObject *receiver1
+);
+PyObject *py_virtual_thread_channel_select2_result(PyObject *vthread);
 /* Fixed-capacity production scheduler-effect trace. Reset/read are intended
  * for quiescent diagnostics and gates; recording itself is allocation-free. */
 enum {
@@ -1104,7 +1238,9 @@ enum {
     PCC_VTHREAD_EFFECT_IO_WAKE = 11,
     PCC_VTHREAD_EFFECT_CANCEL_TIMER = 12,
     PCC_VTHREAD_EFFECT_CANCEL_IO = 13,
-    PCC_VTHREAD_EFFECT_COMPLETE = 14
+    PCC_VTHREAD_EFFECT_COMPLETE = 14,
+    PCC_VTHREAD_EFFECT_FAIL = 15,
+    PCC_VTHREAD_EFFECT_CANCEL_COMPLETE = 16
 };
 int64_t   py_virtual_thread_effect_reset(void);
 int64_t   py_virtual_thread_effect_count(void);
@@ -1122,7 +1258,12 @@ int64_t   py_virtual_thread_carrier_pool_start(int64_t carrier_count);
 int64_t   py_virtual_thread_carrier_pool_stop(void);
 int64_t   py_virtual_thread_state(PyObject *vthread);
 int64_t   py_virtual_thread_complete(PyObject *vthread, PyObject *result);
+int64_t   py_virtual_thread_fail(PyObject *vthread, PyObject *exception);
+int64_t   py_virtual_thread_join(PyObject *vthread, PyObject *target);
+PyObject *py_virtual_thread_join_result(PyObject *vthread);
 PyObject *py_virtual_thread_result(PyObject *vthread);
+PyObject *py_virtual_thread_exception(PyObject *vthread);
+int64_t   py_virtual_thread_outcome(PyObject *vthread);
 PyObject *py_task_new(PyObject *coro);
 PyObject *py_task_step(PyObject *task);
 int64_t   py_task_is_done(PyObject *task);
@@ -1150,6 +1291,7 @@ PyObject *py_file_readline(PyObject *file, int64_t limit);
 PyObject *py_file_seek(PyObject *file, int64_t offset, int64_t whence);
 PyObject *py_file_tell(PyObject *file);
 PyObject *py_file_flush(PyObject *file);
+PyObject *py_file_fileno(PyObject *file);
 PyObject *py_fileinput_new(PyObject *files, PyObject *openhook);
 PyObject *py_fileinput_readline(PyObject *state);
 PyObject *py_fileinput_filename(PyObject *state);
@@ -1165,17 +1307,22 @@ PyObject *py_sys_stdout_write(PyObject *text);
 PyObject *py_sys_stderr_write(PyObject *text);
 
 /* ---- Process startup --------------------------------------------------- */
-/* Borrow the host process argc/argv so compiled Python programs can
- * observe their command-line arguments (directly or through CPython
- * fallback modules such as argparse). */
+/* Borrow the host process argc/argv so compiled Python programs can observe
+ * their command-line arguments (directly or through CPython fallback modules
+ * such as argparse).  The pcc1 runner may prefix argv with the private
+ * `--pcc-internal-python-argv0-v1`, ENTRY_MODE, LOGICAL_ARGV0 envelope; the
+ * runtime strips that envelope before publishing the arguments. */
 void py_set_program_args(int argc, const char **argv);
 int64_t py_program_argc(void);
 const char *py_program_argv(int64_t index);
+const char *py_program_executable(void);
+int32_t py_program_mode(void); /* 0=direct, 1=script, 2=module, 3=-c, 4=stdin */
 void py_process_exit(int64_t code);
 PyObject *py_sys_executable_str(void);
 PyObject *py_sys_prefix_str(int64_t kind);
 PyObject *py_os_getpid(void);
 PyObject *py_subprocess_check_output(PyObject *argv);
+int64_t py_process_normalize_wait_status(int64_t status);
 int64_t py_subprocess_run(PyObject *argv, int32_t capture_output);
 int64_t py_subprocess_run_timeout(
     PyObject *argv, int32_t capture_output, int64_t timeout_ms
@@ -1264,7 +1411,12 @@ PyObject   *py_platform_release_str(void);
 /* Boxed `os.getcwd()` value. NULL if getcwd() fails. */
 PyObject   *py_os_getcwd_str(void);
 /* Recursive `os.makedirs(path, exist_ok=...)`; raises OSError on failure. */
-PyObject   *py_os_makedirs(PyObject *path, int32_t exist_ok);
+PyObject   *py_os_makedirs(PyObject *path, int64_t mode, int32_t exist_ok);
+/* Durable filesystem mutation helpers used by native persistence code. */
+PyObject   *py_os_unlink(PyObject *path);
+PyObject   *py_os_replace(PyObject *source, PyObject *destination);
+PyObject   *py_os_chmod(PyObject *path, int64_t mode);
+PyObject   *py_os_fsync(int64_t fd);
 /* `os.access(path, mode)` — returns 1 (accessible) / 0 (not). */
 int32_t     py_os_access(PyObject *path, int32_t mode);
 /* `os.write(fd, data)` — writes bytes/str data to fd. Returns number of bytes written. */
@@ -1276,6 +1428,7 @@ int32_t     py_os_write(int32_t fd, PyObject *data);
  * Arguments are pcc str objects. Returns 0 on success, negative on error. */
 int64_t     py_http_download_to_file(PyObject *url, PyObject *dest_path);
 PyObject   *py_sha256_file_hex(PyObject *path);
+PyObject   *py_sha256_file_hex_bounded(PyObject *path, int64_t max_bytes);
 
 /* ---- Exceptions (Phase 3) --------------------------------------------- */
 
@@ -1341,13 +1494,27 @@ int64_t   py_exc_traceback_len(PyObject *exc);
  * PyClassObject*. Returns 1 on match, 0 otherwise. */
 int64_t py_exc_matches(PyObject *exc, PyObject *type);
 
-/* Append a PyFrameRecord to the exception's traceback. `func_name` and
- * `filename` are borrowed — the caller must guarantee they outlive the
- * exception (typically static rodata strings emitted by the compiler). */
+/* Append a PyFrameRecord to the exception's traceback. `func_name`,
+ * `filename`, and optional `source_line` are borrowed — the caller must
+ * guarantee they outlive the exception (typically static rodata strings
+ * emitted by the compiler).  The four-argument entry remains the C-oracle
+ * compatibility surface; compiler-emitted frames use the source-aware form. */
 void py_exc_append_frame(PyObject *exc,
                          const char *func_name,
                          const char *filename,
                          int32_t line);
+void py_exc_append_frame_source(PyObject *exc,
+                                const char *func_name,
+                                const char *filename,
+                                const char *source_line,
+                                int32_t line);
+
+/* Turn a runtime helper's otherwise-silent failure into a RuntimeError and
+ * attach an innermost synthetic traceback frame naming the helper.  Existing
+ * pending exceptions are preserved unchanged.  `helper_name` must have static
+ * storage (the frame borrows it); `message` is copied by py_exc_new. */
+PyObject *py_runtime_error_if_unset(const char *helper_name,
+                                    const char *message);
 
 /* Format exception traceback-style text and write to stdout. Used by
  * the unhandled-exception handler at program top level. */
@@ -1426,8 +1593,9 @@ void      py_dealloc_cpy_handle(PyObject *o);
 void      py_cpy_handle_set_release_fn(void (*fn)(void *));
 PyObject *py_cpy_to_pcc_str(void *cpy_obj);
 /* Best-effort CPython PyObject* -> pcc PyObject* converter. Handles
- * None/bool/int/float/str/list/tuple/dict/set recursively; unsupported
- * foreign objects fall back to str(obj). Returns a new pcc-owned ref. */
+ * None/bool/int/float/str/list/tuple/dict/set recursively, preserving aliases
+ * and container cycles within one conversion; unsupported foreign objects
+ * fall back to index/float/str conversion. Returns a new pcc-owned ref. */
 PyObject *py_cpy_to_pcc_obj(void *cpy_obj);
 void  py_cpy_decref(void *obj);
 void  py_cpy_incref(void *obj);
@@ -1437,15 +1605,18 @@ int64_t py_cpy_to_i64(void *obj);
 void   *py_cpy_from_f64(double value);
 double  py_cpy_to_f64(void *obj);
 void   *py_cpy_from_pccstr(PyObject *s);
-/* Universal pcc PyObject → CPython PyObject* converter. Rebuilds the
- * object by recursing on lists / tuples / dicts so CPython APIs called
- * from pcc-emitted code receive real CPython containers, not pcc-
- * internal ones. Returns NULL on error. Caller owns the new ref. */
+/* Universal pcc PyObject → CPython PyObject* converter. Rebuilds lists,
+ * tuples, dicts, and sets so CPython APIs receive real CPython containers,
+ * and preserves aliases plus mutable-only container cycles within one
+ * conversion. Cycles that re-enter a tuple under construction fail closed;
+ * PyTuple_SetItem cannot safely publish such a tuple early. Returns NULL on
+ * error. Caller owns the new ref. */
 void   *py_cpy_from_pcc_obj(PyObject *o);
 
-/* Positional + keyword call. ``argv[0..n_pos)`` refs are stolen into
- * the positional tuple (caller must not decref). ``kw_vals`` are
- * borrowed by PyDict_SetItemString so the caller retains ownership.
+/* Positional + keyword call. The callee consumes every owned
+ * ``argv[0..n_pos)`` reference on every return path (normally by stealing
+ * it into the positional tuple), so the caller must not decref it.
+ * ``kw_vals`` are borrowed by the keyword dict, so the caller retains ownership.
  * ``kw_names`` are NUL-terminated C strings (static lifetime).
  * Returns a new owned ref or NULL on error. */
 void   *py_cpy_call_kw(void *callable,
@@ -1453,12 +1624,15 @@ void   *py_cpy_call_kw(void *callable,
                        int64_t n_kw, const char **kw_names, void **kw_vals);
 
 /* Call ``callable(*args, **kwargs_dict)`` where ``kwargs_dict`` is
- * already a CPython mapping object. Positional refs are stolen into the
- * tuple; ``kwargs_dict`` is borrowed. Returns a new owned ref or NULL
- * on error. */
+ * already a CPython mapping object. The callee consumes every owned
+ * positional ref on every return path; ``kwargs_dict`` is borrowed.
+ * Returns a new owned ref or NULL on error. */
 void   *py_cpy_call_kwdict(void *callable,
                            int64_t n_pos, void **argv,
                            void *kwargs_dict);
+/* Like ``py_cpy_call_kwdict``, with additional explicit keywords. The
+ * positional refs are always consumed; explicit keyword values and the
+ * mapping are borrowed. Duplicate explicit/mapping keys raise TypeError. */
 void   *py_cpy_call_kwdict_plus(void *callable,
                                 int64_t n_pos, void **argv,
                                 int64_t n_kw,

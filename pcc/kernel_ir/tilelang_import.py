@@ -11,6 +11,10 @@ local TileLang reference:
 * ``T.alloc_shared`` / ``T.alloc_fragment`` / ``T.alloc_local``
 * ``T.clear`` / zero-valued ``T.fill`` / ``T.copy`` / ``T.atomic_add`` /
   ``T.gemm``
+* one bounded ``T.reduce_sum`` form: a static contiguous rank-2 global input
+  reduced across its last dimension into a static ``(rows, 1)`` f32 output;
+  the importer materializes the required shared reduction scratch explicitly
+  in Kernel IR
 * split-k copy span metadata for the current ``bz * (K // split_k)``,
   ``bz * T.ceildiv(K, split_k)``, and exact expanded
   ``bz * ((K + split_k - 1) // split_k)`` / ``bz * (((K - 1) // split_k) + 1)``
@@ -81,6 +85,9 @@ TILELANG_SOURCE_SUBSET_CLAIM = "pcc-tilelang-source-subset"
 TILELANG_WGMMA_LAYOUT_REFERENCE_COMMIT = "ed00dfcd7f9c200e1150896b1be59c41ff3e8d9d"
 TILELANG_WGMMA_LAYOUT_REFERENCE_PATH = "tilelang/layout/swizzle.py"
 TILELANG_WGMMA_LAYOUT_REFERENCE_SHA256 = "0389a53684dec7697bd22c8e1b30f30a6a1afc5e02980de540c277080082bb55"
+TILELANG_REDUCE_SUM_REFERENCE_COMMIT = "dff136d4da552389b0a41f394edfa1a9fe47a590"
+TILELANG_REDUCE_SUM_REFERENCE_PATH = "tilelang/language/reduce_op.py"
+TILELANG_REDUCE_SUM_REFERENCE_SHA256 = "cc1a7f2d9f67bf40378934416d214c42e8241ff22143377f8fd392d0c314b8c1"
 
 # Attribute stamped onto every KernelModule this module returns so downstream
 # consumers can prove which claim label produced it. Frozen-dataclass instances
@@ -1185,6 +1192,91 @@ def _parse_expr_call(
             ),
             attrs,
         )
+    if func_name == "T.reduce_sum":
+        if extra_attrs:
+            raise TileLangImportError(
+                "the bounded T.reduce_sum importer requires a direct kernel-body "
+                "call; scheduled/nested reduction bodies are not supported"
+            )
+        if not call.args:
+            raise TileLangImportError("T.reduce_sum expects an input buffer")
+        if len(call.args) > 5:
+            raise TileLangImportError(
+                "T.reduce_sum accepts input, output, optional dim, clear, and batch"
+            )
+        keyword_nodes: dict[str, ast.AST] = {}
+        for keyword in call.keywords:
+            if keyword.arg not in {"out", "dim", "clear", "batch"}:
+                raise TileLangImportError(
+                    f"T.reduce_sum keyword {keyword.arg!r} is not supported"
+                )
+            if keyword.arg in keyword_nodes:
+                raise TileLangImportError(
+                    f"T.reduce_sum keyword {keyword.arg!r} was specified more than once"
+                )
+            keyword_nodes[keyword.arg] = keyword.value
+
+        if len(call.args) >= 2:
+            if "out" in keyword_nodes:
+                raise TileLangImportError(
+                    "T.reduce_sum output was supplied both positionally and with out="
+                )
+            output_node = call.args[1]
+        else:
+            output_node = keyword_nodes.pop("out", None)
+            if output_node is None:
+                raise TileLangImportError("T.reduce_sum expects an output buffer")
+        if not isinstance(call.args[0], ast.Name) or not isinstance(output_node, ast.Name):
+            raise TileLangImportError(
+                "bounded T.reduce_sum requires whole-buffer input/output names; "
+                "subscripted regions are not supported"
+            )
+
+        option_names = ("dim", "clear", "batch")
+        option_nodes: dict[str, ast.AST] = {}
+        for index, node in enumerate(call.args[2:]):
+            name = option_names[index]
+            if name in keyword_nodes:
+                raise TileLangImportError(
+                    f"T.reduce_sum {name} was supplied both positionally and by keyword"
+                )
+            option_nodes[name] = node
+        option_nodes.update(keyword_nodes)
+        if "dim" in option_nodes:
+            dim = _eval_expr(option_nodes["dim"], env)
+            if isinstance(dim, bool) or not isinstance(dim, int):
+                raise TileLangImportError(
+                    f"T.reduce_sum dim must be an integer, got {dim!r}"
+                )
+        else:
+            dim = -1
+        clear = _eval_bool(option_nodes["clear"], env) if "clear" in option_nodes else True
+        batch = _eval_int(option_nodes["batch"], env) if "batch" in option_nodes else 1
+        return KernelOp(
+            "reduce",
+            (_symbol_ref(call.args[0]), _symbol_ref(output_node)),
+            {
+                "reduction": "sum",
+                "dim": dim,
+                "clear": clear,
+                "batch": batch,
+                "tilelang_direct_output": True,
+            },
+        )
+    if func_name in {
+        "T.reduce",
+        "T.reduce_max",
+        "T.reduce_min",
+        "T.reduce_abssum",
+        "T.reduce_absmax",
+        "T.reduce_bitand",
+        "T.reduce_bitor",
+        "T.reduce_bitxor",
+    }:
+        raise TileLangImportError(
+            f"{func_name} is outside the current Metal reduction slice; only "
+            "bounded static last-dimension T.reduce_sum is supported"
+        )
     if func_name in {"T.wgmma_gemm_sp", "T.tcgen05_gemm_sp"}:
         raise TileLangImportError(
             f"{func_name} is not supported by the Metal TileLang importer yet; "
@@ -1412,6 +1504,150 @@ def _parse_kernel_region(stmt: ast.With, env: Mapping[str, Any]) -> tuple[tuple[
     return grid, threads, locals_, ops
 
 
+def _lower_static_row_reduce_sum(
+    params: tuple[BufferParam, ...],
+    locals_: list[LocalBuffer],
+    ops: list[KernelOp],
+    *,
+    grid: tuple[int, ...],
+    threads: int,
+) -> tuple[list[LocalBuffer], list[KernelOp]]:
+    """Expand the bounded TileLang row-sum form into explicit Kernel IR.
+
+    The accepted source shape is intentionally finite and directly executable
+    by the existing Metal threadgroup reduction path:
+
+    * input: contiguous static ``(rows, width)`` f16/f32 global buffer;
+    * output: static ``(rows, 1)`` f32 global buffer;
+    * launch: one threadgroup per row and one thread per input column;
+    * semantics: ``dim`` is the last dimension, ``clear=True``, ``batch=1``.
+
+    A pcc-owned shared f32 scratch buffer is materialized in Kernel IR.  The
+    importer does not hide device-local storage in the Metal finalizer and does
+    not claim the broader TileLang reducer scope/batch/kind matrix.
+    """
+
+    reductions = [
+        (index, op)
+        for index, op in enumerate(ops)
+        if op.op == "reduce" and op.attrs.get("tilelang_direct_output") is True
+    ]
+    if not reductions:
+        return locals_, ops
+    if len(reductions) != 1:
+        raise TileLangImportError(
+            "the bounded static T.reduce_sum importer accepts exactly one reduction per kernel"
+        )
+    reduce_index, reduce_op = reductions[0]
+    if len(ops) != 1 or reduce_index != 0:
+        raise TileLangImportError(
+            "the bounded static T.reduce_sum call must be the kernel's only executable operation"
+        )
+    if len(reduce_op.args) != 2:
+        raise TileLangImportError("T.reduce_sum requires input and output buffer references")
+
+    params_by_name = {param.name: param for param in params}
+    source_name, output_name = reduce_op.args
+    if source_name == output_name:
+        raise TileLangImportError(
+            "bounded T.reduce_sum requires distinct input and output buffers"
+        )
+    source = params_by_name.get(source_name)
+    output = params_by_name.get(output_name)
+    if source is None or output is None:
+        raise TileLangImportError(
+            "the bounded T.reduce_sum form requires global input and output parameters"
+        )
+    if source.scope is not MemoryScope.GLOBAL or output.scope is not MemoryScope.GLOBAL:
+        raise TileLangImportError("T.reduce_sum input and output must be global buffers")
+    if source.shape is None or len(source.shape) != 2:
+        raise TileLangImportError(
+            "bounded T.reduce_sum requires a static contiguous rank-2 input"
+        )
+    rows, width = source.shape
+    raw_dim = reduce_op.attrs.get("dim", -1)
+    if not isinstance(raw_dim, int) or isinstance(raw_dim, bool):
+        raise TileLangImportError(f"T.reduce_sum dim must be an integer, got {raw_dim!r}")
+    dim = raw_dim + 2 if raw_dim < 0 else raw_dim
+    if dim != 1:
+        raise TileLangImportError(
+            "bounded T.reduce_sum supports only the last dimension of a rank-2 input"
+        )
+    if reduce_op.attrs.get("clear") is not True:
+        raise TileLangImportError(
+            "bounded T.reduce_sum requires clear=True; accumulation into an existing output is not implemented"
+        )
+    if reduce_op.attrs.get("batch") != 1:
+        raise TileLangImportError(
+            "bounded T.reduce_sum requires batch=1; batched AllReduce lowering is not implemented"
+        )
+    if source.dtype not in {ScalarType.F16, ScalarType.F32}:
+        raise TileLangImportError(
+            "bounded T.reduce_sum input dtype must be float16 or float32"
+        )
+    if output.dtype is not ScalarType.F32:
+        raise TileLangImportError(
+            "bounded T.reduce_sum output dtype must be float32 for explicit accumulation semantics"
+        )
+    if output.shape != (rows, 1):
+        raise TileLangImportError(
+            f"bounded T.reduce_sum output shape must be ({rows}, 1), got {output.shape!r}"
+        )
+    if grid != (rows,):
+        raise TileLangImportError(
+            f"bounded T.reduce_sum requires grid=({rows},), got {grid!r}"
+        )
+    if threads != width:
+        raise TileLangImportError(
+            f"bounded T.reduce_sum requires threads={width}, got {threads}"
+        )
+    if threads > 1024:
+        raise TileLangImportError(
+            f"bounded T.reduce_sum width {threads} exceeds the Metal threadgroup limit 1024"
+        )
+    if rows > 0xFFFFFFFF or rows * width > 0xFFFFFFFF:
+        raise TileLangImportError(
+            "bounded T.reduce_sum grid/extent exceeds the uint32 Metal launch domain"
+        )
+
+    used_names = set(params_by_name)
+    used_names.update(local.name for local in locals_)
+    scratch_index = 0
+    while True:
+        scratch_name = f"__pcc_reduce_sum_scratch_{scratch_index}"
+        if scratch_name not in used_names:
+            break
+        scratch_index += 1
+    scratch = LocalBuffer(
+        scratch_name,
+        ScalarType.F32,
+        shape=(threads,),
+        scope=MemoryScope.SHARED,
+        layout=Layout.TILE,
+    )
+    reduction_attrs = {
+        "reduction": "sum",
+        "dim": dim,
+        "clear": True,
+        "batch": 1,
+        "extent": rows * width,
+        "row_count": rows,
+        "row_width": width,
+        "source_shape": [rows, width],
+        "output_shape": [rows, 1],
+        "import_kind": "tilelang.reduce_sum.static_row.v1",
+    }
+    lowered_ops = [
+        KernelOp("reduce", (source_name, scratch_name), reduction_attrs),
+        KernelOp(
+            "copy",
+            (scratch_name, output_name),
+            {"reduction_output": True},
+        ),
+    ]
+    return [*locals_, scratch], lowered_ops
+
+
 def import_tilelang_source(
     source: str,
     *,
@@ -1450,6 +1686,13 @@ def import_tilelang_source(
             f"TileLang prim_func {func.name!r} must contain exactly one T.Kernel region"
         )
     grid, threads, locals_, ops = _parse_kernel_region(kernel_regions[0], env)
+    locals_, ops = _lower_static_row_reduce_sum(
+        params,
+        locals_,
+        ops,
+        grid=grid,
+        threads=threads,
+    )
     module = KernelModule(
         module_name or f"{func.name}_tilelang_import",
         funcs=(
@@ -1479,6 +1722,9 @@ __all__ = [
     "TILELANG_WGMMA_LAYOUT_REFERENCE_COMMIT",
     "TILELANG_WGMMA_LAYOUT_REFERENCE_PATH",
     "TILELANG_WGMMA_LAYOUT_REFERENCE_SHA256",
+    "TILELANG_REDUCE_SUM_REFERENCE_COMMIT",
+    "TILELANG_REDUCE_SUM_REFERENCE_PATH",
+    "TILELANG_REDUCE_SUM_REFERENCE_SHA256",
     "tilelang_source_import_claim",
     "tilelang_source_import_claim_of",
     "assert_not_native_import_tilelang_claim",

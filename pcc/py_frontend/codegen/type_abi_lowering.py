@@ -294,62 +294,12 @@ class TypeAbiLoweringMixin:
             if field_ir_ty is None:
                 return None
             field_ir_types.append(field_ir_ty)
-        n_fields = len(field_ir_types)
-        if n_fields == 1:
-            return ir.LiteralStructType((field_ir_types[0],))
-        if n_fields == 2:
-            return ir.LiteralStructType((field_ir_types[0], field_ir_types[1]))
-        if n_fields == 3:
-            return ir.LiteralStructType(
-                (
-                    field_ir_types[0],
-                    field_ir_types[1],
-                    field_ir_types[2],
-                )
-            )
-        if n_fields == 4:
-            return ir.LiteralStructType(
-                (
-                    field_ir_types[0],
-                    field_ir_types[1],
-                    field_ir_types[2],
-                    field_ir_types[3],
-                )
-            )
-        if n_fields == 5:
-            return ir.LiteralStructType(
-                (
-                    field_ir_types[0],
-                    field_ir_types[1],
-                    field_ir_types[2],
-                    field_ir_types[3],
-                    field_ir_types[4],
-                )
-            )
-        if n_fields == 6:
-            return ir.LiteralStructType(
-                (
-                    field_ir_types[0],
-                    field_ir_types[1],
-                    field_ir_types[2],
-                    field_ir_types[3],
-                    field_ir_types[4],
-                    field_ir_types[5],
-                )
-            )
-        if n_fields == 7:
-            return ir.LiteralStructType(
-                (
-                    field_ir_types[0],
-                    field_ir_types[1],
-                    field_ir_types[2],
-                    field_ir_types[3],
-                    field_ir_types[4],
-                    field_ir_types[5],
-                    field_ir_types[6],
-                )
-            )
-        return None
+        # The scaffold has a dynamic LiteralStructType constructor for a
+        # runtime-built list.  The former 1..7 source unroll predated that
+        # path and silently changed an eight-field valueclass into the object
+        # ABI.  Field *types* may still reject projection above; field count
+        # alone must not.
+        return ir.LiteralStructType(field_ir_types)
 
     def _valueclass_field_payload_ir_type(
         self,

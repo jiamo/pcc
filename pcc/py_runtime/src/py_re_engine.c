@@ -1,9 +1,9 @@
 /*
  * py_re_engine.c — E0 faithful regex engine subset (steps 1+2).
  *
- * Standalone, pure-C, byte/ASCII regex engine intended to replace the toy
- * matcher in py_re.c as the backend for native re support. NOT wired into
- * the runtime build yet (not listed in the Makefile); exercised directly by
+ * Standalone, pure-C, byte/ASCII regex engine retained as the host-C
+ * differential oracle. The production pcc-Python runtime owns these ABIs in
+ * py/freestanding_re_engine.py; this source is exercised directly by
  * tests/python/test_re_engine_differential.py via a cc -dynamiclib build.
  *
  * Subset: literals, '.', character classes [...] with ranges / negation /

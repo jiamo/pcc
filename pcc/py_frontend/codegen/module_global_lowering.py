@@ -8,12 +8,14 @@ from ..py_ast import (
     Assign,
     Attr,
     AugAssign,
+    BoolLit,
     Expr,
     For,
     FuncDef,
     If,
     Import,
     ImportFrom,
+    IntLit,
     IntType,
     ListExpr,
     Name,
@@ -21,6 +23,7 @@ from ..py_ast import (
     Try,
     Type,
     TupleExpr,
+    UnaryOp,
     While,
     With,
 )
@@ -34,6 +37,26 @@ _I8 = ir.IntType(8)
 _I1 = ir.IntType(1)
 _I32 = ir.IntType(32)
 _CSTR = _I8.as_pointer()
+
+
+def _scalar_literal_initializer(expr) -> tuple[bool, int]:
+    """Return a signed integer or Boolean literal for static storage."""
+    if isinstance(expr, BoolLit):
+        return (True, int(expr.value))
+    if isinstance(expr, IntLit):
+        value = int(expr.value)
+        if -(1 << 63) <= value <= (1 << 63) - 1:
+            return (True, value)
+        return (False, 0)
+    if isinstance(expr, UnaryOp) and expr.op in ("+", "-"):
+        found, value = _scalar_literal_initializer(expr.operand)
+        if not found:
+            return (False, 0)
+        if expr.op == "-":
+            value = -value
+        if -(1 << 63) <= value <= (1 << 63) - 1:
+            return (True, value)
+    return (False, 0)
 
 
 def _import_names_from_stmt(stmt):
@@ -277,7 +300,6 @@ class ModuleGlobalLoweringMixin:
                         "fileinput",
                         "shutil",
                         "shlex",
-                        "sysconfig",
                         "math",
                         "json",
                         "re",
@@ -289,7 +311,6 @@ class ModuleGlobalLoweringMixin:
                         "threading",
                         "pcc.virtual_thread",
                         "pcc",
-                        "importlib",
                         "inspect",
                         "contextlib",
                         "contextvars",
@@ -579,7 +600,16 @@ class ModuleGlobalLoweringMixin:
                 or self._is_valueclass_payload_type(target_ty)
             ):
                 continue
-            self._ensure_module_global_name(t.ident, target_ty)
+            gv, _declared_ty = self._ensure_module_global_name(t.ident, target_ty)
+            if (
+                self._python_library
+                and self._module_has_c_abi_export
+                and isinstance(gv.value_type, ir.IntType)
+            ):
+                found, value = _scalar_literal_initializer(stmt.value)
+                if not found:
+                    value = 0
+                gv.initializer = ir.Constant(gv.value_type, value)
             if len(stmt.targets) != 1 or not isinstance(stmt.targets[0], Name):
                 continue
             threading_kind = self._threading_constructor_kind_for_expr(stmt.value)
@@ -623,6 +653,7 @@ class ModuleGlobalLoweringMixin:
         declared_ty: Type | None = None,
         value_is_owned: bool = False,
         is_cpy_value: bool = False,
+        raw_pointer: bool = False,
     ) -> None:
         if (
             not is_cpy_value
@@ -634,7 +665,10 @@ class ModuleGlobalLoweringMixin:
             self._refresh_module_global_valueclass_payload_roots(gv, declared_ty)
             self._mark_module_global_initialized(gv)
             return
-        if is_cpy_value or not isinstance(value.type, ir.PointerType):
+        # Raw pcc.unsafe/extern pointers (stack_alloc/calloc/ptr_add/...) are NOT
+        # GC-managed PyObjects; pinning/rooting them writes PY_FLAG_GC_PINNED
+        # into the pointed-to buffer (obj+12 flags word) and corrupts it.
+        if is_cpy_value or raw_pointer or not isinstance(value.type, ir.PointerType):
             self.builder.store(value, gv)
             self._mark_module_global_initialized(gv)
             return
@@ -642,8 +676,8 @@ class ModuleGlobalLoweringMixin:
             gv,
             name=self._fresh("mod.global.old"),
         )
-        self.builder.call(self.runtime["pcc_gc_unpin"], [old_value])
-        self.builder.call(self.runtime["pcc_gc_pin"], [value])
+        self._gc_unpin(old_value)
+        self._gc_pin(value)
         self.builder.call(
             self.runtime["pcc_gc_store_root"],
             [
@@ -743,10 +777,18 @@ class ModuleGlobalLoweringMixin:
 
     def _emit_class_global_root_enters(self) -> None:
         frame_map = self._gc_one_slot_frame_map()
+        entered_globals: set[str] = set()
         for info in self.class_lowering.classes.values():
-            self._emit_current_gc_frame_enter(frame_map, info.global_var)
+            global_name = str(info.global_var.name)
+            if global_name not in entered_globals:
+                self._emit_current_gc_frame_enter(frame_map, info.global_var)
+                entered_globals.add(global_name)
             for gv, _attr_ty in info.class_attrs.values():
+                attr_global_name = str(gv.name)
+                if attr_global_name in entered_globals:
+                    continue
                 self._emit_current_gc_frame_enter(frame_map, gv)
+                entered_globals.add(attr_global_name)
 
     def _emit_module_root_enters(self) -> None:
         self._emit_module_global_root_enters()

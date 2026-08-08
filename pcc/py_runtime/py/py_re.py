@@ -5,6 +5,10 @@ This intentionally remains the same bootstrap regex subset as the C helper:
 '?', the ASCII classes \d, \w, \s plus uppercase negations, and the re.I /
 re.S flags.
 """
+from pcc.py_runtime.py.py_abi_constants import (
+    PY_TYPE_INT,
+    PY_TYPE_STR,
+)
 
 from pcc.extern import extern, c_abi_export, c_int64, c_ptr, c_void
 from pcc.unsafe import (
@@ -30,7 +34,7 @@ py_tuple_set_item = extern("py_tuple_set_item", (c_ptr, c_int64, c_ptr), c_void)
 py_int_from_i64 = extern("py_int_from_i64", (c_int64,), c_ptr)
 py_int_to_i64 = extern("py_int_to_i64", (c_ptr, c_ptr), c_int64)
 py_func_new_named = extern("py_func_new_named", (c_ptr, c_ptr, c_ptr), c_ptr)
-# E1a/E4 faithful-engine bridge (C-only helper, py_re_engine_obj.c — no port)
+# E1a/E4 faithful-engine bridge (owned by py_re_engine_runtime.py).
 py_re_engine_truth_flags = extern(
     "py_re_engine_truth_flags", (c_ptr, c_ptr, c_int64, c_int64), c_ptr
 )
@@ -50,7 +54,7 @@ py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 
 def _type_of(obj) -> int:
     if is_tagged_int(obj):
-        return 2
+        return PY_TYPE_INT
     return load_i32(obj, 8)
 
 
@@ -291,7 +295,7 @@ def _re_match_impl(pattern, text, flags: int, search: int):
     none = global_load_ptr("py_None")
     if ptr_is_null(pattern) or ptr_is_null(text):
         return none
-    if _type_of(pattern) != 4 or _type_of(text) != 4:
+    if _type_of(pattern) != PY_TYPE_STR or _type_of(text) != PY_TYPE_STR:
         return none
     if (flags & ~26) == 0:  # 26 == re.I|re.M|re.S — the engine flag mask
         # Subset patterns (incl. re.I/M/S since E4) run on the faithful
@@ -354,7 +358,7 @@ def py_re_fullmatch_flags(pattern, text, flags: int):
     none = global_load_ptr("py_None")
     if ptr_is_null(pattern) or ptr_is_null(text):
         return none
-    if _type_of(pattern) != 4 or _type_of(text) != 4:
+    if _type_of(pattern) != PY_TYPE_STR or _type_of(text) != PY_TYPE_STR:
         return none
     if (flags & ~26) == 0:  # 26 == re.I|re.M|re.S — the engine flag mask
         return py_re_engine_fullmatch_flags(pattern, text, flags)
@@ -499,10 +503,10 @@ def _findall_parenthesized(text):
 def py_re_findall_flags(pattern, text, flags: int):
     if ptr_is_null(pattern) != 0 or ptr_is_null(text) != 0:
         return py_list_new(0)
-    if _type_of(pattern) != 4 or _type_of(text) != 4:
+    if _type_of(pattern) != PY_TYPE_STR or _type_of(text) != PY_TYPE_STR:
         return py_list_new(0)
     if (flags & ~26) == 0:
-        # E3/E4 faithful-engine findall (C-only helper, py_re_engine_obj.c)
+        # E3/E4 faithful-engine findall (owned by py_re_engine_runtime.py).
         return py_re_engine_findall(pattern, text, flags)
     py_raise(
         py_exc_new(

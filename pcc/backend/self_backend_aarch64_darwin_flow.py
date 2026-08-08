@@ -18,13 +18,147 @@ from .self_backend_aarch64_darwin_slots import (
     zero_address,
 )
 from .self_backend_ir import (
+    ParsedBlock,
     ParsedFunction,
     TypeDesc,
     _align_to,
     text_key_mapping_get,
+    text_key_names_equal,
 )
 from .self_backend_module_symbols import PreparedModuleSymbols
 from .self_backend_parse import is_aggregate_literal_value
+
+
+def _canonical_post_call_error_edge(
+    block: ParsedBlock,
+) -> tuple[str, str] | None:
+    """Return ``(error, success)`` for the frontend's exact post-call check.
+
+    Keep this recognizer intentionally structural and finite.  The canonical
+    block tail is one possibly-raising call, a direct zero-argument
+    ``py_err_occurred`` call, ``icmp ne i64 <result>, 0``, and a conditional
+    branch on that comparison.  Merely seeing an equivalent-looking assembly
+    branch is not enough: ordinary conditionals and hand-written status checks
+    must retain source block order.
+    """
+    term = block.terminator
+    if (
+        term is None
+        or term.kind != "br_cond"
+        or len(term.data) != 3
+        or len(block.instructions) < 3
+    ):
+        return None
+    raising_call = block.instructions[-3]
+    err_call = block.instructions[-2]
+    compare = block.instructions[-1]
+    if (
+        raising_call.kind != "call"
+        or err_call.kind != "call"
+        or compare.kind != "icmp"
+        or len(raising_call.data) != 8
+        or len(err_call.data) != 8
+        or len(compare.data) != 5
+    ):
+        return None
+
+    (
+        _raising_dest,
+        _raising_ret_type,
+        raising_callee,
+        raising_is_indirect,
+        _raising_args,
+        _raising_fixed_arg_count,
+        _raising_is_vararg,
+        _raising_arg_alignments,
+    ) = raising_call.data
+    if not raising_is_indirect and raising_callee == "py_err_occurred":
+        return None
+
+    (
+        err_dest,
+        err_ret_type,
+        err_callee,
+        err_is_indirect,
+        err_args,
+        err_fixed_arg_count,
+        err_is_vararg,
+        _err_arg_alignments,
+    ) = err_call.data
+    if (
+        err_dest is None
+        or err_is_indirect
+        or err_callee != "py_err_occurred"
+        or len(err_args) != 0
+        or err_fixed_arg_count != 0
+        or err_is_vararg
+        or not err_ret_type.is_int
+        or err_ret_type.width != 64
+    ):
+        return None
+
+    predicate, compare_dest, value_type, lhs, rhs = compare.data
+    if (
+        predicate != "ne"
+        or not value_type.is_int
+        or value_type.width != 64
+        or not text_key_names_equal(lhs, err_dest)
+        or rhs != "0"
+    ):
+        return None
+
+    cond_name, error_target, success_target = term.data
+    if not text_key_names_equal(cond_name, compare_dest):
+        return None
+    return error_target, success_target
+
+
+def plan_aarch64_canonical_error_fallthroughs(
+    func: ParsedFunction,
+    *,
+    enabled: bool,
+) -> None:
+    """Place only canonical post-call success blocks after their checks."""
+    func.aarch64_block_layout = []
+    func.aarch64_cold_fallthrough_edges = []
+    if not enabled:
+        return
+
+    ordered = list(func.blocks)
+    index = 0
+    while index < len(ordered):
+        block = ordered[index]
+        edge = _canonical_post_call_error_edge(block)
+        if edge is None:
+            index += 1
+            continue
+        error_target, success_target = edge
+
+        target_index = -1
+        candidate_index = index + 1
+        while candidate_index < len(ordered):
+            if text_key_names_equal(
+                ordered[candidate_index].name,
+                success_target,
+            ):
+                target_index = candidate_index
+                break
+            candidate_index += 1
+        # Do not pull a previously emitted/back-edge target across the source;
+        # that would be global block placement rather than this finite pass.
+        if target_index < index + 1:
+            index += 1
+            continue
+        if target_index != index + 1:
+            success_block = ordered.pop(target_index)
+            ordered.insert(index + 1, success_block)
+        func.aarch64_cold_fallthrough_edges.append(
+            (block.name, error_target, success_target)
+        )
+        index += 1
+
+    if func.aarch64_cold_fallthrough_edges:
+        func.aarch64_block_layout = ordered
 
 
 def emit_bit_count_intrinsic_call(

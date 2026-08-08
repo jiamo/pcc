@@ -132,6 +132,18 @@ class AssignmentStoreLoweringMixin:
                 return
             slot = self.env.get(lhs.ident)
             target_ty = lhs.ty
+            # The function-level representation plan is authoritative here.
+            # A destructuring target can be re-inferred as Dyn from the
+            # iterable element even though the same local was already joined
+            # to one exact-int object slot at function entry.  Re-checking the
+            # statement-local AST type would bypass the rooted replacement
+            # protocol and either store an i64 into a ptr alloca or install an
+            # owned pointer with no write barrier.
+            planned_exact_int = lhs.ident in getattr(
+                self,
+                "_planned_exact_int_local_names",
+                set(),
+            )
             if slot is None and target_ty is not None:
                 if self._is_object(target_ty):
                     ir_ty = self._storage_ir_type(target_ty)
@@ -145,6 +157,14 @@ class AssignmentStoreLoweringMixin:
                         )
                         self.env[lhs.ident] = (alloca, ir_ty, target_ty)
                         slot = self.env[lhs.ident]
+            if planned_exact_int:
+                self._store_value_at_name(
+                    lhs,
+                    value,
+                    value_ty,
+                    value_is_owned=unpack_value_is_owned,
+                )
+                return
             slot_for_release = slot
             if slot_for_release is not None and unpack_value_is_owned:
                 alloca, ir_ty, _decl_ty = slot_for_release
@@ -286,6 +306,75 @@ class AssignmentStoreLoweringMixin:
             slot = self.env[target.ident]
 
         alloca, _ir_ty, declared_ty = slot
+        # Membership already means the function-level analysis proved this
+        # semantic int local needs the object projection on every edge.  The
+        # current unpack target may carry Dyn after iterable inference, so its
+        # local AST type cannot override that established slot contract.
+        planned_exact_int = target.ident in getattr(
+            self,
+            "_planned_exact_int_local_names",
+            set(),
+        )
+        if planned_exact_int:
+            if not (
+                isinstance(_ir_ty, ir.PointerType)
+                and self._ir_type_matches(_ir_ty, _CSTR)
+            ):
+                raise NotImplementedError(
+                    "planned exact-int local does not have object storage: "
+                    + target.ident
+                )
+            incoming = value
+            incoming_owned = bool(value_is_owned)
+            if incoming in getattr(self, "_cpy_values", ()):
+                incoming = self._emit_value_as_pcc_object_or_bridge(
+                    incoming,
+                    value_ty,
+                    target.ident + ".exact.unpack.bridge",
+                )
+                incoming_owned = True
+            elif not isinstance(incoming.type, ir.PointerType):
+                incoming = marshal.marshal_to_object(
+                    self.builder,
+                    self.module,
+                    self.runtime,
+                    incoming,
+                    value_ty,
+                )
+                incoming_owned = True
+            if not incoming_owned:
+                incoming = self._gc_retain(
+                    incoming,
+                    name=self._fresh(target.ident + ".exact.unpack.retain"),
+                )
+            # The slot now owns a pcc PyInt object even when the unpacked
+            # value originated in CPython.  Leaving the foreign-domain flag
+            # behind makes the next Name load reinterpret this pcc pointer as
+            # a CPython PyObject*.
+            self._cpy_env_flags.pop(target.ident, None)
+            self._gc_pin(incoming)
+            self.builder.call(
+                self.runtime["pcc_gc_store_root"],
+                [self._as_gc_ptr(alloca), incoming],
+            )
+            self._gc_unpin(incoming)
+            # Root-store retained the replacement for the local slot and
+            # released its previous owner.  Consume the owned temporary
+            # supplied by the unpack expression (or the retain above).
+            self._gc_release(
+                incoming,
+                self._release_context_label(
+                    "exact-unpack-incoming:" + target.ident
+                ),
+            )
+            self.env[target.ident] = (alloca, _CSTR, target.ty)
+            self._exact_int_env_flags[target.ident] = True
+            self._owned_local_names.add(target.ident)
+            self._owned_local_has_value.add(target.ident)
+            self._ensure_owned_local_gc_root(target.ident, alloca, _CSTR)
+            flag = self._ensure_owned_local_flag(target.ident, alloca)
+            self.builder.store(ir.Constant(_I1, 1), flag)
+            return
         value = self._coerce(value, value_ty, declared_ty)
         self.builder.store(value, alloca)
         if self._is_valueclass_payload_type(declared_ty):

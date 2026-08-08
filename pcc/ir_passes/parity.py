@@ -28,13 +28,14 @@ rig already tracks executable-level timings.
 from __future__ import annotations
 
 import re
-import shutil
 import subprocess
 from collections import Counter
 from dataclasses import dataclass, field
 from typing import Iterable
 
 import llvmlite.binding as llvm
+
+from pcc.passes.llvm_text_pipeline import find_opt_binary
 
 from .manager import AnalysisManager, IRPassManager, ModulePass, PreservedAnalyses
 
@@ -51,16 +52,17 @@ class OptNotFoundError(RuntimeError):
 def _locate_opt(explicit: str | None = None) -> str:
     """Return a path to an ``opt`` binary.
 
-    Looks at ``explicit`` first, then ``$PATH``. Raises
+    Looks at ``explicit`` first, then for an LLVM version matching llvmlite.
+    Raises
     :class:`OptNotFoundError` if nothing is found — parity tests that
-    need ``opt`` should skip in that case rather than fail noisily.
+    need ``opt`` should use collection-time ``pcc_gate`` when unavailable.
     """
     if explicit is not None:
         return explicit
-    found = shutil.which("opt")
+    found = find_opt_binary()
     if found is None:
         raise OptNotFoundError(
-            "no LLVM 'opt' binary on PATH; parity harness cannot run"
+            "no LLVM 'opt' matching llvmlite; parity harness cannot run"
         )
     return found
 

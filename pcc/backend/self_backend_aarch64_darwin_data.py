@@ -21,12 +21,102 @@ from .self_backend_parse import (
 )
 
 
+_GLOBAL_CTORS_NAME = "llvm.global_ctors"
+
+
+def _emit_global_ctors(
+    global_: GlobalDef,
+    module_symbols: PreparedModuleSymbols,
+) -> list[str]:
+    """Lower LLVM's appending ctor array to Mach-O initializer pointers."""
+    ty = global_.type
+    if (
+        not ty.is_array
+        or ty.elem is None
+        or not ty.elem.is_struct
+        or len(ty.elem.fields) != 3
+        or not ty.elem.fields[0].is_int
+        or ty.elem.fields[0].width != 32
+        or not ty.elem.fields[1].is_ptr
+        or not ty.elem.fields[2].is_ptr
+    ):
+        raise BackendUnavailable(
+            "self backend expected llvm.global_ctors as "
+            "[N x { i32, ptr, ptr }]"
+        )
+
+    initializer = strip_typed_initializer(global_.initializer)
+    if initializer == "zeroinitializer":
+        return []
+    if not (initializer.startswith("[") and initializer.endswith("]")):
+        raise BackendUnavailable(
+            "self backend expected an array initializer for llvm.global_ctors"
+        )
+    body = initializer[1:-1].strip()
+    raw_entries = [] if not body else split_top_level(body)
+    if len(raw_entries) != ty.count:
+        raise BackendUnavailable(
+            "self backend llvm.global_ctors count does not match its type"
+        )
+
+    entries: list[tuple[int, int, str]] = []
+    for ordinal, raw_entry in enumerate(raw_entries):
+        record = strip_typed_initializer(raw_entry)
+        if not (record.startswith("{") and record.endswith("}")):
+            raise BackendUnavailable(
+                f"bad llvm.global_ctors record {raw_entry!r}"
+            )
+        fields = split_top_level(record[1:-1].strip())
+        if len(fields) != 3:
+            raise BackendUnavailable(
+                f"bad llvm.global_ctors record {raw_entry!r}"
+            )
+        priority_text = decode_value_token(strip_typed_initializer(fields[0]))
+        target = decode_value_token(strip_typed_initializer(fields[1]))
+        associated = decode_value_token(strip_typed_initializer(fields[2]))
+        try:
+            priority = int(priority_text, 0)
+        except ValueError as exc:
+            raise BackendUnavailable(
+                f"non-integer llvm.global_ctors priority {priority_text!r}"
+            ) from exc
+        if not -(1 << 31) <= priority < (1 << 32):
+            raise BackendUnavailable(
+                f"llvm.global_ctors priority outside i32: {priority_text!r}"
+            )
+        priority &= 0xFFFFFFFF
+        if not target.startswith("@"):
+            raise BackendUnavailable(
+                f"non-symbol llvm.global_ctors target {target!r}"
+            )
+        if associated != "null":
+            raise BackendUnavailable(
+                "associated-data llvm.global_ctors entries are not proven"
+            )
+        entries.append((priority, ordinal, target[1:]))
+
+    entries.sort(key=lambda entry: (entry[0], entry[1]))
+    if not entries:
+        return []
+    lines = [
+        ".section __DATA,__mod_init_func,mod_init_funcs",
+        ".p2align 3",
+    ]
+    for _priority, _ordinal, target_name in entries:
+        lines.append(f"  .quad {asm_symbol(target_name, module_symbols)}")
+    lines.append("")
+    return lines
+
+
 def emit_globals(
     globals_: list[GlobalDef],
     module_symbols: PreparedModuleSymbols,
 ) -> list[str]:
     lines: list[str] = []
     for global_ in globals_:
+        if global_.name == _GLOBAL_CTORS_NAME:
+            lines.extend(_emit_global_ctors(global_, module_symbols))
+            continue
         section = (
             ".section __DATA,__const"
             if global_.is_constant

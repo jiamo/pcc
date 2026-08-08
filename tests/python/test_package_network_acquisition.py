@@ -464,6 +464,12 @@ def test_self_backend_transport_and_sha256_kernel_primitives(tmp_path):
     payload = served / "payload.bin"
     payload.write_bytes(b"pcc-owned-acquisition\x00payload\n")
     expected = hashlib.sha256(payload.read_bytes()).hexdigest()
+    empty = served / "empty.bin"
+    empty.write_bytes(b"")
+    empty_expected = hashlib.sha256(b"").hexdigest()
+    multiblock = served / "multiblock.bin"
+    multiblock.write_bytes(bytes(range(256)) * 257)
+    multiblock_expected = hashlib.sha256(multiblock.read_bytes()).hexdigest()
     downloaded = tmp_path / "downloaded.bin"
     source = tmp_path / "probe.py"
     exe = tmp_path / "probe"
@@ -477,7 +483,26 @@ def test_self_backend_transport_and_sha256_kernel_primitives(tmp_path):
             + repr(str(downloaded))
             + "))\n"
             + "print(os._pcc_sha256_file_hex("
+            + repr(str(empty))
+            + "))\n"
+            + "print(os._pcc_sha256_file_hex("
+            + repr(str(multiblock))
+            + "))\n"
+            + "print(os._pcc_sha256_file_hex("
+            + repr(str(served / "missing.bin"))
+            + "))\n"
+            + "print(os._pcc_sha256_file_hex("
             + repr(str(downloaded))
+            + "))\n"
+            + "print(os._pcc_sha256_file_hex_bounded("
+            + repr(str(multiblock))
+            + ", "
+            + repr(multiblock.stat().st_size)
+            + "))\n"
+            + "print(os._pcc_sha256_file_hex_bounded("
+            + repr(str(multiblock))
+            + ", "
+            + repr(multiblock.stat().st_size - 1)
             + "))\n",
             encoding="utf-8",
         )
@@ -507,7 +532,15 @@ def test_self_backend_transport_and_sha256_kernel_primitives(tmp_path):
             timeout=30,
         )
 
-    assert proc.stdout.splitlines() == ["0", expected]
+    assert proc.stdout.splitlines() == [
+        "0",
+        empty_expected,
+        multiblock_expected,
+        "",
+        expected,
+        multiblock_expected,
+        "",
+    ]
     assert downloaded.read_bytes() == payload.read_bytes()
 
 

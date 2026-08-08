@@ -30,7 +30,7 @@ saved ──slot[0]──▶ exception ──message──▶ [1, 2, 3]
 
 pcc 的论题(见第 1 章)把"五 GC 比较运行时"列为五大差异化之一:它不是一个收集器加四个实验品,而是一个研究纲领——同一份编译产物,通过环境变量切换五种收集策略,在同一自举负载和同一语义契约下比较。[docs/refs_docs/gc-research/](../../docs/refs_docs/gc-research/) 下保存着五个参照实现(CPython、Lua、Go、OCaml、ZGC)的源码,仓库规则要求移植前先读参照、不得重新发明。
 
-这个纲领的最大风险不是某个算法写错,而是**五个后端各自演化出一套"什么算可达、什么算存活"的对象图规则**。一旦规则有两套,同一程序在不同后端会看到不同的对象生存期;差异以最难调试的方式呈现——只在某个后端出现的释放后使用、只在某个后端丢失的属性。[codex-goal-prompt.md](../../codex-goal-prompt.md) 的 5-GC Production Equality Rule(生产平等规则)就是对这个风险的制度化回答:
+这个纲领的最大风险不是某个算法写错,而是**五个后端各自演化出一套"什么算可达、什么算存活"的对象图规则**。一旦规则有两套,同一程序在不同后端会看到不同的对象生存期;差异以最难调试的方式呈现——只在某个后端出现的释放后使用、只在某个后端丢失的属性。[goal-prompt.md](../../docs/goal/goal-prompt.md) 的 5-GC Production Equality Rule(生产平等规则)就是对这个风险的制度化回答:
 
 - **语义是硬性要求,五后端必须一致**:对象可达性、根安全、异常与帧的存活、容器图安全、弱引用/终结器/复活策略、扩展对象生存期、值类指针载荷安全、虚拟线程挂起帧与调度器根安全。
 - **性能是可报告差异,允许不同**:暂停、吞吐、RSS、碎片画像、收集节奏都是每个后端自己的画像。
@@ -64,21 +64,17 @@ pcc-Python 镜像 [pcc/py_runtime/py/py_gc_backend.py](../../pcc/py_runtime/py/p
 
 这里的"槽位"不是抽象术语,就是运行时结构体里能指向另一个 Python 对象的位置。列表的 `items[i]` 是槽位,字典表项里的 key/value 是槽位,异常对象的 message 是槽位,生成器保存的堆帧也是槽位。收集器并不理解"异常消息很重要"这种语义句子;它只会问一个对象:"把你的所有指针槽交出来。"少交一个槽,被指向的对象就可能被当作垃圾;搬家后少更新一个槽,旧地址就会留在对象图里。
 
-这份形状信息如果在两处声明,就会漂移;漂移的后果不是编译错误,而是某个后端在标记时漏看一个槽(对象被误回收)或在重定位后漏改一个槽(悬挂指针)。AGENTS.md 把这条写成了硬规则:五个后端、C kernel、pcc-Python 镜像必须消费**同一套**槽位 trace/update 契约(`py_obj_visit_slots` / `py_obj_update_slot` / root + frame + native-handle 注册),"决不允许出现第二套各自漂移的对象图规则"。[codex-goal-prompt.md](../../codex-goal-prompt.md) 的 G-track 把机制说得更具体:每个运行时对象类型把自己的引用槽**声明一次**(强/弱/借用/钉住/可移动/原生句柄/值载荷指针/帧局部/调度器根),五个后端各自以不同身份消费同一份声明——#0 用于可达性与环检测,#1 用于标记屏障,#2 用于工作缓冲,#3 用于记忆集(remembered set)与晋升,#4 用于转发与槽改写;后端**不得**手写按类型分支的对象图遍历器。
+这份形状信息如果在两个生产实现里声明,就会漂移;漂移的后果不是编译错误,而是某个后端在标记时漏看一个槽(对象被误回收)或在重定位后漏改一个槽(悬挂指针)。AGENTS.md 把这条写成硬规则:五个后端必须消费**同一套由 pcc-Python 拥有的**槽位 trace/update 契约(实际统一入口为 `pcc_gc_visit_object_slots`,配套 root + frame + native-handle 注册),C 版本只作差分 oracle。[goal-prompt.md](../../docs/goal/goal-prompt.md) 的 G-track 把机制说得更具体:每个运行时对象类型把自己的引用槽**声明一次**(强/弱/借用/钉住/可移动/原生句柄/值载荷指针/帧局部/调度器根),五个后端各自以不同身份消费同一份声明——#0 用于可达性与环检测,#1 用于标记屏障,#2 用于工作缓冲,#3 用于记忆集(remembered set)与晋升,#4 用于转发与槽改写。
 
-### 10.3.2 诚实的现状:契约已采纳,机制在收敛中
+### 10.3.2 诚实的现状:生产契约已经迁入 pcc-Python
 
-按声明卫生的要求,必须写清现状与目标的距离。`py_obj_visit_slots(obj, visitor)` 这个单一声明点是 2026-05-31 被采纳(ADOPTED)的**原则**;[codex-goal-prompt.md](../../codex-goal-prompt.md) 同时记录:把它建成机制(槽契约表、共同测试套件、镜像乘五后端的运行器、每对象核对清单)是一个尚未建完的工程纲领。今天源码里的实际形态是**多份按类型分支的遍历器,靠纪律与测试矩阵保持一致**:
+2026-08-03 的 [freestanding five-GC production closure](../../docs/goal/evidence/2026-08-03-freestanding-gc-done-strong.md)改变了本节早期快照。生产 collector policy 不再由 `src/py_gc_backend.c` 与 `py/py_gc_backend.py` 两份大实现维持镜像;它被拆入 `freestanding_gc_*` 模块。`freestanding_gc_object_slots.py` 的 `pcc_gc_visit_object_slots()` 是对象槽统一入口,依次处理核心容器、固定 owner、弱引用、continuation、class、C-extension 和 instance 槽。root/frame registry、mark cycle、backend0 collector、incremental/concurrent scheduler、generational promotion 与 relocation/ZPage mechanics 也各有 pcc-Python owner。
 
-- 后端 #0 的环收集器([pcc/py_runtime/src/py_obj_gc.c](../../pcc/py_runtime/src/py_obj_gc.c))有 `py_gc_visit_referents()`(标记用)与 `py_gc_clear_referents()`(清环用);
-- 追踪后端([pcc/py_runtime/src/py_gc_backend.c](../../pcc/py_runtime/src/py_gc_backend.c))有 `pcc_gc_trace_referents()`(染灰用)、`pcc_gc_clear_referents()`(两阶段清除用)、`pcc_gc_promote_owner_referents()`(#3 晋升与即时槽改写用)、`pcc_gc_relocate_copy_payload()`(#4 重定位拷贝用,且受 `pcc_gc_colored_relocate_copy_supported_tag()` 白名单约束——不在白名单上的类型不会被搬动,宁可不优化也不冒险);
-- pcc-Python 端口([pcc/py_runtime/py/py_gc_backend.py](../../pcc/py_runtime/py/py_gc_backend.py))把上述每一个都镜像了一份,而且是用 `load_ptr(o, 24)` 这样的**裸字节偏移**写的——比如 `_trace_referents` 对异常对象(tag 12)访问偏移 16/24/32/40,即 `exc_class`/`message`/`cause`/`context`。
+C collector 源仍保留,但 production link map 已证明没有 C-owned collector 定义。它的角色是差分 oracle,不是第二个运行时政策 owner。共同契约套件、weakref/finalizer/resurrection/suspended-frame/C-extension-root/relocation 闸门、五后端长跑与 GC0–GC4 的 current-source pcc1→pcc2→pcc3 fixed point 共同约束这条声明。新增带指针槽的类型时,生产必改点是统一 pcc-Python slot owner;C oracle 需要相同输入的差分更新,却不能重新进入生产归档。
 
-也就是说,同一个"list 的槽是 items[0..length)"的事实,今天至少在六个函数里各写了一遍。把这种状态如实称为风险面,正是平等契约存在的理由:目前的一致性由三道闸门(gate)托住——[tests/python/gc_production_contract/](../../tests/python/gc_production_contract/) 的共同契约套件(本文写作时 130 个测试)、五后端全自举矩阵、以及"新运行时类型必须同时改 C 与端口并过五后端"的镜像纪律。新增一个带指针槽的类型时,这些遍历器每一个都是必改点;漏改哪一个,对应后端就在那个类型上失明。第 7 章讲过 C 结构体与端口布局逐字节一致的纪律;本章的遍历器是同一纪律在对象图维度的延伸。
+### 10.3.3 分层:索引、分配器和原子也不再是永久 C kernel
 
-### 10.3.3 分层:哪些是镜像,哪些是单一 C 实现
-
-注意一个有意的不对称。端口文件开头有一长串 `extern` 声明:`pcc_gc_frame_index_insert`、`pcc_gc_object_index_find`、`pcc_gc_forwarding_index_*`……这些哈希索引表([pcc/py_runtime/src/py_gc_index_table.c](../../pcc/py_runtime/src/py_gc_index_table.c))**只有 C 实现,没有 pcc-Python 镜像**;端口直接通过 extern 调进去。这正是第 1 章与第 14 章的运行时四层模型在 GC 子系统里的投影:指针哈希表、原子操作、分配器属于 C kernel(保留并最小化,不懂任何 Python 语义);"异常对象有哪些槽""清环的顺序是什么"属于语义运行时(目标是迁往 pcc-Python)。镜像纪律只约束语义层;kernel 层刻意单一实现,因为给一张哈希表维护两份实现没有任何语义收益,只有漂移风险。
+早期版本把 `pcc_gc_frame_index_insert`、`pcc_gc_object_index_find` 与 `pcc_gc_forwarding_index_*` 所在的哈希表视为只有 C 实现的 kernel。当前 `freestanding_gc_index_table.py` 已导出这些 ABI,开放寻址、rehash、backward-shift deletion 和 frame/object/forwarding/ZPage 索引均由 freestanding pcc-Python 拥有;`src/py_gc_index_table.c` 留作差分 oracle。分配器同样由 `freestanding_allocator.py` 拥有。真正保留在编译器内建里的只有 raw memory、atomics、page/syscall/host-ABI 等机器操作,而非哈希策略或对象图语义。完整的去 C/libc 分层见第 14 章。
 
 ## 10.4 读写屏障:`pcc_gc_store_ptr` 与 `pcc_gc_load_ptr` 各为谁服务
 

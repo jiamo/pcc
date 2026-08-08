@@ -39,6 +39,7 @@ def test_real_numpy_l5_build_smoke_and_pcc_native_abi_blocker(tmp_path):
             "pip",
             "install",
             str(NUMPY_ROOT),
+            "--build=host",
             "--abi",
             "cpython-compat",
             "--target",
@@ -55,6 +56,10 @@ def test_real_numpy_l5_build_smoke_and_pcc_native_abi_blocker(tmp_path):
     assert install.returncode == 0, install.stderr or install.stdout
     report = json.loads(install.stdout)
     assert report["ok"] is True
+    assert report["build_mode_requested"] == "host"
+    assert report["installs"][0]["build_report"]["build_ownership"] == "host"
+    assert report["installs"][0]["build_report"]["host_python"]
+    assert report["installs"][0]["build_report"]["host_free_build_claim"] is False
     assert report["installs"][0]["build_report"]["actions"][0]["status"] == "passed"
 
     smoke_env = env.copy()

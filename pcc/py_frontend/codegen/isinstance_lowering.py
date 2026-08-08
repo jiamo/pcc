@@ -9,6 +9,8 @@ from pcc.llvm_capi.compat import ir
 from ..py_ast import (
     Attr,
     BoolType,
+    ByteArrayType,
+    BytesType,
     Call,
     DictType,
     DynType,
@@ -20,6 +22,7 @@ from ..py_ast import (
     Name,
     NoneLit,
     NoneType,
+    SetType,
     StrType,
     Subscript,
     TupleExpr,
@@ -27,6 +30,20 @@ from ..py_ast import (
 )
 from .builtin_exceptions import BUILTIN_EXC_TAG as _BUILTIN_EXC_TAG
 from .errors import L1CodegenError
+from .freestanding_abi_constants import (
+    PY_TYPE_BOOL,
+    PY_TYPE_BYTEARRAY,
+    PY_TYPE_BYTES,
+    PY_TYPE_DICT,
+    PY_TYPE_FLOAT,
+    PY_TYPE_FUNC,
+    PY_TYPE_INT,
+    PY_TYPE_LIST,
+    PY_TYPE_NONE,
+    PY_TYPE_SET,
+    PY_TYPE_STR,
+    PY_TYPE_TUPLE,
+)
 from .runtime_abi import declare_runtime_global
 
 _I1 = ir.IntType(1)
@@ -40,18 +57,24 @@ _BUILTIN_TYPE_MATCHERS = {
     "list": ListType,
     "dict": DictType,
     "tuple": TupleType,
+    "set": SetType,
+    "bytes": BytesType,
+    "bytearray": ByteArrayType,
     "NoneType": NoneType,
 }
 _BUILTIN_TYPE_TAGS = {
-    "NoneType": 0,
-    "bool": 1,
-    "int": 2,
-    "float": 3,
-    "str": 4,
-    "list": 5,
-    "dict": 6,
-    "tuple": 7,
-    "FunctionType": 9,
+    "NoneType": PY_TYPE_NONE,
+    "bool": PY_TYPE_BOOL,
+    "int": PY_TYPE_INT,
+    "float": PY_TYPE_FLOAT,
+    "str": PY_TYPE_STR,
+    "list": PY_TYPE_LIST,
+    "dict": PY_TYPE_DICT,
+    "tuple": PY_TYPE_TUPLE,
+    "set": PY_TYPE_SET,
+    "FunctionType": PY_TYPE_FUNC,
+    "bytes": PY_TYPE_BYTES,
+    "bytearray": PY_TYPE_BYTEARRAY,
 }
 
 

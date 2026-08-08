@@ -51,6 +51,17 @@ _CPY_BUILTIN_TYPE_NAMES = frozenset(
 class UnaryCallLoweringMixin:
     def _emit_unary(self, expr: UnaryOp) -> ir.Value:
         ty = expr.operand.ty
+        if (
+            getattr(self, "_freestanding_module", False)
+            and isinstance(ty, IntType)
+            and ty.name == "int"
+            and expr.op in ("+", "-", "~")
+        ):
+            raise RuntimeError(
+                "freestanding ordinary Python int unary arithmetic cannot "
+                "preserve arbitrary precision; annotate the machine boundary "
+                "with pcc.i64 or pcc.u64"
+            )
         if expr.op in ("-", "~") and isinstance(ty, ClassType):
             # CPython dispatches __neg__/__invert__; the numeric coercion
             # below crashed with "cannot coerce ClassType to int" (found on
@@ -69,6 +80,20 @@ class UnaryCallLoweringMixin:
                 f"{expr.op!r} on a class instance"
             )
         operand = self._emit_expr(expr.operand)
+        operand_is_cpy = operand in getattr(self, "_cpy_values", ())
+        if operand_is_cpy and expr.op in ("+", "-", "~"):
+            # Preserve CPython numeric protocol semantics (including custom
+            # dunders and arbitrary-precision ints) without a new runtime ABI:
+            # acquire the unary method and reuse the existing guarded no-arg
+            # callable contract.  _emit_cpy_attr consumes only a fresh
+            # receiver; borrowed CPython locals stay borrowed.
+            dunder_name = {
+                "+": "__pos__",
+                "-": "__neg__",
+                "~": "__invert__",
+            }[expr.op]
+            fn_val = self._emit_cpy_attr(operand, dunder_name)
+            return self._emit_cpy_func_call(fn_val, dunder_name, ())
         if expr.op == "+":
             return operand
         if expr.op == "-":
@@ -82,8 +107,7 @@ class UnaryCallLoweringMixin:
                     name=self._fresh("complex.neg"),
                 )
             if isinstance(ty, FloatType):
-                zero = ir.Constant(_DOUBLE, 0.0)
-                return self.builder.fsub(zero, operand, name=self._fresh("fneg"))
+                return self.builder.fneg(operand, name=self._fresh("fneg"))
             if self._int_exprs_are_boxed() and isinstance(ty, (IntType, BoolType)):
                 operand_obj = marshal.marshal_to_object(
                     self.builder,
@@ -92,11 +116,37 @@ class UnaryCallLoweringMixin:
                     operand,
                     ty,
                 )
-                return self.builder.call(
+                operand_owned = (
+                    isinstance(operand.type, ir.PointerType)
+                    and operand not in getattr(self, "_cpy_values", ())
+                    and self._pcc_pointer_source_is_owned(expr.operand)
+                )
+                operand_pinned = (
+                    isinstance(operand.type, ir.PointerType)
+                    and operand not in getattr(self, "_cpy_values", ())
+                )
+                operand_cleanup = ()
+                if operand_pinned:
+                    self._gc_pin(operand)
+                    operand_cleanup = ((operand, operand_owned),)
+                result = self.builder.call(
                     self.runtime["py_int_neg"],
                     [operand_obj],
                     name=self._fresh("int.obj.neg"),
                 )
+                self._emit_post_call_err_check(
+                    None,
+                    pinned_release_on_error=operand_cleanup,
+                )
+                self._guard_cpy_value_not_null(
+                    result,
+                    pinned_pcc_on_error=operand_cleanup,
+                )
+                if operand_pinned:
+                    self._gc_unpin(operand)
+                if operand_owned:
+                    self._gc_release(operand)
+                return result
             ival = self._to_int64(operand, ty)
             return self.builder.neg(ival, name=self._fresh("neg"))
         if expr.op == "~":
@@ -109,16 +159,70 @@ class UnaryCallLoweringMixin:
                     ty,
                 )
                 minus_one = self._emit_int_literal_object(-1)
-                return self.builder.call(
+                operand_owned = (
+                    isinstance(operand.type, ir.PointerType)
+                    and operand not in getattr(self, "_cpy_values", ())
+                    and self._pcc_pointer_source_is_owned(expr.operand)
+                )
+                operand_pinned = (
+                    isinstance(operand.type, ir.PointerType)
+                    and operand not in getattr(self, "_cpy_values", ())
+                )
+                operand_cleanup = ()
+                if operand_pinned:
+                    self._gc_pin(operand)
+                    operand_cleanup = ((operand, operand_owned),)
+                result = self.builder.call(
                     self.runtime["py_int_xor"],
                     [operand_obj, minus_one],
                     name=self._fresh("int.obj.invert"),
                 )
+                self._emit_post_call_err_check(
+                    None,
+                    pinned_release_on_error=operand_cleanup,
+                )
+                self._guard_cpy_value_not_null(
+                    result,
+                    pinned_pcc_on_error=operand_cleanup,
+                )
+                if operand_pinned:
+                    self._gc_unpin(operand)
+                if operand_owned:
+                    self._gc_release(operand)
+                return result
             ival = self._to_int64(operand, ty)
             return self.builder.not_(ival, name=self._fresh("bnot"))
         if expr.op == "not":
+            if operand_is_cpy:
+                self._guard_cpy_value_not_null(operand)
+            operand_pcc_owned = (
+                isinstance(operand.type, ir.PointerType)
+                and not operand_is_cpy
+                and self._pcc_pointer_source_is_owned(expr.operand)
+            )
+            operand_pcc_pinned = (
+                isinstance(operand.type, ir.PointerType)
+                and not operand_is_cpy
+            )
+            operand_cleanup = ()
+            if operand_pcc_pinned:
+                self._gc_pin(operand)
+                operand_cleanup = ((operand, operand_pcc_owned),)
             b = self._truthy(operand, ty)
-            return self.builder.not_(b, name=self._fresh("not"))
+            if operand_pcc_pinned:
+                self._emit_post_call_err_check(
+                    None,
+                    pinned_release_on_error=operand_cleanup,
+                )
+            result = self.builder.not_(b, name=self._fresh("not"))
+            if operand_is_cpy and self._cpy_value_is_owned(operand):
+                self.builder.call(self.runtime["py_cpy_decref"], [operand])
+                self._forget_owned_cpy_value(operand)
+            if operand_pcc_pinned:
+                self._gc_unpin(operand)
+            if operand_pcc_owned:
+                self._gc_release(operand)
+            return result
         raise NotImplementedError(f"Layer 1 unary {expr.op!r} not supported")
 
     # -- Compare -------------------------------------------------------
@@ -134,6 +238,7 @@ class UnaryCallLoweringMixin:
         call_name: str,
         span: Optional[SourceSpan] = None,
         root_result: bool = False,
+        pinned_arg_temps: tuple[tuple[ir.Value, bool], ...] = (),
     ) -> ir.Value:
         """Call a user function; after the call, check py_err_occurred()
         and branch to the active error-propagation block if a Python
@@ -155,9 +260,18 @@ class UnaryCallLoweringMixin:
             and not getattr(self, "_suppress_implicit_gc_roots", False)
             and not (self.ast_module.name or "").startswith("pcc.py_runtime.py.")
         ):
-            root_slot = self.builder.alloca(
+            # Entry-block alloca, NOT builder.alloca at the call site: a
+            # call inside a loop body re-executes a body-positioned alloca
+            # every iteration and the stack is only reclaimed at function
+            # exit, so hot loops overflow the 8MB stack after ~500K
+            # iterations (shared-refcount contention benchmark, SIGSEGV in
+            # py_incref prologue). The null re-store below stays at the
+            # call site: the slot is nulled again after every use, so the
+            # store is a no-op on re-entry but keeps the first-use
+            # store_root from decref'ing garbage.
+            root_slot = self._alloca_in_entry(
                 result.type,
-                name=self._fresh("call.ret.root"),
+                self._fresh("call.ret.root"),
             )
             self.builder.store(ir.Constant(result.type, None), root_slot)
             root_ptr = self._as_gc_ptr(
@@ -172,7 +286,13 @@ class UnaryCallLoweringMixin:
                 self._gc_one_slot_frame_map(),
                 root_slot,
             )
-        self._emit_post_call_err_check(span)
+        self._emit_post_call_err_check(
+            span,
+            pinned_release_on_error=pinned_arg_temps,
+            lifo_owned_root_slots_on_error=(
+                (root_slot,) if root_slot is not None else ()
+            ),
+        )
         if root_slot is not None and root_ptr is not None:
             result = self.builder.call(
                 self.runtime["pcc_gc_load_ptr"],
@@ -195,17 +315,46 @@ class UnaryCallLoweringMixin:
         self._last_call_arg_owned_temp = False
         if isinstance(target_ty, IntType):
             if isinstance(param_ir_ty, ir.PointerType):
-                raw = self._emit_expr(ast_arg)
+                if self._int_expr_needs_exact_object_boundary(ast_arg):
+                    raw = self._emit_exact_int_operand_object(ast_arg)
+                else:
+                    raw = self._emit_expr(ast_arg)
                 if raw in getattr(self, "_cpy_values", ()):
                     self._last_call_arg_owned_temp = True
-                    return self.builder.call(
-                        self.runtime["py_cpy_to_pcc_obj"],
-                        [raw],
-                        name=self._fresh("cpy.arg.to_pcc"),
+                    return self._emit_value_as_pcc_object_or_bridge(
+                        raw,
+                        ast_arg.ty,
+                        "cpy.arg.to_pcc",
                     )
-                return self._emit_exact_int_operand_object(ast_arg)
-            if isinstance(param_ir_ty, ir.IntType) and param_ir_ty.width == 64:
-                return self._emit_expr_as_i64(ast_arg)
+                if isinstance(raw.type, ir.PointerType):
+                    self._last_call_arg_owned_temp = (
+                        self._pcc_pointer_source_is_owned(ast_arg)
+                    )
+                    return raw
+                self._last_call_arg_owned_temp = True
+                return self.builder.call(
+                    self.runtime["py_int_from_i64"],
+                    [self._to_int64(raw, ast_arg.ty)],
+                    name=self._fresh("exact.int.arg.box"),
+                )
+            if isinstance(param_ir_ty, ir.IntType):
+                if param_ir_ty.width == 1:
+                    raw = self._emit_expr(ast_arg)
+                    return self._truthy(raw, ast_arg.ty)
+                value = self._emit_expr_as_i64(ast_arg)
+                if param_ir_ty.width < 64:
+                    return self.builder.trunc(
+                        value,
+                        param_ir_ty,
+                        name=self._fresh("abi.arg.trunc"),
+                    )
+                if param_ir_ty.width > 64:
+                    return self.builder.sext(
+                        value,
+                        param_ir_ty,
+                        name=self._fresh("abi.arg.extend"),
+                    )
+                return value
         if isinstance(target_ty, BoolType):
             if isinstance(param_ir_ty, ir.IntType) and param_ir_ty.width == 1:
                 raw = self._emit_expr(ast_arg)
@@ -224,7 +373,14 @@ class UnaryCallLoweringMixin:
                 if boxed_valueclass is not None:
                     self._last_call_arg_owned_temp = True
                     return boxed_valueclass
-                return self._coerce(payload, ast_arg.ty, target_ty)
+                coerced_payload = self._coerce(payload, ast_arg.ty, target_ty)
+                if (
+                    isinstance(param_ir_ty, ir.PointerType)
+                    and isinstance(coerced_payload.type, ir.PointerType)
+                    and not isinstance(payload.type, ir.PointerType)
+                ):
+                    self._last_call_arg_owned_temp = True
+                return coerced_payload
         if (
             isinstance(param_ir_ty, ir.PointerType)
             and isinstance(ast_arg, Name)
@@ -244,6 +400,7 @@ class UnaryCallLoweringMixin:
                     source_ty = env_entry[2]
             boxed_valueclass = self._emit_valueclass_payload_to_object(v, source_ty)
             if boxed_valueclass is not None:
+                self._last_call_arg_owned_temp = True
                 return boxed_valueclass
         if v in getattr(self, "_cpy_values", ()) and isinstance(
             param_ir_ty,
@@ -255,7 +412,68 @@ class UnaryCallLoweringMixin:
                 [v],
                 name=self._fresh("cpy.arg.to_pcc"),
             )
-        return self._coerce(v, ast_arg.ty, target_ty)
+        coerced = self._coerce(v, ast_arg.ty, target_ty)
+        if (
+            isinstance(param_ir_ty, ir.PointerType)
+            and isinstance(coerced.type, ir.PointerType)
+            and not isinstance(v.type, ir.PointerType)
+        ):
+            # Native -> object coercion creates a call-owned temporary.  The
+            # method/function lowering path pins it across later operands and
+            # must release it on both the success and exception edges.
+            self._last_call_arg_owned_temp = True
+        return coerced
+
+    def _emit_arg_for_abi_param_with_cleanup(
+        self,
+        ast_arg: Expr,
+        target_ty: Type,
+        param_ir_ty: ir.Type,
+        pinned_pcc: tuple[tuple[ir.Value, bool], ...],
+    ) -> ir.Value:
+        """Evaluate one ABI argument while unwinding earlier pointer args."""
+        if not pinned_pcc:
+            return self._emit_arg_for_abi_param(ast_arg, target_ty, param_ir_ty)
+        previous_cpy_cleanup = getattr(
+            self,
+            "_cpy_operand_cleanup_block",
+            None,
+        )
+        previous_pcc_target = self._current_try_err_block()
+        pcc_target = previous_pcc_target
+        if pcc_target is None:
+            pcc_target = self._ensure_fn_err_exit()
+        pcc_cleanup = self._make_cpy_operand_cleanup_block(
+            (),
+            (),
+            pcc_target,
+            "abi.arg.pcc.cleanup",
+            pinned_pcc,
+        )
+        cpy_target = previous_cpy_cleanup
+        if cpy_target is None:
+            cpy_target = self._ensure_fn_err_exit()
+        if cpy_target is pcc_target:
+            cpy_cleanup = pcc_cleanup
+        else:
+            cpy_cleanup = self._make_cpy_operand_cleanup_block(
+                (),
+                (),
+                cpy_target,
+                "abi.arg.cpy.cleanup",
+                pinned_pcc,
+            )
+        self._try_err_block = pcc_cleanup
+        self._cpy_operand_cleanup_block = cpy_cleanup
+        try:
+            return self._emit_arg_for_abi_param(
+                ast_arg,
+                target_ty,
+                param_ir_ty,
+            )
+        finally:
+            self._try_err_block = previous_pcc_target
+            self._cpy_operand_cleanup_block = previous_cpy_cleanup
 
     def _is_native_set_dyn(self, ty: Type) -> bool:
         return isinstance(ty, SetType)
@@ -356,11 +574,13 @@ class UnaryCallLoweringMixin:
                 val_obj = self._emit_as_object(expr.args[1])
             else:
                 val_obj = self._emit_none_literal()
-            return self.builder.call(
+            result = self.builder.call(
                 self.runtime["py_dict_fromkeys"],
                 [iter_obj, val_obj],
                 name=self._fresh("dict.fromkeys"),
             )
+            self._emit_post_call_err_check(getattr(expr, "span", None))
+            return result
         if (
             builtin_name == "int"
             and attr.name == "from_bytes"

@@ -15,6 +15,9 @@ Layout offsets (LP64, pcc int64_t = long):
     16: len      (int64)
     24: items[0], items[1], ...      (ptr each, 8 bytes)
 """
+from pcc.py_runtime.py.py_abi_constants import (
+    PY_TYPE_TUPLE,
+)
 from pcc.extern import extern, c_ptr, c_int64, c_void
 from pcc.unsafe import (
     load_i64,
@@ -37,9 +40,6 @@ OFFSET_FLAGS:    int = 12
 OFFSET_LEN:      int = 16
 OFFSET_ITEMS:    int = 24
 SIZEOF_PTR:      int = 8
-
-PY_TYPE_TUPLE:   int = 7
-
 
 def py_tuple_new_py(n: int):
     if n < 0:

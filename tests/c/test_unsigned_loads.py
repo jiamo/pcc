@@ -1,8 +1,10 @@
 import os
 import sys
 
-this_dir = os.path.dirname(__file__)
-parent_dir = os.path.dirname(this_dir)
+this_dir = os.path.dirname(os.path.abspath(__file__))
+# tests/{c,python}/<file>.py -> repo root is two levels up. This used to
+# rely on tests/conftest.py's global Path.resolve/dirname shim.
+parent_dir = os.path.dirname(os.path.dirname(this_dir))
 sys.path.insert(0, parent_dir)
 
 from pcc.evaluater.c_evaluator import CEvaluator
@@ -267,6 +269,31 @@ def test_unsigned_ternary_result_stays_unsigned_for_modulo():
             unsigned int u = 3426781690u;
 
             return (((1 ? u : 1u) % 960) == 250u) ? 0 : 1;
+        }
+    """
+
+    assert _evaluate(source) == 0
+
+
+def test_ternary_uses_c_rank_before_unsignedness_for_shift_compare_and_divide():
+    source = r"""
+        static long shifted(int flag) {
+            return (flag ? -1L : 2u) >> 1;
+        }
+
+        static int compared(int flag) {
+            return (flag ? -1L : 2u) > 0;
+        }
+
+        static long divided(int lhs_flag, int rhs_flag) {
+            return (lhs_flag ? 6L : 2u) / (rhs_flag ? -3L : 1u);
+        }
+
+        int main(void) {
+            if (shifted(1) != -1L) return 1;
+            if (compared(1) != 0) return 2;
+            if (divided(1, 1) != -2L) return 3;
+            return 0;
         }
     """
 

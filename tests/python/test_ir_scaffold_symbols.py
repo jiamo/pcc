@@ -258,6 +258,60 @@ def test_function_type_ctor_zero_params():
     assert "@user_pcc_llvm_capi_ir_FunctionType___init__0" in ir_text
 
 
+def test_function_type_ctor_three_params_has_runtime_bridge():
+    program = textwrap.dedent(
+        """
+        from pcc.llvm_capi import ir
+
+        def use_fnty3(ret_ty, p1, p2, p3):
+            return ir.FunctionType(ret_ty, [p1, p2, p3])
+        """
+    )
+    ir_text = _compile_to_ll(program, "sym_fnty3", mode="on")
+    assert "@user_pcc_llvm_capi_ir_FunctionType___init__3" in ir_text
+    assert "def FunctionType___init__3(" in (
+        _REPO_ROOT / "pcc" / "llvm_capi" / "ir.py"
+    ).read_text(encoding="utf-8")
+
+
+def test_function_type_ctor_eight_params_has_runtime_bridge():
+    program = textwrap.dedent(
+        """
+        from pcc.llvm_capi import ir
+
+        def use_fnty8(ret_ty, p1, p2, p3, p4, p5, p6, p7, p8):
+            return ir.FunctionType(ret_ty, [p1, p2, p3, p4, p5, p6, p7, p8])
+        """
+    )
+    ir_text = _compile_to_ll(program, "sym_fnty8", mode="on")
+    assert "@user_pcc_llvm_capi_ir_FunctionType___init__8" in ir_text
+    assert "def FunctionType___init__8(" in (
+        _REPO_ROOT / "pcc" / "llvm_capi" / "ir.py"
+    ).read_text(encoding="utf-8")
+
+
+def test_function_type_ctor_dynamic_variadic_flag_boxes_bool_handle():
+    program = textwrap.dedent(
+        """
+        from pcc.llvm_capi import ir
+
+        def use_fnty_dyn(ret_ty, param_types, is_variadic: bool):
+            return ir.FunctionType(
+                ret_ty,
+                param_types,
+                var_arg=is_variadic,
+            )
+        """
+    )
+    ir_text = _compile_to_ll(program, "sym_fnty_dyn_va", mode="on")
+    body = _function_body(ir_text, "use_fnty_dyn")
+    assert body is not None
+    assert "@user_pcc_llvm_capi_ir_FunctionType___init___dyn" in body
+    assert "@py_bool_from_bit" in body
+    assert "inttoptr i1" not in body
+    assert "py_cpy_" not in body, body
+
+
 def test_literal_struct_three_elems():
     program = textwrap.dedent(
         """

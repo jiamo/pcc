@@ -1,11 +1,6 @@
 from __future__ import annotations
 
-"""Backend selection primitives for optional back-end execution paths.
-
-The project currently defaults to the existing LLVM/llvmlite path.  This module
-only introduces the contract used by task A1/A2: explicit backend choice and
-cache-stable backend identity.
-"""
+"""Backend selection and cache-stable identity for owned execution paths."""
 
 from dataclasses import dataclass
 
@@ -61,10 +56,12 @@ _BACKEND_TABLE = {
         ),
     },
     "self": {
-        # Partial asm-first bootstrap path only; execution/object emission still
-        # intentionally unsupported.
+        # The self backend owns assembly, object emission, and native execution
+        # for its registered targets.  Unsupported triples and instruction
+        # shapes fail closed in the target registry/emitter; they do not make
+        # the backend itself an unimplemented placeholder.
         "semver": "self-aarch64-asm-v0",
-        "supported": False,
+        "supported": True,
         "capabilities": (
             "emit-asm",
             "emit-object",
@@ -105,8 +102,9 @@ def resolve_backend(
 
     Args:
       requested: user-supplied backend name (`llvm`, `llvm_capi`, `self`).
-      allow_unimplemented: when True, return config objects even for known-but-
-        unimplemented backends such as `self`.
+      allow_unimplemented: compatibility switch for any future known-but-
+        unavailable backend entries.  ``self`` is a supported backend whose
+        individual target/IR boundaries still fail closed.
     """
     env_raw = os.environ.get(_ENV_BACKEND)
     kind = _normalize_backend_name(requested if requested is not None else env_raw)

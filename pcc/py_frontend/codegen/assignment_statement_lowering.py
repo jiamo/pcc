@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import sys
+import os
 from pcc.llvm_capi.compat import ir
 
 from ..py_ast import (
     Assign,
     Attr,
     AugAssign,
+    BinOp,
     BoolExpr,
     BoolType,
     ByteArrayType,
@@ -507,7 +510,9 @@ class AssignmentStatementLoweringMixin:
             self._weakref_env_flags.pop(target_ident, None)
             return
 
-        imported_native_module = self._native_importlib_literal_module(stmt.value)
+        imported_native_module = self._native_literal_dunder_import_module(
+            stmt.value
+        )
         if imported_native_module is not None:
             if self._is_native_builtin_dynamic_module(imported_native_module):
                 self._register_native_builtin_module_alias(
@@ -707,12 +712,23 @@ class AssignmentStatementLoweringMixin:
             target_ty,
         ):
             return
-        boxed_int_target = (
-            isinstance(target_ty, IntType) and self._int_exprs_are_boxed()
+        forced_exact_int_target = isinstance(target_ty, IntType) and bool(
+            getattr(self, "_exact_int_env_flags", {}).get(target.ident, False)
+            or target.ident
+            in getattr(self, "_planned_exact_int_local_names", set())
+        )
+        boxed_int_target = isinstance(target_ty, IntType) and (
+            self._int_exprs_are_boxed() or forced_exact_int_target
         )
         exact_int_value = None
         if boxed_int_target and isinstance(stmt.value.ty, (IntType, BoolType)):
             exact_int_value = self._emit_exact_int_operand_object(stmt.value)
+        elif boxed_int_target and self._is_walrus_sentinel(stmt.value):
+            # Chained assignment is lifted as ``outer = _walrus(inner, rhs)``
+            # and the sentinel itself is Dyn-typed.  Its real RHS still needs
+            # the exact projection, while evaluating the sentinel performs
+            # the hidden target stores exactly once.
+            exact_int_value = self._emit_walrus(stmt.value)
         elif isinstance(
             target_ty, IntType
         ) and self._int_expr_needs_exact_object_boundary(stmt.value):
@@ -804,6 +820,7 @@ class AssignmentStatementLoweringMixin:
                 declared_ty=declared_ty,
                 value_is_owned=False,
                 is_cpy_value=is_cpy_value,
+                raw_pointer=self._expr_returns_unsafe_raw_pointer(stmt.value),
             )
             self._publish_module_global_assignment(
                 target.ident,
@@ -849,6 +866,19 @@ class AssignmentStatementLoweringMixin:
             else self._storage_ir_type(local_target_ty)
         )
         if (
+            forced_exact_int_target
+            and isinstance(ir_ty, ir.PointerType)
+            and self._ir_type_matches(ir_ty, _CSTR)
+        ):
+            # A planned local can temporarily carry a Dyn/object for-target
+            # binding and later return to its exact-int projection.  Keep the
+            # entry-allocated pointer slot, but restore the semantic type now;
+            # otherwise the assignment stores a valid PyInt* while subsequent
+            # Name loads still follow the Dyn path and the exact-int flag that
+            # the loop cleared is never re-established.
+            declared_ty = local_target_ty
+            self.env[target.ident] = (alloca, ir_ty, declared_ty)
+        if (
             not (boxed_int_target or exact_int_value is not None)
             and self._ir_type_matches(ir_ty, target_storage_ty)
             and _assign_type_name(declared_ty) != _assign_type_name(local_target_ty)
@@ -883,14 +913,42 @@ class AssignmentStatementLoweringMixin:
                 )
             self._exact_int_env_flags[target.ident] = True
         else:
-            self._exact_int_env_flags.pop(target.ident, None)
+            if not forced_exact_int_target:
+                self._exact_int_env_flags.pop(target.ident, None)
             value = self._coerce(value, stmt.value.ty, declared_ty)
         rhs_local_copy_is_owned = False
+        exact_int_name_source_is_borrowed = False
+        if exact_int_value is not None and isinstance(stmt.value, Name):
+            source_slot = self.env.get(stmt.value.ident)
+            exact_int_name_source_is_borrowed = bool(
+                source_slot is not None
+                and isinstance(source_slot[1], ir.PointerType)
+            )
+            if not exact_int_name_source_is_borrowed:
+                module_global = self._module_globals.get(stmt.value.ident)
+                if module_global is not None:
+                    global_storage_ty = getattr(
+                        module_global[0],
+                        "value_type",
+                        None,
+                    )
+                    exact_int_name_source_is_borrowed = isinstance(
+                        global_storage_ty,
+                        ir.PointerType,
+                    )
+        exact_int_name_copy = (
+            exact_int_value is not None
+            and isinstance(stmt.value, Name)
+            and exact_int_name_source_is_borrowed
+            and isinstance(value.type, ir.PointerType)
+            and value not in getattr(self, "_cpy_values", ())
+        )
         if (
             isinstance(stmt.value, Name)
             and (
                 stmt.value.ident in getattr(self, "_owned_local_names", set())
                 or stmt.value.ident in getattr(self, "_except_binding_names", set())
+                or exact_int_name_copy
             )
             and isinstance(value.type, ir.PointerType)
             and self._ir_type_matches(ir_ty, _CSTR)
@@ -905,14 +963,19 @@ class AssignmentStatementLoweringMixin:
                 name=self._fresh(target.ident + ".local.copy.retain"),
             )
             rhs_local_copy_is_owned = True
+        exact_int_result_is_owned = exact_int_value is not None and not (
+            isinstance(stmt.value, Name) and exact_int_name_source_is_borrowed
+        )
         rhs_is_safe_owned_in_raw = (
             rhs_local_copy_is_owned
             or self._raw_scaffold_object_rhs_is_owned(stmt.value)
+            or exact_int_result_is_owned
         )
         rhs_returns_owned_object = (
             rhs_local_copy_is_owned
             or rhs_native_file_is_owned
             or self._expr_returns_owned_object(stmt.value)
+            or exact_int_result_is_owned
         )
         in_raw_scaffold = self._module_uses_raw_int_scaffold
         # In raw-scaffold mode, only enable owned-local management when the
@@ -923,7 +986,10 @@ class AssignmentStatementLoweringMixin:
         manages_owned_local = (
             isinstance(ir_ty, ir.PointerType)
             and self._ir_type_matches(ir_ty, _CSTR)
-            and target.ident not in getattr(self, "_current_param_names", set())
+            and (
+                target.ident not in getattr(self, "_current_param_names", set())
+                or forced_exact_int_target
+            )
             and target.ident not in getattr(self, "_current_global_names", set())
             and (
                 target.ident in getattr(self, "_owned_local_names", set())
@@ -933,12 +999,28 @@ class AssignmentStatementLoweringMixin:
                 )
             )
         )
-        if manages_owned_local:
+        exact_root_store = (
+            manages_owned_local
+            and (exact_int_result_is_owned or rhs_local_copy_is_owned)
+            and isinstance(value.type, ir.PointerType)
+            and value not in getattr(self, "_cpy_values", ())
+            and self._ir_type_matches(ir_ty, _CSTR)
+        )
+        exact_replacement_pinned = False
+        if exact_root_store:
+            # Root-store retains the replacement and releases the previous
+            # slot owner as one relocation-aware operation.  Keep the fresh
+            # exact value stable while that operation enters backend 3/4.
+            self._gc_pin(value)
+            exact_replacement_pinned = True
+        if manages_owned_local and not exact_root_store:
             self._emit_release_owned_local_if_flagged(target.ident, alloca)
+        if manages_owned_local:
             self._owned_local_names.discard(target.ident)
         if (
             manages_owned_local
             and rhs_returns_owned_object
+            and not exact_root_store
             and isinstance(value.type, ir.PointerType)
             and self._ir_type_matches(ir_ty, _CSTR)
             and value not in getattr(self, "_cpy_values", ())
@@ -949,6 +1031,8 @@ class AssignmentStatementLoweringMixin:
                 name=self._fresh(target.ident + ".owned.resolve"),
             )
         if (
+            not exact_root_store
+            and
             (
                 manages_owned_local
                 or target.ident in getattr(self, "_gc_rooted_local_names", set())
@@ -976,10 +1060,30 @@ class AssignmentStatementLoweringMixin:
                     value = self.builder.sext(value, ir_ty, name=self._fresh("sext"))
             else:
                 value = self.builder.trunc(value, ir_ty, name=self._fresh("trunc"))
-        self.builder.store(value, alloca)
+        if exact_root_store:
+            self.builder.call(
+                self.runtime["pcc_gc_store_root"],
+                [self._as_gc_ptr(alloca), value],
+            )
+        else:
+            self.builder.store(value, alloca)
+        if exact_replacement_pinned:
+            self._gc_unpin(value)
+            # ``pcc_gc_store_root`` created the local slot's owner.  Consume
+            # the fresh/retained temporary that was transferred into it.
+            self._gc_release(
+                value,
+                self._release_context_label(
+                    "exact-local-incoming:" + target.ident
+                ),
+            )
         if self._is_valueclass_payload_type(declared_ty):
             self._ensure_valueclass_payload_gc_roots(target.ident, alloca, declared_ty)
-        if rhs_local_copy_is_owned or rhs_native_file_is_owned:
+        if (
+            rhs_local_copy_is_owned
+            or rhs_native_file_is_owned
+            or exact_int_result_is_owned
+        ):
             self._owned_local_names.add(target.ident)
             self._ensure_owned_local_gc_root(target.ident, alloca, ir_ty)
         else:
@@ -1116,8 +1220,28 @@ class AssignmentStatementLoweringMixin:
 
             rhs_vals: list = []
             rhs_tys: list = []
-            for e in rhs.elems:
-                rhs_vals.append(self._emit_expr(e))
+            rhs_owned: list[bool | None] = []
+            for index, e in enumerate(rhs.elems):
+                lhs = target.elems[index]
+                planned_exact_int = (
+                    isinstance(lhs, Name)
+                    and lhs.ident
+                    in getattr(self, "_planned_exact_int_local_names", set())
+                    and isinstance(lhs.ty, IntType)
+                    and isinstance(e.ty, (IntType, BoolType))
+                )
+                if planned_exact_int:
+                    # Destructuring evaluates every RHS before publishing any
+                    # target.  Preserve that ordering, but evaluate an element
+                    # destined for a planned exact-int slot directly in the
+                    # object projection.  Emitting the generic scalar value
+                    # first (for example ``1 << 70``) would overflow in i64
+                    # before the later store had a chance to box it.
+                    rhs_vals.append(self._emit_exact_int_operand_object(e))
+                    rhs_owned.append(self._pcc_pointer_source_is_owned(e))
+                else:
+                    rhs_vals.append(self._emit_expr(e))
+                    rhs_owned.append(None)
                 rhs_tys.append(e.ty)
             i = 0
             while i < len(target.elems):
@@ -1125,6 +1249,7 @@ class AssignmentStatementLoweringMixin:
                     target.elems[i],
                     rhs_vals[i],
                     rhs_tys[i],
+                    value_is_owned=rhs_owned[i],
                 )
                 i += 1
             return
@@ -1515,6 +1640,32 @@ class AssignmentStatementLoweringMixin:
     def _emit_augassign(self, stmt: AugAssign) -> None:
         op_bare = stmt.op.rstrip("=")
         if isinstance(stmt.target, Name):
+            if (
+                isinstance(stmt.target.ty, IntType)
+                and getattr(self, "_exact_int_env_flags", {}).get(
+                    stmt.target.ident,
+                    False,
+                )
+            ):
+                # Reuse the exact Assign path so lhs pinning, RHS error
+                # cleanup, owned-result replacement, root barriers, and the
+                # local owned flag stay identical to ``x = x <op> rhs``.
+                combined = BinOp(
+                    span=stmt.span,
+                    ty=stmt.target.ty,
+                    op=op_bare,
+                    lhs=stmt.target,
+                    rhs=stmt.value,
+                )
+                self._emit_assign(
+                    Assign(
+                        span=stmt.span,
+                        targets=(stmt.target,),
+                        value=combined,
+                        annotation=stmt.target.ty,
+                    )
+                )
+                return
             slot = self.env.get(stmt.target.ident)
             module_global_target = stmt.target.ident in self._module_globals and (
                 self.current_func_def is None
@@ -1669,6 +1820,7 @@ class AssignmentStatementLoweringMixin:
                     self.runtime["py_obj_set_slice"],
                     [obj_as_obj, lo_obj, hi_obj, step_obj, result_raw],
                 )
+                self._emit_post_call_err_check(getattr(stmt, "span", None))
                 return
             # Exact list receivers use the raising typed accessors with a
             # single i64 index evaluation; everything else keeps the generic
@@ -1767,8 +1919,91 @@ class AssignmentStatementLoweringMixin:
             self._emit_post_call_err_check(getattr(stmt, "span", None))
             return
         if isinstance(stmt.target, Attr):
-            # ``self.x += rhs`` — load via attr, op, store back.
             target = stmt.target
+            # A typed scalar field on ``self`` must use the same
+            # receiver-aware field layout as ordinary ``self.x`` loads and
+            # stores.  This matters for methods defined on a mixin: the
+            # lexical class does not own the composed receiver's fixed field
+            # slots, and generic ``py_obj_getattr`` cannot recover those slots
+            # by name.  The old dynamic-only path made L1CodeGen's inherited
+            # ``self._tmp_counter += 1`` load NULL inside pcc1.
+            if (
+                isinstance(target.obj, Name)
+                and target.obj.ident == "self"
+                and isinstance(target.ty, (IntType, FloatType))
+            ):
+                cur = self._emit_attr(target)
+                rhs = self._emit_expr(stmt.value)
+                result = self._emit_binop_value(
+                    op_bare,
+                    cur,
+                    target.ty,
+                    rhs,
+                    stmt.value.ty,
+                    result_ty=target.ty,
+                )
+                result = self._coerce(result, target.ty, target.ty)
+                self._emit_attr_store_value(target, result, target.ty)
+                return
+
+            if isinstance(target.obj, Name) and target.obj.ident == "self":
+                cur = self._emit_attr(target)
+                cur_obj = marshal.marshal_to_object(
+                    self.builder,
+                    self.module,
+                    self.runtime,
+                    cur,
+                    target.ty,
+                )
+                rhs = self._emit_expr(stmt.value)
+                rhs_obj = marshal.marshal_to_object(
+                    self.builder,
+                    self.module,
+                    self.runtime,
+                    rhs,
+                    stmt.value.ty,
+                )
+                _ip_code = {
+                    "+": 0,
+                    "-": 1,
+                    "*": 2,
+                    "/": 3,
+                    "//": 4,
+                    "%": 5,
+                }.get(op_bare)
+                if _ip_code is not None:
+                    result_obj = self.builder.call(
+                        self.runtime["py_obj_inplace_op"],
+                        [cur_obj, rhs_obj, ir.Constant(_I64, _ip_code)],
+                        name=self._fresh("augassign.self.inplace"),
+                    )
+                    self._emit_post_call_err_check(getattr(stmt, "span", None))
+                else:
+                    result_obj = self._emit_binop_value(
+                        op_bare,
+                        cur_obj,
+                        DynType(name="dyn"),
+                        rhs_obj,
+                        DynType(name="dyn"),
+                        result_ty=DynType(name="dyn"),
+                    )
+                    if not self._ir_type_matches(result_obj.type, _CSTR):
+                        result_obj = marshal.marshal_to_object(
+                            self.builder,
+                            self.module,
+                            self.runtime,
+                            result_obj,
+                            IntType(name="int"),
+                        )
+                self._emit_attr_store_value(
+                    target,
+                    result_obj,
+                    DynType(name="dyn"),
+                )
+                return
+
+            # Dynamic/object attribute augmented assignment keeps Python's
+            # get/in-place-op/set protocol (including descriptors).
             obj_val = self._emit_expr(target.obj)
             name_ptr = self._attr_name_ptr(target.name)
             cur_obj = self.builder.call(

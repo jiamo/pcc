@@ -7,7 +7,7 @@ agree — so we gate the status on passing the same corpus against
 ``opt -passes=adce``.
 """
 
-import shutil
+import pytest
 import unittest
 
 import llvmlite.binding as llvm
@@ -15,7 +15,9 @@ import llvmlite.binding as llvm
 from pcc.ir_passes.adce import ADCEPass, adce_module_text
 from pcc.ir_passes.parity import assert_ir_parity
 
-_OPT = shutil.which("opt")
+from pcc.passes.llvm_text_pipeline import find_opt_binary
+
+_OPT = find_opt_binary()
 
 
 class ADCETests(unittest.TestCase):
@@ -394,7 +396,7 @@ merge:
 ]
 
 
-@unittest.skipUnless(_OPT, "requires opt")
+@pytest.mark.pcc_gate(unavailable=None if _OPT else "matching LLVM opt not installed")
 class UpstreamParityTests(unittest.TestCase):
     def _assert_structural_parity(self, ir: str):
         report = assert_ir_parity(ir, ADCEPass(), "adce")
@@ -492,7 +494,7 @@ class UpstreamParityTests(unittest.TestCase):
         """)
 
 
-@unittest.skipUnless(_OPT, "requires opt")
+@pytest.mark.pcc_gate(unavailable=None if _OPT else "matching LLVM opt not installed")
 class CorpusParityTests(unittest.TestCase):
     def _parity(self, ir: str, tag: str) -> None:
         report = assert_ir_parity(ir, ADCEPass(), "adce")

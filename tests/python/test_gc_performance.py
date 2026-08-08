@@ -275,8 +275,12 @@ def test_gc_collect_no_cycles_overhead(tmp_path):
 
 
 def test_gc_collect_cycle_throughput(tmp_path):
-    """Building 10k 2-node cycles + one collect() should finish in
-    under 2s — translates to ~10k cycles/s collection throughput."""
+    """One explicit collect drains all 10k two-node cycles.
+
+    Incremental scheduler work may be batch-bounded, but ``gc.collect()``
+    must neither stop after the first 1024 candidates nor defer the remainder
+    to later calls.  Check both the reported count and the empty second pass.
+    """
     elapsed, out = _compile_and_run_timed(tmp_path, """
         import gc
 
@@ -296,11 +300,12 @@ def test_gc_collect_cycle_throughput(tmp_path):
             make_cycles(10_000)
             n = gc.collect()
             print(n >= 20_000)   # expect 2 nodes per cycle
+            print(gc.collect() == 0)
 
         if __name__ == "__main__":
             main()
         """)
-    assert out == "True"
+    assert out == "True\nTrue"
     assert elapsed < 2.0, f"10k-cycle collect took {elapsed:.2f}s"
 
 

@@ -975,13 +975,17 @@ class TestObligation6GCEquality:
         diverged = {n: o for n, o in outs.items() if o != outs[0]}
         assert not diverged, f"GC backends diverge from backend-0: {diverged}"
 
-    @pytest.mark.parametrize("source", GC_GAP_PROGRAMS)
-    def test_identical_across_backends_gap(self, tmp_path, source):
-        """GC-semantics surfaces that do NOT yet agree across backends (xfail)."""
-        outs = {n: _compile_and_run(tmp_path / f"gc{n}", source, gc_backend=n)
-                for n in range(5)}
-        diverged = {n: o for n, o in outs.items() if o != outs[0]}
-        assert not diverged, f"GC backends diverge from backend-0: {diverged}"
+    if GC_GAP_PROGRAMS:
+
+        @pytest.mark.parametrize("source", GC_GAP_PROGRAMS)
+        def test_identical_across_backends_gap(self, tmp_path, source):
+            """GC-semantics surfaces that do not yet agree across backends."""
+            outs = {
+                n: _compile_and_run(tmp_path / f"gc{n}", source, gc_backend=n)
+                for n in range(5)
+            }
+            diverged = {n: o for n, o in outs.items() if o != outs[0]}
+            assert not diverged, f"GC backends diverge from backend-0: {diverged}"
 
 
 # =========================================================================== #
@@ -993,7 +997,11 @@ class TestObligation6GCEquality:
 # =========================================================================== #
 @pytest.mark.integration
 class TestIntentGaps:
-    @pytest.mark.parametrize("source", GAP_CASES)
-    def test_unmet_obligation(self, tmp_path, source):
-        """Each is xfail; passes (XPASS) only when pcc matches CPython."""
-        assert _compile_and_run(tmp_path, source) == _run_cpython(tmp_path, source)
+    """Verified-red intent gaps, when any remain."""
+
+    if GAP_CASES:
+
+        @pytest.mark.parametrize("source", GAP_CASES)
+        def test_unmet_obligation(self, tmp_path, source):
+            """Each passes only when pcc matches CPython."""
+            assert _compile_and_run(tmp_path, source) == _run_cpython(tmp_path, source)

@@ -1,14 +1,16 @@
 """Real-transform tests for LoopSinkPass (subset)."""
 
 import re
-import shutil
+import pytest
 import unittest
 
 from pcc.ir_passes.loop_sink import LoopSinkPass, loop_sink_text
 from pcc.ir_passes.parity import assert_ir_parity, run_pcc_ir_pass
 
 
-_OPT = shutil.which("opt")
+from pcc.passes.llvm_text_pipeline import find_opt_binary
+
+_OPT = find_opt_binary()
 
 
 def _block_text(ir: str, block: str) -> str:
@@ -141,7 +143,7 @@ exit:
         self.assertIn("%t = add i32 %x, 1", _block_text(out, "then"))
 
 
-@unittest.skipUnless(_OPT, "requires LLVM opt")
+@pytest.mark.pcc_gate(unavailable=None if _OPT else "matching LLVM opt not installed")
 class UpstreamParityTests(unittest.TestCase):
     def test_guarded_add_matches_upstream(self):
         report = assert_ir_parity("""

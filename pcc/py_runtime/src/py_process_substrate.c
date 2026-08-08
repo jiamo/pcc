@@ -121,11 +121,11 @@ int64_t py_subprocess_run(PyObject *argv, int32_t capture_output) {
     }
     int rc = system(cmd);
     free(cmd);
-    return (int64_t)rc;
+    return py_process_normalize_wait_status((int64_t)rc);
 }
 
 PyObject *py_sys_executable_str(void) {
-    const char *arg0 = py_program_argv(0);
+    const char *arg0 = py_program_executable();
     if (arg0 == NULL) return py_str_new("", 0);
     return py_str_new(arg0, (int64_t)strlen(arg0));
 }

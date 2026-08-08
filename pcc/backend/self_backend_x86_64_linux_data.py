@@ -74,6 +74,13 @@ _RESERVED_ASM_SYMBOLS = frozenset(
     | {f"xmm{i}" for i in range(32)}
 )
 
+_X86_TLS_DIAGNOSTIC_PREFIX = "self-x86_64-linux ELF TLS lowering"
+_SUPPORTED_TLS_MODELS = frozenset({"default", "initialexec"})
+_SUPPORTED_TLS_PREFIX_WORDS = frozenset(
+    {"dso_local", "internal", "private", "local_unnamed_addr", "unnamed_addr"}
+)
+_THREAD_LOCAL_PREFIX_RE = re.compile(r"\bthread_local(?:\([^()]*\))?")
+
 
 def asm_symbol(name: str, module_symbols: PreparedModuleSymbols) -> str:
     if name in module_symbols.internal_symbols:
@@ -232,7 +239,111 @@ def emit_global_initializer(global_: GlobalDef, module_symbols: PreparedModuleSy
     )
 
 
-def emit_globals(globals_: list[GlobalDef], module_symbols: PreparedModuleSymbols) -> list[str]:
+def _tls_initializer_is_zero(global_: GlobalDef) -> bool:
+    init = global_.initializer.strip()
+    if global_.type.is_int:
+        if init in {"false", "zeroinitializer"}:
+            return True
+        if init in {"true", "poison", "undef"}:
+            return False
+        try:
+            return int(init) == 0
+        except ValueError:
+            return False
+    if global_.type.is_ptr:
+        if init in {"null", "zeroinitializer"}:
+            return True
+        if init.startswith("inttoptrconst:"):
+            try:
+                return int(init.split(":", 1)[1]) == 0
+            except ValueError:
+                return False
+    return False
+
+
+def validate_x86_tls_global(global_: GlobalDef) -> None:
+    if not global_.tls_model:
+        return
+    if global_.tls_model not in _SUPPORTED_TLS_MODELS:
+        supported = ", ".join(sorted(_SUPPORTED_TLS_MODELS))
+        raise BackendUnavailable(
+            f"{_X86_TLS_DIAGNOSTIC_PREFIX} does not support model "
+            f"{global_.tls_model!r} for {global_.name!r}; supported models: {supported}"
+        )
+    remaining_prefix = _THREAD_LOCAL_PREFIX_RE.sub(" ", global_.ir_prefix)
+    unsupported_prefix = sorted(
+        word
+        for word in remaining_prefix.split()
+        if word not in _SUPPORTED_TLS_PREFIX_WORDS
+    )
+    if unsupported_prefix:
+        raise BackendUnavailable(
+            f"{_X86_TLS_DIAGNOSTIC_PREFIX} does not support global prefix "
+            f"{unsupported_prefix!r} for {global_.name!r}"
+        )
+    unsupported_attributes = [
+        attribute
+        for attribute in global_.trailing_attributes
+        if not re.fullmatch(r"align\s+\d+", attribute)
+    ]
+    if unsupported_attributes:
+        raise BackendUnavailable(
+            f"{_X86_TLS_DIAGNOSTIC_PREFIX} does not support attributes "
+            f"{unsupported_attributes!r} for {global_.name!r}"
+        )
+    align_attributes = [
+        attribute
+        for attribute in global_.trailing_attributes
+        if re.fullmatch(r"align\s+\d+", attribute)
+    ]
+    if len(align_attributes) > 1:
+        raise BackendUnavailable(
+            f"{_X86_TLS_DIAGNOSTIC_PREFIX} found duplicate align attributes "
+            f"for {global_.name!r}"
+        )
+    alignment = global_.alignment or global_.type.align
+    if alignment <= 0 or alignment > 8 or alignment & (alignment - 1):
+        raise BackendUnavailable(
+            f"{_X86_TLS_DIAGNOSTIC_PREFIX} requires power-of-two alignment at "
+            f"most 8 for {global_.name!r}, got {alignment}"
+        )
+    if global_.is_constant:
+        raise BackendUnavailable(
+            f"{_X86_TLS_DIAGNOSTIC_PREFIX} does not support thread-local "
+            f"constants for {global_.name!r}"
+        )
+    if global_.type.is_int:
+        if global_.type.width <= 0 or global_.type.width > 64:
+            raise BackendUnavailable(
+                f"{_X86_TLS_DIAGNOSTIC_PREFIX} supports integer widths up to "
+                f"64 bits for {global_.name!r}, got {global_.type.describe()}"
+            )
+        try:
+            if global_.initializer not in {"true", "false", "zeroinitializer"}:
+                int(global_.initializer)
+        except ValueError as exc:
+            raise BackendUnavailable(
+                f"{_X86_TLS_DIAGNOSTIC_PREFIX} requires a concrete integer "
+                f"initializer for {global_.name!r}, got {global_.initializer!r}"
+            ) from exc
+        return
+    if global_.type.is_ptr and _tls_initializer_is_zero(global_):
+        return
+    raise BackendUnavailable(
+        f"{_X86_TLS_DIAGNOSTIC_PREFIX} supports scalar integers and null "
+        f"pointers only for {global_.name!r}, got {global_.type.describe()} "
+        f"initialized by {global_.initializer!r}"
+    )
+
+
+def validate_x86_tls_globals(globals_: list[GlobalDef]) -> None:
+    for global_ in globals_:
+        validate_x86_tls_global(global_)
+
+
+def emit_globals(
+    globals_: list[GlobalDef], module_symbols: PreparedModuleSymbols
+) -> list[str]:
     lines: list[str] = []
     for global_ in globals_:
         if not (
@@ -245,15 +356,32 @@ def emit_globals(globals_: list[GlobalDef], module_symbols: PreparedModuleSymbol
             raise BackendUnavailable(
                 f"x86_64 self backend global type not translated yet for {global_.name!r}: {global_.type.describe()}"
             )
-        section = ".section .rodata" if global_.is_constant else ".data"
+        validate_x86_tls_global(global_)
+        tls_zero = bool(global_.tls_model) and _tls_initializer_is_zero(global_)
+        if global_.tls_model:
+            section = (
+                '.section .tbss,"awT",@nobits'
+                if tls_zero
+                else '.section .tdata,"awT",@progbits'
+            )
+        else:
+            section = ".section .rodata" if global_.is_constant else ".data"
         lines.append(section)
-        lines.append(f".p2align {max(global_.type.align.bit_length() - 1, 0)}")
+        alignment = (
+            global_.alignment or global_.type.align
+            if global_.tls_model
+            else global_.type.align
+        )
+        lines.append(f".p2align {max(alignment.bit_length() - 1, 0)}")
         symbol = asm_symbol(global_.name, module_symbols)
         if not global_.is_internal:
             lines.append(f".globl {symbol}")
         lines.append(f".type {symbol}, @object")
         lines.append(f".size {symbol}, {global_.type.slot_size}")
         lines.append(f"{symbol}:")
-        lines.append(emit_global_initializer(global_, module_symbols))
+        if tls_zero:
+            lines.extend(emit_zero_fill(global_.type.slot_size))
+        else:
+            lines.append(emit_global_initializer(global_, module_symbols))
         lines.append("")
     return lines

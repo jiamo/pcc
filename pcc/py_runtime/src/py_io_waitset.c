@@ -1,7 +1,13 @@
-/* py_io_waitset.c - scalable virtual-thread IO waitset (C mirror).
+/* Host-C oracle for the production freestanding pcc-Python IO waitset.
+ *
+ * The production no-libpython archive owns these ABIs in
+ * py/freestanding_io_waitset.py; this source remains an explicit host-C and
+ * pcc-C oracle input.
+ *
+ * py_io_waitset.c - scalable virtual-thread IO waitset (C mirror).
  *
  * Mirrors pcc/vthread/io_waitset_oracle.py exactly. See the header for the
- * abstraction, the two backends (poll fallback + Darwin kqueue), and the
+ * abstraction and its poll fallback, Darwin kqueue, and Linux epoll backends,
  * semantics contract; see docs/design/pcc-vthread-oracles.md for the design
  * rationale (why a readiness-notifier replaces the O(n) per-poll rescan, and
  * why the fallback keeps level-triggered poll semantics).
@@ -9,14 +15,17 @@
  * The poll-fallback structure is deliberately dependency-free (no PyObject, no
  * GC, no libpython, no <poll.h>): readiness is FED via set_ready, exactly like
  * the oracle's PollWaitSet stands in for poll(2)'s revents. That keeps it
- * deterministic and diffable against the oracle without live fds. The kqueue
- * backend (Darwin/BSD only) is the real syscall path over LIVE fds; on other
- * platforms it is unavailable and callers must use the poll fallback.
+ * deterministic and diffable against the oracle without live fds. Kqueue and
+ * epoll are real bounded syscall paths over LIVE fds; both use generation
+ * tokens to reject stale delivery after an integer fd is reused.
  */
 #include "py_io_waitset.h"
 
+#include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
+#include <unistd.h>
 
 /* The real kqueue backend is compiled only where <sys/event.h> exists. */
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined(__NetBSD__) \
@@ -25,13 +34,21 @@
 #include <sys/event.h>
 #include <sys/time.h>
 #include <sys/types.h>
-#include <errno.h>
-#include <unistd.h>
 #else
 #define PCC_IO_WAITSET_HAVE_KQUEUE 0
 #endif
 
+#if defined(__linux__)
+#define PCC_IO_WAITSET_HAVE_EPOLL 1
+#include <sys/epoll.h>
+#include <sys/eventfd.h>
+#else
+#define PCC_IO_WAITSET_HAVE_EPOLL 0
+#endif
+
 #define PCC_IO_WAITSET_MIN_CAP 8
+#define PCC_IO_WAITSET_WAKE_IDENT 1
+#define PCC_IO_WAITSET_WAKE_TOKEN UINT64_C(0)
 
 /* ---- slot table --------------------------------------------------------- */
 
@@ -40,6 +57,25 @@ static int64_t pcc_io_find_slot(const PccIoWaitSet *ws, int64_t fd) {
         if (ws->slots[i].state == 1 && ws->slots[i].fd == fd) return i;
     }
     return -1;
+}
+
+static int64_t pcc_io_find_slot_generation(
+    const PccIoWaitSet *ws,
+    int64_t fd,
+    uint32_t generation
+) {
+    int64_t idx = pcc_io_find_slot(ws, fd);
+    if (idx < 0 || ws->slots[idx].generation != generation) return -1;
+    return idx;
+}
+
+static uint32_t pcc_io_next_generation(PccIoWaitSet *ws) {
+    if (ws->next_generation == 0 || ws->next_generation >= 0x7fffffffU) {
+        ws->next_generation = 1;
+    } else {
+        ws->next_generation++;
+    }
+    return ws->next_generation;
 }
 
 static int pcc_io_reserve_slot(PccIoWaitSet *ws) {
@@ -89,21 +125,95 @@ static void pcc_io_compact(PccIoWaitSet *ws) {
     ws->len = w;
 }
 
+#if PCC_IO_WAITSET_HAVE_EPOLL
+static uint64_t pcc_io_epoll_token(const PccIoWaitSlot *slot) {
+    return ((uint64_t)slot->generation << 32) | (uint32_t)slot->fd;
+}
+
+static int pcc_io_epoll_update(
+    PccIoWaitSet *ws,
+    const PccIoWaitSlot *slot,
+    int operation
+) {
+    struct epoll_event event;
+    memset(&event, 0, sizeof(event));
+    if (slot->interest & PCC_IO_POLLIN) event.events |= EPOLLIN;
+    if (slot->interest & PCC_IO_POLLOUT) event.events |= EPOLLOUT;
+    event.events |= EPOLLONESHOT;
+    if (slot->edge) event.events |= EPOLLET;
+    event.data.u64 = pcc_io_epoll_token(slot);
+    int rc = epoll_ctl(ws->kq_fd, operation, (int)slot->fd, &event);
+    if (rc == 0) return 0;
+    if (operation == EPOLL_CTL_DEL && (errno == ENOENT || errno == EBADF)) {
+        return 0;
+    }
+    if (operation == EPOLL_CTL_ADD && errno == EEXIST) {
+        return epoll_ctl(ws->kq_fd, EPOLL_CTL_MOD, (int)slot->fd, &event);
+    }
+    return -1;
+}
+#endif
+
 /* ---- lifecycle ---------------------------------------------------------- */
 
 int pcc_io_waitset_init(PccIoWaitSet *ws, PccIoWaitSetBackend backend) {
     if (ws == NULL) return -1;
     memset(ws, 0, sizeof(*ws));
     ws->kq_fd = -1;
+    ws->wake_fd = -1;
     ws->backend = backend;
+    if (
+        backend != PCC_IO_WAITSET_BACKEND_POLL
+        && backend != PCC_IO_WAITSET_BACKEND_KQUEUE
+        && backend != PCC_IO_WAITSET_BACKEND_EPOLL
+    ) return -1;
     if (backend == PCC_IO_WAITSET_BACKEND_KQUEUE) {
 #if PCC_IO_WAITSET_HAVE_KQUEUE
         int kq = kqueue();
         if (kq < 0) return -1;
         ws->kq_fd = kq;
+        struct kevent wake_event;
+        EV_SET(
+            &wake_event,
+            PCC_IO_WAITSET_WAKE_IDENT,
+            EVFILT_USER,
+            EV_ADD | EV_CLEAR,
+            0,
+            0,
+            NULL
+        );
+        if (kevent(kq, &wake_event, 1, NULL, 0, NULL) < 0) {
+            close(kq);
+            ws->kq_fd = -1;
+            return -1;
+        }
 #else
         /* Not available on this platform - caller must probe first and fall
          * back to the poll backend. */
+        return -1;
+#endif
+    }
+    if (backend == PCC_IO_WAITSET_BACKEND_EPOLL) {
+#if PCC_IO_WAITSET_HAVE_EPOLL
+        int epfd = epoll_create1(EPOLL_CLOEXEC);
+        if (epfd < 0) return -1;
+        int wake = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+        if (wake < 0) {
+            close(epfd);
+            return -1;
+        }
+        struct epoll_event wake_event;
+        memset(&wake_event, 0, sizeof(wake_event));
+        wake_event.events = EPOLLIN;
+        wake_event.data.u64 = PCC_IO_WAITSET_WAKE_TOKEN;
+        if (epoll_ctl(epfd, EPOLL_CTL_ADD, wake, &wake_event) != 0) {
+            close(wake);
+            close(epfd);
+            return -1;
+        }
+        ws->kq_fd = epfd;
+        ws->wake_fd = wake;
+#else
         return -1;
 #endif
     }
@@ -112,9 +222,8 @@ int pcc_io_waitset_init(PccIoWaitSet *ws, PccIoWaitSetBackend backend) {
 
 void pcc_io_waitset_dispose(PccIoWaitSet *ws) {
     if (ws == NULL) return;
-#if PCC_IO_WAITSET_HAVE_KQUEUE
+    if (ws->wake_fd >= 0) close(ws->wake_fd);
     if (ws->kq_fd >= 0) close(ws->kq_fd);
-#endif
     free(ws->slots);
     free(ws->ready_buf);
     free(ws->timeout_buf);
@@ -127,6 +236,46 @@ void pcc_io_waitset_dispose(PccIoWaitSet *ws) {
     ws->ready_cap = 0;
     ws->timeout_cap = 0;
     ws->kq_fd = -1;
+    ws->wake_fd = -1;
+    ws->next_generation = 0;
+    ws->backend = PCC_IO_WAITSET_BACKEND_POLL;
+}
+
+int pcc_io_waitset_interrupt(PccIoWaitSet *ws) {
+    if (ws == NULL) return -1;
+    if (ws->backend == PCC_IO_WAITSET_BACKEND_POLL) return 0;
+#if PCC_IO_WAITSET_HAVE_KQUEUE
+    if (ws->backend == PCC_IO_WAITSET_BACKEND_KQUEUE) {
+        struct kevent trigger;
+        EV_SET(
+            &trigger,
+            PCC_IO_WAITSET_WAKE_IDENT,
+            EVFILT_USER,
+            0,
+            NOTE_TRIGGER,
+            0,
+            NULL
+        );
+        for (;;) {
+            if (kevent(ws->kq_fd, &trigger, 1, NULL, 0, NULL) == 0) return 0;
+            if (errno != EINTR) return -1;
+        }
+    }
+#endif
+#if PCC_IO_WAITSET_HAVE_EPOLL
+    if (ws->backend == PCC_IO_WAITSET_BACKEND_EPOLL) {
+        uint64_t one = 1;
+        for (;;) {
+            ssize_t written = write(ws->wake_fd, &one, sizeof(one));
+            if (written == (ssize_t)sizeof(one)) return 0;
+            if (written < 0 && errno == EINTR) continue;
+            /* A full nonblocking eventfd is already a pending interrupt. */
+            if (written < 0 && errno == EAGAIN) return 0;
+            return -1;
+        }
+    }
+#endif
+    return -1;
 }
 
 /* ---- kqueue filter (un)registration ------------------------------------- */
@@ -135,19 +284,32 @@ void pcc_io_waitset_dispose(PccIoWaitSet *ws) {
 /* Arm/disarm the EVFILT_READ / EVFILT_WRITE filters for one fd according to its
  * interest mask. On disarm we ignore ENOENT (filter was never armed). Returns 0
  * on success, -1 on a hard error. */
-static int pcc_io_kq_update(PccIoWaitSet *ws, int64_t fd, int64_t interest, int add) {
+static int pcc_io_kq_update(
+    PccIoWaitSet *ws,
+    int64_t fd,
+    int64_t interest,
+    uint32_t generation,
+    int add
+) {
     struct kevent changes[2];
     int nchg = 0;
     unsigned short flags = add ? (EV_ADD | EV_CLEAR) : EV_DELETE;
+    uint64_t token = ((uint64_t)generation << 32) | (uint32_t)fd;
     /* EV_CLEAR gives edge-triggered semantics; we re-derive level behavior in
      * wait() by re-checking the reported readiness against interest, matching
      * the oracle's level-mode re-arm. */
     if (interest & PCC_IO_POLLIN) {
-        EV_SET(&changes[nchg], (uintptr_t)fd, EVFILT_READ, flags, 0, 0, NULL);
+        EV_SET(
+            &changes[nchg], (uintptr_t)fd, EVFILT_READ, flags, 0, 0,
+            (void *)(uintptr_t)token
+        );
         nchg++;
     }
     if (interest & PCC_IO_POLLOUT) {
-        EV_SET(&changes[nchg], (uintptr_t)fd, EVFILT_WRITE, flags, 0, 0, NULL);
+        EV_SET(
+            &changes[nchg], (uintptr_t)fd, EVFILT_WRITE, flags, 0, 0,
+            (void *)(uintptr_t)token
+        );
         nchg++;
     }
     if (nchg == 0) return 0;
@@ -171,6 +333,9 @@ int pcc_io_waitset_add(
 ) {
     if (ws == NULL) return -1;
     int64_t idx = pcc_io_find_slot(ws, fd);
+    int is_new = idx < 0;
+    PccIoWaitSlot old_slot;
+    memset(&old_slot, 0, sizeof(old_slot));
     if (idx < 0) {
         if (pcc_io_reserve_slot(ws) != 0) return -1;
         idx = ws->len++;
@@ -178,10 +343,14 @@ int pcc_io_waitset_add(
         ws->slots[idx].state = 1;
         ws->live_count++;
     } else {
+        old_slot = ws->slots[idx];
 #if PCC_IO_WAITSET_HAVE_KQUEUE
         if (ws->backend == PCC_IO_WAITSET_BACKEND_KQUEUE) {
             /* Re-registration: drop old filters before re-arming the new mask. */
-            (void)pcc_io_kq_update(ws, fd, ws->slots[idx].interest, 0);
+            (void)pcc_io_kq_update(
+                ws, fd, ws->slots[idx].interest,
+                ws->slots[idx].generation, 0
+            );
         }
 #endif
     }
@@ -189,13 +358,38 @@ int pcc_io_waitset_add(
     ws->slots[idx].interest = interest;
     ws->slots[idx].deadline = deadline;
     ws->slots[idx].edge = edge ? 1 : 0;
+    ws->slots[idx].generation = pcc_io_next_generation(ws);
 #if PCC_IO_WAITSET_HAVE_KQUEUE
     if (ws->backend == PCC_IO_WAITSET_BACKEND_KQUEUE) {
-        if (pcc_io_kq_update(ws, fd, interest, 1) != 0) {
-            /* Roll the slot back so the waitset stays consistent. */
-            ws->slots[idx].state = 0;
-            ws->live_count--;
-            pcc_io_compact(ws);
+        if (pcc_io_kq_update(
+            ws, fd, interest, ws->slots[idx].generation, 1
+        ) != 0) {
+            if (is_new) {
+                ws->slots[idx].state = 0;
+                ws->live_count--;
+                pcc_io_compact(ws);
+            } else {
+                ws->slots[idx] = old_slot;
+                (void)pcc_io_kq_update(
+                    ws, old_slot.fd, old_slot.interest,
+                    old_slot.generation, 1
+                );
+            }
+            return -1;
+        }
+    }
+#endif
+#if PCC_IO_WAITSET_HAVE_EPOLL
+    if (ws->backend == PCC_IO_WAITSET_BACKEND_EPOLL) {
+        int operation = is_new ? EPOLL_CTL_ADD : EPOLL_CTL_MOD;
+        if (pcc_io_epoll_update(ws, &ws->slots[idx], operation) != 0) {
+            if (is_new) {
+                ws->slots[idx].state = 0;
+                ws->live_count--;
+                pcc_io_compact(ws);
+            } else {
+                ws->slots[idx] = old_slot;
+            }
             return -1;
         }
     }
@@ -210,7 +404,15 @@ int pcc_io_waitset_remove(PccIoWaitSet *ws, int64_t fd) {
     if (idx < 0) return 0;
 #if PCC_IO_WAITSET_HAVE_KQUEUE
     if (ws->backend == PCC_IO_WAITSET_BACKEND_KQUEUE) {
-        (void)pcc_io_kq_update(ws, fd, ws->slots[idx].interest, 0);
+        (void)pcc_io_kq_update(
+            ws, fd, ws->slots[idx].interest,
+            ws->slots[idx].generation, 0
+        );
+    }
+#endif
+#if PCC_IO_WAITSET_HAVE_EPOLL
+    if (ws->backend == PCC_IO_WAITSET_BACKEND_EPOLL) {
+        (void)pcc_io_epoll_update(ws, &ws->slots[idx], EPOLL_CTL_DEL);
     }
 #endif
     ws->slots[idx].state = 0;
@@ -274,87 +476,314 @@ static int pcc_io_wait_poll(PccIoWaitSet *ws, int64_t now, PccIoWaitResult *out)
     return 0;
 }
 
-/* ---- wait: Darwin kqueue ------------------------------------------------ */
+/* ---- absolute deadline helpers ----------------------------------------- */
 
+static int64_t pcc_io_monotonic_ms(void) {
+    struct timespec value;
+    if (clock_gettime(CLOCK_MONOTONIC, &value) != 0) return -1;
+    return (int64_t)value.tv_sec * 1000 + (int64_t)value.tv_nsec / 1000000;
+}
+
+static int64_t pcc_io_effective_deadline(
+    const PccIoWaitSet *ws,
+    int64_t wait_deadline,
+    int64_t now
+) {
+    if (ws->live_count <= 0) return now;
+    int64_t deadline = wait_deadline;
+    for (int64_t i = 0; i < ws->len; i++) {
+        const PccIoWaitSlot *slot = &ws->slots[i];
+        if (slot->state != 1) continue;
+        /* A previous bounded finish may have deferred a cached readiness
+         * result.  Do not enter an unbounded kernel wait before draining it. */
+        if (
+            slot->ready_mask
+            & (slot->interest | PCC_IO_ALWAYS_REPORTED)
+        ) return now;
+        if (slot->deadline < 0) continue;
+        if (deadline < 0 || slot->deadline < deadline) {
+            deadline = slot->deadline;
+        }
+    }
+    return deadline;
+}
+
+static int pcc_io_remaining_ms(int64_t now, int64_t deadline) {
+    if (deadline < 0) return -1;
+    if (deadline <= now) return 0;
+    int64_t remaining = deadline - now;
+    return remaining > INT32_MAX ? INT32_MAX : (int)remaining;
+}
+
+/* ---- split live wait --------------------------------------------------- */
+
+void pcc_io_waitset_wait_discard(PccIoWaitBatch *batch) {
+    if (batch == NULL) return;
+    free(batch->events);
+    memset(batch, 0, sizeof(*batch));
+}
+
+int pcc_io_waitset_wait_prepare(
+    PccIoWaitSet *ws,
+    int64_t now,
+    int64_t wait_deadline,
+    PccIoWaitBatch *batch
+) {
+    if (ws == NULL || batch == NULL) return -1;
+    memset(batch, 0, sizeof(*batch));
+    if (
+        ws->backend != PCC_IO_WAITSET_BACKEND_KQUEUE
+        && ws->backend != PCC_IO_WAITSET_BACKEND_EPOLL
+    ) return -1;
+    int64_t bounded_live = ws->live_count;
+    if (bounded_live < 1) bounded_live = 1;
+    if (bounded_live > 256) bounded_live = 256;
+    int64_t capacity = bounded_live + 1; /* + compiler-owned wake event */
+    size_t event_size = 0;
+    if (ws->backend == PCC_IO_WAITSET_BACKEND_KQUEUE) {
 #if PCC_IO_WAITSET_HAVE_KQUEUE
-static int pcc_io_wait_kqueue(PccIoWaitSet *ws, int64_t now, PccIoWaitResult *out) {
-    if (pcc_io_reserve_output(ws, ws->live_count) != 0) return -1;
-
-    struct timespec zero;
-    zero.tv_sec = 0;
-    zero.tv_nsec = 0;
-
-    /* Collect up to live_count events (each fd contributes at most one relevant
-     * ready delivery per wait). Bound by a small floor so a 0-registration wait
-     * still passes a valid buffer. */
-    int64_t evcap = ws->live_count > 0 ? ws->live_count : 1;
-    /* An fd with both READ and WRITE interest can surface two kevents; size for
-     * the worst case so nothing is dropped mid-drain. */
-    struct kevent *evbuf = (struct kevent *)malloc(
-        (size_t)(evcap * 2) * sizeof(struct kevent)
+        capacity = bounded_live * 2 + 1;
+        event_size = sizeof(struct kevent);
+#else
+        return -1;
+#endif
+    } else {
+#if PCC_IO_WAITSET_HAVE_EPOLL
+        event_size = sizeof(struct epoll_event);
+#else
+        return -1;
+#endif
+    }
+    /* Reserve every fallible output allocation before kevent/epoll_wait can
+     * consume an edge or disarm an EPOLLONESHOT registration.  The extra
+     * event-capacity allowance covers registrations added while block() runs
+     * without the ownership lock; finish() bounds any still-larger timeout
+     * burst and leaves it live for the next immediate drain. */
+    if (ws->live_count > INT64_MAX - capacity) return -1;
+    if (pcc_io_reserve_output(ws, ws->live_count + capacity) != 0) return -1;
+    batch->events = malloc((size_t)capacity * event_size);
+    if (batch->events == NULL) return -1;
+    batch->event_capacity = capacity;
+    batch->event_count = 0;
+    batch->current_now = now;
+    batch->effective_deadline = pcc_io_effective_deadline(
+        ws, wait_deadline, now
     );
-    if (evbuf == NULL) return -1;
+    batch->wait_deadline = wait_deadline;
+    batch->backend = ws->backend;
+    batch->status = 0;
+    return 0;
+}
 
-    int nev = kevent(ws->kq_fd, NULL, 0, evbuf, (int)(evcap * 2), &zero);
-    if (nev < 0) {
-        free(evbuf);
-        if (errno == EINTR) {
-            /* Treat as "no readiness this tick"; timeouts still processed. */
-            nev = 0;
+int pcc_io_waitset_wait_block(PccIoWaitSet *ws, PccIoWaitBatch *batch) {
+    if (
+        ws == NULL || batch == NULL || batch->events == NULL
+        || batch->backend != ws->backend
+    ) {
+        if (batch != NULL) batch->status = -1;
+        return -1;
+    }
+    int count = -1;
+    for (;;) {
+        int remaining = pcc_io_remaining_ms(
+            batch->current_now, batch->effective_deadline
+        );
+        if (ws->backend == PCC_IO_WAITSET_BACKEND_KQUEUE) {
+#if PCC_IO_WAITSET_HAVE_KQUEUE
+            struct timespec timeout;
+            struct timespec *timeout_ptr = NULL;
+            if (remaining >= 0) {
+                timeout.tv_sec = remaining / 1000;
+                timeout.tv_nsec = (long)(remaining % 1000) * 1000000L;
+                timeout_ptr = &timeout;
+            }
+            count = kevent(
+                ws->kq_fd,
+                NULL,
+                0,
+                (struct kevent *)batch->events,
+                (int)batch->event_capacity,
+                timeout_ptr
+            );
+#else
+            batch->status = -1;
+            return -1;
+#endif
+        } else if (ws->backend == PCC_IO_WAITSET_BACKEND_EPOLL) {
+#if PCC_IO_WAITSET_HAVE_EPOLL
+            count = epoll_wait(
+                ws->kq_fd,
+                (struct epoll_event *)batch->events,
+                (int)batch->event_capacity,
+                remaining
+            );
+#else
+            batch->status = -1;
+            return -1;
+#endif
         } else {
+            batch->status = -1;
             return -1;
         }
-        evbuf = NULL;
+        if (count >= 0 || errno != EINTR) break;
+        int64_t observed = pcc_io_monotonic_ms();
+        if (observed >= 0) batch->current_now = observed;
+        if (
+            batch->effective_deadline >= 0
+            && batch->current_now >= batch->effective_deadline
+        ) {
+            count = 0;
+            break;
+        }
+    }
+    int64_t observed = pcc_io_monotonic_ms();
+    if (observed >= 0) batch->current_now = observed;
+    batch->event_count = count;
+    batch->status = count < 0 ? -1 : 0;
+    return batch->status;
+}
+
+static void pcc_io_drain_epoll_interrupt(PccIoWaitSet *ws) {
+#if PCC_IO_WAITSET_HAVE_EPOLL
+    if (ws->backend != PCC_IO_WAITSET_BACKEND_EPOLL || ws->wake_fd < 0) return;
+    uint64_t value = 0;
+    for (;;) {
+        ssize_t count = read(ws->wake_fd, &value, sizeof(value));
+        if (count == (ssize_t)sizeof(value)) continue;
+        if (count < 0 && errno == EINTR) continue;
+        return;
+    }
+#else
+    (void)ws;
+#endif
+}
+
+int pcc_io_waitset_wait_finish(
+    PccIoWaitSet *ws,
+    PccIoWaitBatch *batch,
+    PccIoWaitResult *out
+) {
+    if (ws == NULL || batch == NULL || out == NULL) return -1;
+    out->ready = NULL;
+    out->ready_len = 0;
+    out->timed_out = NULL;
+    out->timeout_len = 0;
+    if (
+        batch->status != 0 || batch->event_count < 0
+        || batch->backend != ws->backend
+    ) {
+        pcc_io_waitset_wait_discard(batch);
+        return -1;
+    }
+    if (batch->backend == PCC_IO_WAITSET_BACKEND_KQUEUE) {
+#if PCC_IO_WAITSET_HAVE_KQUEUE
+        struct kevent *events = (struct kevent *)batch->events;
+        for (int64_t i = 0; i < batch->event_count; i++) {
+            uint64_t token = (uint64_t)(uintptr_t)events[i].udata;
+            if (token == PCC_IO_WAITSET_WAKE_TOKEN) continue;
+            int64_t fd = (int64_t)(uint32_t)token;
+            uint32_t generation = (uint32_t)(token >> 32);
+            int64_t idx = pcc_io_find_slot_generation(ws, fd, generation);
+            if (idx < 0) continue;
+            int64_t bits = 0;
+            if (events[i].filter == EVFILT_READ) bits |= PCC_IO_POLLIN;
+            else if (events[i].filter == EVFILT_WRITE) bits |= PCC_IO_POLLOUT;
+            if (events[i].flags & EV_EOF) bits |= PCC_IO_POLLHUP;
+            if (events[i].flags & EV_ERROR) bits |= PCC_IO_POLLERR;
+            ws->slots[idx].ready_mask |= bits;
+        }
+#else
+        pcc_io_waitset_wait_discard(batch);
+        return -1;
+#endif
+    } else if (batch->backend == PCC_IO_WAITSET_BACKEND_EPOLL) {
+#if PCC_IO_WAITSET_HAVE_EPOLL
+        struct epoll_event *events = (struct epoll_event *)batch->events;
+        for (int64_t i = 0; i < batch->event_count; i++) {
+            uint64_t token = events[i].data.u64;
+            if (token == PCC_IO_WAITSET_WAKE_TOKEN) continue;
+            int64_t fd = (int64_t)(uint32_t)token;
+            uint32_t generation = (uint32_t)(token >> 32);
+            int64_t idx = pcc_io_find_slot_generation(ws, fd, generation);
+            if (idx < 0) continue;
+            int64_t bits = 0;
+            if (events[i].events & EPOLLIN) bits |= PCC_IO_POLLIN;
+            if (events[i].events & EPOLLOUT) bits |= PCC_IO_POLLOUT;
+            if (events[i].events & EPOLLERR) bits |= PCC_IO_POLLERR;
+            if (events[i].events & (EPOLLHUP | 0x2000U)) {
+                bits |= PCC_IO_POLLHUP;
+            }
+            ws->slots[idx].ready_mask |= bits;
+        }
+        pcc_io_drain_epoll_interrupt(ws);
+#else
+        pcc_io_waitset_wait_discard(batch);
+        return -1;
+#endif
+    } else {
+        pcc_io_waitset_wait_discard(batch);
+        return -1;
     }
 
+    int64_t current_now = batch->current_now;
+    pcc_io_waitset_wait_discard(batch);
+    /* A mutation may have shortened an aggregate fd deadline while block()
+     * ran without the ownership lock. Observe the clock after re-locking so
+     * finish does not defer that newly-expired registration to another wait. */
+    int64_t finish_now = pcc_io_monotonic_ms();
+    if (finish_now >= 0) current_now = finish_now;
     int64_t nready = 0;
-    /* Accumulate per-fd ready bits before delivering (an fd may report READ and
-     * WRITE separately; the C poller reports the union masked by interest). */
-    for (int i = 0; i < nev; i++) {
-        struct kevent *ev = &evbuf[i];
-        int64_t fd = (int64_t)ev->ident;
-        int64_t idx = pcc_io_find_slot(ws, fd);
-        if (idx < 0) continue; /* stale delivery for an already-removed fd */
-        int64_t bits = 0;
-        if (ev->filter == EVFILT_READ) bits |= PCC_IO_POLLIN;
-        else if (ev->filter == EVFILT_WRITE) bits |= PCC_IO_POLLOUT;
-        if (ev->flags & EV_EOF) bits |= PCC_IO_POLLHUP;
-        if (ev->flags & EV_ERROR) bits |= PCC_IO_POLLERR;
-        ws->slots[idx].ready_mask |= bits;
-    }
-    if (evbuf != NULL) free(evbuf);
-
-    /* Deliver: mirror the poll fallback's interest-mask filtering and one-shot
-     * removal so both backends agree on the readiness sequence (level mode). */
     for (int64_t i = 0; i < ws->len; i++) {
         PccIoWaitSlot *slot = &ws->slots[i];
         if (slot->state != 1) continue;
         int64_t hit = slot->ready_mask
             & (slot->interest | PCC_IO_ALWAYS_REPORTED);
         if (hit == 0) continue;
+        /* Concurrent add/expiry bursts can make live_count exceed the
+         * prepare-time snapshot.  Never overrun the pre-reserved buffer: the
+         * cached ready_mask makes a deferred slot an immediate next drain. */
+        if (nready >= ws->ready_cap) continue;
         ws->ready_buf[nready].fd = slot->fd;
         ws->ready_buf[nready].events = hit;
         nready++;
-        (void)pcc_io_kq_update(ws, slot->fd, slot->interest, 0);
+#if PCC_IO_WAITSET_HAVE_KQUEUE
+        if (ws->backend == PCC_IO_WAITSET_BACKEND_KQUEUE) {
+            (void)pcc_io_kq_update(
+                ws, slot->fd, slot->interest, slot->generation, 0
+            );
+        }
+#endif
+#if PCC_IO_WAITSET_HAVE_EPOLL
+        if (ws->backend == PCC_IO_WAITSET_BACKEND_EPOLL) {
+            (void)pcc_io_epoll_update(ws, slot, EPOLL_CTL_DEL);
+        }
+#endif
         slot->state = 0;
         ws->live_count--;
     }
 
-    /* Timeouts: only fds with a finite deadline that has passed AND that did
-     * not just deliver (ready wins over timeout at the same tick, enforced by
-     * the state==1 check above having cleared delivered fds). */
     int64_t ntimeout = 0;
     for (int64_t i = 0; i < ws->len; i++) {
         PccIoWaitSlot *slot = &ws->slots[i];
         if (slot->state != 1) continue;
-        if (slot->deadline >= 0 && slot->deadline <= now) {
-            ws->timeout_buf[ntimeout++] = slot->fd;
-            (void)pcc_io_kq_update(ws, slot->fd, slot->interest, 0);
-            slot->state = 0;
-            ws->live_count--;
+        if (slot->deadline < 0 || slot->deadline > current_now) continue;
+        if (ntimeout >= ws->timeout_cap) continue;
+        ws->timeout_buf[ntimeout++] = slot->fd;
+#if PCC_IO_WAITSET_HAVE_KQUEUE
+        if (ws->backend == PCC_IO_WAITSET_BACKEND_KQUEUE) {
+            (void)pcc_io_kq_update(
+                ws, slot->fd, slot->interest, slot->generation, 0
+            );
         }
+#endif
+#if PCC_IO_WAITSET_HAVE_EPOLL
+        if (ws->backend == PCC_IO_WAITSET_BACKEND_EPOLL) {
+            (void)pcc_io_epoll_update(ws, slot, EPOLL_CTL_DEL);
+        }
+#endif
+        slot->state = 0;
+        ws->live_count--;
     }
-
     pcc_io_compact(ws);
     out->ready = ws->ready_buf;
     out->ready_len = nready;
@@ -362,22 +791,31 @@ static int pcc_io_wait_kqueue(PccIoWaitSet *ws, int64_t now, PccIoWaitResult *ou
     out->timeout_len = ntimeout;
     return 0;
 }
-#endif
 
-int pcc_io_waitset_wait(PccIoWaitSet *ws, int64_t now, PccIoWaitResult *out) {
+int pcc_io_waitset_wait_until(
+    PccIoWaitSet *ws,
+    int64_t now,
+    int64_t wait_deadline,
+    PccIoWaitResult *out
+) {
     if (ws == NULL || out == NULL) return -1;
     out->ready = NULL;
     out->ready_len = 0;
     out->timed_out = NULL;
     out->timeout_len = 0;
-    if (ws->backend == PCC_IO_WAITSET_BACKEND_KQUEUE) {
-#if PCC_IO_WAITSET_HAVE_KQUEUE
-        return pcc_io_wait_kqueue(ws, now, out);
-#else
-        return -1;
-#endif
+    if (ws->backend == PCC_IO_WAITSET_BACKEND_POLL) {
+        return pcc_io_wait_poll(ws, now, out);
     }
-    return pcc_io_wait_poll(ws, now, out);
+    PccIoWaitBatch batch;
+    if (pcc_io_waitset_wait_prepare(ws, now, wait_deadline, &batch) != 0) {
+        return -1;
+    }
+    (void)pcc_io_waitset_wait_block(ws, &batch);
+    return pcc_io_waitset_wait_finish(ws, &batch, out);
+}
+
+int pcc_io_waitset_wait(PccIoWaitSet *ws, int64_t now, PccIoWaitResult *out) {
+    return pcc_io_waitset_wait_until(ws, now, now, out);
 }
 
 /* ---- platform capability + skip reason ---------------------------------- */
@@ -389,15 +827,48 @@ int pcc_io_waitset_kqueue_available(void) {
 int pcc_io_waitset_real_kqueue_skip(PccIoWaitSetSkip *out) {
 #if PCC_IO_WAITSET_HAVE_KQUEUE
     (void)out;
-    return 0; /* kqueue available -> not skipped */
+    return 0;
 #else
     if (out != NULL) {
         out->path = "io_waitset.real_kqueue";
         out->reason =
-            "real kqueue/kevent requires <sys/event.h> (Darwin/BSD); this "
-            "platform has no kqueue backend. Use the poll fallback; a later "
-            "runtime slice adds epoll_wait on Linux behind the same seam.";
+            "real kqueue/kevent requires Darwin/BSD; Linux uses epoll and "
+            "other targets use the explicitly labeled poll fallback.";
     }
-    return 1; /* skipped with reason */
+    return 1;
+#endif
+}
+
+int pcc_io_waitset_epoll_available(void) {
+    return PCC_IO_WAITSET_HAVE_EPOLL ? 1 : 0;
+}
+
+int pcc_io_waitset_real_epoll_skip(PccIoWaitSetSkip *out) {
+#if PCC_IO_WAITSET_HAVE_EPOLL
+    (void)out;
+    return 0;
+#else
+    if (out != NULL) {
+        out->path = "io_waitset.real_epoll";
+        out->reason = "real epoll is a Linux-only readiness backend";
+    }
+    return 1;
+#endif
+}
+
+const char *pcc_io_waitset_backend_label(int64_t backend) {
+    if (backend == PCC_IO_WAITSET_BACKEND_POLL) return "poll";
+    if (backend == PCC_IO_WAITSET_BACKEND_KQUEUE) return "kqueue";
+    if (backend == PCC_IO_WAITSET_BACKEND_EPOLL) return "epoll";
+    return "unknown";
+}
+
+int64_t pcc_io_waitset_default_backend(void) {
+#if PCC_IO_WAITSET_HAVE_KQUEUE
+    return PCC_IO_WAITSET_BACKEND_KQUEUE;
+#elif PCC_IO_WAITSET_HAVE_EPOLL
+    return PCC_IO_WAITSET_BACKEND_EPOLL;
+#else
+    return PCC_IO_WAITSET_BACKEND_POLL;
 #endif
 }

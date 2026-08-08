@@ -38,6 +38,13 @@ def _same_type_kind(a: Type, b: Type) -> bool:
     return type(a) is type(b)
 
 
+def _raw_int_name(ty: Type) -> str:
+    name = getattr(ty, "name", "")
+    if name == "pcc.i64" or name == "pcc.u64":
+        return name
+    return ""
+
+
 class BinaryOpLoweringMixin:
     def _emit_binop_value(
         self,
@@ -47,6 +54,7 @@ class BinaryOpLoweringMixin:
         rhs: ir.Value,
         rhs_ty: Type,
         result_ty: Type,
+        pinned_pcc_on_error: tuple[tuple[ir.Value, bool], ...] = (),
     ) -> ir.Value:
         # CPython values (libpython mode): a binary operator where either
         # operand is a CPython object (e.g. numpy arrays, ``a + b``) must
@@ -62,16 +70,41 @@ class BinaryOpLoweringMixin:
                 "@": 7,
             }.get(op)
             if _cpy_op is not None:
+                rhs_original_owned = (
+                    rhs in _cpy_vals and self._cpy_value_is_owned(rhs)
+                )
                 lhs_c, _l = self._marshal_to_cpython(lhs, lhs_ty)
+                self._guard_cpy_value_not_null(
+                    lhs_c,
+                    (rhs,) if rhs_original_owned else (),
+                    (),
+                    pinned_pcc_on_error,
+                )
                 rhs_c, _r = self._marshal_to_cpython(rhs, rhs_ty)
+                self._guard_cpy_value_not_null(
+                    rhs_c,
+                    (lhs_c,) if _l else (),
+                    (),
+                    pinned_pcc_on_error,
+                )
                 result = self.builder.call(
                     self.runtime["py_cpy_binop"],
                     [ir.Constant(ir.IntType(64), _cpy_op), lhs_c, rhs_c],
                     name=self._fresh("cpy.binop"),
                 )
-                if not hasattr(self, "_cpy_values"):
-                    self._cpy_values = set()
-                self._cpy_values.add(result)
+                if _l:
+                    self.builder.call(self.runtime["py_cpy_decref"], [lhs_c])
+                    self._forget_owned_cpy_value(lhs_c)
+                if _r:
+                    self.builder.call(self.runtime["py_cpy_decref"], [rhs_c])
+                    self._forget_owned_cpy_value(rhs_c)
+                self._mark_owned_cpy_value(result)
+                self._guard_cpy_value_not_null(
+                    result,
+                    (),
+                    (),
+                    pinned_pcc_on_error,
+                )
                 return result
         # Phase 2 object ops (str concat / repeat, list concat). Keeping
         # the dispatch here lets augassign (``s += "x"``, ``lst += ...``)
@@ -624,6 +657,20 @@ class BinaryOpLoweringMixin:
                 lhs_ty,
                 rhs,
                 rhs_ty,
+                pinned_pcc_on_error=pinned_pcc_on_error,
+            )
+
+        if (
+            getattr(self, "_freestanding_module", False)
+            and isinstance(result_ty, IntType)
+            and result_ty.name == "int"
+            and isinstance(lhs_ty, (IntType, BoolType))
+            and isinstance(rhs_ty, (IntType, BoolType))
+        ):
+            raise RuntimeError(
+                "freestanding ordinary Python int arithmetic cannot preserve "
+                "arbitrary precision; annotate the machine boundary with "
+                "pcc.i64 or pcc.u64"
             )
 
         # Shortcut: bitwise ops + shifts are integer-only.
@@ -636,10 +683,32 @@ class BinaryOpLoweringMixin:
                 return self.builder.or_(lv, rv, name=self._fresh("or"))
             if op == "^":
                 return self.builder.xor(lv, rv, name=self._fresh("xor"))
-            self._emit_negative_shift_count_check(rv)
+            raw_name = _raw_int_name(result_ty)
+            if raw_name:
+                # Explicit machine lanes use the target's modulo-64 shift
+                # count instead of Python's unbounded shift semantics.
+                if (
+                    isinstance(rv, ir.Constant)
+                    and isinstance(rv.value, int)
+                ):
+                    rv = ir.Constant(_I64, rv.value & 63)
+                else:
+                    rv = self.builder.and_(
+                        rv,
+                        ir.Constant(_I64, 63),
+                        name=self._fresh("raw.shift.count"),
+                    )
+            else:
+                self._emit_negative_shift_count_check(rv)
             if op == "<<":
                 return self.builder.shl(lv, rv, name=self._fresh("shl"))
             if op == ">>":
+                if raw_name == "pcc.u64":
+                    return self.builder.lshr(
+                        lv,
+                        rv,
+                        name=self._fresh("lshr"),
+                    )
                 return self.builder.ashr(lv, rv, name=self._fresh("ashr"))
 
         # Python ``/`` always returns float even if both operands are
@@ -719,8 +788,73 @@ class BinaryOpLoweringMixin:
         # Integer (and bool-as-int) path.
         lv = self._to_int64(lhs, lhs_ty)
         rv = self._to_int64(rhs, rhs_ty)
-        return self._emit_binop_int(op, lv, rv)
-    def _emit_binop_int(self, op: str, lv: ir.Value, rv: ir.Value) -> ir.Value:
+        return self._emit_binop_int(op, lv, rv, result_ty)
+
+    def _emit_raw_int_division_guard(
+        self,
+        lhs: ir.Value,
+        rhs: ir.Value,
+        *,
+        signed: bool,
+    ) -> None:
+        """Trap deterministic raw divide UB without managed-runtime edges."""
+        zero = ir.Constant(_I64, 0)
+        invalid = self.builder.icmp_unsigned(
+            "==",
+            rhs,
+            zero,
+            name=self._fresh("raw.div.zero"),
+        )
+        if signed:
+            lhs_min = self.builder.icmp_signed(
+                "==",
+                lhs,
+                ir.Constant(_I64, -(1 << 63)),
+                name=self._fresh("raw.div.min"),
+            )
+            rhs_neg_one = self.builder.icmp_signed(
+                "==",
+                rhs,
+                ir.Constant(_I64, -1),
+                name=self._fresh("raw.div.negone"),
+            )
+            overflow = self.builder.and_(
+                lhs_min,
+                rhs_neg_one,
+                name=self._fresh("raw.div.overflow"),
+            )
+            invalid = self.builder.or_(
+                invalid,
+                overflow,
+                name=self._fresh("raw.div.invalid"),
+            )
+        trap_bb = self.current_function.append_basic_block(
+            name=self._fresh("raw.div.trap")
+        )
+        cont_bb = self.current_function.append_basic_block(
+            name=self._fresh("raw.div.cont")
+        )
+        self.builder.cbranch(invalid, trap_bb, cont_bb)
+        self.builder.position_at_end(trap_bb)
+        trap = self.module.globals.get("llvm.trap")
+        if not isinstance(trap, ir.Function):
+            trap = ir.Function(
+                self.module,
+                ir.FunctionType(ir.VoidType(), []),
+                name="llvm.trap",
+            )
+        self.builder.call(trap, [])
+        self.builder.unreachable()
+        self.builder.position_at_end(cont_bb)
+
+    def _emit_binop_int(
+        self,
+        op: str,
+        lv: ir.Value,
+        rv: ir.Value,
+        result_ty: Type,
+    ) -> ir.Value:
+        raw_name = _raw_int_name(result_ty)
         if op == "+":
             return self.builder.add(lv, rv, name=self._fresh("add"))
         if op == "-":
@@ -728,10 +862,43 @@ class BinaryOpLoweringMixin:
         if op == "*":
             return self.builder.mul(lv, rv, name=self._fresh("mul"))
         if op == "//":
+            if raw_name:
+                signed = raw_name == "pcc.i64"
+                self._emit_raw_int_division_guard(lv, rv, signed=signed)
+                if signed:
+                    return self.builder.sdiv(
+                        lv,
+                        rv,
+                        name=self._fresh("raw.sdiv"),
+                    )
+                return self.builder.udiv(
+                    lv,
+                    rv,
+                    name=self._fresh("raw.udiv"),
+                )
             return self._python_floordiv_i64(lv, rv)
         if op == "%":
+            if raw_name:
+                signed = raw_name == "pcc.i64"
+                self._emit_raw_int_division_guard(lv, rv, signed=signed)
+                if signed:
+                    return self.builder.srem(
+                        lv,
+                        rv,
+                        name=self._fresh("raw.srem"),
+                    )
+                return self.builder.urem(
+                    lv,
+                    rv,
+                    name=self._fresh("raw.urem"),
+                )
             return self._python_mod_i64(lv, rv)
         if op == "**":
+            if raw_name:
+                raise L1CodegenError(
+                    "raw pcc.i64/pcc.u64 exponentiation is not yet supported; "
+                    "use an explicit checked machine helper"
+                )
             # Route through the runtime ``py_int_pow`` helper. Both
             # operands box first, then unbox the result back to i64.
             lbox = self.builder.call(
@@ -764,6 +931,8 @@ class BinaryOpLoweringMixin:
         lhs_ty: Type,
         rhs: ir.Value,
         rhs_ty: Type,
+        *,
+        pinned_pcc_on_error: tuple[tuple[ir.Value, bool], ...] = (),
     ) -> ir.Value:
         fn_name = {
             "+": "py_int_add",
@@ -781,7 +950,10 @@ class BinaryOpLoweringMixin:
         if fn_name is None:
             raise NotImplementedError(f"Layer 1 int binop {op!r} not supported")
         if op == "<<" or op == ">>":
-            self._emit_negative_shift_count_check(self._to_int64(rhs, rhs_ty))
+            self._emit_negative_shift_count_check(
+                self._to_int64(rhs, rhs_ty),
+                pinned_release_on_error=pinned_pcc_on_error,
+            )
         lhs_obj = marshal.marshal_to_object(
             self.builder,
             self.module,
@@ -803,22 +975,56 @@ class BinaryOpLoweringMixin:
             fn_name,
         )
         if inline is not None:
+            self._emit_post_call_err_check(
+                None,
+                pinned_release_on_error=pinned_pcc_on_error,
+            )
+            self._guard_cpy_value_not_null(
+                inline,
+                pinned_pcc_on_error=pinned_pcc_on_error,
+            )
             return inline
         result = self.builder.call(
             self.runtime[fn_name],
             [lhs_obj, rhs_obj],
             name=self._fresh("int.obj"),
         )
-        if op == "<<" or op == ">>":
-            self._emit_post_call_err_check(None)
+        self._emit_post_call_err_check(
+            None,
+            pinned_release_on_error=pinned_pcc_on_error,
+        )
         if op == "//" or op == "%":
             # py_int_floordiv / py_int_mod return NULL (no exception) on a zero
             # divisor; surface ZeroDivisionError so user try/except can catch it.
             self._emit_zero_division_if_null(
-                result, "division by zero"
+                result,
+                "division by zero",
+                pinned_release_on_error=pinned_pcc_on_error,
+            )
+        else:
+            self._guard_cpy_value_not_null(
+                result,
+                pinned_pcc_on_error=pinned_pcc_on_error,
             )
         return result
-    def _emit_negative_shift_count_check(self, rv: ir.Value) -> None:
+    def _emit_negative_shift_count_check(
+        self,
+        rv: ir.Value,
+        *,
+        pinned_release_on_error: tuple[tuple[ir.Value, bool], ...] = (),
+    ) -> None:
+        # A statically non-negative count cannot take Python's ValueError
+        # edge.  Besides avoiding dead control flow, this is required by the
+        # freestanding subset: fixed ABI bitfield extraction must not acquire
+        # a managed exception-runtime dependency merely because Python shifts
+        # reject dynamic negative counts.
+        if (
+            isinstance(rv, ir.Constant)
+            and isinstance(rv.type, ir.IntType)
+            and isinstance(rv.value, int)
+            and rv.value >= 0
+        ):
+            return
         fn = self.current_function
         if fn is None:
             raise L1CodegenError("shift lowering requires an active function")
@@ -836,13 +1042,23 @@ class BinaryOpLoweringMixin:
         )
         self.builder.cbranch(is_negative, err_bb, ok_bb)
         self.builder.position_at_end(err_bb)
+        for value, release_owned in pinned_release_on_error:
+            self._gc_unpin(value)
+            if release_owned:
+                self._gc_release(value)
         self._emit_builtin_exception_and_branch(
             "ValueError",
             "negative shift count",
             None,
         )
         self.builder.position_at_end(ok_bb)
-    def _emit_zero_division_check(self, is_zero: ir.Value, msg: str) -> None:
+    def _emit_zero_division_check(
+        self,
+        is_zero: ir.Value,
+        msg: str,
+        *,
+        pinned_release_on_error: tuple[tuple[ir.Value, bool], ...] = (),
+    ) -> None:
         """Raise ZeroDivisionError when ``is_zero`` (an i1) is true.
 
         Python raises ``ZeroDivisionError`` for ``/``, ``//`` and ``%`` with a
@@ -858,13 +1074,23 @@ class BinaryOpLoweringMixin:
         err_bb = fn.append_basic_block(name=self._fresh("div.zero"))
         self.builder.cbranch(is_zero, err_bb, ok_bb)
         self.builder.position_at_end(err_bb)
+        for value, release_owned in pinned_release_on_error:
+            self._gc_unpin(value)
+            if release_owned:
+                self._gc_release(value)
         self._emit_builtin_exception_and_branch(
             "ZeroDivisionError",
             msg,
             None,
         )
         self.builder.position_at_end(ok_bb)
-    def _emit_zero_division_if_null(self, result: ir.Value, msg: str) -> None:
+    def _emit_zero_division_if_null(
+        self,
+        result: ir.Value,
+        msg: str,
+        *,
+        pinned_release_on_error: tuple[tuple[ir.Value, bool], ...] = (),
+    ) -> None:
         """Raise ZeroDivisionError when a boxed ``//``/``%`` result is NULL.
 
         ``py_int_mod`` / ``py_int_floordiv`` (and ``py_obj_mod`` which delegates
@@ -880,7 +1106,11 @@ class BinaryOpLoweringMixin:
             ir.Constant(result.type, None),
             name=self._fresh("divres_null"),
         )
-        self._emit_zero_division_check(is_null, msg)
+        self._emit_zero_division_check(
+            is_null,
+            msg,
+            pinned_release_on_error=pinned_release_on_error,
+        )
     def _emit_dyn_tagged_int_object_binop(
         self,
         op: str,

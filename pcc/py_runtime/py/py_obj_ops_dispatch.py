@@ -4,37 +4,44 @@ Type-tag dispatch for the simpler generic ops. The compare/hash half
 stays in py_obj_ops_compare.c — porting FNV-1a + bignum cmp to pcc-
 Python is subtle and deferred.
 
-Type tags (inlined per the module-init gotcha):
-    PY_TYPE_NONE     = 0
-    PY_TYPE_BOOL     = 1
-    PY_TYPE_INT      = 2
-    PY_TYPE_FLOAT    = 3
-    PY_TYPE_STR      = 4
-    PY_TYPE_LIST     = 5
-    PY_TYPE_DICT     = 6
-    PY_TYPE_TUPLE    = 7
-    PY_TYPE_SET      = 8
-    PY_TYPE_CLASS    = 10
-    PY_TYPE_INSTANCE = 11
-    PY_TYPE_COMPLEX  = 16
-    PY_TYPE_BYTES    = 17
-    PY_TYPE_BYTEARRAY = 18
-    PY_TYPE_MEMORYVIEW = 19
-    PY_TYPE_COROUTINE = 20
-    PY_TYPE_CONTINUATION = 29
-    PY_TYPE_VIRTUAL_THREAD = 30
-    PY_TYPE_USER     = 100
-
-Object layouts:
-    PyListObject:  length@16   (i64)
-    PyTupleObject: len@16      (i64)
-    PyStrObject:   byte_len@16 (i64)
-    PyDictObject:  size@16     (i64)
-    PySetObject:   size@16     (i64)
-    PyFloatObject: value@16    (f64; we read as i64 bits to test 0)
+Public object layouts and type tags come from generated C-header-derived
+constants.  This module has private operation tables, but it must not carry a
+second numeric copy of the public object ABI in its docstring.
 """
 
 from pcc.extern import extern, c_abi_export, c_int32, c_ptr, c_int64, c_void, c_double
+from pcc.py_runtime.py.py_abi_constants import (
+    C_POINTER_SIZE,
+    PYCLASSOBJECT_MRO_OFFSET,
+    PYCLASSOBJECT_NAME_OFFSET,
+    PYCLASSOBJECT_N_MRO_OFFSET,
+    PYINSTANCEOBJECT_CLS_OFFSET,
+    PY_TYPE_CONTINUATION,
+    PY_TYPE_VIRTUAL_THREAD,
+    PY_TYPE_VTHREAD_CHANNEL,
+)
+from pcc.py_runtime.py.py_abi_constants import (
+    PY_TYPE_BOOL,
+    PY_TYPE_BYTEARRAY,
+    PY_TYPE_BYTES,
+    PY_TYPE_CLASS,
+    PY_TYPE_COMPLEX,
+    PY_TYPE_COROUTINE,
+    PY_TYPE_DICT,
+    PY_TYPE_EXC,
+    PY_TYPE_FLOAT,
+    PY_TYPE_FUNC,
+    PY_TYPE_INSTANCE,
+    PY_TYPE_INT,
+    PY_TYPE_LIST,
+    PY_TYPE_MEMORYVIEW,
+    PY_TYPE_NONE,
+    PY_TYPE_SET,
+    PY_TYPE_STR,
+    PY_TYPE_TUPLE,
+    PY_TYPE_USER_CLASS_START,
+    PY_TYPE_WEAKREF,
+)
 from pcc.unsafe import (
     call_ptr1,
     call_ptr2,
@@ -146,6 +153,12 @@ pcc_capi_cext_object_setattr = extern(
 pcc_capi_cext_object_getitem = extern(
     "pcc_capi_cext_object_getitem", (c_ptr, c_ptr), c_ptr
 )
+pcc_capi_cext_object_setitem = extern(
+    "pcc_capi_cext_object_setitem", (c_ptr, c_ptr, c_ptr), c_int64
+)
+pcc_capi_cext_object_length = extern(
+    "pcc_capi_cext_object_length", (c_ptr,), c_int64
+)
 pcc_capi_type_object_is_callable = extern(
     "pcc_capi_type_object_is_callable", (c_ptr,), c_int64
 )
@@ -169,6 +182,9 @@ py_exc_new_with_value = extern("py_exc_new_with_value", (c_int64, c_ptr), c_ptr)
 py_raise = extern("py_raise", (c_ptr,), c_void)
 py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_err_occurred = extern("py_err_occurred", (), c_int64)
+py_runtime_error_if_unset = extern(
+    "py_runtime_error_if_unset", (c_ptr, c_ptr), c_ptr
+)
 py_gen_send = extern("py_gen_send", (c_ptr, c_ptr), c_ptr)
 py_user_binop_dispatch = extern(
     "py_user_binop_dispatch", (c_ptr, c_ptr, c_ptr, c_ptr, c_ptr), c_ptr
@@ -564,7 +580,7 @@ def _cstr_is_count(s) -> int:
 
 def _type_of(o) -> int:
     if is_tagged_int(o) != 0:
-        return 2  # PY_TYPE_INT
+        return PY_TYPE_INT  # PY_TYPE_INT
     return load_i32(o, 8)
 
 
@@ -588,35 +604,35 @@ def py_obj_truthy(o) -> int:
         if cext_truth > 0:
             return 1
         return 0
-    if tag == 2:  # PY_TYPE_INT
+    if tag == PY_TYPE_INT:  # PY_TYPE_INT
         if py_int_value_i64(o) != 0:
             return 1
         return 0
-    if tag == 3:  # PY_TYPE_FLOAT — read i64 bits at offset 16
+    if tag == PY_TYPE_FLOAT:  # PY_TYPE_FLOAT — read i64 bits at offset 16
         if load_i64(o, 16) != 0:
             return 1
         return 0
-    if tag == 5:  # PY_TYPE_LIST — length@16
+    if tag == PY_TYPE_LIST:  # PY_TYPE_LIST — length@16
         if load_i64(o, 16) != 0:
             return 1
         return 0
-    if tag == 7:  # PY_TYPE_TUPLE — len@16
+    if tag == PY_TYPE_TUPLE:  # PY_TYPE_TUPLE — len@16
         if load_i64(o, 16) != 0:
             return 1
         return 0
-    if tag == 4:  # PY_TYPE_STR — byte_len@16
+    if tag == PY_TYPE_STR:  # PY_TYPE_STR — byte_len@16
         if load_i64(o, 16) != 0:
             return 1
         return 0
-    if tag == 17 or tag == 18 or tag == 19:
+    if tag == PY_TYPE_BYTES or tag == PY_TYPE_BYTEARRAY or tag == PY_TYPE_MEMORYVIEW:
         if py_bytes_len(o) != 0:
             return 1
         return 0
-    if tag == 6:  # PY_TYPE_DICT — size@16
+    if tag == PY_TYPE_DICT:  # PY_TYPE_DICT — size@16
         if load_i64(o, 16) != 0:
             return 1
         return 0
-    if tag == 8:  # PY_TYPE_SET — size@16
+    if tag == PY_TYPE_SET:  # PY_TYPE_SET — size@16
         if load_i64(o, 16) != 0:
             return 1
         return 0
@@ -662,21 +678,26 @@ def py_obj_add(a, b):
         or pcc_capi_is_cext_type_tag(bt) != 0
     ):
         return pcc_capi_cext_binary_number(a, b, 0)
-    if (at == 2 or at == 1) and (bt == 2 or bt == 1):
+    if (at == PY_TYPE_INT or at == PY_TYPE_BOOL) and (bt == PY_TYPE_INT or bt == PY_TYPE_BOOL):
         return py_int_add(a, b)
-    if at == 16 or bt == 16:
+    if at == PY_TYPE_COMPLEX or bt == PY_TYPE_COMPLEX:
         return py_complex_add(a, b)
-    if at == 3 or bt == 3:
+    if at == PY_TYPE_FLOAT or bt == PY_TYPE_FLOAT:
         return py_float_add(a, b)
-    if at == 4 and bt == 4:
+    if at == PY_TYPE_STR and bt == PY_TYPE_STR:
         return py_str_concat(a, b)
-    if (at == 17 or at == 18) and (bt == 17 or bt == 18):
+    if (at == PY_TYPE_BYTES or at == PY_TYPE_BYTEARRAY) and (bt == PY_TYPE_BYTES or bt == PY_TYPE_BYTEARRAY):
         return py_bytes_concat(a, b)
-    if at == 5 and bt == 5:
+    if at == PY_TYPE_LIST and bt == PY_TYPE_LIST:
         return py_list_concat(a, b)
-    if at == 7 and bt == 7:
+    if at == PY_TYPE_TUPLE and bt == PY_TYPE_TUPLE:
         return py_tuple_concat(a, b)
-    if at == 11 or at >= 100 or bt == 11 or bt >= 100:
+    if (
+        at == PY_TYPE_INSTANCE
+        or at >= PY_TYPE_USER_CLASS_START
+        or bt == PY_TYPE_INSTANCE
+        or bt >= PY_TYPE_USER_CLASS_START
+    ):
         return py_user_binop_dispatch(
             a,
             b,
@@ -700,16 +721,21 @@ def py_obj_sub(a, b):
         return null()
     at: int = _type_of(a)
     bt: int = _type_of(b)
-    if (at == 2 or at == 1) and (bt == 2 or bt == 1):
+    if (at == PY_TYPE_INT or at == PY_TYPE_BOOL) and (bt == PY_TYPE_INT or bt == PY_TYPE_BOOL):
         return py_int_sub(a, b)
-    if (at == 3 or at == 2 or at == 1) and (bt == 3 or bt == 2 or bt == 1):
+    if (at == PY_TYPE_FLOAT or at == PY_TYPE_INT or at == PY_TYPE_BOOL) and (bt == PY_TYPE_FLOAT or bt == PY_TYPE_INT or bt == PY_TYPE_BOOL):
         return py_float_sub(a, b)
     if (
         pcc_capi_is_cext_type_tag(at) != 0
         or pcc_capi_is_cext_type_tag(bt) != 0
     ):
         return pcc_capi_cext_subtract(a, b)
-    if at == 11 or at >= 100 or bt == 11 or bt >= 100:
+    if (
+        at == PY_TYPE_INSTANCE
+        or at >= PY_TYPE_USER_CLASS_START
+        or bt == PY_TYPE_INSTANCE
+        or bt >= PY_TYPE_USER_CLASS_START
+    ):
         return py_user_binop_dispatch(
             a,
             b,
@@ -733,28 +759,33 @@ def py_obj_mul(a, b):
         return null()
     at: int = _type_of(a)
     bt: int = _type_of(b)
-    if (at == 2 or at == 1) and (bt == 2 or bt == 1):
+    if (at == PY_TYPE_INT or at == PY_TYPE_BOOL) and (bt == PY_TYPE_INT or bt == PY_TYPE_BOOL):
         return py_int_mul(a, b)
-    if (at == 3 or at == 2 or at == 1) and (bt == 3 or bt == 2 or bt == 1):
+    if (at == PY_TYPE_FLOAT or at == PY_TYPE_INT or at == PY_TYPE_BOOL) and (bt == PY_TYPE_FLOAT or bt == PY_TYPE_INT or bt == PY_TYPE_BOOL):
         return py_float_mul(a, b)
-    if at == 4 and (bt == 1 or bt == 2):
+    if at == PY_TYPE_STR and (bt == PY_TYPE_BOOL or bt == PY_TYPE_INT):
         return py_str_repeat(a, b)
-    if bt == 4 and (at == 1 or at == 2):
+    if bt == PY_TYPE_STR and (at == PY_TYPE_BOOL or at == PY_TYPE_INT):
         return py_str_repeat(b, a)
-    if at == 5 and (bt == 1 or bt == 2):
+    if at == PY_TYPE_LIST and (bt == PY_TYPE_BOOL or bt == PY_TYPE_INT):
         return py_list_repeat(a, py_int_value_i64(b))
-    if bt == 5 and (at == 1 or at == 2):
+    if bt == PY_TYPE_LIST and (at == PY_TYPE_BOOL or at == PY_TYPE_INT):
         return py_list_repeat(b, py_int_value_i64(a))
-    if at == 7 and (bt == 1 or bt == 2):
+    if at == PY_TYPE_TUPLE and (bt == PY_TYPE_BOOL or bt == PY_TYPE_INT):
         return py_tuple_repeat(a, py_int_value_i64(b))
-    if bt == 7 and (at == 1 or at == 2):
+    if bt == PY_TYPE_TUPLE and (at == PY_TYPE_BOOL or at == PY_TYPE_INT):
         return py_tuple_repeat(b, py_int_value_i64(a))
     if (
         pcc_capi_is_cext_type_tag(at) != 0
         or pcc_capi_is_cext_type_tag(bt) != 0
     ):
         return pcc_capi_cext_binary_number(a, b, 2)
-    if at == 11 or at >= 100 or bt == 11 or bt >= 100:
+    if (
+        at == PY_TYPE_INSTANCE
+        or at >= PY_TYPE_USER_CLASS_START
+        or bt == PY_TYPE_INSTANCE
+        or bt >= PY_TYPE_USER_CLASS_START
+    ):
         return py_user_binop_dispatch(
             a,
             b,
@@ -779,10 +810,10 @@ def py_obj_truediv(a, b):
     at: int = _type_of(a)
     bt: int = _type_of(b)
     a_num: int = 0
-    if at == 2 or at == 1 or at == 3:
+    if at == PY_TYPE_INT or at == PY_TYPE_BOOL or at == PY_TYPE_FLOAT:
         a_num = 1
     b_num: int = 0
-    if bt == 2 or bt == 1 or bt == 3:
+    if bt == PY_TYPE_INT or bt == PY_TYPE_BOOL or bt == PY_TYPE_FLOAT:
         b_num = 1
     if a_num == 1 and b_num == 1:
         bd: float = py_float_to_f64(b)
@@ -795,7 +826,9 @@ def py_obj_truediv(a, b):
         pcc_capi_is_cext_type_tag(at) != 0
         or pcc_capi_is_cext_type_tag(bt) != 0
     ):
-        return pcc_capi_cext_binary_number(a, b, 3)
+        # 12 = true_divide in the port op table (3 is remainder there; the
+        # old C shim table used 3 for true divide).
+        return pcc_capi_cext_binary_number(a, b, 12)
     # Non-numeric: full dunder protocol (__truediv__, NotImplemented,
     # reflected __rtruediv__) — the old call_method1 defer only tried
     # the LHS.
@@ -809,40 +842,42 @@ def py_obj_truediv(a, b):
 
 
 def _type_name_cstr_for_tag(tag: int):
-    if tag == 0:
+    if tag == PY_TYPE_NONE:
         return cstr("NoneType")
-    if tag == 1:
+    if tag == PY_TYPE_BOOL:
         return cstr("bool")
-    if tag == 2:
+    if tag == PY_TYPE_INT:
         return cstr("int")
-    if tag == 3:
+    if tag == PY_TYPE_FLOAT:
         return cstr("float")
-    if tag == 4:
+    if tag == PY_TYPE_STR:
         return cstr("str")
-    if tag == 5:
+    if tag == PY_TYPE_LIST:
         return cstr("list")
-    if tag == 6:
+    if tag == PY_TYPE_DICT:
         return cstr("dict")
-    if tag == 7:
+    if tag == PY_TYPE_TUPLE:
         return cstr("tuple")
-    if tag == 8:
+    if tag == PY_TYPE_SET:
         return cstr("set")
-    if tag == 10:
+    if tag == PY_TYPE_CLASS:
         return cstr("type")
-    if tag == 16:
+    if tag == PY_TYPE_COMPLEX:
         return cstr("complex")
-    if tag == 17:
+    if tag == PY_TYPE_BYTES:
         return cstr("bytes")
-    if tag == 18:
+    if tag == PY_TYPE_BYTEARRAY:
         return cstr("bytearray")
-    if tag == 19:
+    if tag == PY_TYPE_MEMORYVIEW:
         return cstr("memoryview")
-    if tag == 20:
+    if tag == PY_TYPE_COROUTINE:
         return cstr("coroutine")
-    if tag == 29:
+    if tag == PY_TYPE_CONTINUATION:
         return cstr("continuation")
-    if tag == 30:
+    if tag == PY_TYPE_VIRTUAL_THREAD:
         return cstr("virtual_thread")
+    if tag == PY_TYPE_VTHREAD_CHANNEL:
+        return cstr("vthread_channel")
     return cstr("object")
 
 
@@ -853,15 +888,15 @@ def py_obj_type_name(o):
         return py_str_new(name, strlen(name))
     tag: int = _type_of(o)
     if _is_instance_tag(tag) != 0:
-        cls = pcc_gc_load_ptr(o, ptr_add(o, 16))
+        cls = pcc_gc_load_ptr(o, ptr_add(o, PYINSTANCEOBJECT_CLS_OFFSET))
         if ptr_is_null(cls) == 0:
-            cls_name = load_ptr(cls, 16)
+            cls_name = load_ptr(cls, PYCLASSOBJECT_NAME_OFFSET)
             if ptr_is_null(cls_name) == 0:
                 return py_str_new(cls_name, strlen(cls_name))
-    if tag == 12:  # PY_TYPE_EXC
+    if tag == PY_TYPE_EXC:  # PY_TYPE_EXC
         cls = pcc_gc_load_ptr(o, ptr_add(o, 16))
         if ptr_is_null(cls) == 0:
-            cls_name = load_ptr(cls, 16)
+            cls_name = load_ptr(cls, PYCLASSOBJECT_NAME_OFFSET)
             if ptr_is_null(cls_name) == 0:
                 return py_str_new(cls_name, strlen(cls_name))
     name = _type_name_cstr_for_tag(tag)
@@ -873,18 +908,24 @@ def py_obj_len(o) -> int:
     if ptr_is_null(o) != 0:
         return 0
     tag: int = _type_of(o)
-    if tag == 5:
+    if tag == PY_TYPE_LIST:
         return py_list_len(o)
-    if tag == 7:
+    if tag == PY_TYPE_TUPLE:
         return py_tuple_len(o)
-    if tag == 4:
+    if tag == PY_TYPE_STR:
         return py_str_len(o)
-    if tag == 17 or tag == 18 or tag == 19:
+    if tag == PY_TYPE_BYTES or tag == PY_TYPE_BYTEARRAY or tag == PY_TYPE_MEMORYVIEW:
         return py_bytes_len(o)
-    if tag == 6:
+    if tag == PY_TYPE_DICT:
         return py_dict_len(o)
-    if tag == 8:
+    if tag == PY_TYPE_SET:
         return py_set_len(o)
+    # Symmetric with py_obj_getitem: a cext object's length is its
+    # mp_length/sq_length slot, not a Python __len__ (-1 = no slot).
+    if pcc_capi_is_cext_type_tag(tag) != 0:
+        cext_len: int = pcc_capi_cext_object_length(o)
+        if cext_len >= 0:
+            return cext_len
     if _is_instance_tag(tag) != 0:
         return py_user_len_dispatch(o, null())
     return 0
@@ -900,21 +941,21 @@ def py_obj_getitem(o, k):
     pcc_runtime_log_event_code(7, 1, tag, _type_of(k), o)
     if pcc_capi_is_cext_type_tag(tag) != 0:
         return pcc_capi_cext_object_getitem(o, k)
-    if tag == 5:
+    if tag == PY_TYPE_LIST:
         idx: int = py_obj_index_i64(k)
         if py_err_occurred() != 0:
             return null()
         return py_list_get(o, idx)
-    if tag == 7:
+    if tag == PY_TYPE_TUPLE:
         idx: int = py_obj_index_i64(k)
         if py_err_occurred() != 0:
             return null()
         return py_tuple_get(o, idx)
-    if tag == 6:
+    if tag == PY_TYPE_DICT:
         return py_dict_get(o, k)
-    if tag == 4:
+    if tag == PY_TYPE_STR:
         return py_str_index(o, k)
-    if tag == 17 or tag == 18 or tag == 19:
+    if tag == PY_TYPE_BYTES or tag == PY_TYPE_BYTEARRAY or tag == PY_TYPE_MEMORYVIEW:
         return py_bytes_getitem(o, k)
     if _is_instance_tag(tag) != 0:
         return py_user_getitem_dispatch(o, k)
@@ -932,20 +973,20 @@ def py_obj_getitem_i64(o, idx: int):
         out = pcc_capi_cext_object_getitem(o, key)
         py_decref(key)
         return out
-    if tag == 5:
+    if tag == PY_TYPE_LIST:
         return py_list_get(o, idx)
-    if tag == 7:
+    if tag == PY_TYPE_TUPLE:
         return py_tuple_get(o, idx)
     key = py_int_from_i64(idx)
-    if tag == 6:
+    if tag == PY_TYPE_DICT:
         out = py_dict_get(o, key)
         py_decref(key)
         return out
-    if tag == 4:
+    if tag == PY_TYPE_STR:
         out = py_str_index(o, key)
         py_decref(key)
         return out
-    if tag == 17 or tag == 18 or tag == 19:
+    if tag == PY_TYPE_BYTES or tag == PY_TYPE_BYTEARRAY or tag == PY_TYPE_MEMORYVIEW:
         out = py_bytes_getitem(o, key)
         py_decref(key)
         return out
@@ -962,9 +1003,9 @@ def py_obj_del_slice(o, lo, hi, step) -> int:
     if ptr_is_null(o) != 0:
         return -1
     tag: int = _type_of(o)
-    if tag == 5:
+    if tag == PY_TYPE_LIST:
         return py_list_del_slice(o, lo, hi, step)
-    if tag == 18:
+    if tag == PY_TYPE_BYTEARRAY:
         return py_bytearray_del_slice(o, lo, hi, step)
     return -1
 
@@ -977,17 +1018,19 @@ def py_obj_setitem(o, k, v) -> int:
         return -1
     tag: int = _type_of(o)
     pcc_runtime_log_event_code(7, 3, tag, _type_of(k), o)
-    if tag == 5:
+    if pcc_capi_is_cext_type_tag(tag) != 0:
+        return pcc_capi_cext_object_setitem(o, k, v)
+    if tag == PY_TYPE_LIST:
         idx: int = py_obj_index_i64(k)
         if py_err_occurred() != 0:
             return -1
         # User-visible store: out-of-range raises catchable IndexError
         # (py_list_set stays the internal non-raising setter).
         return py_list_setitem(o, idx, v)
-    if tag == 6:
+    if tag == PY_TYPE_DICT:
         py_dict_set(o, k, v)
         return 0
-    if tag == 18:
+    if tag == PY_TYPE_BYTEARRAY:
         return py_bytearray_setitem(o, k, v)
     if _is_instance_tag(tag) != 0:
         return py_user_setitem_dispatch(o, k, v, null())
@@ -1000,15 +1043,22 @@ def py_obj_setitem_i64(o, idx: int, v) -> int:
         return -1
     tag: int = _type_of(o)
     pcc_runtime_log_event_code(7, 3, tag, 2, o)
-    if tag == 5:
+    if pcc_capi_is_cext_type_tag(tag) != 0:
+        key = py_int_from_i64(idx)
+        if ptr_is_null(key) != 0:
+            return -1
+        rc: int = pcc_capi_cext_object_setitem(o, key, v)
+        py_decref(key)
+        return rc
+    if tag == PY_TYPE_LIST:
         # User-visible store: out-of-range raises catchable IndexError.
         return py_list_setitem(o, idx, v)
     key = py_int_from_i64(idx)
-    if tag == 6:
+    if tag == PY_TYPE_DICT:
         py_dict_set(o, key, v)
         py_decref(key)
         return 0
-    if tag == 18:
+    if tag == PY_TYPE_BYTEARRAY:
         rc: int = py_bytearray_setitem(o, key, v)
         py_decref(key)
         return rc
@@ -1028,7 +1078,7 @@ def py_obj_delitem(o, k) -> int:
         return -1
     tag: int = _type_of(o)
     pcc_runtime_log_event_code(7, 4, tag, _type_of(k), o)
-    if tag == 5:
+    if tag == PY_TYPE_LIST:
         idx: int = py_obj_index_i64(k)
         if py_err_occurred() != 0:
             return -1
@@ -1036,7 +1086,7 @@ def py_obj_delitem(o, k) -> int:
         if ptr_is_null(popped) == 0:
             py_decref(popped)
         return 0
-    if tag == 6:
+    if tag == PY_TYPE_DICT:
         return py_dict_del(o, k)
     if _is_instance_tag(tag) != 0:
         return py_user_delitem_dispatch(o, k, null())
@@ -1044,9 +1094,9 @@ def py_obj_delitem(o, k) -> int:
 
 
 def _is_instance_tag(tag: int) -> int:
-    if tag == 11:  # PY_TYPE_INSTANCE
+    if tag == PY_TYPE_INSTANCE:  # PY_TYPE_INSTANCE
         return 1
-    if tag >= 100:  # PY_TYPE_USER
+    if tag >= PY_TYPE_USER_CLASS_START:
         return 1
     return 0
 
@@ -1060,15 +1110,21 @@ def _return_builtin_type(cls):
 
 def _dispatch_call_method_with_args(method, self_obj, args, kwargs):
     if ptr_is_null(method) != 0:
-        return null()
+        return py_runtime_error_if_unset(
+            cstr("dispatch_call_method_with_args"),
+            cstr("dispatch_call_method_with_args received NULL method"),
+        )
     n: int = 0
     if ptr_is_null(args) == 0:
         n = py_tuple_len(args)
     if is_tagged_int(method) == 0:
-        if load_i32(method, 8) == 9:  # PY_TYPE_FUNC
+        if load_i32(method, 8) == PY_TYPE_FUNC:  # PY_TYPE_FUNC
             full_args = py_tuple_new(n + 1)
             if ptr_is_null(full_args) != 0:
-                return null()
+                return py_runtime_error_if_unset(
+                    cstr("py_tuple_new"),
+                    cstr("bound method call could not allocate its argument tuple"),
+                )
             py_tuple_set_item(full_args, 0, self_obj)
             i: int = 0
             while i < n:
@@ -1077,16 +1133,37 @@ def _dispatch_call_method_with_args(method, self_obj, args, kwargs):
                 py_decref(item)
                 i = i + 1
             out = py_func_call_kwargs(method, full_args, kwargs)
+            if ptr_is_null(out) != 0:
+                py_runtime_error_if_unset(
+                    cstr("py_func_call_kwargs"),
+                    cstr(
+                        "bound function call returned NULL without setting an exception"
+                    ),
+                )
             py_decref(full_args)
             return out
     if n == 0:
-        return call_ptr1(method, self_obj)
+        out = call_ptr1(method, self_obj)
+        if ptr_is_null(out) != 0:
+            py_runtime_error_if_unset(
+                cstr("bound native method"),
+                cstr("bound native method returned NULL without setting an exception"),
+            )
+        return out
     if n == 1:
         a0 = py_tuple_get(args, 0)
         out = call_ptr2(method, self_obj, a0)
+        if ptr_is_null(out) != 0:
+            py_runtime_error_if_unset(
+                cstr("bound native method"),
+                cstr("bound native method returned NULL without setting an exception"),
+            )
         py_decref(a0)
         return out
-    return null()
+    return py_runtime_error_if_unset(
+        cstr("dispatch_call_method_with_args"),
+        cstr("pcc-Python bound native method supports at most one argument"),
+    )
 
 
 @c_abi_export("py_slice_new")
@@ -1123,7 +1200,8 @@ def py_obj_is_slice(o) -> int:
     if ptr_is_null(cls) != 0:
         return 0
     # py_isinstance does the instance-tag check + MRO walk (an instance may
-    # carry a per-class tag >= PY_TYPE_USER, so don't pre-filter on tag 11).
+    # carry a per-class tag at or above PY_TYPE_USER_CLASS_START, so don't
+    # pre-filter on PY_TYPE_INSTANCE alone).
     return py_isinstance(o, cls)
 
 
@@ -1138,105 +1216,105 @@ def _builtin_type_class_for_tag(tag: int):
             if ptr_is_null(cls) == 0:
                 global_store_ptr("pcc_type_cls_super", cls)
         return _return_builtin_type(cls)
-    if tag == 0:  # PY_TYPE_NONE
+    if tag == PY_TYPE_NONE:  # PY_TYPE_NONE
         cls = global_load_ptr("pcc_type_cls_none")
         if ptr_is_null(cls) != 0:
             cls = py_class_new(cstr("NoneType"), null(), 0, null(), 0)
             if ptr_is_null(cls) == 0:
                 global_store_ptr("pcc_type_cls_none", cls)
         return _return_builtin_type(cls)
-    if tag == 1:  # PY_TYPE_BOOL
+    if tag == PY_TYPE_BOOL:  # PY_TYPE_BOOL
         cls = global_load_ptr("pcc_type_cls_bool")
         if ptr_is_null(cls) != 0:
             cls = py_class_new(cstr("bool"), null(), 0, null(), 0)
             if ptr_is_null(cls) == 0:
                 global_store_ptr("pcc_type_cls_bool", cls)
         return _return_builtin_type(cls)
-    if tag == 2:  # PY_TYPE_INT
+    if tag == PY_TYPE_INT:  # PY_TYPE_INT
         cls = global_load_ptr("pcc_type_cls_int")
         if ptr_is_null(cls) != 0:
             cls = py_class_new(cstr("int"), null(), 0, null(), 0)
             if ptr_is_null(cls) == 0:
                 global_store_ptr("pcc_type_cls_int", cls)
         return _return_builtin_type(cls)
-    if tag == 3:  # PY_TYPE_FLOAT
+    if tag == PY_TYPE_FLOAT:  # PY_TYPE_FLOAT
         cls = global_load_ptr("pcc_type_cls_float")
         if ptr_is_null(cls) != 0:
             cls = py_class_new(cstr("float"), null(), 0, null(), 0)
             if ptr_is_null(cls) == 0:
                 global_store_ptr("pcc_type_cls_float", cls)
         return _return_builtin_type(cls)
-    if tag == 4:  # PY_TYPE_STR
+    if tag == PY_TYPE_STR:  # PY_TYPE_STR
         cls = global_load_ptr("pcc_type_cls_str")
         if ptr_is_null(cls) != 0:
             cls = py_class_new(cstr("str"), null(), 0, null(), 0)
             if ptr_is_null(cls) == 0:
                 global_store_ptr("pcc_type_cls_str", cls)
         return _return_builtin_type(cls)
-    if tag == 5:  # PY_TYPE_LIST
+    if tag == PY_TYPE_LIST:  # PY_TYPE_LIST
         cls = global_load_ptr("pcc_type_cls_list")
         if ptr_is_null(cls) != 0:
             cls = py_class_new(cstr("list"), null(), 0, null(), 0)
             if ptr_is_null(cls) == 0:
                 global_store_ptr("pcc_type_cls_list", cls)
         return _return_builtin_type(cls)
-    if tag == 6:  # PY_TYPE_DICT
+    if tag == PY_TYPE_DICT:  # PY_TYPE_DICT
         cls = global_load_ptr("pcc_type_cls_dict")
         if ptr_is_null(cls) != 0:
             cls = py_class_new(cstr("dict"), null(), 0, null(), 0)
             if ptr_is_null(cls) == 0:
                 global_store_ptr("pcc_type_cls_dict", cls)
         return _return_builtin_type(cls)
-    if tag == 7:  # PY_TYPE_TUPLE
+    if tag == PY_TYPE_TUPLE:  # PY_TYPE_TUPLE
         cls = global_load_ptr("pcc_type_cls_tuple")
         if ptr_is_null(cls) != 0:
             cls = py_class_new(cstr("tuple"), null(), 0, null(), 0)
             if ptr_is_null(cls) == 0:
                 global_store_ptr("pcc_type_cls_tuple", cls)
         return _return_builtin_type(cls)
-    if tag == 8:  # PY_TYPE_SET
+    if tag == PY_TYPE_SET:  # PY_TYPE_SET
         cls = global_load_ptr("pcc_type_cls_set")
         if ptr_is_null(cls) != 0:
             cls = py_class_new(cstr("set"), null(), 0, null(), 0)
             if ptr_is_null(cls) == 0:
                 global_store_ptr("pcc_type_cls_set", cls)
         return _return_builtin_type(cls)
-    if tag == 10:  # PY_TYPE_CLASS
+    if tag == PY_TYPE_CLASS:  # PY_TYPE_CLASS
         cls = global_load_ptr("pcc_type_cls_type")
         if ptr_is_null(cls) != 0:
             cls = py_class_new(cstr("type"), null(), 0, null(), 0)
             if ptr_is_null(cls) == 0:
                 global_store_ptr("pcc_type_cls_type", cls)
         return _return_builtin_type(cls)
-    if tag == 16:  # PY_TYPE_COMPLEX
+    if tag == PY_TYPE_COMPLEX:  # PY_TYPE_COMPLEX
         cls = global_load_ptr("pcc_type_cls_complex")
         if ptr_is_null(cls) != 0:
             cls = py_class_new(cstr("complex"), null(), 0, null(), 0)
             if ptr_is_null(cls) == 0:
                 global_store_ptr("pcc_type_cls_complex", cls)
         return _return_builtin_type(cls)
-    if tag == 17:  # PY_TYPE_BYTES
+    if tag == PY_TYPE_BYTES:  # PY_TYPE_BYTES
         cls = global_load_ptr("pcc_type_cls_bytes")
         if ptr_is_null(cls) != 0:
             cls = py_class_new(cstr("bytes"), null(), 0, null(), 0)
             if ptr_is_null(cls) == 0:
                 global_store_ptr("pcc_type_cls_bytes", cls)
         return _return_builtin_type(cls)
-    if tag == 18:  # PY_TYPE_BYTEARRAY
+    if tag == PY_TYPE_BYTEARRAY:  # PY_TYPE_BYTEARRAY
         cls = global_load_ptr("pcc_type_cls_bytearray")
         if ptr_is_null(cls) != 0:
             cls = py_class_new(cstr("bytearray"), null(), 0, null(), 0)
             if ptr_is_null(cls) == 0:
                 global_store_ptr("pcc_type_cls_bytearray", cls)
         return _return_builtin_type(cls)
-    if tag == 19:  # PY_TYPE_MEMORYVIEW
+    if tag == PY_TYPE_MEMORYVIEW:  # PY_TYPE_MEMORYVIEW
         cls = global_load_ptr("pcc_type_cls_memoryview")
         if ptr_is_null(cls) != 0:
             cls = py_class_new(cstr("memoryview"), null(), 0, null(), 0)
             if ptr_is_null(cls) == 0:
                 global_store_ptr("pcc_type_cls_memoryview", cls)
         return _return_builtin_type(cls)
-    if tag == 20:  # PY_TYPE_COROUTINE
+    if tag == PY_TYPE_COROUTINE:  # PY_TYPE_COROUTINE
         cls = global_load_ptr("pcc_type_cls_coroutine")
         if ptr_is_null(cls) != 0:
             cls = py_class_new(cstr("coroutine"), null(), 0, null(), 0)
@@ -1258,13 +1336,13 @@ def py_type_builtin(o):
     if is_tagged_int(o) != 0:
         return _builtin_type_class_for_tag(2)
     tag: int = _type_of(o)
-    if tag == 12:  # PY_TYPE_EXC
+    if tag == PY_TYPE_EXC:  # PY_TYPE_EXC
         cls = pcc_gc_load_ptr(o, ptr_add(o, 16))
         if ptr_is_null(cls) == 0:
             py_incref(cls)
             return cls
     if _is_instance_tag(tag) != 0:
-        cls = pcc_gc_load_ptr(o, ptr_add(o, 16))
+        cls = pcc_gc_load_ptr(o, ptr_add(o, PYINSTANCEOBJECT_CLS_OFFSET))
         if ptr_is_null(cls) == 0:
             py_incref(cls)
             return cls
@@ -1283,33 +1361,33 @@ def py_builtin_type_class_tag(value) -> int:
     if ptr_eq(value, global_load_ptr("pcc_type_cls_super")) != 0:
         return -3
     if ptr_eq(value, global_load_ptr("pcc_type_cls_none")) != 0:
-        return 0
+        return PY_TYPE_NONE
     if ptr_eq(value, global_load_ptr("pcc_type_cls_bool")) != 0:
-        return 1
+        return PY_TYPE_BOOL
     if ptr_eq(value, global_load_ptr("pcc_type_cls_int")) != 0:
-        return 2
+        return PY_TYPE_INT
     if ptr_eq(value, global_load_ptr("pcc_type_cls_float")) != 0:
-        return 3
+        return PY_TYPE_FLOAT
     if ptr_eq(value, global_load_ptr("pcc_type_cls_str")) != 0:
-        return 4
+        return PY_TYPE_STR
     if ptr_eq(value, global_load_ptr("pcc_type_cls_list")) != 0:
-        return 5
+        return PY_TYPE_LIST
     if ptr_eq(value, global_load_ptr("pcc_type_cls_dict")) != 0:
-        return 6
+        return PY_TYPE_DICT
     if ptr_eq(value, global_load_ptr("pcc_type_cls_tuple")) != 0:
-        return 7
+        return PY_TYPE_TUPLE
     if ptr_eq(value, global_load_ptr("pcc_type_cls_set")) != 0:
-        return 8
+        return PY_TYPE_SET
     if ptr_eq(value, global_load_ptr("pcc_type_cls_type")) != 0:
-        return 10
+        return PY_TYPE_CLASS
     if ptr_eq(value, global_load_ptr("pcc_type_cls_complex")) != 0:
-        return 16
+        return PY_TYPE_COMPLEX
     if ptr_eq(value, global_load_ptr("pcc_type_cls_bytes")) != 0:
-        return 17
+        return PY_TYPE_BYTES
     if ptr_eq(value, global_load_ptr("pcc_type_cls_bytearray")) != 0:
-        return 18
+        return PY_TYPE_BYTEARRAY
     if ptr_eq(value, global_load_ptr("pcc_type_cls_memoryview")) != 0:
-        return 19
+        return PY_TYPE_MEMORYVIEW
     if ptr_eq(value, global_load_ptr("pcc_type_cls_object")) != 0:
         return -1
     return -2
@@ -1369,7 +1447,7 @@ def _py_list_pop_bound_entry(captures, args):
     nargs: int = 0
     if ptr_is_null(args) == 0:
         if is_tagged_int(args) == 0:
-            if load_i32(args, 8) == 7:  # PY_TYPE_TUPLE
+            if load_i32(args, 8) == PY_TYPE_TUPLE:  # PY_TYPE_TUPLE
                 nargs = py_tuple_len(args)
     if nargs > 1:
         py_decref(lst)
@@ -1399,7 +1477,7 @@ def _py_dict_pop_bound_entry(captures, args):
     nargs: int = 0
     if ptr_is_null(args) == 0:
         if is_tagged_int(args) == 0:
-            if load_i32(args, 8) == 7:  # PY_TYPE_TUPLE
+            if load_i32(args, 8) == PY_TYPE_TUPLE:  # PY_TYPE_TUPLE
                 nargs = py_tuple_len(args)
     if nargs < 1:
         py_decref(d)
@@ -1435,7 +1513,7 @@ def _py_set_pop_bound_entry(captures, args):
     nargs: int = 0
     if ptr_is_null(args) == 0:
         if is_tagged_int(args) == 0:
-            if load_i32(args, 8) == 7:  # PY_TYPE_TUPLE
+            if load_i32(args, 8) == PY_TYPE_TUPLE:  # PY_TYPE_TUPLE
                 nargs = py_tuple_len(args)
     if nargs > 0:
         py_decref(s)
@@ -1484,7 +1562,7 @@ def _py_str_count_bound_entry(captures, args):
     nargs: int = 0
     if ptr_is_null(args) == 0:
         if is_tagged_int(args) == 0:
-            if load_i32(args, 8) == 7:  # PY_TYPE_TUPLE
+            if load_i32(args, 8) == PY_TYPE_TUPLE:  # PY_TYPE_TUPLE
                 nargs = py_tuple_len(args)
     if nargs < 1 or nargs > 3:
         py_decref(s)
@@ -1496,7 +1574,7 @@ def _py_str_count_bound_entry(captures, args):
     if ptr_is_null(sub) != 0:
         py_decref(s)
         return null()
-    if is_tagged_int(sub) != 0 or load_i32(sub, 8) != 4:  # PY_TYPE_STR
+    if is_tagged_int(sub) != 0 or load_i32(sub, 8) != PY_TYPE_STR:  # PY_TYPE_STR
         py_decref(sub)
         py_decref(s)
         exc = py_exc_new(3, cstr("str.count argument must be str"))
@@ -1574,14 +1652,14 @@ def py_obj_getattr(o, name):
         return _raise_attribute_error(name)
 
     if _cstr_is_pop(name) != 0:
-        if tag == 5:  # PY_TYPE_LIST
+        if tag == PY_TYPE_LIST:  # PY_TYPE_LIST
             return _py_list_pop_bound(o)
-        if tag == 6:  # PY_TYPE_DICT
+        if tag == PY_TYPE_DICT:  # PY_TYPE_DICT
             return _py_dict_pop_bound(o)
-        if tag == 8:  # PY_TYPE_SET
+        if tag == PY_TYPE_SET:  # PY_TYPE_SET
             return _py_set_pop_bound(o)
 
-    if tag == 4 and _cstr_is_count(name) != 0:  # PY_TYPE_STR
+    if tag == PY_TYPE_STR and _cstr_is_count(name) != 0:  # PY_TYPE_STR
         return _py_str_count_bound(o)
 
     if _is_instance_tag(tag) != 0:
@@ -1591,14 +1669,14 @@ def py_obj_getattr(o, name):
         if py_err_occurred() != 0:
             return result
         return _raise_attribute_error(name)
-    if tag == 10:  # PY_TYPE_CLASS
+    if tag == PY_TYPE_CLASS:  # PY_TYPE_CLASS
         result = py_class_getattr(o, name)
         if ptr_is_null(result) == 0:
             return result
         if py_err_occurred() != 0:
             return result
         return _raise_attribute_error(name)
-    if tag == 9:  # PY_TYPE_FUNC
+    if tag == PY_TYPE_FUNC:  # PY_TYPE_FUNC
         attrs = pcc_gc_load_ptr(o, ptr_add(o, 88))
         if ptr_is_null(attrs) == 0:
             key = py_str_new(name, strlen(name))
@@ -1635,7 +1713,7 @@ def py_obj_getattr(o, name):
                 py_incref(self_obj)
                 return self_obj
         return _raise_attribute_error(name)
-    if tag == 21:  # PY_TYPE_WEAKREF
+    if tag == PY_TYPE_WEAKREF:  # PY_TYPE_WEAKREF
         target = py_weakref_call(o)
         if ptr_is_null(target) != 0:
             exc = py_exc_new(
@@ -1655,7 +1733,7 @@ def py_obj_getattr(o, name):
         result = py_obj_getattr(target, name)
         py_decref(target)
         return result
-    if tag == 20:  # PY_TYPE_COROUTINE
+    if tag == PY_TYPE_COROUTINE:  # PY_TYPE_COROUTINE
         result = null()
         if _cstr_is_dunder_class(name) != 0:
             result = py_coroutine_class()
@@ -1667,7 +1745,7 @@ def py_obj_getattr(o, name):
         if py_err_occurred() != 0:
             return result
         return _raise_attribute_error(name)
-    if tag == 29:  # PY_TYPE_CONTINUATION
+    if tag == PY_TYPE_CONTINUATION:
         result = null()
         if _cstr_is_dunder_class(name) != 0:
             result = py_continuation_class()
@@ -1677,13 +1755,13 @@ def py_obj_getattr(o, name):
         if py_err_occurred() != 0:
             return result
         return _raise_attribute_error(name)
-    if tag == 16:  # PY_TYPE_COMPLEX
+    if tag == PY_TYPE_COMPLEX:  # PY_TYPE_COMPLEX
         if _cstr_is_real(name) != 0:
             return py_complex_real(o)
         if _cstr_is_imag(name) != 0:
             return py_complex_imag(o)
         return _raise_attribute_error(name)
-    if tag == 12:  # PY_TYPE_EXC
+    if tag == PY_TYPE_EXC:  # PY_TYPE_EXC
         result = null()
         if _cstr_is_dunder_class(name) != 0:
             result = pcc_gc_load_ptr(o, ptr_add(o, 16))
@@ -1719,7 +1797,7 @@ def py_obj_getattr(o, name):
             empty: int = 0
             if ptr_is_null(msg) != 0 or ptr_eq(msg, none) != 0:
                 empty = 1
-            elif load_i32(msg, 8) == 4 and load_i64(msg, 16) == 0:
+            elif load_i32(msg, 8) == PY_TYPE_STR and load_i64(msg, 16) == 0:
                 # PY_TYPE_STR(4) with byte_len 0: a no-arg exception stores ""
                 # as message, so args == () like CPython.
                 empty = 1
@@ -1759,7 +1837,7 @@ def py_obj_getattr_default(o, name):
         if py_err_occurred() != 0:
             return result
         return _raise_attribute_error(name)
-    if tag == 10:  # PY_TYPE_CLASS
+    if tag == PY_TYPE_CLASS:  # PY_TYPE_CLASS
         result = py_class_getattr(o, name)
         if ptr_is_null(result) == 0:
             return result
@@ -1794,13 +1872,13 @@ def py_obj_setattr(o, name, v) -> int:
         if py_err_occurred() != 0:
             return rc
         return _raise_attribute_status(name)
-    if tag == 10:  # PY_TYPE_CLASS
+    if tag == PY_TYPE_CLASS:  # PY_TYPE_CLASS
         rc: int = py_class_setattr(o, name, v)
         if rc == 0:
             return rc
         if py_err_occurred() != 0:
             return rc
-    if tag == 9:  # PY_TYPE_FUNC
+    if tag == PY_TYPE_FUNC:  # PY_TYPE_FUNC
         attrs = pcc_gc_load_ptr(o, ptr_add(o, 88))
         attrs_created: int = 0
         if ptr_is_null(attrs) != 0:
@@ -1835,30 +1913,81 @@ def py_obj_delattr(o, name) -> int:
 
     if _is_instance_tag(tag) != 0:
         return py_instance_delattr(o, name)
-    if tag == 10:  # PY_TYPE_CLASS
+    if tag == PY_TYPE_CLASS:  # PY_TYPE_CLASS
         return py_class_delattr(o, name)
     return -1
+
+
+def _require_call_result(result, callee, message):
+    if ptr_is_null(result) != 0 and py_err_occurred() == 0:
+        py_runtime_error_if_unset(callee, message)
+    return result
+
+
+def _not_callable_message(tag: int):
+    if tag == PY_TYPE_NONE:
+        return cstr("'NoneType' object is not callable")
+    if tag == PY_TYPE_BOOL:
+        return cstr("'bool' object is not callable")
+    if tag == PY_TYPE_INT:
+        return cstr("'int' object is not callable")
+    if tag == PY_TYPE_FLOAT:
+        return cstr("'float' object is not callable")
+    if tag == PY_TYPE_STR:
+        return cstr("'str' object is not callable")
+    if tag == PY_TYPE_LIST:
+        return cstr("'list' object is not callable")
+    if tag == PY_TYPE_DICT:
+        return cstr("'dict' object is not callable")
+    if tag == PY_TYPE_TUPLE:
+        return cstr("'tuple' object is not callable")
+    if tag == PY_TYPE_SET:
+        return cstr("'set' object is not callable")
+    if tag == PY_TYPE_BYTES:
+        return cstr("'bytes' object is not callable")
+    if tag == PY_TYPE_BYTEARRAY:
+        return cstr("'bytearray' object is not callable")
+    if tag == PY_TYPE_MEMORYVIEW:
+        return cstr("'memoryview' object is not callable")
+    if tag == PY_TYPE_INSTANCE or tag >= PY_TYPE_USER_CLASS_START:
+        return cstr("instance has no __call__ method")
+    return cstr("object type has no callable protocol")
+
+
+def _raise_not_callable(callable, tag: int):
+    pcc_runtime_log_event_code(7, 10, tag, 0, callable)
+    py_raise_owned(py_exc_new(3, _not_callable_message(tag)))
+    return null()
 
 
 @c_abi_export("py_obj_call")
 def py_obj_call(callable, args, kwargs):
     if ptr_is_null(callable) != 0:
-        return null()
+        return py_runtime_error_if_unset(
+            cstr("py_obj_call"),
+            cstr("py_obj_call received NULL callable"),
+        )
     if is_tagged_int(callable) != 0:
-        return null()
+        return _raise_not_callable(callable, 2)
     tag: int = load_i32(callable, 8)
     pcc_runtime_log_event_code(7, 8, tag, 0, callable)
 
     if pcc_capi_type_object_is_callable(callable) != 0:
-        return pcc_capi_call_type_object(callable, args, kwargs)
+        return _require_call_result(
+            pcc_capi_call_type_object(callable, args, kwargs),
+            cstr("pcc_capi_call_type_object"),
+            cstr(
+                "pcc_capi_call_type_object returned NULL without setting an exception"
+            ),
+        )
 
-    if tag == 10:  # PY_TYPE_CLASS
+    if tag == PY_TYPE_CLASS:  # PY_TYPE_CLASS
         nargs: int = 0
         if ptr_is_null(args) == 0:
             nargs = py_tuple_len(args)
         nkwargs: int = 0
         if ptr_is_null(kwargs) == 0 and ptr_eq(kwargs, global_load_ptr("py_None")) == 0:
-            if _type_of(kwargs) == 6:
+            if _type_of(kwargs) == PY_TYPE_DICT:
                 nkwargs = py_dict_len(kwargs)
         is_builtin: int = 0
         if ptr_eq(callable, global_load_ptr("pcc_type_cls_bool")) != 0:
@@ -1898,12 +2027,12 @@ def py_obj_call(callable, args, kwargs):
             elif ptr_eq(callable, global_load_ptr("pcc_type_cls_int")) != 0:
                 if ptr_is_null(arg) != 0:
                     out = py_int_from_i64(0)
-                elif _type_of(arg) == 2:
+                elif _type_of(arg) == PY_TYPE_INT:
                     py_incref(arg)
                     out = arg
-                elif _type_of(arg) == 1:
+                elif _type_of(arg) == PY_TYPE_BOOL:
                     out = py_int_from_i64(py_obj_truthy(arg))
-                elif _type_of(arg) == 4:
+                elif _type_of(arg) == PY_TYPE_STR:
                     out = py_int_from_cstr_or_raise(py_str_utf8(arg), 10)
                 else:
                     py_raise_owned(
@@ -1931,7 +2060,7 @@ def py_obj_call(callable, args, kwargs):
             elif ptr_eq(callable, global_load_ptr("pcc_type_cls_tuple")) != 0:
                 if ptr_is_null(arg) != 0:
                     out = py_tuple_new(0)
-                elif _type_of(arg) == 7:
+                elif _type_of(arg) == PY_TYPE_TUPLE:
                     py_incref(arg)
                     out = arg
                 else:
@@ -1944,7 +2073,7 @@ def py_obj_call(callable, args, kwargs):
             else:
                 out = py_dict_new()
                 if ptr_is_null(out) == 0 and ptr_is_null(arg) == 0:
-                    if _type_of(arg) != 6:
+                    if _type_of(arg) != PY_TYPE_DICT:
                         py_decref(out)
                         py_raise_owned(
                             py_exc_new(
@@ -1955,21 +2084,39 @@ def py_obj_call(callable, args, kwargs):
                         out = null()
                     else:
                         py_dict_update(out, arg)
+            _require_call_result(
+                out,
+                cstr("native builtin constructor"),
+                cstr(
+                    "native builtin constructor returned NULL without setting an exception"
+                ),
+            )
             if ptr_is_null(arg) == 0:
                 py_decref(arg)
             return out
         inst = py_instance_new(callable)
         if ptr_is_null(inst) != 0:
-            return null()
+            return _require_call_result(
+                null(),
+                cstr("py_instance_new"),
+                cstr("py_instance_new returned NULL without setting an exception"),
+            )
         init_method = py_class_lookup(callable, cstr("__init__"))
         if ptr_is_null(init_method) == 0:
             if is_tagged_int(init_method) == 0:
-                if load_i32(init_method, 8) == 9:  # PY_TYPE_FUNC
+                if load_i32(init_method, 8) == PY_TYPE_FUNC:  # PY_TYPE_FUNC
                     n: int = 0
                     if ptr_is_null(args) == 0:
                         n = py_tuple_len(args)
                     full_args = py_tuple_new(n + 1)
                     if ptr_is_null(full_args) != 0:
+                        _require_call_result(
+                            null(),
+                            cstr("py_tuple_new"),
+                            cstr(
+                                "bound method call could not allocate its argument tuple"
+                            ),
+                        )
                         py_decref(inst)
                         return null()
                     py_tuple_set_item(full_args, 0, inst)
@@ -1980,43 +2127,98 @@ def py_obj_call(callable, args, kwargs):
                         py_decref(item)
                         i = i + 1
                     out = py_func_call_kwargs(init_method, full_args, kwargs)
+                    if ptr_is_null(out) != 0:
+                        _require_call_result(
+                            null(),
+                            cstr("class __init__"),
+                            cstr(
+                                "class __init__ returned NULL without setting an exception"
+                            ),
+                        )
                     py_decref(full_args)
                     if ptr_is_null(out) != 0:
-                        if py_err_occurred() != 0:
-                            py_decref(inst)
-                            return null()
-                    else:
-                        py_decref(out)
+                        py_decref(inst)
+                        return null()
+                    py_decref(out)
         return inst
-    if tag == 9:  # PY_TYPE_FUNC
-        return py_func_call_kwargs(callable, args, kwargs)
-    if tag == 21:  # PY_TYPE_WEAKREF
-        return py_weakref_call(callable)
+    if tag == PY_TYPE_FUNC:  # PY_TYPE_FUNC
+        return _require_call_result(
+            py_func_call_kwargs(callable, args, kwargs),
+            cstr("py_func_call_kwargs"),
+            cstr("py_func_call_kwargs returned NULL without setting an exception"),
+        )
+    if tag == PY_TYPE_WEAKREF:  # PY_TYPE_WEAKREF
+        return _require_call_result(
+            py_weakref_call(callable),
+            cstr("py_weakref_call"),
+            cstr("py_weakref_call returned NULL without setting an exception"),
+        )
     if pcc_capi_is_cext_type_tag(tag) != 0:
-        return pcc_capi_call_cext_object(callable, args, kwargs)
+        return _require_call_result(
+            pcc_capi_call_cext_object(callable, args, kwargs),
+            cstr("pcc_capi_call_cext_object"),
+            cstr(
+                "pcc_capi_call_cext_object returned NULL without setting an exception"
+            ),
+        )
     if _is_instance_tag(tag) != 0:
-        cls = pcc_gc_load_ptr(callable, ptr_add(callable, 16))
+        cls = pcc_gc_load_ptr(
+            callable, ptr_add(callable, PYINSTANCEOBJECT_CLS_OFFSET)
+        )
         method = py_class_lookup(cls, cstr("__call__"))
         if ptr_is_null(method) == 0:
-            return _dispatch_call_method_with_args(method, callable, args, kwargs)
-    return null()
+            return _require_call_result(
+                _dispatch_call_method_with_args(method, callable, args, kwargs),
+                cstr("instance __call__"),
+                cstr("instance __call__ returned NULL without setting an exception"),
+            )
+    return _raise_not_callable(callable, tag)
 
 
 @c_abi_export("py_obj_call_method1")
 def py_obj_call_method1(o, name, arg):
     if ptr_is_null(o) != 0:
-        return null()
+        return py_runtime_error_if_unset(
+            cstr("py_obj_call_method1"),
+            cstr("py_obj_call_method1 received NULL object"),
+        )
     if ptr_is_null(name) != 0:
-        return null()
+        return py_runtime_error_if_unset(
+            cstr("py_obj_call_method1"),
+            cstr("py_obj_call_method1 received NULL method name"),
+        )
+    if ptr_is_null(arg) != 0:
+        return py_runtime_error_if_unset(
+            cstr("py_obj_call_method1"),
+            cstr("py_obj_call_method1 received NULL argument"),
+        )
     method = py_obj_getattr(o, name)
     if ptr_is_null(method) != 0:
-        return null()
+        return _require_call_result(
+            null(),
+            cstr("py_obj_getattr"),
+            cstr("py_obj_getattr returned NULL without setting an exception"),
+        )
     args = py_tuple_new(2)
     if ptr_is_null(args) != 0:
+        _require_call_result(
+            null(),
+            cstr("py_tuple_new"),
+            cstr("py_obj_call_method1 could not allocate its argument tuple"),
+        )
+        py_decref(method)
         return null()
     py_tuple_set_item(args, 0, o)
     py_tuple_set_item(args, 1, arg)
     out = py_obj_call(method, args, global_load_ptr("py_None"))
+    _require_call_result(
+        out,
+        cstr("py_obj_call"),
+        cstr(
+            "py_obj_call_method1 callee returned NULL without setting an exception"
+        ),
+    )
+    py_decref(method)
     py_decref(args)
     return out
 
@@ -2029,23 +2231,23 @@ def py_obj_isinstance(o, cls) -> int:
         return 0
     if is_tagged_int(cls) != 0:
         return 0
-    if load_i32(cls, 8) != 10:  # PY_TYPE_CLASS
+    if load_i32(cls, 8) != PY_TYPE_CLASS:  # PY_TYPE_CLASS
         return 0
     tag: int = _type_of(o)
     if ptr_eq(cls, global_load_ptr("pcc_type_cls_bool")) != 0:
-        return 1 if tag == 1 else 0
+        return 1 if tag == PY_TYPE_BOOL else 0
     if ptr_eq(cls, global_load_ptr("pcc_type_cls_int")) != 0:
-        return 1 if tag == 1 or tag == 2 else 0
+        return 1 if tag == PY_TYPE_BOOL or tag == PY_TYPE_INT else 0
     if ptr_eq(cls, global_load_ptr("pcc_type_cls_float")) != 0:
-        return 1 if tag == 3 else 0
+        return 1 if tag == PY_TYPE_FLOAT else 0
     if ptr_eq(cls, global_load_ptr("pcc_type_cls_str")) != 0:
-        return 1 if tag == 4 else 0
+        return 1 if tag == PY_TYPE_STR else 0
     if ptr_eq(cls, global_load_ptr("pcc_type_cls_list")) != 0:
-        return 1 if tag == 5 else 0
+        return 1 if tag == PY_TYPE_LIST else 0
     if ptr_eq(cls, global_load_ptr("pcc_type_cls_dict")) != 0:
-        return 1 if tag == 6 else 0
+        return 1 if tag == PY_TYPE_DICT else 0
     if ptr_eq(cls, global_load_ptr("pcc_type_cls_tuple")) != 0:
-        return 1 if tag == 7 else 0
+        return 1 if tag == PY_TYPE_TUPLE else 0
     pcc_runtime_log_event_code(7, 9, _type_of(o), _type_of(cls), o)
     return py_isinstance(o, cls)
 
@@ -2056,14 +2258,14 @@ def py_obj_issubclass(derived, cls) -> int:
         py_raise(py_exc_new(3, cstr("issubclass() arg 1 must be a class")))
         return -1
     derived_is_capi_type: int = pcc_capi_is_type_object_value(derived)
-    if derived_is_capi_type == 0 and load_i32(derived, 8) != 10:  # PY_TYPE_CLASS
+    if derived_is_capi_type == 0 and load_i32(derived, 8) != PY_TYPE_CLASS:  # PY_TYPE_CLASS
         py_raise(py_exc_new(3, cstr("issubclass() arg 1 must be a class")))
         return -1
     if ptr_is_null(cls) != 0 or is_tagged_int(cls) != 0:
         py_raise(py_exc_new(3, cstr("issubclass() arg 2 must be a class")))
         return -1
     cls_is_capi_type: int = pcc_capi_is_type_object_value(cls)
-    if cls_is_capi_type == 0 and load_i32(cls, 8) != 10:  # PY_TYPE_CLASS
+    if cls_is_capi_type == 0 and load_i32(cls, 8) != PY_TYPE_CLASS:  # PY_TYPE_CLASS
         py_raise(py_exc_new(3, cstr("issubclass() arg 2 must be a class")))
         return -1
     if derived_is_capi_type != 0 or cls_is_capi_type != 0:
@@ -2074,11 +2276,13 @@ def py_obj_issubclass(derived, cls) -> int:
     cls = pcc_gc_note_relocation_read(cls)
     if ptr_eq(derived, cls) != 0:
         return 1
-    n_mro: int = load_i32(derived, 40)
-    mro = load_ptr(derived, 48)
+    n_mro: int = load_i32(derived, PYCLASSOBJECT_N_MRO_OFFSET)
+    mro = load_ptr(derived, PYCLASSOBJECT_MRO_OFFSET)
     i: int = 0
     while i < n_mro:
-        candidate = pcc_gc_load_ptr(derived, ptr_add(mro, i * 8))
+        candidate = pcc_gc_load_ptr(
+            derived, ptr_add(mro, i * C_POINTER_SIZE)
+        )
         if ptr_eq(candidate, cls) != 0:
             return 1
         i += 1

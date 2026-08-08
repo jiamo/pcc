@@ -1,6 +1,6 @@
 # 《pcc 的设计与实现》/ The Design and Implementation of pcc — 全书蓝图
 
-十部十九章 + 前言 + 附录。每章蓝图含:主题边界、必读素材、必须回答的设计问题、
+十一部二十章 + 前言 + 附录。每章蓝图含:主题边界、必读素材、必须回答的设计问题、
 必讲的案例研究来源。写作 agent 不得越出本章边界(相邻章节会覆盖)。
 
 跨章引用写法:「见第 N 章」/ "see Chapter N",不要复述他章内容。
@@ -14,7 +14,9 @@
 - 边界:pcc 的论题(thesis)——native / auditable / self-hostable / no-libpython;
   五大差异化(自举不动点、五 GC、值模型、self 后端、长跑效率);七义务;
   "一个使命,不是两个"(工业↔学术);"性能是已证语义的后果";
-  运行时四层(C kernel / C semantic runtime / pcc-Python runtime / C-API shim)总览。
+  运行时四层(compiler intrinsics / freestanding pcc-Python / semantic pcc-Python /
+  C/libc oracle)总览;区分 no-libpython、Python-owned runtime、Linux zero-libc 与
+  Darwin named-libSystem boundary。
 - 素材:`AGENTS.md`(Project Intent 全文)、`README.md`、`codex-goal-prompt.md` 开头部分、
   `docs/current-goal-state.md` 顶部审计快照。
 - 设计问题:为什么"加速器"不是目标?为什么 honesty(mode-labeled claims)是架构的一部分?
@@ -117,7 +119,7 @@
 文件:`ch10-gc-architecture.md`
 - 边界:`PCC_GC_KIND_*` 枚举与 `PCC_GC_BACKEND` 运行时选择;**一套槽位契约**
   (`py_obj_visit_slots`/`py_obj_update_slot`/root+frame+native-handle 注册)供五后端、
-  C kernel、pcc-Python 镜像共用——生产平等规则,为什么决不允许第二套对象图规则;
+  freestanding/semantic pcc-Python 共用——生产平等规则,为什么决不允许第二套对象图规则;
   读写屏障 API(`pcc_gc_load_ptr`/`pcc_gc_store_ptr`)及哪些后端依赖哪侧;
   帧根:槽粒度、非 LIFO,为什么 frame_index 必须是哈希(换链表曾把 gc3 退化到 900s);
   终结器/弱引用/复活/挂起协程帧/调度队列/C 扩展引用——任何后端不得靠弱化这些取胜。
@@ -166,19 +168,21 @@
 
 ## 第 VII 部 自举与 no-libpython (Part VII: Self-Hosting)
 
-### 第 14 章 no-libpython:把运行时收缩成内核 (No-libpython: Shrinking the Runtime to a Kernel)
+### 第 14 章 no-libpython 与 zero-libc:让运行时成为 pcc-Python (No-libpython and Zero-libc: Making the Runtime pcc-Python)
 文件:`ch14-no-libpython.md`
-- 边界:四层模型(C kernel KEEP-minimize / C semantic runtime SHRINK /
-  pcc-Python runtime GROW / C-API shim KEEP-spec)详解;no-libpython ≠ 零 C;
-  `pcc/extern/` 与 `pcc/unsafe/` 如何让 pcc-Python 写底层;C↔pcc-Python 镜像纪律与
-  默认链接 PY_MODULES 端口(而非 C 源)的构建事实;回退棘轮
-  (`tests/fallback_baseline.json`、fallback_explainer/fallback_routes);
-  C-only helper 何时合理(单一 C 实现、无端口镜像)。
-- 素材:`AGENTS.md` Runtime layering、`pcc/py_runtime/py/` 目录、`pcc/extern/`、
-  `pcc/unsafe/`、`pcc/py_runtime/` 的 Makefile/构建脚本(rg 查 PY_MODULES)、
-  fallback 基线测试。
-- 案例研究:PCC_RUNTIME_CC=cc 测出假信心(C 修复在 PY_MODULES 文件里默认模式不生效);
-  float repr 多路径;no-libpython idiom slices 工作法。
+- 边界:四层模型(compiler intrinsics KEEP / freestanding pcc-Python GROW /
+  semantic pcc-Python GROW / C-libc source REMOVE-from-production);严格区分
+  no-libpython、pcc-Python-owned runtime、Linux tracer zero-libc、完整生产 zero-libc;
+  Darwin 只允许具名 libSystem ABI,绝不标 zero-libc;`pcc/extern/` 与 `pcc/unsafe/`
+  如何让 pcc-Python 写分配器、线程、GC、libc-like substrate 与 ABI shim;
+  `PCC_PY_OBJECTS`/provenance 归档构建;fallback 棘轮与 link-map 闭包的正交关系;
+  当前有限 DONE_STRONG 切片与 `LIBC-P3-FREESTANDING-RUNTIME-CLOSURE` 开放边界。
+- 素材:`AGENTS.md` Runtime layering、`pcc/py_runtime/Makefile`、
+  `pcc/py_runtime/py/freestanding_{mem_str,allocator,linux_start,gc_index_table,platform_io}.py`、
+  `docs/goal/evidence/2026-08-03-{linux-zero-libc-python-start,freestanding-gc-done-strong,freestanding-mem-str-done-strong,freestanding-allocator-done-strong,freestanding-platform-wrappers-done-strong}.md`、
+  `tests/fallback_baseline.json`。
+- 案例研究:`PCC_RUNTIME_CC=cc` 的 oracle 假信心;`py_capi_shim.o` 改名
+  `py_capi_compat.o` 绕过文件名棘轮,最终改成 source-ownership 断言。
 
 ### 第 15 章 自举:pcc1→pcc2→pcc3 不动点 (Bootstrap: the pcc1→pcc2→pcc3 Fixed Point)
 文件:`ch15-bootstrap-fixed-point.md`
@@ -248,6 +252,30 @@
 - 设计问题:为什么"oracle,不是 owner"必须写进架构(与 self 后端对 LLVM、值模型对 Valhalla 同律)?
   为什么"有 TVM/tilelang 支持"是要防的 overclaim?
 - 案例研究:import 上游帮你跑通 kernel ≠ 执行所有权;claim level 阶梯为何存在。
+
+## 第 XI 部 应用执行 (Part XI: Application Execution)
+
+### 第 20 章 声明式 GUI:组件、调度与无 WebView 应用边界 (Declarative GUI: Components, Scheduling, and a Webview-Free Application Boundary)
+文件:`ch20-declarative-gui.md`
+- 边界:GUI 作为执行所有权的产品压力测试;canonical `pcc_gui_kit` 的 generation-id
+  可回收节点池、layout/clip/scroll/paint-order hit path;机器可读 v1 ABI 的 bounded
+  render context/descriptor/state/update/effect/listener/command 记录;key+type reconcile 与
+  atomic commit;SET/reducer queue、四 lane、aging、yield/restart/replay;唯一 event dispatch
+  owner 与 effect phases;namespaced token、bounded utility candidate compiler/cache;
+  managed state、invoke/result/error/cancellation;无 WebView 的 app lifecycle;
+  CoreGraphics/Metal/AppKit 边界与 `mac_diff_app` canary。明确“吸收机制”不等于
+  React/Tailwind/Tauri API/wire compatibility。
+- 素材:`docs/design/gui-declarative-absorption.md`、
+  `pcc/py_runtime/gui_declarative_contract_v1.json`、
+  `pcc/py_runtime/py/pcc_gui_{kit,components,scheduler,events,style,commands,app_lifecycle}.py`、
+  `projects/mac_diff_app/{declarative_app,declarative_headless,app}.py`、
+  `tests/python/test_pcc_gui_*.py`、`tests/python/test_mac_diff_app_declarative.py`。
+- 设计问题:为什么 committed tree 只能有一个 mutation owner?为什么 priority lane 需要
+  base-queue replay 而非 dirty bit?为什么 native bridge acknowledgement 不等于 pixel correctness?
+  为什么 managed Python references 必须先加入五 GC slot contract?
+- 案例研究:runtime/project/app 三份 kernel 导致证据无归属;GUI 暴露的 class-method
+  argument tagging 与 raw module-pointer rooting 边界。状态必须写成 source-present、
+  gate-defined、task-board TODO_READY 三层,不得把未运行闸门写成完成。
 
 ---
 

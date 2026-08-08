@@ -7,6 +7,7 @@ import pytest
 from pcc.backend import BackendUnavailable
 from pcc.backend.self_backend_analysis import collect_used_values, value_has_uses
 from pcc.backend.self_backend_aarch64_darwin_abi import (
+    aggregate_hfa_members,
     aggregate_reg_chunks,
     assign_abi_arg_regs,
     stack_arg_offsets,
@@ -109,12 +110,14 @@ from pcc.backend.self_backend_aarch64_darwin import (
     _drop_fallthrough_uncond_branches,
     _drop_unreferenced_empty_local_labels,
     _retarget_branch,
+    _thread_trampoline_branches,
 )
 from pcc.backend.self_backend_dispatch import (
     emit_self_asm,
     self_backend_target_identity,
 )
 from pcc.backend.self_backend_x86_64_linux import emit_x86_64_linux_asm
+from pcc.tools.text_filecheck import check_text
 from pcc.backend.self_backend_emit import emit_function_blocks
 from pcc.backend.self_backend_instruction_dispatch import emit_instruction_dispatch
 from pcc.backend.self_backend_ir import (
@@ -519,6 +522,147 @@ bb0:
     assert ".byte 1" in asm_text
 
 
+def test_self_backend_x86_64_linux_emits_initial_exec_tls_sections_and_accesses():
+    ir_text = r'''
+target triple = "x86_64-unknown-linux-gnu"
+
+@tls_init = thread_local global i32 37, align 4
+@tls_zero = thread_local(initialexec) global ptr null, align 8
+
+define i32 @tls_read() {
+entry:
+  %value = load i32, ptr @tls_init, align 4
+  ret i32 %value
+}
+
+define void @tls_write(i32 %value) {
+entry:
+  store i32 %value, ptr @tls_init, align 4
+  ret void
+}
+
+define ptr @tls_address() {
+entry:
+  ret ptr @tls_zero
+}
+'''.strip()
+
+    asm_text = emit_x86_64_linux_asm(ir_text)
+
+    assert '.section .tdata,"awT",@progbits' in asm_text
+    assert '.section .tbss,"awT",@nobits' in asm_text
+    assert ".type tls_init, @object" in asm_text
+    assert ".type tls_zero, @object" in asm_text
+    assert "  .long 37" in asm_text
+    assert "  .zero 8" in asm_text
+    assert "tls_init@gottpoff[rip]" in asm_text
+    assert "tls_zero@gottpoff[rip]" in asm_text
+    assert "QWORD PTR fs:0" in asm_text
+    assert "__tls_get_addr" not in asm_text
+    assert "lea rax, tls_zero[rip]" not in asm_text
+    assert "DWORD PTR tls_init[rip]" not in asm_text
+
+
+def test_self_backend_bootstrap_parsers_avoid_unowned_regex_constructs():
+    assert self_backend_parse._thread_local_models(
+        "internal thread_local(initialexec) unnamed_addr ",
+        "@value = internal thread_local(initialexec) global i32 1",
+    ) == ["initialexec"]
+    assert self_backend_parse._thread_local_models(
+        "thread_local ",
+        "@value = thread_local global i32 1",
+    ) == ["default"]
+    assert self_backend_parse._parse_call_arg_alignment(
+        "noundef align 16 dereferenceable(16) %value"
+    ) == 16
+    assert self_backend_parse._parse_call_arg_alignment("noundef %value") == 0
+
+
+def test_self_backend_bootstrap_parsers_reject_malformed_finite_attributes():
+    with pytest.raises(BackendUnavailable, match="empty thread_local model"):
+        self_backend_parse._thread_local_models(
+            "thread_local() ",
+            "@value = thread_local() global i32 1",
+        )
+    with pytest.raises(BackendUnavailable, match="without a value"):
+        self_backend_parse._parse_call_arg_alignment("noundef align")
+    with pytest.raises(BackendUnavailable, match="non-integer alignment"):
+        self_backend_parse._parse_call_arg_alignment("noundef align wide %value")
+    with pytest.raises(BackendUnavailable, match="invalid alignment 3"):
+        self_backend_parse._parse_call_arg_alignment("noundef align 3 %value")
+
+
+@pytest.mark.parametrize(
+    "model",
+    ("localexec", "localdynamic", "generaldynamic", "futuremodel"),
+)
+def test_self_backend_x86_64_linux_rejects_unsupported_tls_models(model):
+    ir_text = f'''
+target triple = "x86_64-unknown-linux-gnu"
+@tls_value = thread_local({model}) global i32 7, align 4
+
+define i32 @main() {{
+entry:
+  %value = load i32, ptr @tls_value, align 4
+  ret i32 %value
+}}
+'''.strip()
+
+    with pytest.raises(
+        BackendUnavailable,
+        match="self-x86_64-linux ELF TLS lowering does not support model",
+    ):
+        emit_x86_64_linux_asm(ir_text)
+
+
+def test_self_backend_x86_64_linux_rejects_external_tls_before_asm_publication():
+    ir_text = r'''
+target triple = "x86_64-unknown-linux-gnu"
+@tls_external = external thread_local global i32
+
+define i32 @main() {
+entry:
+  %value = load i32, ptr @tls_external, align 4
+  ret i32 %value
+}
+'''.strip()
+
+    with pytest.raises(
+        BackendUnavailable,
+        match="self-x86_64-linux ELF TLS lowering does not support external",
+    ):
+        emit_x86_64_linux_asm(ir_text)
+
+
+def test_self_backend_x86_64_linux_rejects_unsupported_tls_storage_shapes():
+    section_ir = r'''
+target triple = "x86_64-unknown-linux-gnu"
+@tls_value = thread_local global i32 7, section ".custom_tls", align 4
+
+define i32 @main() {
+entry:
+  %value = load i32, ptr @tls_value, align 4
+  ret i32 %value
+}
+'''.strip()
+    aggregate_ir = r'''
+target triple = "x86_64-unknown-linux-gnu"
+@tls_value = thread_local global [2 x i32] [i32 7, i32 9], align 4
+
+define ptr @main() {
+entry:
+  ret ptr @tls_value
+}
+'''.strip()
+
+    with pytest.raises(BackendUnavailable, match="does not support attributes"):
+        emit_x86_64_linux_asm(section_ir)
+    with pytest.raises(
+        BackendUnavailable, match="scalar integers and null pointers"
+    ):
+        emit_x86_64_linux_asm(aggregate_ir)
+
+
 def test_self_backend_x86_64_linux_mangles_reserved_global_symbol_names():
     ir_text = """
 target triple = "x86_64-unknown-linux-gnu"
@@ -687,6 +831,51 @@ bb0:
     assert ".zero 8" in asm_text
     assert ".byte 104" in asm_text
     assert ".byte 0" in asm_text
+
+
+def test_self_backend_x86_64_linux_emits_mixed_word_pointer_struct_global():
+    """define_global_struct_words emits a struct global mixing i64 words and
+    a pointer-to-global reference at an exact word offset.  This is the
+    primitive the C-API Py*_Type recognition tokens are built on."""
+    ir_text = """
+target triple = "x86_64-unknown-linux-gnu"
+
+@name = internal constant [4 x i8] c"int\00"
+
+@PyLong_Type = global { i64, i64, i64, i64, ptr, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64, i64 } { i64 1, i64 0, i64 0, i64 0, ptr @name, i64 0, i64 0, i64 0, i64 0, i64 0, i64 0, i64 0, i64 0, i64 0, i64 0, i64 0, i64 0, i64 0, i64 0, i64 0, i64 0, i64 0, i64 0, i64 4096 }
+
+define i32 @main() {
+bb0:
+  ret i32 0
+}
+""".strip()
+
+    asm_text = emit_x86_64_linux_asm(ir_text)
+    module = parse_self_backend_module(ir_text)
+    symbols = prepare_module_symbols(
+        ir_text, list(module.globals_), list(module.functions)
+    )
+    internal_name = symbols.internal_prefix + "name"
+    # Refcount is first and the name pointer is exactly word 4 (offset 32).
+    # Ordered/NEXT matching makes a reordered or dropped pointer field fail;
+    # the old three independent substring assertions did not.  The input name
+    # is internal, so require its exact deterministic module-local spelling
+    # rather than pretending it is the exported symbol ``name``.
+    check_text(
+        asm_text,
+        f"""
+        CHECK: .globl PyLong_Type
+        CHECK: PyLong_Type:
+        CHECK-NEXT: .quad 1
+        CHECK-NEXT: .quad 0
+        CHECK-NEXT: .quad 0
+        CHECK-NEXT: .quad 0
+        CHECK-NOT: .quad 4096
+        CHECK-NEXT: .quad {internal_name}
+        CHECK: .quad 4096
+        """,
+        label="x86_64 mixed word/pointer struct global asm",
+    )
 
 
 def test_self_backend_x86_64_linux_emits_nested_array_globals():
@@ -888,6 +1077,23 @@ entry:
     assert ".Lmain_sel_select_false:" in asm_text
 
 
+def test_self_backend_x86_64_linux_sanitizes_anonymous_select_labels():
+    ir_text = """
+target triple = "x86_64-unknown-linux-gnu"
+
+define i32 @popen(i1 %cond, i32 %x, i32 %y) {
+entry:
+  %.83 = select i1 %cond, i32 %x, i32 %y
+  ret i32 %.83
+}
+""".strip()
+
+    asm_text = emit_x86_64_linux_asm(ir_text)
+
+    assert ".Lpopen_dot83_select_false:" in asm_text
+    assert ".Lpopen_%" not in asm_text
+
+
 def test_self_backend_x86_64_linux_lowers_vector_splat_binop_reduce_subset():
     ir_text = """
 target triple = "x86_64-unknown-linux-gnu"
@@ -1001,6 +1207,42 @@ entry:
     asm_text = emit_x86_64_linux_asm(ir_text)
     assert "lea r10, [rbp -" in asm_text
     assert "mov QWORD PTR [rbp -" in asm_text
+
+
+def test_self_backend_x86_64_linux_emits_scalar_fp_int_bitcasts():
+    ir_text = """
+target triple = "x86_64-unknown-linux-gnu"
+
+define i64 @double_bits(double %value) {
+entry:
+  %bits = bitcast double %value to i64
+  ret i64 %bits
+}
+
+define double @bits_double(i64 %bits) {
+entry:
+  %value = bitcast i64 %bits to double
+  ret double %value
+}
+
+define i32 @float_bits(float %value) {
+entry:
+  %bits = bitcast float %value to i32
+  ret i32 %bits
+}
+
+define float @bits_float(i32 %bits) {
+entry:
+  %value = bitcast i32 %bits to float
+  ret float %value
+}
+""".strip()
+
+    asm_text = emit_x86_64_linux_asm(ir_text)
+    assert "movq r10, xmm10" in asm_text
+    assert "movq xmm10, r10" in asm_text
+    assert "movd r10d, xmm10" in asm_text
+    assert "movd xmm10, r10d" in asm_text
 
 
 def test_self_backend_x86_64_linux_emits_trunc_subset():
@@ -1412,6 +1654,7 @@ def test_self_backend_target_registry_lists_current_target_identities():
 def test_self_backend_target_matchers_cover_current_aliases():
     assert is_aarch64_darwin_triple("arm64-apple-darwin23.6.0") is True
     assert is_aarch64_darwin_triple("aarch64-apple-darwin") is True
+    assert is_aarch64_darwin_triple("arm64-apple-macosx12.0.0") is True
     assert is_x86_64_linux_triple("x86_64-unknown-linux-gnu") is True
     assert is_x86_64_linux_triple("amd64-pc-linux-gnu") is True
     assert is_supported_self_backend_target_triple("arm64-apple-darwin23.6.0") is True
@@ -1495,8 +1738,10 @@ entry:
 
     assert instrs[1].kind == "store"
     assert instrs[1].data[0] == TypeDesc("int", 32)
+    assert instrs[1].is_volatile
     assert instrs[2].kind == "load"
     assert instrs[2].data[1] == TypeDesc("int", 32)
+    assert instrs[2].is_volatile
 
 
 def test_self_backend_shared_parser_accepts_anonymous_struct_return_header():
@@ -1988,6 +2233,33 @@ def test_self_backend_aarch64_abi_helpers_cover_small_aggregate_and_stack_overfl
     assert assignments[:8] == [(f"x{i}",) for i in range(8)]
     assert assignments[8] == ()
     assert stack_arg_offsets(arg_types, assignments)[8] == 16
+
+
+def test_self_backend_aarch64_hfa_helpers_flatten_nested_natural_offsets():
+    f32 = TypeDesc("fp", 32)
+    nested = TypeDesc(
+        "struct",
+        fields=(
+            TypeDesc("array", count=2, elem=f32),
+            TypeDesc("struct", fields=(f32, f32)),
+        ),
+    )
+
+    assert aggregate_hfa_members(nested) == (
+        (f32, 0),
+        (f32, 4),
+        (f32, 8),
+        (f32, 12),
+    )
+    assert store_value_to_address("x9", nested, 2) == [
+        "  str s2, [x9]",
+        "  str s3, [x9, #4]",
+        "  str s4, [x9, #8]",
+        "  str s5, [x9, #12]",
+    ]
+
+    mixed = TypeDesc("struct", fields=(f32, TypeDesc("fp", 64)))
+    assert aggregate_hfa_members(mixed) == ()
 
 
 def test_self_backend_aarch64_memory_helpers_cover_opcode_selection_and_copy_chunks():
@@ -2877,6 +3149,7 @@ entry:
         ((TypeDesc("int", 64), "lhs"), (TypeDesc("int", 64), "rhs")),
         0,
         False,
+        (0, 0),
     )
     assert extract_instr.kind == "extractvalue"
     assert extract_instr.data[:3] == ("value", pair_type, "mul")
@@ -2907,6 +3180,7 @@ entry:
         ((pair_type, "pair"), (TypeDesc("int", 64), "extra")),
         2,
         False,
+        (0, 0),
     )
 
 
@@ -3015,6 +3289,37 @@ done:
     assert entry.terminator.data == ("taken",)
     assert taken.terminator.kind == "br"
     assert taken.terminator.data == ("done",)
+
+
+def test_constant_branch_folding_removes_only_the_discarded_phi_edge():
+    ir_text = """
+target triple = "arm64-apple-darwin23.6.0"
+
+define i64 @main() {
+entry:
+  br i1 true, label %live, label %join
+
+live:
+  br label %join
+
+join:
+  %value = phi i64 [ 1, %entry ], [ 2, %live ]
+  ret i64 %value
+}
+""".strip()
+    module = parse_self_backend_module(ir_text)
+    function = module.functions[0]
+    blocks = {block.name: block for block in function.blocks}
+
+    assert blocks["entry"].terminator.kind == "br"
+    assert blocks["entry"].terminator.data == ("live",)
+    assert tuple(
+        incoming.label for incoming in blocks["join"].phis[0].incoming
+    ) == ("live",)
+    prepare_module_for_target(
+        ir_text,
+        aggregate_returned_indirect=lambda _type: False,
+    )
 
 
 def test_self_backend_parse_supports_switch_with_numeric_labels():
@@ -4192,18 +4497,12 @@ entry:
     func = module.functions[0]
     prepare_parsed_function(func)
     assign_stack_slots(func, aggregate_returned_indirect=lambda _ty: False)
+    call_instr = func.blocks[0].instructions[0]
+    assert call_instr.kind == "call"
     assert emit_compute_instruction(
         func,
-        "call",
-        (
-            "r",
-            TypeDesc("int", 32),
-            "foo",
-            False,
-            ((TypeDesc("int", 32), "x"),),
-            1,
-            False,
-        ),
+        call_instr.kind,
+        call_instr.data,
         symbols,
     ) == [
         f"  ldur w0, [x29, #-{func.value_slots['x'].offset}]",
@@ -5625,17 +5924,18 @@ entry:
     assert emit_memory_instruction(func, "store", store_instr.data, symbols) == [
         f"  adrp x9, {asm_symbol('gd', symbols)}@PAGE",
         f"  add x9, x9, {asm_symbol('gd', symbols)}@PAGEOFF",
-        "  movz x14, #0",
-        "  str x14, [x9]",
-        "  add x16, x9, #8",
-        "  movz x14, #16368, lsl #48",
-        "  str x14, [x16]",
-        "  add x16, x9, #16",
-        "  movz x14, #16384, lsl #48",
-        "  str x14, [x16]",
-        "  add x16, x9, #24",
-        "  movz x14, #16392, lsl #48",
-        "  str x14, [x16]",
+        "  movz x12, #0",
+        "  fmov d10, x12",
+        "  movz x12, #16368, lsl #48",
+        "  fmov d11, x12",
+        "  movz x12, #16384, lsl #48",
+        "  fmov d12, x12",
+        "  movz x12, #16392, lsl #48",
+        "  fmov d13, x12",
+        "  str d10, [x9]",
+        "  str d11, [x9, #8]",
+        "  str d12, [x9, #16]",
+        "  str d13, [x9, #24]",
     ]
 
 
@@ -5796,18 +6096,19 @@ merge:
   %phi = phi i32 [%a, %t], [%b, %f]
   ret i32 %phi
 }
-""".strip()
+    """.strip()
     module = parse_self_backend_module(phi_ir)
+    symbols = prepare_module_symbols(
+        phi_ir, list(module.globals_), list(module.functions)
+    )
     func = module.functions[0]
     prepare_parsed_function(func)
     assign_stack_slots(func, aggregate_returned_indirect=lambda _ty: False)
     phi_lines = emit_phi_assignments(
         func, source_block="t", target_block="merge", module_symbols=symbols
     )
-    assert f"  ldur w9, [x29, #-{func.value_slots['a'].offset}]" in phi_lines
-    assert f"  stur w9, [x29, #-{func.value_slots['phi'].offset}]" in phi_lines
-    assert "  sub sp, sp, #16" not in phi_lines
-    assert "  add sp, sp, #16" not in phi_lines
+    assert func.value_slots["a"].offset == func.value_slots["phi"].offset
+    assert phi_lines == []
 
 
 def test_self_backend_aarch64_phi_assignments_skip_temp_for_independent_scalar_sources():
@@ -6004,23 +6305,16 @@ merge:
         "  autiasp",
         "  ret",
     ]
-    # Older codegen materialized phi-incoming values via a
-    # stack-scratch shuffle: ``sub sp, sp, #16; mov x13, sp; str ...;
-    # mov x13, sp; ldr ...; stur ...; add sp, sp, #16``. The current
-    # backend folds the scratch dance into a direct load + store
-    # because the source slot ``a`` is already in stack memory.
-    # Both are semantically correct: copy ``%a`` into ``%phi``'s
-    # slot, then branch to ``merge``. Assert the new compact form.
+    # Slot allocation coalesces this phi with both incoming values, so the
+    # edge needs no copy at all. Dedicated phi tests below cover non-coalesced
+    # direct copies and parallel-copy cycles.
+    assert func.value_slots["a"].offset == func.value_slots["phi"].offset
     assert emit_branch_terminator(
         func,
         source_block="t",
         target="merge",
         module_symbols=symbols,
-    ) == [
-        f"  ldur w9, [x29, #-{func.value_slots['a'].offset}]",
-        f"  stur w9, [x29, #-{func.value_slots['phi'].offset}]",
-        "  b L_main_merge",
-    ]
+    ) == ["  b L_main_merge"]
     assert emit_cond_branch_terminator(
         func,
         block_name="entry",
@@ -6286,6 +6580,28 @@ def test_self_backend_can_execute_via_evaluate(tmp_path):
     assert result == 0
 
 
+def test_self_backend_evaluate_does_not_publish_llvm_native_cache(
+    tmp_path, monkeypatch
+):
+    import pcc.evaluater.c_evaluator as c_evaluator
+
+    def fail_native_cache(*_args, **_kwargs):
+        raise AssertionError("self backend must not enter LLVM native cache")
+
+    monkeypatch.setattr(c_evaluator, "_build_native_cache", fail_native_cache)
+    result = c_evaluator.CEvaluator(
+        backend="self",
+        allow_unimplemented_backend=True,
+    ).evaluate(
+        "int main(void) { return 0; }\n",
+        optimize=0,
+        base_dir=str(tmp_path),
+        use_system_cpp=False,
+    )
+
+    assert result == 0
+
+
 def test_self_backend_system_link_uses_self_emitter_not_llvm_object_path(
     tmp_path, monkeypatch
 ):
@@ -6520,6 +6836,93 @@ def test_self_backend_supports_simple_struct_field(tmp_path):
     )
 
     assert result == 0
+
+
+def test_self_backend_aarch64_aligned_fixed_block_simd_runtime(tmp_path):
+    def copy_probe(size: int) -> str:
+        tail_offset = size - 8
+        return f'''
+define i32 @copy_{size}() {{
+entry:
+  %src = alloca [{size} x i8], align 16
+  %dst = alloca [{size} x i8], align 16
+  %src.tail = getelementptr inbounds i8, ptr %src, i64 {tail_offset}
+  %dst.tail = getelementptr inbounds i8, ptr %dst, i64 {tail_offset}
+  store i64 1234605616436508552, ptr %src, align 8
+  store i64 72623859790382856, ptr %src.tail, align 8
+  call void @llvm.memcpy.p0.p0.i64(ptr align 16 %dst, ptr align 16 %src, i64 {size}, i1 false)
+  %head = load i64, ptr %dst, align 8
+  %tail = load i64, ptr %dst.tail, align 8
+  %head.bad = icmp ne i64 %head, 1234605616436508552
+  %tail.bad = icmp ne i64 %tail, 72623859790382856
+  %bad = or i1 %head.bad, %tail.bad
+  %result = zext i1 %bad to i32
+  ret i32 %result
+}}
+'''.strip()
+
+    def zero_probe(size: int) -> str:
+        tail_offset = size - 8
+        return f'''
+define i32 @zero_{size}() {{
+entry:
+  %dst = alloca [{size} x i8], align 16
+  %dst.tail = getelementptr inbounds i8, ptr %dst, i64 {tail_offset}
+  store i64 -1, ptr %dst, align 8
+  store i64 -1, ptr %dst.tail, align 8
+  call void @llvm.memset.p0.i64(ptr align 16 %dst, i8 0, i64 {size}, i1 false)
+  %head = load i64, ptr %dst, align 8
+  %tail = load i64, ptr %dst.tail, align 8
+  %merged = or i64 %head, %tail
+  %bad = icmp ne i64 %merged, 0
+  %result = zext i1 %bad to i32
+  ret i32 %result
+}}
+'''.strip()
+
+    probes = [
+        *(copy_probe(size) for size in (32, 64, 128)),
+        *(zero_probe(size) for size in (32, 64, 128)),
+    ]
+    calls = []
+    status = "0"
+    for kind in ("copy", "zero"):
+        for size in (32, 64, 128):
+            result = f"{kind}.{size}"
+            merged = f"status.{kind}.{size}"
+            calls.append(f"  %{result} = call i32 @{kind}_{size}()")
+            calls.append(f"  %{merged} = or i32 {status}, %{result}")
+            status = f"%{merged}"
+    ir_text = "\n\n".join(
+        (
+            'target triple = "arm64-apple-darwin23.6.0"',
+            "declare void @llvm.memcpy.p0.p0.i64(ptr, ptr, i64, i1)",
+            "declare void @llvm.memset.p0.i64(ptr, i8, i64, i1)",
+            *probes,
+            "\n".join(
+                (
+                    "define i32 @main() {",
+                    "entry:",
+                    *calls,
+                    f"  ret i32 {status}",
+                    "}",
+                )
+            ),
+        )
+    )
+    asm_path = tmp_path / "simd-fixed-blocks.s"
+    asm_text = emit_aarch64_darwin_asm(ir_text)
+    asm_path.write_text(asm_text, encoding="utf-8")
+
+    assert asm_text.count("  ldr q0, [x10") == (32 + 64 + 128) // 16
+    assert asm_text.count("  str q0, [x9") == 2 * (32 + 64 + 128) // 16
+    assert asm_text.count("  movi v0.16b, #0") == 3
+    assert "  bl _memcpy" not in asm_text
+    assert "  bl _memset" not in asm_text
+
+    run = _assemble_and_run(asm_path, tmp_path)
+
+    assert run.returncode == 0
 
 
 def test_self_backend_resolves_forward_referenced_named_types_in_ir(tmp_path):
@@ -7508,6 +7911,18 @@ no:
 
 
 def test_self_backend_aarch64_forwards_one_intervening_stack_store_load():
+    assert _forward_one_intervening_stack_store_load(
+        [
+            "  stur x0, [x29, #-24]",
+            "  ldur x9, [x29, #-8]",
+            "  ldur x10, [x29, #-24]",
+        ]
+    ) == [
+        "  stur x0, [x29, #-24]",
+        "  ldur x9, [x29, #-8]",
+        "  mov x10, x0",
+    ]
+
     ir_text = """
 target triple = "arm64-apple-darwin23.6.0"
 target datalayout = "e-m:o-p270:32:32-p271:32:32-p272:64:64-i64:64-i128:128-n32:64-S128-Fn32"
@@ -7525,13 +7940,25 @@ bb0:
     asm_text = emit_aarch64_darwin_asm(ir_text)
     lines = asm_text.splitlines()
 
-    assert "  mov x10, x0" in lines
-    assert not any(
-        lines[index].startswith("  stur x0, [x29, #-")
-        and lines[index + 1].startswith("  ldur x9, [x29, #-")
-        and lines[index + 2].startswith("  ldur x10, [x29, #-")
-        for index in range(len(lines) - 2)
+    # A precise-stackmap anchor after the call is an optimization barrier: the
+    # return-value store must not be forwarded across the metadata position.
+    result_store = next(
+        index
+        for index, line in enumerate(lines)
+        if line.startswith("  stur x0, [x29, #-")
     )
+    stackmap_anchor = next(
+        index
+        for index, line in enumerate(lines)
+        if line.startswith("L_pcc_smap_") and index > result_store
+    )
+    result_reload = next(
+        index
+        for index, line in enumerate(lines)
+        if line.startswith("  ldur x10, [x29, #-")
+    )
+    assert result_store < stackmap_anchor < result_reload
+    assert "  mov x10, x0" not in lines
 
 
 def test_self_backend_aarch64_does_not_forward_through_aliasing_intervening_load():
@@ -7646,6 +8073,7 @@ next:
 def test_self_backend_aarch64_folds_conditional_branch_to_fallthrough_pair():
     assert _fold_cond_branch_to_fallthrough(
         [
+            "L_main_source:",
             "  b.eq L_then",
             "  b L_else",
             "",
@@ -7653,8 +8081,10 @@ def test_self_backend_aarch64_folds_conditional_branch_to_fallthrough_pair():
             "  ret",
             "L_else:",
             "  ret",
-        ]
+        ],
+        [("L_main_source", "L_else", "L_then")],
     ) == [
+        "L_main_source:",
         "  b.ne L_else",
         "",
         "L_then:",
@@ -7665,15 +8095,33 @@ def test_self_backend_aarch64_folds_conditional_branch_to_fallthrough_pair():
 
     assert _fold_cond_branch_to_fallthrough(
         [
+            "L_main_source:",
             "  b.eq L_then",
             "  b L_else",
             "L_other:",
             "L_then:",
-        ]
+        ],
+        [("L_main_source", "L_else", "L_then")],
     ) == [
+        "L_main_source:",
         "  b.eq L_then",
         "  b L_else",
         "L_other:",
+        "L_then:",
+    ]
+
+    assert _fold_cond_branch_to_fallthrough(
+        [
+            "L_main_source:",
+            "  b.eq L_then",
+            "  b L_else",
+            "L_then:",
+        ],
+        [],
+    ) == [
+        "L_main_source:",
+        "  b.eq L_then",
+        "  b L_else",
         "L_then:",
     ]
 
@@ -7717,6 +8165,15 @@ def test_self_backend_aarch64_drops_only_unreferenced_empty_local_labels():
         "  mov x0, x0",
         "L_next:",
     ]
+
+    stack_map_lines = [
+        "L_pcc_smap_0123456789abcdef_7:",
+        "  b L_target",
+        "L_target:",
+        "  ret",
+    ]
+    assert _thread_trampoline_branches(stack_map_lines) == stack_map_lines
+    assert _drop_unreferenced_empty_local_labels(stack_map_lines) == stack_map_lines
 
 
 def test_self_backend_aarch64_folds_zero_compare_immediate():
@@ -7867,6 +8324,18 @@ def test_self_backend_aarch64_folds_dead_zero_store_source():
 
 
 def test_self_backend_aarch64_folds_dead_mov_store_source():
+    # An atomic release store consumes w10.  The preceding stack load only
+    # redefines x9, so forwarding a stack reload of w10 does not make the move
+    # dead.  This is the exact sequence emitted for a constant atomic store to
+    # a global after _forward_one_intervening_stack_store_load runs.
+    release_store_lines = [
+        "  mov w10, w9",
+        "  stur w10, [x29, #-28]",
+        "  ldur x9, [x29, #-24]",
+        "  stlr w10, [x9]",
+    ]
+    assert _fold_mov_store_source(release_store_lines) == release_store_lines
+
     assert _fold_mov_store_source(
         [
             "  mov x10, x0",

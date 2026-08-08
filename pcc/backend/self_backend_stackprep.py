@@ -139,6 +139,36 @@ def assign_stack_slots(
                     func.value_slots.setdefault(
                         dest, alloc_value_slot(dest, value_type)
                     )
+            elif kind == "load_atomic":
+                dest, value_type, _ptr_type, _ptr, _ordering = data
+                func.value_types[dest] = value_type
+                if value_is_used(dest):
+                    func.value_slots.setdefault(
+                        dest, alloc_value_slot(dest, value_type)
+                    )
+            elif kind == "atomicrmw":
+                dest, _op, _ptr_type, _ptr, value_type, _value, _ordering = data
+                func.value_types[dest] = value_type
+                if value_is_used(dest):
+                    func.value_slots.setdefault(
+                        dest, alloc_value_slot(dest, value_type)
+                    )
+            elif kind == "cmpxchg":
+                dest = data[0]
+                pair_type = data[1]
+                func.value_types[dest] = pair_type
+                if value_is_used(dest):
+                    func.value_slots.setdefault(
+                        dest, alloc_value_slot(dest, pair_type)
+                    )
+            elif kind == "syscall6":
+                dest = data[0]
+                i64_type = TypeDesc("int", 64)
+                func.value_types[dest] = i64_type
+                if value_is_used(dest):
+                    func.value_slots.setdefault(
+                        dest, alloc_value_slot(dest, i64_type)
+                    )
             elif kind == "binop":
                 _op, dest, value_type, _lhs, _rhs = data
                 func.value_types[dest] = value_type
@@ -275,6 +305,7 @@ def assign_stack_slots(
                     _args,
                     _fixed_arg_count,
                     _is_vararg_call,
+                    _arg_alignments,
                 ) = data
                 if dest is not None:
                     func.value_types[dest] = ret_type

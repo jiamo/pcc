@@ -100,7 +100,7 @@ class LoopInfo:
 
 
 class LoopInfoResult(AnalysisResult):
-    KEY = AnalysisKey("loop-info")
+    KEY = AnalysisKey("loop-info", scope="function")
 
     def __init__(self, info: LoopInfo) -> None:
         self.info = info

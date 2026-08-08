@@ -8,6 +8,7 @@
 
 #include "py_internal.h"
 
+#include <stdio.h>
 #include <sys/stat.h>
 #include <stdlib.h>
 #include <string.h>
@@ -51,7 +52,7 @@ static PyObject *path_seq_borrow(PyObject *parts, int64_t i) {
     }
 }
 
-PyObject *py_os_makedirs(PyObject *path, int32_t exist_ok) {
+PyObject *py_os_makedirs(PyObject *path, int64_t mode, int32_t exist_ok) {
     PyObject *owned = NULL;
     PyObject *item = coerce_path_str(path, &owned);
     if (item == NULL) {
@@ -84,9 +85,10 @@ PyObject *py_os_makedirs(PyObject *path, int32_t exist_ok) {
         if (i != end && buf[i] != '/') continue;
         char saved = buf[i];
         buf[i] = '\0';
-        if (mkdir(buf, 0777) != 0) {
+        int final_component = (i == end);
+        mode_t component_mode = final_component ? (mode_t)mode : (mode_t)0777;
+        if (mkdir(buf, component_mode) != 0) {
             int32_t kind = py_path_stat_kind(buf);
-            int final_component = (i == end);
             if (kind != 2 || (final_component && !exist_ok)) {
                 buf[i] = saved;
                 free(buf);
@@ -100,6 +102,69 @@ PyObject *py_os_makedirs(PyObject *path, int32_t exist_ok) {
 
     free(buf);
     py_decref(owned);
+    return py_None;
+}
+
+PyObject *py_os_unlink(PyObject *path) {
+    PyObject *owned = NULL;
+    PyObject *item = coerce_path_str(path, &owned);
+    if (item == NULL) {
+        py_decref(owned);
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "path must be string-like"));
+        return NULL;
+    }
+    int rc = unlink(py_str_utf8(item));
+    py_decref(owned);
+    if (rc != 0) {
+        py_raise_owned(py_exc_new(PY_EXC_OSERROR, "could not unlink path"));
+        return NULL;
+    }
+    return py_None;
+}
+
+PyObject *py_os_replace(PyObject *source, PyObject *destination) {
+    PyObject *source_owned = NULL;
+    PyObject *destination_owned = NULL;
+    PyObject *source_item = coerce_path_str(source, &source_owned);
+    PyObject *destination_item = coerce_path_str(destination, &destination_owned);
+    if (source_item == NULL || destination_item == NULL) {
+        py_decref(source_owned);
+        py_decref(destination_owned);
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "paths must be string-like"));
+        return NULL;
+    }
+    int rc = rename(py_str_utf8(source_item), py_str_utf8(destination_item));
+    py_decref(source_owned);
+    py_decref(destination_owned);
+    if (rc != 0) {
+        py_raise_owned(py_exc_new(PY_EXC_OSERROR, "could not replace path"));
+        return NULL;
+    }
+    return py_None;
+}
+
+PyObject *py_os_chmod(PyObject *path, int64_t mode) {
+    PyObject *owned = NULL;
+    PyObject *item = coerce_path_str(path, &owned);
+    if (item == NULL) {
+        py_decref(owned);
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "path must be string-like"));
+        return NULL;
+    }
+    int rc = chmod(py_str_utf8(item), (mode_t)mode);
+    py_decref(owned);
+    if (rc != 0) {
+        py_raise_owned(py_exc_new(PY_EXC_OSERROR, "could not change path mode"));
+        return NULL;
+    }
+    return py_None;
+}
+
+PyObject *py_os_fsync(int64_t fd) {
+    if (fsync((int)fd) != 0) {
+        py_raise_owned(py_exc_new(PY_EXC_OSERROR, "could not synchronize file"));
+        return NULL;
+    }
     return py_None;
 }
 

@@ -1,5 +1,10 @@
 """pcc-Python replacement for py_runtime/src/py_int_decimal.c."""
 from pcc.extern import extern, c_abi_export, c_int64, c_ptr
+from pcc.py_runtime.py.py_abi_constants import (
+    PYINTOBJECT_DIGITS_OFFSET,
+    PYINTOBJECT_NDIGITS_OFFSET,
+    PYINTOBJECT_SIGN_OFFSET,
+)
 from pcc.unsafe import (
     free,
     load_i8,
@@ -29,35 +34,35 @@ def _store_u32(obj, offset: int, value: int) -> None:
 
 
 def _normalize(b) -> None:
-    ndigits: int = load_i32(b, 20)
-    while ndigits > 0 and _load_u32(b, 24 + (ndigits - 1) * 4) == 0:
+    ndigits: int = load_i32(b, PYINTOBJECT_NDIGITS_OFFSET)
+    while ndigits > 0 and _load_u32(b, PYINTOBJECT_DIGITS_OFFSET + (ndigits - 1) * 4) == 0:
         ndigits = ndigits - 1
-    store_i32(b, 20, ndigits)
+    store_i32(b, PYINTOBJECT_NDIGITS_OFFSET, ndigits)
     if ndigits == 0:
-        store_i32(b, 16, 0)
-    elif load_i32(b, 16) == 0:
-        store_i32(b, 16, 1)
+        store_i32(b, PYINTOBJECT_SIGN_OFFSET, 0)
+    elif load_i32(b, PYINTOBJECT_SIGN_OFFSET) == 0:
+        store_i32(b, PYINTOBJECT_SIGN_OFFSET, 1)
 
 
 def _bigint_copy(a):
-    ndigits: int = load_i32(a, 20)
+    ndigits: int = load_i32(a, PYINTOBJECT_NDIGITS_OFFSET)
     r = py_bigint_alloc(ndigits)
     if ptr_is_null(r):
         return r
-    store_i32(r, 16, load_i32(a, 16))
+    store_i32(r, PYINTOBJECT_SIGN_OFFSET, load_i32(a, PYINTOBJECT_SIGN_OFFSET))
     i: int = 0
     while i < ndigits:
-        store_i32(r, 24 + i * 4, load_i32(a, 24 + i * 4))
+        store_i32(r, PYINTOBJECT_DIGITS_OFFSET + i * 4, load_i32(a, PYINTOBJECT_DIGITS_OFFSET + i * 4))
         i = i + 1
     return r
 
 
 def _divmod_small_inplace(a, divisor: int) -> int:
     rem: int = 0
-    i: int = load_i32(a, 20) - 1
+    i: int = load_i32(a, PYINTOBJECT_NDIGITS_OFFSET) - 1
     while i >= 0:
-        cur: int = rem * 4294967296 + _load_u32(a, 24 + i * 4)
-        _store_u32(a, 24 + i * 4, cur // divisor)
+        cur: int = rem * 4294967296 + _load_u32(a, PYINTOBJECT_DIGITS_OFFSET + i * 4)
+        _store_u32(a, PYINTOBJECT_DIGITS_OFFSET + i * 4, cur // divisor)
         rem = cur % divisor
         i = i - 1
     _normalize(a)
@@ -72,7 +77,7 @@ def _write_digit(buf, pos: int, digit: int) -> int:
 
 @c_abi_export("py_bigint_to_cstr")
 def py_bigint_to_cstr(b):
-    if load_i32(b, 16) == 0:
+    if load_i32(b, PYINTOBJECT_SIGN_OFFSET) == 0:
         s = malloc(2)
         if ptr_is_null(s):
             return s
@@ -80,7 +85,7 @@ def py_bigint_to_cstr(b):
         store_i8(s, 1, 0)
         return s
 
-    ndigits: int = load_i32(b, 20)
+    ndigits: int = load_i32(b, PYINTOBJECT_NDIGITS_OFFSET)
     bufsz: int = ndigits * 10 + 2
     buf = malloc(bufsz)
     if ptr_is_null(buf):
@@ -90,14 +95,14 @@ def py_bigint_to_cstr(b):
     if ptr_is_null(tmp):
         free(buf)
         return null()
-    store_i32(tmp, 16, 1)
+    store_i32(tmp, PYINTOBJECT_SIGN_OFFSET, 1)
 
     pos: int = bufsz - 1
     store_i8(buf, pos, 0)
 
-    while load_i32(tmp, 20) > 0:
+    while load_i32(tmp, PYINTOBJECT_NDIGITS_OFFSET) > 0:
         rem: int = _divmod_small_inplace(tmp, 1000000000)
-        more: bool = load_i32(tmp, 20) > 0
+        more: bool = load_i32(tmp, PYINTOBJECT_NDIGITS_OFFSET) > 0
         if not more:
             if rem == 0:
                 pos = _write_digit(buf, pos, 0)
@@ -113,7 +118,7 @@ def py_bigint_to_cstr(b):
                 k = k + 1
     free(tmp)
 
-    if load_i32(b, 16) < 0:
+    if load_i32(b, PYINTOBJECT_SIGN_OFFSET) < 0:
         pos = pos - 1
         store_i8(buf, pos, 45)
 
@@ -127,9 +132,9 @@ def py_bigint_to_base_cstr(b, base: int, prefix_ch: int):
     # (lowercase a-f). Mirrors py_bigint_to_base_cstr in py_int_decimal.c:
     # repeated divmod by the small base, one digit per iteration.
     neg: int = 0
-    if load_i32(b, 16) < 0:
+    if load_i32(b, PYINTOBJECT_SIGN_OFFSET) < 0:
         neg = 1
-    ndigits: int = load_i32(b, 20)
+    ndigits: int = load_i32(b, PYINTOBJECT_NDIGITS_OFFSET)
     bufsz: int = ndigits * 32 + 8   # base 2 is widest: <=32 bits per limb
     buf = malloc(bufsz)
     if ptr_is_null(buf):
@@ -138,7 +143,7 @@ def py_bigint_to_base_cstr(b, base: int, prefix_ch: int):
     if ptr_is_null(tmp):
         free(buf)
         return null()
-    store_i32(tmp, 16, 1)           # work on the magnitude (b is nonzero here)
+    store_i32(tmp, PYINTOBJECT_SIGN_OFFSET, 1)           # work on the magnitude (b is nonzero here)
     pos: int = bufsz - 1
     store_i8(buf, pos, 0)           # NUL
     done: int = 0
@@ -149,7 +154,7 @@ def py_bigint_to_base_cstr(b, base: int, prefix_ch: int):
         if rem >= 10:
             ch = 97 + rem - 10      # 'a' + (rem - 10)
         store_i8(buf, pos, ch)
-        if load_i32(tmp, 20) == 0:
+        if load_i32(tmp, PYINTOBJECT_NDIGITS_OFFSET) == 0:
             done = 1
     free(tmp)
     pos = pos - 1
@@ -200,7 +205,7 @@ def py_bigint_from_cstr(s):
             free(acc)
             return null()
 
-        la: int = load_i32(acc, 20)
+        la: int = load_i32(acc, PYINTOBJECT_NDIGITS_OFFSET)
         nxt = py_bigint_alloc(la + 1)
         if ptr_is_null(nxt):
             free(acc)
@@ -209,27 +214,27 @@ def py_bigint_from_cstr(s):
         carry: int = 0
         i: int = 0
         while i < la:
-            cur: int = _load_u32(acc, 24 + i * 4) * mul + carry
-            _store_u32(nxt, 24 + i * 4, cur & 4294967295)
+            cur: int = _load_u32(acc, PYINTOBJECT_DIGITS_OFFSET + i * 4) * mul + carry
+            _store_u32(nxt, PYINTOBJECT_DIGITS_OFFSET + i * 4, cur & 4294967295)
             carry = cur >> 32
             i = i + 1
-        _store_u32(nxt, 24 + la * 4, carry)
+        _store_u32(nxt, PYINTOBJECT_DIGITS_OFFSET + la * 4, carry)
 
         carry = chunk
         i = 0
-        while i < load_i32(nxt, 20) and carry != 0:
-            cur = _load_u32(nxt, 24 + i * 4) + carry
-            _store_u32(nxt, 24 + i * 4, cur & 4294967295)
+        while i < load_i32(nxt, PYINTOBJECT_NDIGITS_OFFSET) and carry != 0:
+            cur = _load_u32(nxt, PYINTOBJECT_DIGITS_OFFSET + i * 4) + carry
+            _store_u32(nxt, PYINTOBJECT_DIGITS_OFFSET + i * 4, cur & 4294967295)
             carry = cur >> 32
             i = i + 1
 
-        store_i32(nxt, 16, 1)
+        store_i32(nxt, PYINTOBJECT_SIGN_OFFSET, 1)
         _normalize(nxt)
         free(acc)
         acc = nxt
 
-    if load_i32(acc, 20) == 0:
-        store_i32(acc, 16, 0)
+    if load_i32(acc, PYINTOBJECT_NDIGITS_OFFSET) == 0:
+        store_i32(acc, PYINTOBJECT_SIGN_OFFSET, 0)
     else:
-        store_i32(acc, 16, sign)
+        store_i32(acc, PYINTOBJECT_SIGN_OFFSET, sign)
     return acc

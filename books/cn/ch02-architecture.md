@@ -16,7 +16,7 @@
 
 1. **C 前端是成熟参照。** 它编译并运行 Lua、SQLite、PostgreSQL `libpq`、zlib、PCRE、OpenSSL 这一级别的真实项目(README 状态表),为整个仓库提供"编译器应当是什么质量"的基线。
 2. **Python 前端是自举(bootstrap)轨道。** 它是实验性的,目标不是覆盖全部 Python,而是把 pcc 自身的源码编译成原生二进制——`pcc0/host → pcc1 → pcc2 → pcc3` 的不动点(见第 15 章)。
-3. **运行时被两条流水线共同消费。** Python 路径把它当链接对象(`libpy_runtime*.a`);而当 `PCC_RUNTIME_CC=pcc` 时,运行时的 C 源本身又由 C 前端编译——C 前端的成熟度直接决定运行时档案的可信度。
+3. **运行时被两条流水线共同消费。** Python 路径把它当链接对象(`libpy_runtime*.a`);当前生产 `libpy_runtime_pcc_py.a` 只由 pcc 编译的 semantic/freestanding Python 对象组装,C 前端继续编译 C/oracle 路径并验证共享 ABI。两条前端因此都约束运行时可信度,但不再共享一个生产 C 实现。
 
 这个闭环解释了仓库里若干否则显得奇怪的纪律。模式标注的(mode-labeled)声明不是文档礼貌,而是结构必需:同一条命令 `pcc x.py`,跑在宿主 CPython 上是 host pcc,跑在编译产物上是 pcc1,两者的能力边界不同(README 明确:pcc1 对 C 输入目前是**委托宿主 `pcc` 的兼容外壳**,不是 pcc1 原生执行 `c_evaluator.py`);`--python-libpython=off` 与 `auto` 产出的二进制依赖面不同;`--backend llvm` 与 `--backend self` 的执行根不同。本章出现的每一个组件都会标注它属于哪个模式空间。
 
@@ -222,7 +222,7 @@ pcc/py_frontend/pipeline.py :: compile_python
 
 ### 2.4.4 运行时档案与两个链接根
 
-`_ensure_runtime` 按三个维度选择要链接的运行时档案:`PCC_RUNTIME_CC`(运行时由 pcc 还是宿主 cc 编译,默认 pcc)× `PCC_RUNTIME_HIGH`(高层运行时模块用 pcc-Python 端口还是 C 实现,默认 py)× 是否需要 libpython 桥。默认组合落在 `libpy_runtime_pcc_py.a`——pcc 编译的、以 pcc-Python 端口为高层的档案;档案存在还要过陈旧检测(`_runtime_archive_stale`),过不了就经 Makefile 重建。四层运行时模型与 C/pcc-Python 镜像纪律见第 14 章;此处只需要这个事实:**默认链接的是 pcc-Python 端口而非 C 源**,所以"只改了 C 实现"的修复在默认模式下可能根本没被链接进来。
+`_ensure_runtime` 按三个维度选择要链接的运行时档案:`PCC_RUNTIME_CC`、`PCC_RUNTIME_HIGH` 与是否需要 libpython 桥。默认组合落在 `libpy_runtime_pcc_py.a`;档案存在还要通过陈旧检测与 provenance 验证,否则经 Makefile 重建。2026-08 的生产配方比早期“高层端口替换 C”模型更强:`LIB_PCC_PY` 只归档 `PCC_PY_OBJECTS`,其中同时含 semantic `PY_MODULES` 与 `FREESTANDING_PY_MODULES`。C 源保留为 oracle,不因存在于 `src/` 就进入生产归档。no-libpython、Python-owned runtime 与 Linux zero-libc 的差别见第 14 章。
 
 链接根有两个,由 `_link_native` 分派:`llvm` 走 `_link_with_clang`(先经 `_clang_link_compatible_python_ir` 把较新的 LLVM 内存效应属性降级成 clang 可吞的形态);`self` 走 `_link_with_self_backend`,其产物发布序列值得整段引用——临时文件上 `codesign --force -s -`,`/bin/mv -f` 原子改名,`codesign --verify`,最后一道发布屏障(`/bin/sync` 或对产物做一次完整读)。这串仪式的来历是 2.6.2 的案例研究。注意 Python 路径的发射后端只接受 `llvm` 与 `self`(`_resolve_native_backend` 对 `llvm_capi` 明确报错):`llvm_capi` 是 IR 构建层的选择,不是 Python 可执行文件的发射器。
 
@@ -252,7 +252,8 @@ pcc/py_frontend/pipeline.py :: compile_python
 | [pcc/parse/c_parser.py](../../pcc/parse/c_parser.py)、[pcc/codegen/c_codegen.py](../../pcc/codegen/c_codegen.py) | C 解析(第 3 章)与 C 语义低层化(第 4 章) |
 | [pcc/parse/py_parse.py](../../pcc/parse/py_parse.py)、`py_lift.py`、[pcc/py_frontend/](../../pcc/py_frontend) | Python 解析/提升、类型推断、低层化(第 5、6 章) |
 | [pcc/py_frontend/pipeline.py](../../pcc/py_frontend/pipeline.py) | Python 流水线总指挥:闭包、回退判定、链接、发布 |
-| [pcc/py_runtime/](../../pcc/py_runtime) | 运行时:C 源 + pcc-Python 端口 + 五 GC(第 7–11、14 章) |
+| [pcc/py_runtime/](../../pcc/py_runtime) | 运行时:semantic/freestanding pcc-Python 生产 owners + C oracle + 五 GC(第 7–11、14 章) |
+| `pcc/py_runtime/py/pcc_gui_*.py`、[projects/mac_diff_app/](../../projects/mac_diff_app) | 声明式 GUI kernel、组件/调度/事件/样式/命令/lifecycle 与产品 canary(第 20 章) |
 | [pcc/llvm_capi/](../../pcc/llvm_capi)、[pcc/backend/](../../pcc/backend) | LLVM-C 构建层(第 12 章)与 self 后端(第 13 章) |
 | [pcc/extern/](../../pcc/extern)、[pcc/unsafe/](../../pcc/unsafe) | pcc-Python 写底层的两件工具(第 14 章) |
 | [utils/fake_libc_include/](../../utils/fake_libc_include) | 伪 libc 头(第 3 章) |

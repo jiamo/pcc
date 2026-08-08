@@ -4,11 +4,13 @@ Keep ``py_tuple_slice`` in its own archive member so ordinary tuple
 construction, indexing, len, concat, and compare paths do not force tuple
 slicing into user-runtime executables.
 """
+from pcc.py_runtime.py.py_abi_constants import (
+    PY_TYPE_TUPLE,
+)
 
 from pcc.extern import c_abi_export, c_int32, c_int64, c_ptr, c_void, extern
 from pcc.unsafe import (
     cstr,
-    getenv,
     global_load_ptr,
     is_tagged_int,
     load_i32,
@@ -18,6 +20,7 @@ from pcc.unsafe import (
     ptr_add,
     ptr_eq,
     ptr_is_null,
+    ptr_to_int,
     untag_int,
 )
 
@@ -28,6 +31,7 @@ py_tuple_new = extern("py_tuple_new", (c_int64,), c_ptr)
 py_tuple_set_item = extern("py_tuple_set_item", (c_ptr, c_int64, c_ptr), c_void)
 pcc_gc_load_ptr = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_ptr)
 _pcc_debug_bad_incref = extern("pcc_debug_bad_incref", (c_ptr, c_int32), c_void)
+getenv = extern("pcc_platform_getenv", (c_ptr,), c_ptr)
 
 
 def _debug_bad_container(o, code: int) -> None:
@@ -35,25 +39,19 @@ def _debug_bad_container(o, code: int) -> None:
         _pcc_debug_bad_incref(o, code)
 
 
+pcc_gc_pointer_is_managed = extern(
+    "pcc_gc_pointer_is_managed", (c_ptr,), c_int64
+)
+
+
 def _ptr_can_have_header(o) -> bool:
-    if ptr_is_null(o) != 0:
-        return False
-    if is_tagged_int(o) != 0:
-        return False
-    bits: int = untag_int(o)
-    if bits < 2048:
-        return False
-    if (bits & 3) != 0:
-        return False
-    if bits >= 140737488355328:
-        return False
-    return True
+    return pcc_gc_pointer_is_managed(o) != 0
 
 
 def _ptr_is_tuple(o) -> bool:
     if not _ptr_can_have_header(o):
         return False
-    return load_i32(o, 8) == 7
+    return load_i32(o, 8) == PY_TYPE_TUPLE
 
 
 def _tuple_is_sane(tuple_ptr, code: int) -> bool:

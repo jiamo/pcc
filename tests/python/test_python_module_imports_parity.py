@@ -116,6 +116,34 @@ def test_import_math_trunc_gcd(tmp_path, monkeypatch):
     assert out == ["3", "-3", "6", "6", "5", "3 -2"]
 
 
+def test_import_math_float_classification(tmp_path, monkeypatch):
+    src = tmp_path / "imp_math_classification.py"
+    exe = tmp_path / "imp_math_classification.out"
+    src.write_text(textwrap.dedent("""
+        import math
+
+        def classify(value) -> None:
+            print(math.isfinite(value), math.isinf(value), math.isnan(value))
+
+        def main() -> None:
+            classify(3.0)
+            classify(float("inf"))
+            classify(float("-inf"))
+            classify(float("nan"))
+
+        if __name__ == "__main__":
+            main()
+        """).lstrip(), encoding="utf-8")
+    _compile(monkeypatch, src, exe)
+    out = _run(exe).strip().splitlines()
+    assert out == [
+        "True False False",
+        "False True False",
+        "False True False",
+        "False False True",
+    ]
+
+
 def test_from_import(tmp_path, monkeypatch):
     src = tmp_path / "imp_from.py"
     exe = tmp_path / "imp_from.out"

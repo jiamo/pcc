@@ -55,8 +55,8 @@ def test_runtime_store_sites_route_through_gc_store_ptr():
 
 
 def test_capi_internal_owner_slots_follow_gc_slot_contract():
-    """Every shim-owned PyObject field must trace, release, store, and load."""
-    src = _read(RUNTIME_SRC / "py_capi_shim.c")
+    """C oracle and production pcc-Python owners share one slot contract."""
+    oracle = _read(RUNTIME_SRC / "py_capi_shim_oracle.c")
 
     type_expectations = {
         "pcc_capi_contextvar_type": (
@@ -73,7 +73,7 @@ def test_capi_internal_owner_slots_follow_gc_slot_contract():
         ),
     }
     for type_name, (traverse, dealloc) in type_expectations.items():
-        block = src.split(f"static PyTypeObject {type_name} =", 1)[1]
+        block = oracle.split(f"static PyTypeObject {type_name} =", 1)[1]
         block = block.split("};", 1)[0]
         assert "Py_TPFLAGS_HAVE_GC" in block
         assert "PCC_TPFLAGS_MANAGED_DEALLOC" in block
@@ -101,7 +101,39 @@ def test_capi_internal_owner_slots_follow_gc_slot_contract():
         "pcc_gc_load_ptr(r, &s->stop)",
         "pcc_gc_load_ptr(r, &s->step)",
     ):
-        assert needle in src, f"py_capi_shim.c missing {needle!r}"
+        assert needle in oracle, f"C oracle missing {needle!r}"
+
+    production_expectations = {
+        RUNTIME_PY / "py_capi_contextvar_runtime.py": (
+            "pcc_capi_visit_slot(ptr_add(obj, 32), visit, arg)",
+            "pcc_capi_visit_slot(ptr_add(obj, 40), visit, arg)",
+            "pcc_gc_store_ptr(obj, ptr_add(obj, 32), def_obj)",
+            "pcc_gc_load_ptr(var, ptr_add(var, 40))",
+            "pcc_gc_load_ptr(var, ptr_add(var, 32))",
+            "pcc_gc_note_slot_write_barrier(var, ptr_add(var, 40), value)",
+            "pcc_gc_store_ptr(self, ptr_add(self, 40), previous)",
+        ),
+        RUNTIME_PY / "py_capi_seqiter_runtime.py": (
+            "pcc_capi_visit_slot(ptr_add(obj, 24), visit, arg)",
+            "pcc_gc_store_ptr(obj, ptr_add(obj, 24), seq)",
+            "pcc_gc_load_ptr(obj, ptr_add(obj, 24))",
+        ),
+        RUNTIME_PY / "py_capi_slice_runtime.py": (
+            "pcc_capi_visit_slot(ptr_add(obj, 24), visit, arg)",
+            "pcc_capi_visit_slot(ptr_add(obj, 32), visit, arg)",
+            "pcc_capi_visit_slot(ptr_add(obj, 40), visit, arg)",
+            "pcc_gc_store_ptr(obj, ptr_add(obj, 24), start)",
+            "pcc_gc_store_ptr(obj, ptr_add(obj, 32), stop)",
+            "pcc_gc_store_ptr(obj, ptr_add(obj, 40), step)",
+            "pcc_gc_load_ptr(r, ptr_add(r, 24))",
+            "pcc_gc_load_ptr(r, ptr_add(r, 32))",
+            "pcc_gc_load_ptr(r, ptr_add(r, 40))",
+        ),
+    }
+    for path, needles in production_expectations.items():
+        source = _read(path)
+        for needle in needles:
+            assert needle in source, f"{path.name} missing {needle!r}"
 
 
 def test_tls_exception_accessors_heal_forwarded_owner_reference():

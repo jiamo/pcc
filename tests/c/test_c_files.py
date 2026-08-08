@@ -7,8 +7,8 @@ import os
 import re
 import pytest
 
-this_dir = os.path.dirname(__file__)
-c_tests_dir = os.path.join(this_dir, "c_cases")
+this_dir = os.path.dirname(os.path.abspath(__file__))
+c_tests_dir = os.path.join(os.path.dirname(this_dir), "c_cases")
 
 
 def _read_expect(fpath):

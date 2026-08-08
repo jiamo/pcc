@@ -1,0 +1,8 @@
+{
+  "candidate_count": 177,
+  "candidate_names_sha256": "68cfec95a3620884150b0a337c6d77439ec860bd090181cb658ad018bdd811a1",
+  "default_classification": "applicable",
+  "exclusions": [],
+  "registry": "tests.py_corpus_support.PYTHON_CORPUS_CASES",
+  "schema": "pcc.host-pcc-pcc1-parity-manifest.v1"
+}

@@ -387,10 +387,14 @@ def test_local_install_can_build_source_before_overlay(tmp_path):
         cache_dir=tmp_path / "cache",
         abi="pcc-native",
         build_source=True,
+        build_mode="host",
     )
 
     assert result["ok"] is True
     assert result["build_report"]["ok"] is True
+    assert result["build_report"]["build_ownership"] == "host"
+    assert result["build_report"]["host_python"] == sys.executable
+    assert result["build_report"]["host_free_build_claim"] is False
     assert [action["kind"] for action in result["build_report"]["actions"]] == [
         "meson_setup",
         "meson_build",
@@ -667,15 +671,19 @@ def test_pcc_package_install_cli_and_pip_install_shape(tmp_path):
             "--cache-dir",
             str(cache),
         ],
-        check=True,
+        check=False,
         text=True,
         capture_output=True,
         timeout=60,
         env=env,
     )
     plan = json.loads(proc.stdout)
-    assert plan["ok"] is True
-    assert plan["installs"][0]["ok"] is True
+    assert proc.returncode == 2
+    assert plan["ok"] is False
+    assert plan["build_mode_requested"] == "owned"
+    assert plan["installs"][0]["build_report"]["diagnostics"] == [
+        "PCC-PKG-OWNED-BUILD-TOOL-REQUIRED"
+    ]
 
 
 def test_pcc_pip_install_find_links_wheelhouse(tmp_path):
@@ -842,30 +850,35 @@ def test_pcc_pip_install_find_links_installs_local_dependencies(tmp_path):
     assert (tmp_path / "site" / "demo_pkg" / "core.py").exists()
 
 
-def test_native_pcc1_existing_meson_outputs_do_not_require_host_python(
-    tmp_path, monkeypatch
-):
+def test_native_pcc1_owned_meson_source_reenters_receipt_bound_build_path(tmp_path):
     from pcc.cli_bootstrap import _native_build_install_source_json
 
     project = _write_demo_project(tmp_path / "demo_pkg-0.1")
     _write_demo_meson_build_overlay(project)
-    monkeypatch.setenv("PCC_HOST_PYTHON", "/usr/bin/false")
 
     report = json.loads(
         _native_build_install_source_json("demo_pkg", str(project), "pcc-native")
     )
 
-    assert report == {
-        "actions": [],
-        "build_backend": "existing",
-        "host_assisted": False,
-        "ok": True,
-        "reason": "existing_build_outputs",
-        "skipped": True,
-    }
+    # meson.build makes this a source tree even when stale build outputs are
+    # present.  Owned mode must re-enter the compiler/tool/source-bound receipt
+    # path instead of accepting those outputs as authoritative prebuilt bytes.
+    assert report["actions"] == []
+    assert report["build_backend"] == "pcc-native-meson"
+    assert report["build_mode_requested"] == "owned"
+    assert report["build_ownership"] == "owned"
+    assert report["diagnostics"] == [
+        "PCC-PKG-OWNED-BUILD-COMPILER-REQUIRED"
+    ]
+    assert report["host_assisted"] is False
+    assert report["host_free_build_claim"] is False
+    assert report["host_python"] is None
+    assert report["ok"] is False
+    assert report["reason"] == "owned_build_compiler_required"
+    assert report["skipped"] is False
 
 
-def test_pcc1_package_install_writes_manifest_without_host_python(tmp_path):
+def test_pcc1_package_install_labels_unproven_prebuilt_payload(tmp_path):
     pcc1 = _find_current_pcc1()
     if pcc1 is None:
         skip_or_fail_no_current_pcc1(
@@ -874,7 +887,6 @@ def test_pcc1_package_install_writes_manifest_without_host_python(tmp_path):
     project = _write_demo_project(tmp_path / "demo_pkg-0.1")
     env = os.environ.copy()
     env.pop("LC_ALL", None)
-    env["PCC_HOST_PYTHON"] = "/usr/bin/false"
     env["PCC_PLATFORM_TAG"] = current_platform_tag()
     _write_demo_meson_build_overlay(project)
     proc = subprocess.run(
@@ -888,6 +900,7 @@ def test_pcc1_package_install_writes_manifest_without_host_python(tmp_path):
             str(tmp_path / "site"),
             "--cache-dir",
             str(tmp_path / "cache"),
+            "--build=host",
             "--json",
         ],
         check=True,
@@ -898,6 +911,8 @@ def test_pcc1_package_install_writes_manifest_without_host_python(tmp_path):
     )
     result = json.loads(proc.stdout)
     assert result["ok"] is True
+    assert result["build_report"]["build_ownership"] == "prebuilt-unverified"
+    assert result["build_report"]["host_free_build_claim"] is False
     assert Path(result["manifest_path"]).exists()
     assert (tmp_path / "site" / "demo_pkg" / "__init__.py").exists()
     assert (tmp_path / "site" / "demo_pkg" / "generated.py").exists()
@@ -913,6 +928,7 @@ def test_pcc1_package_install_writes_manifest_without_host_python(tmp_path):
             str(tmp_path / "site2"),
             "--cache-dir",
             str(tmp_path / "cache"),
+            "--build=host",
             "--json",
         ],
         check=True,

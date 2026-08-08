@@ -487,6 +487,54 @@ def _emit_reduce_sum(
             f"{entry}: reduction accumulator {dst!r} has {local_count} slots for "
             f"{threads} threads"
         )
+    import_kind = attrs.get("import_kind")
+    if import_kind is not None:
+        if import_kind != "tilelang.reduce_sum.static_row.v1":
+            raise MetalFinalizeError(
+                f"{entry}: unknown imported reduction contract {import_kind!r}"
+            )
+        source_record = _record_by_name(
+            _func_param_dicts(func),
+            src,
+            entry=entry,
+        )
+        source_shape = source_record.get("shape")
+        source_dtype = source_record.get("dtype")
+        if (
+            not isinstance(source_shape, list)
+            or len(source_shape) != 2
+            or not all(isinstance(dim, int) and dim > 0 for dim in source_shape)
+        ):
+            raise MetalFinalizeError(
+                f"{entry}: imported row reduce_sum source must have static rank-2 shape"
+            )
+        rows, width = source_shape
+        if source_dtype not in {"f16", "f32"} or dtype != "f32":
+            raise MetalFinalizeError(
+                f"{entry}: imported row reduce_sum requires f16/f32 source and f32 scratch"
+            )
+        expected = {
+            "reduction": "sum",
+            "dim": 1,
+            "clear": True,
+            "batch": 1,
+            "extent": rows * width,
+            "row_count": rows,
+            "row_width": width,
+            "source_shape": [rows, width],
+            "output_shape": [rows, 1],
+            "import_kind": "tilelang.reduce_sum.static_row.v1",
+        }
+        if attrs != expected:
+            raise MetalFinalizeError(
+                f"{entry}: imported row reduce_sum metadata drifted from {expected!r}; "
+                f"got {attrs!r}"
+            )
+        if func.get("grid") != [rows] or threads != width or local_count != width:
+            raise MetalFinalizeError(
+                f"{entry}: imported row reduce_sum launch/scratch no longer matches "
+                f"rows={rows}, width={width}"
+            )
     zero = _zero_literal_for_dtype(dtype)
     load_expr = f"{src}[gid]"
     if extent is not None:
@@ -2104,6 +2152,7 @@ def emit_metal_source(module: KernelModule | PlainTirModule) -> str:
             body.append("        return;")
             body.append("    }")
         reduced_locals: set[str] = set()
+        imported_reduction_attrs: dict[str, dict[str, Any]] = {}
         structured_depth = 1
         for op in func.get("ops", []):
             tir_op = op.get("tir_op")
@@ -2112,6 +2161,23 @@ def emit_metal_source(module: KernelModule | PlainTirModule) -> str:
             if tir_op == "tir.copy_loop" and len(args) >= 2:
                 src, dst = str(args[0]), str(args[1])
                 if src in reduced_locals and scopes.get(dst) == MemoryScope.GLOBAL.value:
+                    imported_attrs = imported_reduction_attrs.get(src)
+                    if imported_attrs is not None:
+                        if attrs != {"reduction_output": True}:
+                            raise MetalFinalizeError(
+                                f"{entry}: imported row reduce_sum output copy metadata "
+                                f"must be {{'reduction_output': True}}, got {attrs!r}"
+                            )
+                        output_record = records_by_name.get(dst)
+                        if (
+                            output_record is None
+                            or output_record.get("dtype") != "f32"
+                            or output_record.get("shape") != imported_attrs.get("output_shape")
+                        ):
+                            raise MetalFinalizeError(
+                                f"{entry}: imported row reduce_sum output {dst!r} no "
+                                "longer matches its f32 keep-dimension shape contract"
+                            )
                     body.extend(
                         [
                             "    if (tid == 0u) {",
@@ -2164,6 +2230,8 @@ def emit_metal_source(module: KernelModule | PlainTirModule) -> str:
                     )
                 )
                 reduced_locals.add(dst)
+                if attrs.get("import_kind") == "tilelang.reduce_sum.static_row.v1":
+                    imported_reduction_attrs[dst] = dict(attrs)
             elif tir_op == "tir.elementwise_add" and len(args) >= 3:
                 lhs, rhs, dst = str(args[0]), str(args[1]), str(args[2])
                 index = str(attrs.get("index") or "gid")

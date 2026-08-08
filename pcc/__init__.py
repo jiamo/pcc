@@ -16,13 +16,31 @@ __all__ = [
     "ValueBox",
     "ValuePayload",
     "array",
+    "i64_buffer",
+    "guarded_i64_dot",
+    "guarded_loop_counter",
+    "i64",
+    "u64",
 ]
 
 
 def __getattr__(name: str):
+    if name == "i64" or name == "u64":
+        # Public annotation markers for explicit fixed-width machine lanes.
+        # They remain ordinary ``int`` at host-Python runtime; the pcc type
+        # checker gives them their distinct, non-Python overflow contract.
+        return int
     if name in __all__:
         from .api import BuildArtifact, Module, build, module
-        from .value_model import ValueBox, ValuePayload, array, valueclass
+        from .value_model import (
+            ValueBox,
+            ValuePayload,
+            array,
+            guarded_i64_dot,
+            guarded_loop_counter,
+            i64_buffer,
+            valueclass,
+        )
 
         exports = {
             "module": module,
@@ -33,6 +51,9 @@ def __getattr__(name: str):
             "ValueBox": ValueBox,
             "ValuePayload": ValuePayload,
             "array": array,
+            "i64_buffer": i64_buffer,
+            "guarded_i64_dot": guarded_i64_dot,
+            "guarded_loop_counter": guarded_loop_counter,
         }
         return exports[name]
     raise AttributeError(f"module 'pcc' has no attribute {name!r}")

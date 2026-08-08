@@ -1,8 +1,30 @@
+import importlib.util
 import os
 import subprocess
+import sys
 
-import conftest as root_conftest
-import run as run_module
+
+def _load_repo_module(name):
+    """Load a repo-root module by path.
+
+    A bare ``import conftest`` used to land on the repository root's
+    conftest.py only because tests/conftest.py patched path resolution so
+    tests/c files looked like tests/ files (TEST-P2-REMOVE-LEGACY-PATH-SHIM).
+    With that shim gone, ``tests/`` is on sys.path and the bare import would
+    pick tests/conftest.py instead, so load the intended file explicitly.
+    """
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    spec = importlib.util.spec_from_file_location(
+        f"_pcc_repo_{name}", os.path.join(root, f"{name}.py")
+    )
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+root_conftest = _load_repo_module("conftest")
+run_module = _load_repo_module("run")
 
 
 def _git(tmp_path, *args):

@@ -24,12 +24,34 @@ if [[ "${PCC_SELF_BACKEND_DOCKER_REBUILD:-0}" == "1" ]] || ! docker image inspec
     "${REPO_ROOT}"
 fi
 
-docker run --rm \
-  --platform linux/amd64 \
-  -e UV_PROJECT_ENVIRONMENT=/tmp/pcc-linux-x86_64-venv \
-  -e UV_LINK_MODE=copy \
-  -e PCC_BUILD_SKIP=1 \
-  -v "${REPO_ROOT}:/workspace" \
-  -w /workspace \
-  "${IMAGE_TAG}" \
-  "$@"
+docker_args=(
+  run --rm
+  --platform linux/amd64
+  -e UV_PROJECT_ENVIRONMENT=/tmp/pcc-linux-x86_64-venv
+  -e UV_LINK_MODE=copy
+  -e PCC_BUILD_SKIP=1
+)
+
+if [[ -n "${PCC_SELF_BACKEND_HOST_ARTIFACTS:-}" ]]; then
+  case "${PCC_SELF_BACKEND_HOST_ARTIFACTS}" in
+    /*) ;;
+    *)
+      echo "PCC_SELF_BACKEND_HOST_ARTIFACTS must be an absolute path" >&2
+      exit 2
+      ;;
+  esac
+  mkdir -p "${PCC_SELF_BACKEND_HOST_ARTIFACTS}"
+  host_artifacts="$(cd "${PCC_SELF_BACKEND_HOST_ARTIFACTS}" && pwd)"
+  docker_args+=(
+    -e PCC_HOST_TEST_ARTIFACTS=/pcc-host-test-artifacts
+    -v "${host_artifacts}:/pcc-host-test-artifacts"
+  )
+fi
+
+docker_args+=(
+  -v "${REPO_ROOT}:/workspace"
+  -w /workspace
+  "${IMAGE_TAG}"
+)
+
+docker "${docker_args[@]}" "$@"

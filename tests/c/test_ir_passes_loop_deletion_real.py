@@ -1,14 +1,9 @@
 """Parity corpus for LoopDeletionPass (subset)."""
 
-import shutil
 import unittest
 
 from pcc.ir_passes.loop_deletion import LoopDeletionPass
 from pcc.ir_passes.parity import assert_ir_parity, run_pcc_ir_pass
-
-
-_OPT = shutil.which("opt")
-
 
 class LoopDeletionTests(unittest.TestCase):
     def test_dead_loop_deleted(self):

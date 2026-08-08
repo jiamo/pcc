@@ -24,7 +24,7 @@ def integer_scalar_layout(bit_width: int) -> CAbiScalarLayout:
 
 
 def floating_scalar_layout(bit_width: int) -> CAbiScalarLayout:
-    if bit_width not in (32, 64, 128):
+    if bit_width not in (16, 32, 64, 128):
         raise ValueError(f"unsupported floating width: {bit_width}")
     size = bit_width // 8
     return CAbiScalarLayout(size=size, alignment=size)
@@ -48,6 +48,8 @@ def builtin_scalar_layout(names: list[str] | tuple[str, ...]) -> CAbiScalarLayou
         return integer_scalar_layout(64)
     if normalized == ("long", "double"):
         return floating_scalar_layout(128)
+    if normalized == ("_Float16",):
+        return floating_scalar_layout(16)
     if "long" in normalized:
         return integer_scalar_layout(64)
     if "float" in normalized:

@@ -44,6 +44,19 @@ class TestWhile(unittest.TestCase):
         print(ret)
         assert(ret == 5049)
 
+    def test_while_statement_nested_in_for_body_preserves_statement_contract(self):
+        ret = CEvaluator().evaluate(
+            """
+            int main(void) {
+                for (; 0;) while (0) {}
+                return 1;
+            }
+            """,
+            optimize=False,
+            use_compile_cache=False,
+        )
+        assert ret == 1
+
 
 #TODO  If is complext should finish the basic
 if __name__ == '__main__':

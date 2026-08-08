@@ -126,9 +126,10 @@ def test_finalizer_events_reach_native_log_file(tmp_path, c_runtime_archive):
     assert ("finalizer", "done") in names
 
 
-def test_pcc_python_runtime_archive_links_runtime_log_helper():
+def test_pcc_python_runtime_archive_links_pcc_python_runtime_log():
     makefile = (RUNTIME / "Makefile").read_text(encoding="utf-8")
-    assert "$(OBJDIR_PY)/pcc_runtime_log.o" in makefile
+    assert "OBJ_PY_CC_HELPERS" not in makefile
+    assert "py_runtime_log" in makefile.split("PY_MODULES =", 1)[1].splitlines()[0]
     py_obj = (RUNTIME / "py" / "py_obj.py").read_text(encoding="utf-8")
     assert "pcc_runtime_log_event_code = extern(" in py_obj
     assert '"pcc_runtime_log_event_code"' in py_obj

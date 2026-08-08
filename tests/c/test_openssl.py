@@ -10,7 +10,9 @@ from pcc.project import (
 )
 
 
-PROJECT_DIR = os.path.dirname(os.path.dirname(__file__))
+PROJECT_DIR = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
 PROJECTS_DIR = os.path.join(PROJECT_DIR, "projects")
 OPENSSL_DIR = os.path.join(PROJECTS_DIR, "openssl-3.4.1")
 OPENSSL_TEST_MAIN = os.path.join(PROJECTS_DIR, "test_openssl_main.c")

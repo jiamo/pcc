@@ -6,8 +6,8 @@ from collections import ChainMap
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from itertools import count
-# β5: route C frontend codegen through compat.ir_c; default = llvmlite
-# (PCC_USE_LLVMCAPI_C=1 opts into pcc.llvm_capi).
+# Route C frontend codegen through compat.ir_c. pcc.llvm_capi is the default;
+# PCC_USE_LLVMLITE_C=1 selects the legacy llvmlite compatibility path.
 from pcc.llvm_capi.compat import ir_c as ir
 from pcc.llvm_capi.compat import add_raw_function_attribute
 from pcc.c_abi_layout import (
@@ -15,28 +15,80 @@ from pcc.c_abi_layout import (
     integer_scalar_layout,
     pointer_scalar_layout,
 )
+from .c_declaration_state import (
+    CodegenError,
+    ExternGlobalRef,
+    FileScopeFunctionState,
+    FileScopeObjectState,
+)
+from .c_layout import (
+    BitFieldRef,
+    StructFieldLayout,
+    StructStorageSegment,
+    ir_type_align as _ir_type_align_static,
+    ir_type_size as _ir_type_size_static,
+    is_floating_ir_type as _is_floating_ir_type_static,
+    is_struct_ir_type as _is_struct_ir_type,
+)
+from .c_scope_context import (
+    NewFunctionContext as _NewFunctionCtx,
+    NewScopeContext as _NewScopeCtx,
+)
+from .c_types import (
+    bool_t,
+    cstring,
+    double_t as _double,
+    false_bit,
+    false_byte,
+    float_t as _float,
+    get_ir_type,
+    get_ir_type_from_names,
+    get_ir_type_from_node,
+    int8_t,
+    int16_t,
+    int32_t,
+    int64_t,
+    int64ptr_t,
+    int128_t,
+    names_to_key as _names_to_key,
+    resolve_node_type as _resolve_node_type,
+    true_bit,
+    true_byte,
+    void_t as _VOID,
+    voidptr_t,
+)
+from .c_libc_declarations import (
+    LIBC_FUNCTIONS,
+    _FILE_ptr,
+    _LEGACY_LIBC_FUNCTIONS,
+    _libc_registry_ir_type,
+    _libc_registry_signature_to_codegen,
+    _size_t,
+    _time_t,
+    libc_registry_shadow_names,
+    refresh_libc_registry_from_declarative,
+)
+from .c_expression_flow import CExpressionFlowMixin
+from .c_control_flow import CControlFlowMixin
+from .c_declaration_lowering import CDeclarationLoweringMixin
+from .c_initializer_lowering import CInitializerLoweringMixin
+from .c_integer_fold_contract import (
+    FOLD_CONSTANT as _C_FOLD_CONSTANT,
+    FOLD_POISON as _C_FOLD_POISON,
+    fold_c_integer_binary as _fold_c_integer_binary,
+    fold_c_integer_unary as _fold_c_integer_unary,
+)
+from .c_switch_flow import CSwitchFlowMixin
+from .c_ssa_lowering import CSSALoweringMixin
 IRBuilder = ir.IRBuilder
 from .c_varargs import (
     build_report as _build_varargs_report,
     postprocess_varargs_ir as _postprocess_varargs_ir,
 )
 from ..ast import c_ast as c_ast
-from pcc.c_libc_registry import LibcSignature, iter_signatures
 
 _logger = logging.getLogger("pcc.codegen")
 
-bool_t = ir.IntType(1)
-int8_t = ir.IntType(8)
-int32_t = ir.IntType(32)
-int64_t = ir.IntType(64)
-int128_t = ir.IntType(128)
-voidptr_t = int8_t.as_pointer()
-int64ptr_t = int64_t.as_pointer()
-true_bit = bool_t(1)
-false_bit = bool_t(0)
-true_byte = int8_t(1)
-false_byte = int8_t(0)
-cstring = voidptr_t
 struct_types = {}
 _aggregate_namespace_counter = count(1)
 _LARGE_AGGREGATE_COPY_BYTES = 128
@@ -44,57 +96,6 @@ _LARGE_AGGREGATE_COPY_BYTES = 128
 
 class SemanticError(ValueError):
     pass
-
-
-@dataclass
-class FileScopeObjectState:
-    type_key: str
-    linkage: str
-    definition_kind: str
-    symbol_name: str
-    ir_type: object
-
-
-@dataclass
-class FileScopeFunctionState:
-    type_key: str
-    function_type: object
-    linkage: str
-    defined: bool
-    symbol_name: str
-
-
-@dataclass
-class StructFieldLayout:
-    name: object
-    byte_offset: int
-    semantic_ir_type: object
-    decl_type: object
-    is_bitfield: bool = False
-    storage_byte_offset: int = 0
-    storage_ir_type: object = None
-    bit_offset: int = 0
-    bit_width: int = 0
-    is_unsigned: bool = False
-
-
-@dataclass
-class StructStorageSegment:
-    kind: str
-    byte_offset: int
-    ir_type: object
-    field_index: object = None
-    bitfield_indices: tuple = ()
-
-
-@dataclass
-class BitFieldRef:
-    container_ptr: object
-    storage_ir_type: object
-    bit_offset: int
-    bit_width: int
-    semantic_ir_type: object
-    is_unsigned: bool
 
 
 @dataclass(frozen=True)
@@ -143,516 +144,6 @@ class ConstIntValue(int):
     @property
     def value(self):
         return int(self)
-
-# Libc function signature registry: name -> (return_type, [param_types], var_arg)
-# Covers: stdio.h, stdlib.h, string.h, ctype.h, math.h, unistd.h, time.h
-_VOID = ir.VoidType()
-_float = ir.FloatType()
-_double = ir.DoubleType()
-_FILE_ptr = voidptr_t  # FILE* modeled as opaque void*
-_size_t = int64_t
-_time_t = int64_t
-
-_LEGACY_LIBC_FUNCTIONS = {
-    # === stdio.h ===
-    "sprintf": (int32_t, [cstring, cstring], True),
-    "snprintf": (int32_t, [cstring, _size_t, cstring], True),
-    "vprintf": (int32_t, [cstring, voidptr_t], False),
-    "vfprintf": (int32_t, [_FILE_ptr, cstring, voidptr_t], False),
-    "vsprintf": (int32_t, [cstring, cstring, voidptr_t], False),
-    "vsnprintf": (int32_t, [cstring, _size_t, cstring, voidptr_t], False),
-    "scanf": (int32_t, [cstring], True),
-    "fscanf": (int32_t, [_FILE_ptr, cstring], True),
-    "sscanf": (int32_t, [cstring, cstring], True),
-    "fopen": (_FILE_ptr, [cstring, cstring], False),
-    "fclose": (int32_t, [_FILE_ptr], False),
-    "fread": (_size_t, [voidptr_t, _size_t, _size_t, _FILE_ptr], False),
-    "fwrite": (_size_t, [voidptr_t, _size_t, _size_t, _FILE_ptr], False),
-    "fseek": (int32_t, [_FILE_ptr, int64_t, int32_t], False),
-    "ftell": (int64_t, [_FILE_ptr], False),
-    "rewind": (_VOID, [_FILE_ptr], False),
-    "feof": (int32_t, [_FILE_ptr], False),
-    "ferror": (int32_t, [_FILE_ptr], False),
-    "fflush": (int32_t, [_FILE_ptr], False),
-    "fgets": (cstring, [cstring, int32_t, _FILE_ptr], False),
-    "fputs": (int32_t, [cstring, _FILE_ptr], False),
-    "fgetc": (int32_t, [_FILE_ptr], False),
-    "fputc": (int32_t, [int32_t, _FILE_ptr], False),
-    "getc": (int32_t, [_FILE_ptr], False),
-    "getc_unlocked": (int32_t, [_FILE_ptr], False),
-    "putc": (int32_t, [int32_t, _FILE_ptr], False),
-    "getchar": (int32_t, [], False),
-    "putchar": (int32_t, [int32_t], False),
-    "ungetc": (int32_t, [int32_t, _FILE_ptr], False),
-    "flockfile": (_VOID, [_FILE_ptr], False),
-    "funlockfile": (_VOID, [_FILE_ptr], False),
-    "puts": (int32_t, [cstring], False),
-    "perror": (_VOID, [cstring], False),
-    "remove": (int32_t, [cstring], False),
-    "rename": (int32_t, [cstring, cstring], False),
-    "fseeko": (int32_t, [_FILE_ptr, int64_t, int32_t], False),
-    "ftello": (int64_t, [_FILE_ptr], False),
-    # === stdlib.h ===
-    "calloc": (voidptr_t, [_size_t, _size_t], False),
-    "realloc": (voidptr_t, [voidptr_t, _size_t], False),
-    "exit": (_VOID, [int32_t], False),
-    "_Exit": (_VOID, [int32_t], False),
-    "abort": (_VOID, [], False),
-    "atexit": (int32_t, [voidptr_t], False),
-    "abs": (int32_t, [int32_t], False),
-    "labs": (int64_t, [int64_t], False),
-    "llabs": (int64_t, [int64_t], False),
-    "imaxabs": (int64_t, [int64_t], False),
-    "atoi": (int32_t, [cstring], False),
-    "atol": (int64_t, [cstring], False),
-    "atof": (_double, [cstring], False),
-    "strtol": (int64_t, [cstring, voidptr_t, int32_t], False),
-    "strtoul": (int64_t, [cstring, voidptr_t, int32_t], False),
-    "strtod": (_double, [cstring, voidptr_t], False),
-    "strtof": (_double, [cstring, voidptr_t], False),
-    "rand": (int32_t, [], False),
-    "srand": (_VOID, [int32_t], False),
-    "qsort": (_VOID, [voidptr_t, _size_t, _size_t, voidptr_t], False),
-    "bsearch": (voidptr_t, [voidptr_t, voidptr_t, _size_t, _size_t, voidptr_t], False),
-    "getenv": (cstring, [cstring], False),
-    "getlogin": (cstring, [], False),
-    "getpwent": (voidptr_t, [], False),
-    "getpwnam": (voidptr_t, [cstring], False),
-    "getpwuid": (voidptr_t, [int32_t], False),
-    "setpwent": (_VOID, [], False),
-    "endpwent": (_VOID, [], False),
-    "setenv": (int32_t, [cstring, cstring, int32_t], False),
-    "putenv": (int32_t, [cstring], False),
-    "unsetenv": (int32_t, [cstring], False),
-    "system": (int32_t, [cstring], False),
-    # === string.h ===
-    "strcmp": (int32_t, [cstring, cstring], False),
-    "strncmp": (int32_t, [cstring, cstring, _size_t], False),
-    "strcpy": (cstring, [cstring, cstring], False),
-    "strncpy": (cstring, [cstring, cstring, _size_t], False),
-    "strcat": (cstring, [cstring, cstring], False),
-    "strncat": (cstring, [cstring, cstring, _size_t], False),
-    "strlcpy": (_size_t, [cstring, cstring, _size_t], False),
-    "strlcat": (_size_t, [cstring, cstring, _size_t], False),
-    "strchr": (cstring, [cstring, int32_t], False),
-    "strrchr": (cstring, [cstring, int32_t], False),
-    "strstr": (cstring, [cstring, cstring], False),
-    "strpbrk": (cstring, [cstring, cstring], False),
-    "strspn": (_size_t, [cstring, cstring], False),
-    "strcspn": (_size_t, [cstring, cstring], False),
-    "strtok": (cstring, [cstring, cstring], False),
-    "memmove": (voidptr_t, [voidptr_t, voidptr_t, _size_t], False),
-    "memcmp": (int32_t, [voidptr_t, voidptr_t, _size_t], False),
-    "memchr": (voidptr_t, [voidptr_t, int32_t, _size_t], False),
-    "strerror": (cstring, [int32_t], False),
-    # === ctype.h ===
-    "isalpha": (int32_t, [int32_t], False),
-    "isdigit": (int32_t, [int32_t], False),
-    "isalnum": (int32_t, [int32_t], False),
-    "isspace": (int32_t, [int32_t], False),
-    "isupper": (int32_t, [int32_t], False),
-    "islower": (int32_t, [int32_t], False),
-    "isprint": (int32_t, [int32_t], False),
-    "ispunct": (int32_t, [int32_t], False),
-    "iscntrl": (int32_t, [int32_t], False),
-    "isxdigit": (int32_t, [int32_t], False),
-    "isgraph": (int32_t, [int32_t], False),
-    "toupper": (int32_t, [int32_t], False),
-    "tolower": (int32_t, [int32_t], False),
-    # === wchar.h / wctype.h ===
-    "mbtowc": (int32_t, [int32_t.as_pointer(), cstring, _size_t], False),
-    "wctomb": (int32_t, [cstring, int32_t], False),
-    "mbrlen": (_size_t, [cstring, _size_t, voidptr_t], False),
-    "mbrtowc": (_size_t, [int32_t.as_pointer(), cstring, _size_t, voidptr_t], False),
-    "mbsrtowcs": (_size_t, [int32_t.as_pointer(), voidptr_t, _size_t, voidptr_t], False),
-    "mbstowcs": (_size_t, [int32_t.as_pointer(), cstring, _size_t], False),
-    "wcrtomb": (_size_t, [cstring, int32_t, voidptr_t], False),
-    "wcsrtombs": (_size_t, [cstring, voidptr_t, _size_t, voidptr_t], False),
-    "wcstombs": (_size_t, [cstring, voidptr_t, _size_t], False),
-    "wcwidth": (int32_t, [int32_t], False),
-    "wcswidth": (int32_t, [voidptr_t, _size_t], False),
-    "wmemchr": (voidptr_t, [voidptr_t, int32_t, _size_t], False),
-    "wmemcpy": (voidptr_t, [voidptr_t, voidptr_t, _size_t], False),
-    "wmemmove": (voidptr_t, [voidptr_t, voidptr_t, _size_t], False),
-    "wmemcmp": (int32_t, [voidptr_t, voidptr_t, _size_t], False),
-    "iswalnum": (int32_t, [int32_t], False),
-    "iswalpha": (int32_t, [int32_t], False),
-    "iswcntrl": (int32_t, [int32_t], False),
-    "iswctype": (int32_t, [int32_t, int32_t], False),
-    "iswgraph": (int32_t, [int32_t], False),
-    "iswlower": (int32_t, [int32_t], False),
-    "iswprint": (int32_t, [int32_t], False),
-    "iswspace": (int32_t, [int32_t], False),
-    "iswupper": (int32_t, [int32_t], False),
-    "towlower": (int32_t, [int32_t], False),
-    "towupper": (int32_t, [int32_t], False),
-    "wctype": (int32_t, [cstring], False),
-    # === math.h ===
-    "sin": (_double, [_double], False),
-    "cos": (_double, [_double], False),
-    "tan": (_double, [_double], False),
-    "asin": (_double, [_double], False),
-    "acos": (_double, [_double], False),
-    "atan": (_double, [_double], False),
-    "atan2": (_double, [_double, _double], False),
-    "sinh": (_double, [_double], False),
-    "cosh": (_double, [_double], False),
-    "tanh": (_double, [_double], False),
-    "exp": (_double, [_double], False),
-    "exp2": (_double, [_double], False),
-    "log": (_double, [_double], False),
-    "log2": (_double, [_double], False),
-    "log10": (_double, [_double], False),
-    "pow": (_double, [_double, _double], False),
-    "sqrt": (_double, [_double], False),
-    "cbrt": (_double, [_double], False),
-    "hypot": (_double, [_double, _double], False),
-    "ceil": (_double, [_double], False),
-    "floor": (_double, [_double], False),
-    "round": (_double, [_double], False),
-    "trunc": (_double, [_double], False),
-    "fmod": (_double, [_double, _double], False),
-    "fabsf": (_float, [_float], False),
-    "fabs": (_double, [_double], False),
-    "fabsl": (_double, [_double], False),
-    "ldexp": (_double, [_double, int32_t], False),
-    # === time.h ===
-    "time": (_time_t, [voidptr_t], False),
-    "clock": (int64_t, [], False),
-    "difftime": (_double, [_time_t, _time_t], False),
-    "gmtime_r": (voidptr_t, [voidptr_t, voidptr_t], False),
-    "localtime_r": (voidptr_t, [voidptr_t, voidptr_t], False),
-    "nanosleep": (int32_t, [voidptr_t, voidptr_t], False),
-    # === unistd.h (POSIX) ===
-    "sleep": (int32_t, [int32_t], False),
-    "alarm": (int32_t, [int32_t], False),
-    "usleep": (int32_t, [int32_t], False),
-    "getuid": (int32_t, [], False),
-    "geteuid": (int32_t, [], False),
-    "access": (int32_t, [cstring, int32_t], False),
-    "fcntl": (int32_t, [int32_t, int32_t], True),
-    "fsync": (int32_t, [int32_t], False),
-    "ftruncate": (int32_t, [int32_t, int64_t], False),
-    "pread": (int64_t, [int32_t, voidptr_t, _size_t, int64_t], False),
-    "pwrite": (int64_t, [int32_t, voidptr_t, _size_t, int64_t], False),
-    "unlink": (int32_t, [cstring], False),
-    "readlink": (int64_t, [cstring, cstring, _size_t], False),
-    "getpid": (int32_t, [], False),
-    "getppid": (int32_t, [], False),
-    "sysconf": (int64_t, [int32_t], False),
-    "isatty": (int32_t, [int32_t], False),
-    "mkstemp": (int32_t, [cstring], False),
-    "tcdrain": (int32_t, [int32_t], False),
-    "tcflow": (int32_t, [int32_t, int32_t], False),
-    "tcgetattr": (int32_t, [int32_t, voidptr_t], False),
-    "tcsetattr": (int32_t, [int32_t, int32_t, voidptr_t], False),
-    "select": (int32_t, [int32_t, voidptr_t, voidptr_t, voidptr_t, voidptr_t], False),
-    "pselect": (int32_t, [int32_t, voidptr_t, voidptr_t, voidptr_t, voidptr_t, voidptr_t], False),
-    # === setjmp.h ===
-    "setjmp": (int32_t, [voidptr_t], False),
-    "longjmp": (_VOID, [voidptr_t, int32_t], False),
-    "_setjmp": (int32_t, [voidptr_t], False),
-    "_longjmp": (_VOID, [voidptr_t, int32_t], False),
-    "sigsetjmp": (int32_t, [voidptr_t, int32_t], False),
-    "siglongjmp": (_VOID, [voidptr_t, int32_t], False),
-    # === signal.h ===
-    "signal": (voidptr_t, [int32_t, voidptr_t], False),
-    "sigaction": (int32_t, [int32_t, voidptr_t, voidptr_t], False),
-    "sigaddset": (int32_t, [voidptr_t, int32_t], False),
-    "sigdelset": (int32_t, [voidptr_t, int32_t], False),
-    "sigemptyset": (int32_t, [voidptr_t], False),
-    "sigismember": (int32_t, [voidptr_t, int32_t], False),
-    "sigprocmask": (int32_t, [int32_t, voidptr_t, voidptr_t], False),
-    "sigsuspend": (int32_t, [voidptr_t], False),
-    "kill": (int32_t, [int32_t, int32_t], False),
-    "raise": (int32_t, [int32_t], False),
-    # === errno ===
-    # === locale.h ===
-    "setlocale": (cstring, [int32_t, cstring], False),
-    "localeconv": (voidptr_t, [], False),
-    "nl_langinfo": (cstring, [int32_t], False),
-    # === misc ===
-    "tmpnam": (cstring, [cstring], False),
-    "tmpfile": (voidptr_t, [], False),
-    "stat": (int32_t, [cstring, voidptr_t], False),
-    "fstat": (int32_t, [int32_t, voidptr_t], False),
-    "lstat": (int32_t, [cstring, voidptr_t], False),
-    "chmod": (int32_t, [cstring, int32_t], False),
-    "fchmod": (int32_t, [int32_t, int32_t], False),
-    "mkdir": (int32_t, [cstring, int32_t], False),
-    "umask": (int32_t, [int32_t], False),
-    "utime": (int32_t, [cstring, voidptr_t], False),
-    "utimes": (int32_t, [cstring, voidptr_t], False),
-    "futimes": (int32_t, [int32_t, voidptr_t], False),
-    "gettimeofday": (int32_t, [voidptr_t, voidptr_t], False),
-    "gmtime": (voidptr_t, [voidptr_t], False),
-    "localtime": (voidptr_t, [voidptr_t], False),
-    "mktime": (_time_t, [voidptr_t], False),
-    "strftime": (_size_t, [cstring, _size_t, cstring, voidptr_t], False),
-    "ctime": (cstring, [voidptr_t], False),
-    "asctime": (cstring, [voidptr_t], False),
-    "frexp": (_double, [_double, int32_t.as_pointer()], False),
-    # GCC/Clang builtins (no-op stubs)
-    "__builtin_va_start": (_VOID, [voidptr_t], False),
-    "__builtin_va_end": (_VOID, [voidptr_t], False),
-    "__builtin_va_copy": (_VOID, [voidptr_t, voidptr_t], False),
-    "__builtin_alloca": (voidptr_t, [int64_t], False),
-    "__builtin_expect": (int64_t, [int64_t, int64_t], False),
-    "__builtin_assume": (_VOID, [int64_t], False),
-    "__builtin_prefetch": (_VOID, [voidptr_t, int32_t, int32_t], False),
-    "__builtin_unreachable": (_VOID, [], False),
-    "__builtin_add_overflow": (int32_t, [int64_t, int64_t, voidptr_t], False),
-    "__builtin_sub_overflow": (int32_t, [int64_t, int64_t, voidptr_t], False),
-    "__builtin_mul_overflow": (int32_t, [int64_t, int64_t, voidptr_t], False),
-    "__builtin_abs": (int32_t, [int32_t], False),
-    "__builtin_labs": (int64_t, [int64_t], False),
-    "__builtin_llabs": (int64_t, [int64_t], False),
-    "__builtin_imaxabs": (int64_t, [int64_t], False),
-    "__builtin_bswap16": (int32_t, [int32_t], False),
-    "__builtin_bswap32": (int32_t, [int32_t], False),
-    "__builtin_bswap64": (int64_t, [int64_t], False),
-    "__builtin_clz": (int32_t, [int32_t], False),
-    "__builtin_clzll": (int32_t, [int64_t], False),
-    "__builtin_ctz": (int32_t, [int32_t], False),
-    "__builtin_ctzll": (int32_t, [int64_t], False),
-    "__builtin_rotateleft32": (int32_t, [int32_t, int32_t], False),
-    "__builtin_rotateleft64": (int64_t, [int64_t, int64_t], False),
-    "__builtin_rotateright32": (int32_t, [int32_t, int32_t], False),
-    "__builtin_rotateright64": (int64_t, [int64_t, int64_t], False),
-    "__sync_synchronize": (_VOID, [], False),
-    "__sync_fetch_and_add": (int64_t, [voidptr_t, int64_t], False),
-    "__sync_bool_compare_and_swap": (int32_t, [voidptr_t, int64_t, int64_t], False),
-    "__atomic_load_n": (int64_t, [voidptr_t, int32_t], False),
-    "__atomic_store_n": (_VOID, [voidptr_t, int64_t, int32_t], False),
-    "__atomic_add_fetch": (int64_t, [voidptr_t, int64_t, int32_t], False),
-    "__atomic_sub_fetch": (int64_t, [voidptr_t, int64_t, int32_t], False),
-    "__atomic_or_fetch": (int64_t, [voidptr_t, int64_t, int32_t], False),
-    "__atomic_and_fetch": (int64_t, [voidptr_t, int64_t, int32_t], False),
-    "__atomic_xor_fetch": (int64_t, [voidptr_t, int64_t, int32_t], False),
-    "__atomic_fetch_add": (int64_t, [voidptr_t, int64_t, int32_t], False),
-    "__atomic_fetch_sub": (int64_t, [voidptr_t, int64_t, int32_t], False),
-    "__atomic_fetch_or": (int64_t, [voidptr_t, int64_t, int32_t], False),
-    "__atomic_fetch_and": (int64_t, [voidptr_t, int64_t, int32_t], False),
-    "__atomic_fetch_xor": (int64_t, [voidptr_t, int64_t, int32_t], False),
-    "__atomic_compare_exchange_n": (
-        int32_t,
-        [voidptr_t, voidptr_t, int64_t, int32_t, int32_t, int32_t],
-        False,
-    ),
-    "__atomic_test_and_set": (int32_t, [voidptr_t, int32_t], False),
-    "__atomic_clear": (_VOID, [voidptr_t, int32_t], False),
-    "__atomic_thread_fence": (_VOID, [int32_t], False),
-    "modf": (_double, [_double, ir.DoubleType().as_pointer()], False),
-    "ldexp": (_double, [_double, int32_t], False),
-    "__builtin_va_arg": (voidptr_t, [voidptr_t, int64_t], False),
-    "strcoll": (int32_t, [cstring, cstring], False),
-    "clearerr": (_VOID, [voidptr_t], False),
-    "fileno": (int32_t, [voidptr_t], False),
-    "popen": (voidptr_t, [cstring, cstring], False),
-    "pclose": (int32_t, [voidptr_t], False),
-    "dlopen": (voidptr_t, [cstring, int32_t], False),
-    "dlsym": (voidptr_t, [voidptr_t, cstring], False),
-    "dlclose": (int32_t, [voidptr_t], False),
-    "dlerror": (cstring, [], False),
-    "setvbuf": (int32_t, [voidptr_t, cstring, int32_t, _size_t], False),
-    "freopen": (voidptr_t, [cstring, cstring, voidptr_t], False),
-    "getc": (int32_t, [voidptr_t], False),
-}
-
-# Public lowered map. Declarative signatures are merged below only after a
-# source guard proves they do not retain a shadow entry in this legacy table.
-LIBC_FUNCTIONS = dict(_LEGACY_LIBC_FUNCTIONS)
-
-
-def _libc_registry_ir_type(type_name: str):
-    """Lower a declarative libc type into the c_codegen IR type universe.
-
-    The declarative registry intentionally stores portable C spelling.  This
-    adapter is the bridge that makes the registry affect the real C frontend
-    today without waiting for the full C1 codegen split.
-    """
-    raw = (type_name or "").strip()
-    clean = raw.replace("const ", "").replace("volatile ", "").strip()
-    clean = clean.replace("struct FILE", "FILE")
-    if clean == "...":
-        return None
-    pointer_depth = 0
-    while clean.endswith("*"):
-        pointer_depth += 1
-        clean = clean[:-1].strip()
-    base_map = {
-        "void": _VOID,
-        "char": int8_t,
-        "signed char": int8_t,
-        "unsigned char": int8_t,
-        "int": int32_t,
-        "signed int": int32_t,
-        "unsigned int": int32_t,
-        "long": int64_t,
-        "long int": int64_t,
-        "unsigned long": int64_t,
-        "long long": int64_t,
-        "unsigned long long": int64_t,
-        "size_t": _size_t,
-        "ssize_t": int64_t,
-        "time_t": _time_t,
-        "double": _double,
-        "float": _float,
-        "FILE": _FILE_ptr,
-    }
-    if pointer_depth == 0:
-        return base_map.get(clean, voidptr_t)
-    if clean == "char" and pointer_depth == 1:
-        return cstring
-    if clean == "FILE" and pointer_depth == 1:
-        return _FILE_ptr
-    ir_type = base_map.get(clean, int8_t)
-    if clean == "void":
-        ir_type = int8_t
-    while pointer_depth > 0:
-        ir_type = ir_type.as_pointer()
-        pointer_depth -= 1
-    return ir_type
-
-
-def _libc_registry_signature_to_codegen(sig: LibcSignature):
-    params = []
-    var_arg = False
-    for arg in sig.arg_types:
-        if arg.strip() == "...":
-            var_arg = True
-            continue
-        lowered = _libc_registry_ir_type(arg)
-        if lowered is not None:
-            params.append(lowered)
-    return (_libc_registry_ir_type(sig.return_type), params, var_arg)
-
-
-def refresh_libc_registry_from_declarative() -> int:
-    """Merge pcc.c_libc_registry into the real codegen libc map.
-
-    This function is intentionally callable by tests and future platform setup
-    code.  It replaces duplicate built-in entries with the declarative source
-    of truth and adds new signatures without touching call sites.
-    """
-    signatures = iter_signatures()
-    overlaps = sorted(
-        sig.name for sig in signatures if sig.name in _LEGACY_LIBC_FUNCTIONS
-    )
-    if overlaps:
-        raise AssertionError(
-            "declarative libc signatures still shadow legacy codegen entries: "
-            + ", ".join(overlaps)
-        )
-    count = 0
-    for sig in signatures:
-        LIBC_FUNCTIONS[sig.name] = _libc_registry_signature_to_codegen(sig)
-        count += 1
-    return count
-
-
-def libc_registry_shadow_names() -> tuple[str, ...]:
-    """Return declarative names that still have a legacy codegen definition."""
-    return tuple(
-        sorted(
-            sig.name
-            for sig in iter_signatures()
-            if sig.name in _LEGACY_LIBC_FUNCTIONS
-        )
-    )
-
-
-refresh_libc_registry_from_declarative()
-
-
-class _NewScopeCtx:
-    """Explicit context manager for `Codegen.new_scope()` — avoids the
-    `@contextmanager` generator pattern that the self-host audit flags."""
-
-    def __init__(self, cg) -> None:
-        self._cg = cg
-
-    def __enter__(self):
-        cg = self._cg
-        self._old_scope_id = cg._current_scope_id
-        cg._scope_id_counter += 1
-        cg._current_scope_id = cg._scope_id_counter
-        cg.env = cg.env.new_child()
-        cg._decl_ast_types = cg._decl_ast_types.new_child()
-        cg._typedef_ast_types = cg._typedef_ast_types.new_child()
-        return cg
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        cg = self._cg
-        cg.env = cg.env.parents
-        cg._decl_ast_types = cg._decl_ast_types.parents
-        cg._typedef_ast_types = cg._typedef_ast_types.parents
-        cg._current_scope_id = self._old_scope_id
-
-
-class _NewFunctionCtx:
-    """Explicit context manager for `Codegen.new_function()`."""
-
-    def __init__(self, cg) -> None:
-        self._cg = cg
-
-    def __enter__(self):
-        cg = self._cg
-        self._oldfunc = cg.function
-        self._old_display_name = cg._function_display_name
-        self._old_frame_address_marker = cg._frame_address_marker
-        self._oldbuilder = cg.builder
-        self._oldenv = cg.env
-        self._old_decl_ast_types = cg._decl_ast_types
-        self._old_typedef_ast_types = cg._typedef_ast_types
-        self._oldlabels = cg._labels
-        self._old_scope_id = cg._current_scope_id
-        cg.in_global = False
-        cg._scope_id_counter += 1
-        cg._current_scope_id = cg._scope_id_counter
-        cg.env = cg.env.new_child()
-        cg._decl_ast_types = cg._decl_ast_types.new_child()
-        cg._typedef_ast_types = cg._typedef_ast_types.new_child()
-        cg._labels = {}
-        cg._frame_address_marker = None
-        return cg
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        cg = self._cg
-        cg.function = self._oldfunc
-        cg._function_display_name = self._old_display_name
-        cg._frame_address_marker = self._old_frame_address_marker
-        cg.builder = self._oldbuilder
-        cg.env = self._oldenv
-        cg._decl_ast_types = self._old_decl_ast_types
-        cg._typedef_ast_types = self._old_typedef_ast_types
-        cg._labels = self._oldlabels
-        cg._current_scope_id = self._old_scope_id
-        cg.in_global = True
-
-
-class CodegenError(Exception):
-    pass
-
-
-class ExternGlobalRef:
-    def __init__(self, symbol_name, ir_type):
-        self.symbol_name = symbol_name
-        self.ir_type = ir_type
-
-
-int16_t = ir.IntType(16)
-
-
-def get_ir_type(type_str):
-    """Get IR type from a single type name string."""
-    return get_ir_type_from_names([type_str] if isinstance(type_str, str) else type_str)
-
-
-def _names_to_key(names):
-    """Convert a names list like ['unsigned', 'int'] to a canonical key string."""
-    return names[0] if len(names) == 1 else " ".join(sorted(names))
-
 
 def _is_unsigned_names(names):
     """Check if a type name list represents an unsigned type."""
@@ -722,6 +213,18 @@ def postprocess_ir_text(text):
     return _postprocess_varargs_ir(text)
 
 
+def _no_builtin_enabled() -> bool:
+    """True when libc-builtin recognition must be disabled for this unit."""
+    import os
+
+    return str(os.environ.get("PCC_NO_BUILTIN", "") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
 _AARCH64_BRANCH_PROTECTION_ATTRS = (
     '"branch-target-enforcement"',
     '"sign-return-address"="non-leaf"',
@@ -729,270 +232,15 @@ _AARCH64_BRANCH_PROTECTION_ATTRS = (
 )
 
 
-def get_ir_type_from_names(names):
-    """Get IR type from a list of type specifier names like ['unsigned', 'int']."""
-    names = [
-        n
-        for n in names
-        if n
-        not in (
-            "const",
-            "volatile",
-            "register",
-            "restrict",
-            "inline",
-            "_Noreturn",
-            "_Thread_local",
-            "thread_local",
-            "signed",
-            "extern",
-            "static",
-        )
-    ]
-    s = " ".join(sorted(names))
-
-    # Exact matches
-    type_map = {
-        "int": int32_t,
-        "char": int8_t,
-        "void": ir.VoidType(),
-        "double": _double,
-        "float": _float,
-        "_Float16": _float,
-        "short": int16_t,
-        "long": int64_t,
-        "int short": int16_t,
-        "int long": int64_t,
-        "long long": int64_t,
-        "int long long": int64_t,
-        "__int128": int128_t,
-        "char unsigned": int8_t,
-        "int unsigned": int32_t,
-        "unsigned": int32_t,
-        "int short unsigned": int16_t,
-        "short unsigned": int16_t,
-        "int long unsigned": int64_t,
-        "long unsigned": int64_t,
-        "long long unsigned": int64_t,
-        "__int128 unsigned": int128_t,
-        # size_t, etc.
-        "size_t": int64_t,
-        "ssize_t": int64_t,
-        "ptrdiff_t": int64_t,
-        "int8_t": int8_t,
-        "int16_t": int16_t,
-        "int32_t": int32_t,
-        "int64_t": int64_t,
-        "uint8_t": int8_t,
-        "uint16_t": int16_t,
-        "uint32_t": int32_t,
-        "uint64_t": int64_t,
-        # C wide-char typedef. The preprocessor usually typedefs it to
-        # `int` via <wchar.h>, but when the SSA path stamps SSAString
-        # types as `wchar_t*` directly we hit this lookup without any
-        # typedef env. Default to i32 to match Linux/macOS ABI (see
-        # clang_compat wide-string regression).
-        "wchar_t": int32_t,
-    }
-
-    if s in type_map:
-        return type_map[s]
-
-    if "double" in names:
-        return _double
-    if "float" in names:
-        return _float
-    if "_Float16" in names:
-        return _float
-    # If it contains 'char', return i8
-    if "char" in names:
-        return int8_t
-    # If it contains 'short', return i16
-    if "short" in names:
-        return int16_t
-    # Default to i64
-    return int64_t
-
-
-def get_ir_type_from_node(node):
-    if isinstance(node, c_ast.EllipsisParam):
-        return voidptr_t  # shouldn't be called, but be safe
-
-    return _resolve_node_type(node.type)
-
-
-def _resolve_node_type(node_type):
-    """Resolve an AST type node to an IR type."""
-    if isinstance(node_type, c_ast.PtrDecl):
-        inner = node_type.type
-        if isinstance(inner, c_ast.FuncDecl):
-            ret_type = _resolve_node_type(inner.type)
-            param_types = []
-            is_var_arg = inner.args is None
-            if inner.args:
-                for p in inner.args.params:
-                    if isinstance(p, c_ast.EllipsisParam):
-                        is_var_arg = True
-                        continue
-                    t = get_ir_type_from_node(p)
-                    if not isinstance(t, ir.VoidType):
-                        param_types.append(t)
-            return ir.FunctionType(
-                ret_type,
-                param_types,
-                var_arg=is_var_arg,
-            ).as_pointer()
-        pointee = _resolve_node_type(inner)
-        if isinstance(pointee, ir.VoidType):
-            return voidptr_t
-        return ir.PointerType(pointee)
-    elif isinstance(node_type, c_ast.TypeDecl):
-        if isinstance(node_type.type, c_ast.IdentifierType):
-            return get_ir_type(node_type.type.names)
-        elif isinstance(node_type.type, c_ast.Struct):
-            snode = node_type.type
-            if snode.decls is not None:
-                # Inline struct with declarations — build real type
-                member_types = []
-                for decl in snode.decls:
-                    member_types.append(_resolve_node_type(decl.type))
-                st = ir.LiteralStructType(member_types)
-                st.members = [d.name for d in snode.decls]
-                st.member_decl_types = [d.type for d in snode.decls]
-                return st
-            return int8_t  # opaque/forward-declared struct
-        elif isinstance(node_type.type, c_ast.Union):
-            unode = node_type.type
-            if unode.decls is not None:
-                # Inline union with declarations — compute max size
-                if len(unode.decls) == 0:
-                    ut = ir.LiteralStructType([])
-                    ut.members = []
-                    ut.member_types = {}
-                    ut.member_decl_types = {}
-                    ut.is_union = True
-                    return ut
-                max_size = 0
-                max_align = 1
-                member_types = {}
-
-                def _resolve_union_member_type(decl_type):
-                    if isinstance(decl_type, c_ast.ArrayDecl):
-                        dims = []
-                        arr_node = decl_type
-                        while isinstance(arr_node, c_ast.ArrayDecl):
-                            dim = 0
-                            if isinstance(arr_node.dim, c_ast.Constant):
-                                dim = int(arr_node.dim.value.rstrip("uUlL"), 0)
-                            elif arr_node.dim is not None:
-                                dim = 0
-                            dims.append(dim)
-                            arr_node = arr_node.type
-                        elem_ir_type = _resolve_node_type(arr_node)
-                        arr_ir_type = elem_ir_type
-                        for dim in reversed(dims):
-                            arr_ir_type = ir.ArrayType(arr_ir_type, dim)
-                        return arr_ir_type
-                    return _resolve_node_type(decl_type)
-
-                for decl in unode.decls:
-                    ir_t = _resolve_union_member_type(decl.type)
-                    member_types[decl.name] = ir_t
-                    sz = ir_t.width // 8 if isinstance(ir_t, ir.IntType) else 8
-                    if _is_struct_ir_type(ir_t):
-                        sz = sum(
-                            e.width // 8 if isinstance(e, ir.IntType) else 8
-                            for e in ir_t.elements
-                        )
-                    if isinstance(ir_t, ir.PointerType):
-                        sz = 8
-                    if _is_floating_ir_type_static(ir_t):
-                        sz = _ir_type_size_static(ir_t)
-                    al = _ir_type_align_static(ir_t)
-                    if sz > max_size:
-                        max_size = sz
-                    if al > max_align:
-                        max_align = al
-                align_map = {8: int64_t, 4: int32_t, 2: int16_t, 1: int8_t}
-                align_type = align_map.get(max_align, int64_t)
-                pad_size = max_size - max_align
-                if pad_size > 0:
-                    ut = ir.LiteralStructType(
-                        [align_type, ir.ArrayType(int8_t, pad_size)]
-                    )
-                else:
-                    ut = ir.LiteralStructType([align_type])
-                ut.members = list(member_types.keys())
-                ut.member_types = member_types
-                ut.is_union = True
-                return ut
-            return int8_t  # opaque/forward-declared union
-        elif isinstance(node_type.type, c_ast.Enum):
-            return int32_t
-        return int64_t
-    elif isinstance(node_type, c_ast.ArrayDecl):
-        return voidptr_t  # array params decay to pointer
-    return int64_t
-
-
-def _is_floating_ir_type_static(ir_type):
-    return isinstance(ir_type, (ir.FloatType, ir.DoubleType))
-
-
-def _ir_type_align_static(ir_type):
-    custom_align = getattr(ir_type, "custom_align", None)
-    if custom_align is not None:
-        return custom_align
-    if isinstance(ir_type, ir.VoidType):
-        return 1
-    if isinstance(ir_type, ir.IntType):
-        return integer_scalar_layout(ir_type.width).alignment
-    if isinstance(ir_type, ir.FloatType):
-        return floating_scalar_layout(32).alignment
-    if isinstance(ir_type, ir.DoubleType):
-        return floating_scalar_layout(64).alignment
-    if isinstance(ir_type, ir.PointerType):
-        return pointer_scalar_layout().alignment
-    if isinstance(ir_type, ir.ArrayType):
-        return _ir_type_align_static(ir_type.element)
-    if _is_struct_ir_type(ir_type):
-        if not ir_type.elements:
-            return 1
-        return max(_ir_type_align_static(e) for e in ir_type.elements)
-    return 8
-
-
-def _ir_type_size_static(ir_type):
-    custom_size = getattr(ir_type, "custom_size", None)
-    if custom_size is not None:
-        return custom_size
-    if isinstance(ir_type, ir.IntType):
-        return integer_scalar_layout(ir_type.width).size
-    if isinstance(ir_type, ir.FloatType):
-        return floating_scalar_layout(32).size
-    if isinstance(ir_type, ir.DoubleType):
-        return floating_scalar_layout(64).size
-    if isinstance(ir_type, ir.PointerType):
-        return pointer_scalar_layout().size
-    if isinstance(ir_type, ir.ArrayType):
-        return int(ir_type.count) * _ir_type_size_static(ir_type.element)
-    if _is_struct_ir_type(ir_type):
-        offset = 0
-        for elem in ir_type.elements:
-            align = _ir_type_align_static(elem)
-            offset = (offset + align - 1) & ~(align - 1)
-            offset += _ir_type_size_static(elem)
-        struct_align = _ir_type_align_static(ir_type)
-        offset = (offset + struct_align - 1) & ~(struct_align - 1)
-        return offset
-    return 8
-
-
-def _is_struct_ir_type(ir_type):
-    return isinstance(ir_type, (ir.LiteralStructType, ir.IdentifiedStructType))
-
-
-class LLVMCodeGenerator(object):
+class LLVMCodeGenerator(
+    CExpressionFlowMixin,
+    CControlFlowMixin,
+    CDeclarationLoweringMixin,
+    CInitializerLoweringMixin,
+    CSwitchFlowMixin,
+    CSSALoweringMixin,
+    object,
+):
 
     def __init__(self, translation_unit_name=None, emit_debug=False, pass_ctx=None):
         self.module = ir.Module()
@@ -1215,1022 +463,6 @@ class LLVMCodeGenerator(object):
                 continue
             for attribute in _AARCH64_BRANCH_PROTECTION_ATTRS:
                 add_raw_function_attribute(function, attribute)
-
-    def _get_var_alloc_strategy(self, var_name):
-        """Query PassContext for the allocation strategy of a variable."""
-        if self._pass_ctx is None:
-            return None
-        func_name = self._function_display_name
-        if func_name is None:
-            return None
-        func_info = self._pass_ctx.functions.get(func_name)
-        if func_info is None:
-            return None
-        var_info = func_info.var_infos.get(var_name)
-        if var_info is None:
-            return None
-        return var_info.alloc_strategy
-
-    def _should_ssa_promote(self, var_name):
-        """Check if a variable should be promoted to SSA (no alloca).
-
-        Returns True only for variables the escape analysis proved safe:
-        single-def, non-escaping scalars. _safe_load already handles
-        non-pointer values by returning them as-is, so this works
-        transparently with the rest of codegen.
-        """
-        try:
-            from ..passes.context import AllocStrategy
-        except ImportError:
-            return False
-        strategy = self._get_var_alloc_strategy(var_name)
-        return strategy == AllocStrategy.SSA
-
-    def _ssa_ir_type(self, type_name):
-        if not type_name:
-            return int32_t
-        resolved = self._resolve_type_str(type_name)
-        if isinstance(resolved, ir.Type):
-            return resolved
-        if type_name.endswith("*"):
-            depth = 0
-            base = type_name
-            while base.endswith("*"):
-                depth += 1
-                base = base[:-1].strip()
-            ir_type = self._ssa_ir_type(base)
-            if isinstance(ir_type, ir.VoidType):
-                ir_type = int8_t
-            for _ in range(depth):
-                ir_type = ir.PointerType(ir_type)
-            return ir_type
-        if isinstance(resolved, str):
-            resolved_text = resolved.strip()
-            if resolved_text.startswith("struct "):
-                tag_name = resolved_text.split(" ", 1)[1]
-                tag_key = self._tag_type_key(tag_name)
-                if tag_key in self.env:
-                    return self.env[tag_key][0]
-                return self.module.context.get_identified_type(
-                    self._aggregate_type_name("struct", tag_name)
-                )
-            if resolved_text.startswith("union "):
-                tag_name = resolved_text.split(" ", 1)[1]
-                tag_key = self._tag_type_key(tag_name)
-                if tag_key in self.env:
-                    return self.env[tag_key][0]
-                return self.module.context.get_identified_type(
-                    self._aggregate_type_name("union", tag_name)
-                )
-            if resolved_text.startswith("enum "):
-                return int32_t
-            resolved_names = resolved_text.split()
-        else:
-            resolved_names = resolved
-        return get_ir_type_from_names(resolved_names)
-
-    def _ssa_resolve_int_typedef(self, type_name):
-        """Walk typedef chain for integer typedef names so `size_t` /
-        `uint32_t` / `lu_byte` etc. reach their canonical integer
-        spelling. Pointer/array forms pass through unchanged. Used by
-        the SSA comparison path where the common promoted type must be
-        correct for signedness.
-        """
-        if not type_name or type_name.endswith("*"):
-            return type_name
-        seen = set()
-        current = type_name
-        for _ in range(16):
-            if current in seen:
-                break
-            seen.add(current)
-            tokens = current.split()
-            if len(tokens) == 1:
-                node = self._lookup_typedef_ast_type(tokens[0])
-                if node is not None:
-                    # Unwrap TypeDecl → IdentifierType
-                    import pcc.ast.c_ast as _cast
-                    inner = node
-                    if isinstance(inner, _cast.TypeDecl):
-                        inner = inner.type
-                    if isinstance(inner, _cast.IdentifierType):
-                        current = " ".join(inner.names)
-                        continue
-            break
-        return current
-
-    def _ssa_is_unsigned_type(self, type_name):
-        if not type_name or type_name.endswith("*"):
-            return False
-        resolved = self._resolve_type_str(type_name)
-        if isinstance(resolved, list):
-            return self._is_unsigned_type_names(resolved)
-        if isinstance(resolved, str):
-            names = resolved.split()
-            return self._is_unsigned_type_names(names if len(names) > 1 else resolved)
-        return False
-
-    # ------------------------------------------------------------------
-    # Phase 2: SSA → LLVM IR lowering
-    #
-    # LLVM reference boundary:
-    #   PromoteMemoryToRegister.cpp achieves the same result bottom-up:
-    #   alloca/load/store → IDF phi placement → renaming pass.
-    #   We go top-down: C AST → internal SSA (builder.py already placed
-    #   phis via structured CFG construction) → LLVM values + phi nodes.
-    #   The output is equivalent: promotable scalar locals become LLVM
-    #   SSA values with phi nodes at join points, no alloca needed.
-    #
-    # Subset intentionally narrower than LLVM mem2reg:
-    #   - only functions the SSA builder accepted (structured scalar CFG)
-    #   - scalar integers plus direct-ID calls and pointer-typed values that
-    #     stay inside the builder/lowering subset
-    #   - no attempt yet to model LLVM mem2reg's full promotable-allocation
-    #     surface, address-taken locals, or arbitrary CFG / MemorySSA cases
-    # ------------------------------------------------------------------
-
-    def _has_ssa_function(self, func_name):
-        """Check if internal SSA IR is available for a function."""
-        if self._pass_ctx is None:
-            return False
-        return func_name in getattr(self._pass_ctx, "ssa_functions", {})
-
-    def _lower_ssa_function(self, func_name, return_type):
-        """Lower a function from internal SSA IR directly to LLVM IR.
-
-        Replaces _codegen_compound_items for eligible functions.
-        Returns True if lowering succeeded, False to fall back to AST codegen.
-        """
-        from ..ssa.ir import (
-            SSABinaryOp,
-            SSABlock,
-            SSABranch,
-            SSACast,
-            SSACall,
-            SSAConstant,
-            SSAFieldAddr,
-            SSAJump,
-            SSALoad,
-            SSAParam,
-            SSAPhi,
-            SSAReturn,
-            SSASwitch,
-            SSAUndef,
-            SSAStore,
-            SSAUnaryOp,
-        )
-
-        ssa_func = self._pass_ctx.ssa_functions[func_name]
-
-        # --- Phase 3 integration: consume SCCP results ---
-        # If SCCP proved values constant or branches foldable, use that
-        # during lowering to emit simpler code.
-        sccp_constants: dict[str, int] = {}
-        sccp_folded_branches: dict[str, str] = {}
-        sccp_reachable: set[str] | None = None
-        sccp_result = getattr(self._pass_ctx, "ssa_sccp_results", {}).get(func_name)
-        if sccp_result is not None:
-            # Only consume safe-fold constants here. Unsafe folds (ordered
-            # compares, arithmetic under unsigned wrap, shifts) yield
-            # Python ints that would be wrong for the unsigned cases at
-            # LLVM level — see unsigned_cmp.c regression.
-            sccp_constants = sccp_result.safe_constant_value_names()
-            sccp_folded_branches = sccp_result.folded_branches
-            sccp_reachable = sccp_result.reachable_blocks
-
-        ssa_value_types = {}
-        for param in ssa_func.params:
-            ssa_value_types[param.name] = param.type_name
-        for block in ssa_func.blocks:
-            for inst in block.instructions:
-                ssa_value_types[inst.name] = getattr(inst, "type_name", "int")
-
-        # --- Step 1: Create LLVM basic blocks ---
-        llvm_blocks: dict[str, ir.Block] = {}
-        for ssa_block in ssa_func.blocks:
-            if ssa_block.name == ssa_func.entry_block:
-                # Entry block already exists (created by codegen_FuncDef)
-                llvm_blocks[ssa_block.name] = self.builder.block
-            else:
-                llvm_blocks[ssa_block.name] = self.function.append_basic_block(
-                    ssa_block.name,
-                )
-
-        # --- Step 2: Map SSA params to LLVM function args ---
-        value_map: dict[str, ir.Value] = {}
-        for i, param in enumerate(ssa_func.params):
-            if i < len(self.function.args):
-                value_map[param.name] = self.function.args[i]
-
-        # --- Step 3: Lower each block ---
-        # First pass: create phi nodes (they must come first in LLVM blocks)
-        phi_nodes: dict[str, ir.PhiInstr] = {}
-        for ssa_block in ssa_func.blocks:
-            self.builder.position_at_end(llvm_blocks[ssa_block.name])
-            for inst in ssa_block.instructions:
-                if isinstance(inst, SSAPhi):
-                    phi = self.builder.phi(
-                        self._ssa_ir_type(getattr(inst, "type_name", "int")),
-                        name=inst.name,
-                    )
-                    phi_nodes[inst.name] = phi
-                    value_map[inst.name] = phi
-
-        # Pre-populate value_map with SCCP-proven constants so that
-        # downstream instructions and terminators see folded values.
-        for ssa_name, const_val in sccp_constants.items():
-            if ssa_name not in value_map:
-                value_map[ssa_name] = self._ssa_constant_ir_value(
-                    ssa_value_types.get(ssa_name, "int"),
-                    const_val,
-                )
-
-        # Compute reverse postorder so every instruction's SSA operands
-        # have been emitted into value_map by the time the user block is
-        # lowered. Short-circuit chains and complex loop shapes create
-        # blocks in outside-in creation order but execute inside-out —
-        # using ssa_func.blocks order makes the outer block reference
-        # inner defs that are not yet in value_map and fall back to 0.
-        def _rpo_block_order(func):
-            name_to_block = {b.name: b for b in func.blocks}
-            visited: set[str] = set()
-            post: list = []
-
-            def visit(name):
-                if name in visited or name not in name_to_block:
-                    return
-                visited.add(name)
-                blk = name_to_block[name]
-                for succ in blk.successors:
-                    visit(succ)
-                post.append(blk)
-
-            visit(func.entry_block)
-            ordered = list(reversed(post))
-            for b in func.blocks:
-                if b.name not in visited:
-                    ordered.append(b)
-            return ordered
-
-        block_order = _rpo_block_order(ssa_func)
-
-        # Second pass: lower instructions and terminators
-        emitted_successors: dict[str, set[str]] = {}
-        for ssa_block in block_order:
-            # Skip unreachable blocks (SCCP dead code)
-            if sccp_reachable is not None and ssa_block.name not in sccp_reachable:
-                if ssa_block.name in llvm_blocks:
-                    self.builder.position_at_end(llvm_blocks[ssa_block.name])
-                    self.builder.unreachable()
-                emitted_successors[ssa_block.name] = set()
-                continue
-
-            self.builder.position_at_end(llvm_blocks[ssa_block.name])
-
-            for inst in ssa_block.instructions:
-                if isinstance(inst, SSAPhi):
-                    continue  # already created above
-
-                # SCCP constant fold: if the result is already known
-                # constant, skip emitting the instruction.
-                if inst.name in sccp_constants:
-                    value_map[inst.name] = self._ssa_constant_ir_value(
-                        getattr(inst, "type_name", "int"),
-                        sccp_constants[inst.name],
-                    )
-                    continue
-
-                val = self._lower_ssa_instruction(
-                    inst, value_map,
-                )
-                if val is not None:
-                    value_map[inst.name] = val
-
-            # Lower terminator
-            term = ssa_block.terminator
-            if isinstance(term, SSAReturn):
-                if term.value is None:
-                    self.builder.ret_void()
-                else:
-                    ret_val = self._resolve_ssa_value(
-                        term.value, value_map,
-                    )
-                    if isinstance(return_type, ir.VoidType):
-                        self.builder.ret_void()
-                    else:
-                        if ret_val.type != return_type:
-                            ret_val = self._ssa_convert(
-                                ret_val,
-                                return_type,
-                                source_type_name=getattr(term.value, "type_name", None),
-                            )
-                        self.builder.ret(ret_val)
-            elif isinstance(term, SSAJump):
-                self.builder.branch(llvm_blocks[term.target])
-                emitted_successors[ssa_block.name] = {term.target}
-            elif isinstance(term, SSABranch):
-                # Jump-threading: if SCCP folded this branch, emit
-                # unconditional jump to the known target.
-                folded_target = sccp_folded_branches.get(ssa_block.name)
-                if folded_target is not None and folded_target in llvm_blocks:
-                    self.builder.branch(llvm_blocks[folded_target])
-                    emitted_successors[ssa_block.name] = {folded_target}
-                else:
-                    cond = self._resolve_ssa_value(
-                        term.condition, value_map,
-                    )
-                    cond_i1 = self._to_bool(cond)
-                    self.builder.cbranch(
-                        cond_i1,
-                        llvm_blocks[term.true_target],
-                        llvm_blocks[term.false_target],
-                    )
-                    emitted_successors[ssa_block.name] = {
-                        term.true_target,
-                        term.false_target,
-                    }
-            elif isinstance(term, SSASwitch):
-                folded_target = sccp_folded_branches.get(ssa_block.name)
-                if folded_target is not None and folded_target in llvm_blocks:
-                    self.builder.branch(llvm_blocks[folded_target])
-                    emitted_successors[ssa_block.name] = {folded_target}
-                else:
-                    switch_val = self._resolve_ssa_value(term.value, value_map)
-                    default_block = llvm_blocks[term.default_target]
-                    sw = self.builder.switch(switch_val, default_block)
-                    for case_const, target_name in term.cases:
-                        case_ir = ir.Constant(switch_val.type, case_const)
-                        sw.add_case(case_ir, llvm_blocks[target_name])
-                    emitted_successors[ssa_block.name] = {
-                        term.default_target, *(t for _, t in term.cases),
-                    }
-            else:
-                emitted_successors[ssa_block.name] = set()
-
-        # --- Step 4: Fill in phi incoming values ---
-        # `_resolve_ssa_value` may emit a `load` instruction when the
-        # value is an SSAGlobalRef or string literal — that load must
-        # land in the PREDECESSOR block (so it dominates the phi), not
-        # at wherever the builder happened to be after step 3. Position
-        # just before the predecessor's terminator before each resolve.
-        for ssa_block in ssa_func.blocks:
-            for inst in ssa_block.instructions:
-                if isinstance(inst, SSAPhi):
-                    phi = phi_nodes[inst.name]
-                    for pred_name, ssa_val in inst.incomings:
-                        if ssa_block.name not in emitted_successors.get(pred_name, set()):
-                            continue
-                        pred_llvm = llvm_blocks.get(pred_name)
-                        if pred_llvm is not None and pred_llvm.instructions:
-                            term = pred_llvm.instructions[-1]
-                            self.builder.position_before(term)
-                        elif pred_llvm is not None:
-                            self.builder.position_at_end(pred_llvm)
-                        incoming_val = self._resolve_ssa_value(
-                            ssa_val, value_map,
-                        )
-                        phi.add_incoming(incoming_val, llvm_blocks[pred_name])
-
-        return True
-
-    def _lower_ssa_instruction(self, inst, value_map):
-        """Lower a single SSA instruction to an LLVM value."""
-        from ..ssa.ir import SSABinaryOp, SSACall, SSACast, SSAFieldAddr, SSAFieldExtract, SSAGlobalRef, SSALoad, SSAStackAlloc, SSAStore, SSAUnaryOp
-
-        if isinstance(inst, SSABinaryOp):
-            left = self._resolve_ssa_value(inst.left, value_map)
-            right = self._resolve_ssa_value(inst.right, value_map)
-            # Pointer arithmetic is a special case: keep the integer index as
-            # an integer and let _lower_ssa_binop translate it to GEP.
-            is_pointer_arith = (
-                inst.op in {"+", "-"}
-                and (
-                    (
-                        isinstance(left.type, ir.PointerType)
-                        and isinstance(right.type, ir.IntType)
-                    )
-                    or (
-                        inst.op == "+"
-                        and isinstance(left.type, ir.IntType)
-                        and isinstance(right.type, ir.PointerType)
-                    )
-                )
-            )
-            # Ensure both operands have the same type for the non-pointer
-            # case. Widen BOTH toward the SSA-declared result type rather
-            # than blindly matching left's type: when `int - long` yields
-            # `long`, narrowing the long operand to int produces wrong
-            # values (see gcc_torture nestfunc-4.c).
-            result_type_name = getattr(inst, "type_name", "int")
-            result_ir_type = self._ssa_ir_type(result_type_name)
-            left_tn = getattr(inst.left, "type_name", "int")
-            right_tn = getattr(inst.right, "type_name", "int")
-            is_cmp = inst.op in {"==", "!=", "<", ">", "<=", ">="}
-            if (
-                not is_pointer_arith
-                and isinstance(result_ir_type, ir.IntType)
-                and not is_cmp
-            ):
-                if isinstance(left.type, ir.IntType) and left.type != result_ir_type:
-                    left = self._ssa_convert(
-                        left,
-                        result_ir_type,
-                        source_type_name=left_tn,
-                    )
-                # Shift: C11 6.5.7p3 promotes both operands independently,
-                # so the shift amount also widens to the result type. LLVM
-                # requires shift operands to share a type.
-                if isinstance(right.type, ir.IntType) and right.type != result_ir_type:
-                    right = self._ssa_convert(
-                        right,
-                        result_ir_type,
-                        source_type_name=right_tn,
-                    )
-            elif (
-                is_cmp
-                and isinstance(left.type, ir.IntType)
-                and isinstance(right.type, ir.IntType)
-            ):
-                # Comparison result is `int` but both operands must be
-                # compared at their common promoted type per C11 6.3.1.8
-                # (usual arithmetic conversions) — e.g. `unsigned short ==
-                # signed char` promotes both to int, making 65535 != -1
-                # instead of 0xffff == 0xffff (gcc_torture 20080813-1.c).
-                # Resolve typedef spellings (e.g. `size_t` → `unsigned long`)
-                # on the operand sides first so the rank table picks the
-                # right common type (test_size_t_still_uses_unsigned_*).
-                from ..ssa.builder import SSABuilder as _B
-                resolver = getattr(self, "_ssa_resolve_int_typedef", None)
-                if resolver is not None:
-                    class _V:
-                        def __init__(self, tn):
-                            self.type_name = tn
-                    common_name = _B._binary_result_type(
-                        "+",
-                        _V(resolver(getattr(inst.left, "type_name", "int"))),
-                        _V(resolver(getattr(inst.right, "type_name", "int"))),
-                    )
-                else:
-                    common_name = _B._binary_result_type("+", inst.left, inst.right)
-                common_ir = self._ssa_ir_type(common_name)
-                if isinstance(common_ir, ir.IntType):
-                    # Decide signedness of the compare using the common
-                    # (post-promotion) type, so the same rules in
-                    # `_binary_result_type` apply here. `_ssa_is_unsigned_type`
-                    # resolves typedefs (e.g. `size_t` → unsigned long)
-                    # and handles qualified names. A mixed
-                    # `signed vs unsigned` operand pair converges on the
-                    # correct C11 6.3.1.8 common type via the rank-based
-                    # _binary_result_type. Using only the common type
-                    # avoids the "any operand unsigned → do unsigned"
-                    # mistake (test_unsigned_loads covers both failing
-                    # and still-unsigned shapes).
-                    if left.type != common_ir:
-                        left = self._ssa_convert(
-                            left, common_ir, source_type_name=left_tn,
-                        )
-                    if right.type != common_ir:
-                        right = self._ssa_convert(
-                            right, common_ir, source_type_name=right_tn,
-                        )
-                    left_tn = right_tn = common_name
-            elif left.type != right.type and not is_pointer_arith:
-                right = self._ssa_convert(
-                    right,
-                    left.type,
-                    source_type_name=right_tn,
-                )
-            return self._lower_ssa_binop(
-                inst.op,
-                left,
-                right,
-                inst.name,
-                result_type_name=result_type_name,
-                left_type_name=left_tn,
-                right_type_name=right_tn,
-            )
-
-        if isinstance(inst, SSAUnaryOp):
-            operand = self._resolve_ssa_value(inst.operand, value_map)
-            return self._lower_ssa_unop(
-                inst.op,
-                operand,
-                inst.name,
-                result_type_name=getattr(inst, "type_name", "int"),
-                operand_type_name=getattr(inst.operand, "type_name", "int"),
-            )
-
-        if isinstance(inst, SSACast):
-            operand = self._resolve_ssa_value(inst.operand, value_map)
-            return self._lower_ssa_cast(
-                operand,
-                result_type_name=getattr(inst, "type_name", "int"),
-                operand_type_name=getattr(inst.operand, "type_name", "int"),
-            )
-
-        if isinstance(inst, SSALoad):
-            # If the load's base is a bare SSAGlobalRef and the load
-            # targets the *same* scalar type the global stores, we need
-            # the global's ADDRESS (pointer) rather than the
-            # auto-loaded value that `_resolve_ssa_value(SSAGlobalRef)`
-            # returns — that happens when the SSA builder snapshots a
-            # scalar global into a decl initializer (`long tmp = level;`
-            # in nestfunc-4.c). For pointer globals where the load's
-            # result differs from the base's declared pointee (e.g.
-            # `*p` where `p: int*` loads `int`), we still need the
-            # default two-step resolution: load `p` first to get the
-            # pointer, then load through it. Same for arrays.
-            from ..ssa.ir import SSAGlobalRef as _SSAGlobalRef
-            base = None
-            if isinstance(inst.base, _SSAGlobalRef):
-                base_type_name = getattr(inst.base, "type_name", "")
-                result_type_name = getattr(inst, "type_name", "int")
-                try:
-                    value_type, binding = self.lookup(inst.base.symbol_name)
-                except Exception:
-                    value_type, binding = None, None
-                if (
-                    binding is not None
-                    and not isinstance(value_type, ir.ArrayType)
-                    and isinstance(getattr(binding, "type", None), ir.PointerType)
-                    and not base_type_name.endswith("*")
-                    and base_type_name == result_type_name
-                ):
-                    base = binding
-            if base is None:
-                base = self._resolve_ssa_value(inst.base, value_map)
-            index = (
-                self._resolve_ssa_value(inst.index, value_map)
-                if inst.index is not None
-                else None
-            )
-            index_type_name = (
-                getattr(inst.index, "type_name", None)
-                if inst.index is not None
-                else None
-            )
-            return self._lower_ssa_load(
-                base,
-                index,
-                result_type_name=getattr(inst, "type_name", "int"),
-                index_type_name=index_type_name,
-            )
-
-        if isinstance(inst, SSAFieldAddr):
-            base = self._resolve_ssa_value(inst.base, value_map)
-            return self._lower_ssa_field_addr(
-                base,
-                inst.field_name,
-                result_type_name=getattr(inst, "type_name", "int"),
-            )
-
-        if isinstance(inst, SSAFieldExtract):
-            base = self._resolve_ssa_value(inst.base, value_map)
-            return self._lower_ssa_field_extract(
-                base,
-                inst.field_name,
-                result_type_name=getattr(inst, "type_name", "int"),
-            )
-
-        if isinstance(inst, SSAGlobalRef):
-            return self._resolve_ssa_value(inst, value_map)
-
-        if isinstance(inst, SSAStackAlloc):
-            elem_type = self._ssa_ir_type(getattr(inst, "elem_type_name", "int"))
-            size = None if getattr(inst, "count", 1) == 1 else ir.Constant(int32_t, inst.count)
-            return self.builder.alloca(elem_type, size=size, name=inst.name)
-
-        if isinstance(inst, SSAStore):
-            addr = self._resolve_ssa_value(inst.addr, value_map)
-            value = self._resolve_ssa_value(inst.value, value_map)
-            self._lower_ssa_store(addr, value)
-            return None
-
-        if isinstance(inst, SSACall):
-            return self._lower_ssa_call(inst, value_map)
-
-        return None
-
-    def _ssa_constant_ir_value(self, type_name, value):
-        ir_type = self._ssa_ir_type(type_name)
-        if isinstance(ir_type, ir.PointerType):
-            if value == 0:
-                return ir.Constant(ir_type, None)
-            # Non-zero pointer constant (e.g. `(void *) 1`): emit an
-            # `inttoptr` expression rather than a literal integer, which
-            # LLVM rejects as "integer constant must have integer type"
-            # (gcc_torture pr86231.c).
-            int_const = ir.Constant(ir.IntType(64), value)
-            return int_const.inttoptr(ir_type)
-        return ir.Constant(ir_type, value)
-
-    def _resolve_ssa_value(self, ssa_val, value_map):
-        """Resolve an SSA value to an LLVM IR value."""
-        from ..ssa.ir import SSAConstant, SSAGlobalRef, SSAStringConstant, SSAUndef
-
-        if isinstance(ssa_val, SSAConstant):
-            return self._ssa_constant_ir_value(ssa_val.type_name, ssa_val.value)
-        if isinstance(ssa_val, SSAStringConstant):
-            literal_node = c_ast.Constant(ssa_val.literal_kind, ssa_val.value)
-            gv = self._make_global_string_literal_constant(literal_node, name_hint="ssastr")
-            target_type = self._ssa_ir_type(getattr(ssa_val, "type_name", "char*"))
-            return self._const_pointer_to_first_elem(gv, target_type)
-        if isinstance(ssa_val, SSAGlobalRef):
-            value_type, binding = self.lookup(ssa_val.symbol_name)
-            if isinstance(binding, ir.values.Constant):
-                return binding
-            if isinstance(binding, ir.Function):
-                return binding
-            if isinstance(value_type, ir.ArrayType):
-                return self.builder.gep(
-                    binding,
-                    [ir.Constant(int64_t, 0), ir.Constant(int64_t, 0)],
-                    name="ssaglobal.arraydecay",
-                )
-            if isinstance(getattr(binding, "type", None), ir.PointerType):
-                return self._safe_load(binding)
-            return binding
-        if isinstance(ssa_val, SSAUndef):
-            return ir.Constant(self._ssa_ir_type(ssa_val.type_name), ir.Undefined)
-        if ssa_val.name in value_map:
-            return value_map[ssa_val.name]
-        # Fallback: zero
-        return ir.Constant(self._ssa_ir_type(getattr(ssa_val, "type_name", "int")), 0)
-
-    def _lower_ssa_binop(
-        self,
-        op,
-        left,
-        right,
-        name,
-        *,
-        result_type_name,
-        left_type_name,
-        right_type_name,
-    ):
-        """Lower a binary operation to LLVM IR.
-
-        LLVM reference: LLVM distinguishes integer instructions
-        (Instruction::Add/Sub/Mul/UDiv/SDiv/URem/SRem, ICmpInst) from
-        floating-point ones (Instruction::FAdd/FSub/FMul/FDiv/FRem,
-        FCmpInst). FCmpInst asserts `isFPOrFPVectorTy()` on operands —
-        mismatching int vs fp dispatch produces `icmp requires integer
-        operands` verifier errors. See
-        /tmp/llvm-src/.../lib/IR/Instructions.cpp FCmpInst::AssertOK.
-        """
-        b = self.builder
-        _FLOAT_TYPES = (ir.HalfType, ir.FloatType, ir.DoubleType)
-        is_float = isinstance(left.type, _FLOAT_TYPES) or isinstance(right.type, _FLOAT_TYPES)
-        if (
-            op == "+"
-            and isinstance(left.type, ir.IntType)
-            and isinstance(right.type, ir.PointerType)
-        ):
-            left, right = right, left
-        if (
-            op == "-"
-            and isinstance(left.type, ir.PointerType)
-            and isinstance(right.type, ir.PointerType)
-        ):
-            # C11 6.5.6p9: the pointer difference is in ELEMENTS of the
-            # pointed-to type, not bytes. Divide the byte difference by
-            # sizeof(*ptr). gcc_torture 20010116-1.c has `last - first`
-            # with Data (sizeof 12) where only the element count (4) is
-            # meaningful.
-            left_int = self.builder.ptrtoint(left, int64_t, name=f"{name}.lhs")
-            right_int = self.builder.ptrtoint(right, int64_t, name=f"{name}.rhs")
-            byte_diff = self.builder.sub(left_int, right_int, name=f"{name}.bytes")
-            pointee = left.type.pointee
-            elem_size = None
-            try:
-                elem_size = pointee.get_abi_size(self._target_data)
-            except Exception:
-                elem_size = None
-            if elem_size is None or elem_size <= 0:
-                elem_size = 1
-            if elem_size == 1:
-                diff = byte_diff
-            else:
-                diff = self.builder.sdiv(
-                    byte_diff,
-                    ir.Constant(int64_t, elem_size),
-                    name=name,
-                )
-            target_type = self._ssa_ir_type(result_type_name)
-            if isinstance(target_type, ir.IntType) and diff.type != target_type:
-                return self._ssa_convert(
-                    diff,
-                    target_type,
-                    source_type_name="long",
-                )
-            return diff
-        if isinstance(left.type, ir.PointerType) and isinstance(right.type, ir.IntType):
-            index = right
-            if index.type.width < int64_t.width:
-                # Pointer index widening must preserve unsigned-ness so
-                # `x[(unsigned char)i]` wraps correctly for 0xe8-style
-                # values instead of sign-extending to a negative index
-                # (gcc_torture 20030916-1.c).
-                if self._ssa_is_unsigned_type(right_type_name):
-                    index = b.zext(index, int64_t)
-                else:
-                    index = b.sext(index, int64_t)
-            elif index.type.width > int64_t.width:
-                index = b.trunc(index, int64_t)
-            if op == "-":
-                index = b.neg(index, name=f"{name}.neg")
-            if op in {"+", "-"}:
-                return b.gep(left, [index], name=name)
-        if is_float:
-            # Unordered fcmp (fcmp_unordered) matches C semantics for NaN:
-            # `x != x` is true when x is NaN, so use unordered for `!=` and
-            # ordered for the rest, aligning with how the existing
-            # AST-path codegen handles float compare (see line ~2066 and
-            # ~7470 for fcmp_ordered usage).
-            if op == "+":
-                return b.fadd(left, right, name=name)
-            if op == "-":
-                return b.fsub(left, right, name=name)
-            if op == "*":
-                return b.fmul(left, right, name=name)
-            if op == "/":
-                return b.fdiv(left, right, name=name)
-            if op == "%":
-                return b.frem(left, right, name=name)
-            if op in ("==", "<", ">", "<=", ">="):
-                cmp = b.fcmp_ordered(op, left, right, name=name)
-                return b.zext(cmp, self._ssa_ir_type(result_type_name), name=f"{name}.i")
-            if op == "!=":
-                cmp = b.fcmp_unordered(op, left, right, name=name)
-                return b.zext(cmp, self._ssa_ir_type(result_type_name), name=f"{name}.i")
-            # Bitwise / shift ops are not defined on floats in C.
-            raise ValueError(f"unsupported float binop {op!r}")
-        # For comparison ops the caller has already converted both
-        # operands to the common (promoted) type and set both
-        # {left,right}_type_name to that common type's name
-        # (see usual-arithmetic-conversions block above). Decide
-        # signedness from that common type only — "any operand
-        # unsigned" would be wrong for e.g. `long < unsigned int` where
-        # the unsigned side promotes to the signed wider type. For
-        # other ops the individual operand types are still meaningful;
-        # keep the "any unsigned" heuristic for `/` and `%`.
-        is_cmp_here = op in ("==", "!=", "<", ">", "<=", ">=")
-        if is_cmp_here:
-            is_unsigned = self._ssa_is_unsigned_type(left_type_name)
-        else:
-            is_unsigned = (
-                self._ssa_is_unsigned_type(left_type_name)
-                or self._ssa_is_unsigned_type(right_type_name)
-            )
-        # SEC-P1-UBSAN guards (no-op unless the flag is enabled). Signedness of
-        # `+ - *` uses the common (result) type, matching the sdiv/srem choice.
-        _ubsan_signed = not self._ssa_is_unsigned_type(result_type_name)
-        if op in ("+", "-", "*"):
-            self._maybe_ubsan_guard_arith(left, right, op, signed=_ubsan_signed)
-        elif op in ("/", "%"):
-            self._maybe_ubsan_guard_div(left, right, signed=not is_unsigned)
-        if op == "+":
-            return b.add(left, right, name=name)
-        if op == "-":
-            return b.sub(left, right, name=name)
-        if op == "*":
-            return b.mul(left, right, name=name)
-        if op == "/":
-            return b.udiv(left, right, name=name) if is_unsigned else b.sdiv(left, right, name=name)
-        if op == "%":
-            return b.urem(left, right, name=name) if is_unsigned else b.srem(left, right, name=name)
-        if op in ("==", "!=", "<", ">", "<=", ">="):
-            cmp = (
-                b.icmp_unsigned(op, left, right, name=name)
-                if is_unsigned
-                else b.icmp_signed(op, left, right, name=name)
-            )
-            return b.zext(cmp, self._ssa_ir_type(result_type_name), name=f"{name}.i")
-        if op == "&":
-            return b.and_(left, right, name=name)
-        if op == "|":
-            return b.or_(left, right, name=name)
-        if op == "^":
-            return b.xor(left, right, name=name)
-        if op == "<<":
-            self._maybe_ubsan_guard_shift(left, right)  # SEC-P1-UBSAN (no-op if off)
-            return b.shl(left, right, name=name)
-        if op == ">>":
-            self._maybe_ubsan_guard_shift(left, right)  # SEC-P1-UBSAN (no-op if off)
-            return b.lshr(left, right, name=name) if self._ssa_is_unsigned_type(left_type_name) else b.ashr(left, right, name=name)
-        # Fallback
-        return b.add(left, right, name=name)
-
-    def _lower_ssa_unop(self, op, operand, name, *, result_type_name, operand_type_name):
-        """Lower a unary operation to LLVM IR."""
-        b = self.builder
-        _FLOAT_TYPES = (ir.HalfType, ir.FloatType, ir.DoubleType)
-        if op == "-":
-            if isinstance(operand.type, _FLOAT_TYPES):
-                return b.fneg(operand, name=name)
-            return b.neg(operand, name=name)
-        if op == "!":
-            cmp = self._to_bool(operand)
-            zero = ir.Constant(ir.IntType(1), 0)
-            inv = b.icmp_unsigned("==", cmp, zero, name=name)
-            return b.zext(inv, self._ssa_ir_type(result_type_name))
-        if op == "~":
-            return b.not_(operand, name=name)
-        return operand
-
-    def _lower_ssa_cast(self, operand, *, result_type_name, operand_type_name):
-        """Lower an explicit SSA cast for the current scalar subset."""
-        target_type = self._ssa_ir_type(result_type_name)
-        if operand.type == target_type:
-            return operand
-        if isinstance(operand.type, ir.IntType) and isinstance(target_type, ir.IntType):
-            return self._ssa_convert(
-                operand,
-                target_type,
-                source_type_name=operand_type_name,
-            )
-        # Float -> integer: explicit SSA casts keep their own declared-type
-        # path, matching the generic implicit conversion's signedness choice.
-        _FLOAT_TYPES = (ir.HalfType, ir.FloatType, ir.DoubleType)
-        if isinstance(operand.type, _FLOAT_TYPES) and isinstance(target_type, ir.IntType):
-            if self._ssa_is_unsigned_type(result_type_name):
-                return self.builder.fptoui(operand, target_type)
-            return self.builder.fptosi(operand, target_type)
-        # Integer → float: pick signed vs unsigned based on source.
-        if isinstance(operand.type, ir.IntType) and isinstance(target_type, _FLOAT_TYPES):
-            if self._ssa_is_unsigned_type(operand_type_name):
-                return self.builder.uitofp(operand, target_type)
-            return self.builder.sitofp(operand, target_type)
-        return self._implicit_convert(operand, target_type)
-
-    def _lower_ssa_load(self, base, index, *, result_type_name, index_type_name=None):
-        """Lower a side-effect-free SSA load from a pointer base.
-
-        Widening the index must preserve unsignedness — `hist[data[i]]`
-        where `data[i]` is `unsigned char` but sign-extended as a GEP
-        index would read from `hist[-1]` instead of `hist[0xNN]`, a
-        byte_histogram bench regression we were measuring under Phase 3.
-        """
-        if not isinstance(getattr(base, "type", None), ir.PointerType):
-            return ir.Constant(self._ssa_ir_type(result_type_name), 0)
-
-        elem_ptr = base
-        if index is not None:
-            if not isinstance(index.type, ir.IntType):
-                index = self.builder.fptoui(index, int64_t)
-            elif index.type.width < int64_t.width:
-                if index_type_name and self._ssa_is_unsigned_type(index_type_name):
-                    index = self.builder.zext(index, int64_t)
-                else:
-                    index = self.builder.sext(index, int64_t)
-            elif index.type.width > int64_t.width:
-                index = self.builder.trunc(index, int64_t)
-            elem_ptr = self.builder.gep(base, [index], name="ssaload.idx")
-
-        loaded = self._safe_load(elem_ptr)
-        return self._implicit_convert(loaded, self._ssa_ir_type(result_type_name))
-
-    def _lower_ssa_field_addr(self, base, field_name, *, result_type_name):
-        """Lower a read-only aggregate field address inside the SSA subset."""
-        if not isinstance(getattr(base, "type", None), ir.PointerType):
-            return ir.Constant(self._ssa_ir_type(result_type_name), ir.Undefined)
-        aggregate_type = base.type.pointee
-        field_offset, semantic_field_type = self._get_aggregate_field_info(
-            aggregate_type,
-            field_name,
-        )
-        target_ptr_type = ir.PointerType(semantic_field_type)
-        if result_type_name:
-            target_ptr_type = self._ssa_ir_type(result_type_name)
-        return self._byte_offset_ptr(
-            base,
-            field_offset,
-            target_ptr_type,
-            name="ssafieldptr",
-        )
-
-    def _lower_ssa_field_extract(self, base, field_name, *, result_type_name):
-        """Lower a scalar field extract from an aggregate SSA value."""
-        aggregate_type = getattr(base, "type", None)
-        if not self._is_aggregate_ir_type(aggregate_type):
-            return ir.Constant(self._ssa_ir_type(result_type_name), 0)
-        field_path = self._aggregate_field_path(aggregate_type, field_name)
-        if field_path is None:
-            return ir.Constant(self._ssa_ir_type(result_type_name), 0)
-        extracted = self.builder.extract_value(base, field_path, name="ssafield")
-        return self._implicit_convert(extracted, self._ssa_ir_type(result_type_name))
-
-    def _lower_ssa_store(self, addr, value):
-        """Lower a narrow SSA memory store."""
-        if not isinstance(getattr(addr, "type", None), ir.PointerType):
-            return
-        self._safe_store(value, addr)
-
-    def _lower_ssa_call(self, inst, value_map):
-        """Lower an SSA call instruction to an LLVM call."""
-        callee_func = None
-        ftype = None
-        if inst.callee is not None:
-            callee_func = self._resolve_ssa_value(inst.callee, value_map)
-            if (
-                isinstance(getattr(callee_func, "type", None), ir.PointerType)
-                and isinstance(callee_func.type.pointee, ir.FunctionType)
-            ):
-                ftype = callee_func.type.pointee
-        else:
-            try:
-                _, callee_func = self.lookup(inst.callee_name)
-            except (KeyError, Exception):
-                pass
-
-            if callee_func is None or not isinstance(callee_func, ir.Function):
-                _, callee_func = self._declare_implicit_function(
-                    inst.callee_name,
-                    call_arg_count=len(inst.args),
-                )
-
-            if isinstance(callee_func, ir.Function):
-                ftype = callee_func.function_type
-            elif (
-                isinstance(getattr(callee_func, "type", None), ir.PointerType)
-                and isinstance(callee_func.type.pointee, ir.FunctionType)
-            ):
-                ftype = callee_func.type.pointee
-
-        if callee_func is None or ftype is None:
-            return ir.Constant(self._ssa_ir_type(getattr(inst, "type_name", "int")), 0)
-
-        call_args = []
-        is_variadic = bool(getattr(ftype, "var_arg", False))
-        _FLOAT_TYPES = (ir.HalfType, ir.FloatType, ir.DoubleType)
-        for i, ssa_arg in enumerate(inst.args):
-            arg_val = self._resolve_ssa_value(ssa_arg, value_map)
-            if i < len(ftype.args):
-                expected = ftype.args[i]
-                if arg_val.type != expected:
-                    arg_val = self._ssa_convert(
-                        arg_val,
-                        expected,
-                        source_type_name=getattr(ssa_arg, "type_name", "int"),
-                    )
-            elif is_variadic:
-                # C11 6.5.2.2p6: default argument promotions apply to
-                # extra variadic args. char/short → int, float → double.
-                # Without this, `printf("%x", u8_value)` passes i8 and
-                # the callee reads wrong-width data (see c-testsuite
-                # 00216.c `flow: 809 ...` regression).
-                if (
-                    isinstance(arg_val.type, ir.IntType)
-                    and arg_val.type.width < 32
-                ):
-                    source_type_name = getattr(ssa_arg, "type_name", "int")
-                    if self._ssa_is_unsigned_type(source_type_name):
-                        arg_val = self.builder.zext(arg_val, ir.IntType(32))
-                    else:
-                        arg_val = self.builder.sext(arg_val, ir.IntType(32))
-                elif isinstance(arg_val.type, ir.FloatType):
-                    arg_val = self.builder.fpext(arg_val, ir.DoubleType())
-            call_args.append(arg_val)
-
-        # Emit the call
-        is_void = isinstance(ftype.return_type, ir.VoidType)
-        call_target = self._direct_call_callee(callee_func, call_args)
-        if is_void:
-            self.builder.call(call_target, call_args)
-            return None
-
-        result = self.builder.call(call_target, call_args, name=inst.name)
-        # If the actual LLVM return type doesn't match the SSA metadata
-        # type (e.g. builder defaulted to `int` for an undeclared
-        # `strlen` but LLVM knows it returns `size_t`/i64), convert the
-        # result. Otherwise a downstream phi typed from `inst.type_name`
-        # would mismatch the actual value type — see test_separate_tus
-        # lua `*len = s ? strlen(s) : 0;` regression.
-        declared_type = self._ssa_ir_type(getattr(inst, "type_name", "int"))
-        if (
-            isinstance(result.type, ir.IntType)
-            and isinstance(declared_type, ir.IntType)
-            and result.type != declared_type
-        ):
-            result = self._ssa_convert(
-                result,
-                declared_type,
-                source_type_name=None,
-            )
-        return result
-
-    def _ssa_convert(self, val, target_type, source_type_name=None):
-        """Convert an LLVM value to target type (int width change)."""
-        if val.type == target_type:
-            return val
-        if isinstance(val.type, ir.IntType) and isinstance(target_type, ir.IntType):
-            if val.type.width < target_type.width:
-                if self._ssa_is_unsigned_type(source_type_name or ""):
-                    return self.builder.zext(val, target_type)
-                return self.builder.sext(val, target_type)
-            if val.type.width > target_type.width:
-                return self.builder.trunc(val, target_type)
-        return self._implicit_convert(val, target_type)
 
     def define(self, name, val):
         self.env[name] = val
@@ -2965,12 +1197,14 @@ class LLVMCodeGenerator(object):
         return lhs, rhs, self._is_unsigned_val(lhs)
 
     def _is_floating_ir_type(self, ir_type):
-        return isinstance(ir_type, (ir.FloatType, ir.DoubleType))
+        return isinstance(ir_type, (ir.HalfType, ir.FloatType, ir.DoubleType))
 
     def _common_float_type(self, lhs_type, rhs_type):
         if isinstance(lhs_type, ir.DoubleType) or isinstance(rhs_type, ir.DoubleType):
             return _double
-        return _float
+        if isinstance(lhs_type, ir.FloatType) or isinstance(rhs_type, ir.FloatType):
+            return _float
+        return ir.HalfType()
 
     def _parse_float_constant(self, raw):
         is_float32 = raw.endswith(("f", "F"))
@@ -3232,7 +1466,24 @@ class LLVMCodeGenerator(object):
             name=f"{callee_func.name}.callabi",
         )
 
+    # GCC/clang builtins that are plain libm/libc entry points at the ABI
+    # level. musl's pow() calls __builtin_fma; emitting that name verbatim
+    # left an undefined ___builtin_fma symbol at link time.
+    _BUILTIN_SYMBOL_ALIASES = {
+        "__builtin_fma": "fma",
+        "__builtin_fmaf": "fmaf",
+        "__builtin_fabs": "fabs",
+        "__builtin_fabsf": "fabsf",
+        "__builtin_copysign": "copysign",
+        "__builtin_copysignf": "copysignf",
+        "__builtin_sqrt": "sqrt",
+        "__builtin_sqrtf": "sqrtf",
+    }
+
     def _declare_implicit_function(self, name, call_arg_count=0):
+        alias = self._BUILTIN_SYMBOL_ALIASES.get(name)
+        if alias is not None:
+            name = alias
         function_type, ret_ir = self._implicit_function_ir_type(
             name, call_arg_count=call_arg_count
         )
@@ -3283,7 +1534,11 @@ class LLVMCodeGenerator(object):
             "emissionKind": ir.DIToken("FullDebug"),
         }, is_distinct=True)
         self._di_scope = self._di_file
-        self.module.add_named_metadata("llvm.dbg.cu", [self._di_compile_unit])
+        # Named metadata owns the compile-unit node directly.  Passing a list
+        # asks both llvmlite and the native builder to manufacture an extra
+        # ``!{!cu}`` tuple; LLVM then rejects the named operand as an invalid
+        # compile unit and silently drops all DWARF during object emission.
+        self.module.add_named_metadata("llvm.dbg.cu", self._di_compile_unit)
         di_flags = self.module.add_named_metadata("llvm.module.flags")
         i32 = ir.IntType(32)
         # Dwarf Version = 4
@@ -3306,6 +1561,8 @@ class LLVMCodeGenerator(object):
             encoding = ir.DIToken("DW_ATE_signed")
         elif isinstance(ir_type, ir.DoubleType):
             name, size, encoding = "double", 64, ir.DIToken("DW_ATE_float")
+        elif isinstance(ir_type, ir.HalfType):
+            name, size, encoding = "_Float16", 16, ir.DIToken("DW_ATE_float")
         elif isinstance(ir_type, ir.FloatType):
             name, size, encoding = "float", 32, ir.DIToken("DW_ATE_float")
         else:
@@ -3352,6 +1609,22 @@ class LLVMCodeGenerator(object):
         })
         if hasattr(inst, "set_metadata"):
             inst.set_metadata("dbg", di_loc)
+
+    def _di_attach_function_call_locations(self, func, node):
+        """Give every call in a debug function a valid source location.
+
+        LLVM requires calls in a function carrying ``DISubprogram`` metadata
+        to have ``!dbg`` locations.  The C lowerer does not yet retain a source
+        node on every emitted IR instruction, so use the enclosing function's
+        coordinate as the honest finite fallback instead of letting clang
+        discard the entire compile unit.
+        """
+        if not self.emit_debug or self._di_scope is None:
+            return
+        for block in func.blocks:
+            for inst in block.instructions:
+                if getattr(inst, "opname", "") == "call":
+                    self._di_set_location(inst, node)
 
     def generate_code(self, node):
         self._init_debug_info()
@@ -3476,30 +1749,14 @@ class LLVMCodeGenerator(object):
             elif isinstance(ext, c_ast.Typedef):
                 is_type_def = True
             if is_type_def:
-                try:
-                    self.codegen(ext)
-                except Exception as exc:
-                    _logger.debug("pass1: skipping typedef: %s", exc)
+                self.codegen(ext)
                 pass1.add(i)
         remaining_exts = [ext for i, ext in enumerate(node.ext) if i not in pass1]
         self._collect_file_scope_function_ir_types(remaining_exts)
         self._collect_file_scope_object_ir_types(remaining_exts)
         for i, ext in enumerate(node.ext):
             if i not in pass1:
-                try:
-                    self.codegen(ext)
-                except Exception as e:
-                    ename = type(e).__name__
-                    # Non-fatal errors: skip the problematic declaration/definition
-                    if ename in ("DuplicatedNameError",) or isinstance(
-                        e, (AssertionError, TypeError)
-                    ):
-                        _logger.debug("pass2: skipping non-fatal %s: %s", ename, e)
-                        continue
-                    if isinstance(e, KeyError) and e.args and e.args[0] is None:
-                        _logger.debug("pass2: skipping KeyError(None)")
-                        continue
-                    raise
+                self.codegen(ext)
 
     _escape_map = {
         "n": "\n",
@@ -3672,20 +1929,29 @@ class LLVMCodeGenerator(object):
         # Evaluate the condition as a compile-time constant
         try:
             cond_val, _ = self.codegen(node.cond)
-            if isinstance(cond_val, ir.Constant):
-                val = self._constant_raw_value(cond_val)
-                if isinstance(val, int) and val == 0:
-                    msg = node.message
-                    if hasattr(msg, 'value'):
-                        msg = msg.value.strip('"')
-                    msg = msg or "static assertion failed"
-                    raise SemanticError(
-                        f"_Static_assert failed: {msg}"
-                    )
+            if not isinstance(cond_val, ir.Constant):
+                raise SemanticError(
+                    "_Static_assert condition is not an integer constant expression"
+                )
+            val = self._constant_raw_value(cond_val)
+            if not isinstance(val, int):
+                raise SemanticError(
+                    "_Static_assert condition is not an integer constant expression"
+                )
+            if val == 0:
+                msg = node.message
+                if hasattr(msg, 'value'):
+                    msg = msg.value.strip('"')
+                msg = msg or "static assertion failed"
+                raise SemanticError(
+                    f"_Static_assert failed: {msg}"
+                )
         except SemanticError:
             raise
-        except Exception:
-            pass
+        except Exception as exc:
+            raise SemanticError(
+                "unable to evaluate _Static_assert condition: " + str(exc)
+            ) from exc
         return None, None
 
     def codegen_Alignas(self, node):
@@ -3929,7 +2195,7 @@ class LLVMCodeGenerator(object):
             if isinstance(lv.type, ir.PointerType):
                 delta = ir.Constant(int64_t, 1 if is_inc else -1)
                 new_val = self.builder.gep(lv, [delta], name="ptrincdec")
-            elif isinstance(lv.type, (ir.FloatType, ir.DoubleType)):
+            elif self._is_floating_ir_type(lv.type):
                 one = ir.Constant(lv.type, 1.0)
                 new_val = (
                     self._fadd(lv, one, "inc")
@@ -4266,1449 +2532,6 @@ class LLVMCodeGenerator(object):
             self._tag_unsigned_return(value)
         return value
 
-    def _build_const_array_init(self, init_list, array_type, elem_ir_type):
-        """Build a constant initializer for a global array."""
-        actual_elem = (
-            array_type.element if isinstance(array_type, ir.ArrayType) else elem_ir_type
-        )
-        values = []
-        for expr in init_list.exprs:
-            if isinstance(expr, c_ast.InitList):
-                sub_type = actual_elem
-                values.append(
-                    self._build_const_array_init(expr, sub_type, elem_ir_type)
-                )
-            else:
-                try:
-                    val = self._eval_const_expr(expr)
-                    c = self._ir_constant_from_value(actual_elem, val)
-                    str(c)  # verify serializable
-                    values.append(c)
-                except Exception:
-                    values.append(ir.Constant(actual_elem, None))
-        try:
-            result = ir.Constant(array_type, values)
-            str(result)  # verify
-            return result
-        except Exception:
-            return ir.Constant(array_type, None)
-
-    def _zero_initializer(self, ir_type):
-        if isinstance(ir_type, ir.PointerType):
-            return ir.Constant(ir_type, None)
-        if self._is_floating_ir_type(ir_type):
-            return ir.Constant(ir_type, 0.0)
-        if isinstance(ir_type, ir.IntType):
-            return ir.Constant(ir_type, 0)
-        return ir.Constant(ir_type, None)
-
-    def _make_global_string_constant(self, raw, name_hint="str"):
-        processed = self._process_escapes(raw)
-        data = self._string_bytes(processed + "\00")
-        arr_type = ir.ArrayType(int8_t, len(data))
-        gv = ir.GlobalVariable(
-            self.module, arr_type, self.module.get_unique_name(name_hint)
-        )
-        gv.initializer = ir.Constant(arr_type, data)
-        gv.global_constant = True
-        gv.linkage = "internal"
-        return gv
-
-    def _make_global_string_literal_constant(self, node, name_hint="str"):
-        data = self._string_literal_data(node)
-        is_wide = self._is_wide_string_constant(node)
-        # Deduplicate identical string literals so that `foo(s)` and
-        # `s + 2` — which both reference the same source-level
-        # `const char *s = "...";` — compare equal at runtime. Without
-        # dedup each reference created a fresh `@ssastr.N` and pointer
-        # equality failed (gcc_torture pr34415.c).
-        cache = getattr(self, "_string_literal_cache", None)
-        if cache is None:
-            cache = {}
-            self._string_literal_cache = cache
-        cache_key = (is_wide, tuple(data))
-        cached = cache.get(cache_key)
-        if cached is not None:
-            return cached
-        if is_wide:
-            elem_type = int32_t
-            values = [ir.Constant(int32_t, cp) for cp in data]
-            arr_type = ir.ArrayType(elem_type, len(values))
-            initializer = ir.Constant(arr_type, values)
-        else:
-            elem_type = int8_t
-            arr_type = ir.ArrayType(elem_type, len(data))
-            initializer = ir.Constant(arr_type, data)
-        gv = ir.GlobalVariable(
-            self.module, arr_type, self.module.get_unique_name(name_hint)
-        )
-        gv.initializer = initializer
-        gv.global_constant = True
-        gv.linkage = "internal"
-        cache[cache_key] = gv
-        return gv
-
-    def _compound_literal_ir_type(self, ast_type, init_node=None):
-        if isinstance(ast_type, c_ast.ArrayDecl):
-            return self._build_array_ir_type(ast_type, init_node=init_node)
-        return self._resolve_ast_type(ast_type)
-
-    def _materialize_global_compound_literal(self, ast_type, init_node):
-        cache_key = id(init_node)
-        cached = self._global_compound_literal_cache.get(cache_key)
-        if cached is not None:
-            return cached
-
-        ir_type = self._compound_literal_ir_type(ast_type, init_node)
-        gv = ir.GlobalVariable(
-            self.module,
-            ir_type,
-            self.module.get_unique_name("compoundlit"),
-        )
-        gv.initializer = self._build_const_init(init_node, ir_type)
-        gv.linkage = "internal"
-        self._global_compound_literal_cache[cache_key] = gv
-        return gv
-
-    def _const_pointer_to_first_elem(self, gv, target_type):
-        idx0 = ir.Constant(int64_t, 0)
-        ptr = gv.gep([idx0, idx0])
-        return ptr if ptr.type == target_type else ptr.bitcast(target_type)
-
-    def _is_little_endian(self):
-        return not str(self.module.data_layout).startswith("E")
-
-    def _zero_bytes(self, size):
-        return [ir.Constant(int8_t, 0) for _ in range(size)]
-
-    def _scalar_init_node(self, init_node):
-        if not isinstance(init_node, c_ast.InitList):
-            return init_node
-        if not init_node.exprs:
-            return None
-        return self._scalar_init_node(init_node.exprs[0])
-
-    def _initializer_slot_count(self, ir_type):
-        if getattr(ir_type, "is_union", False):
-            member_names = self._aggregate_member_names(ir_type)
-            if not member_names:
-                return 1
-            return self._initializer_slot_count(
-                self._aggregate_member_ir_type(ir_type, 0)
-            )
-
-        if isinstance(ir_type, ir.ArrayType):
-            return ir_type.count * self._initializer_slot_count(ir_type.element)
-
-        if _is_struct_ir_type(ir_type):
-            if getattr(ir_type, "has_custom_layout", False):
-                layouts = getattr(ir_type, "field_layouts_by_index", None) or []
-                if layouts:
-                    return sum(
-                        self._initializer_slot_count(layout.semantic_ir_type)
-                        for layout in layouts
-                    )
-            return sum(
-                self._initializer_slot_count(member_type)
-                for member_type in getattr(ir_type, "elements", ())
-            )
-
-        return 1
-
-    def _initializer_expr_consumption(self, exprs, ir_type):
-        if not exprs:
-            return 0
-
-        first_expr = exprs[0]
-        if (
-            isinstance(first_expr, c_ast.InitList)
-            or self._is_array_string_initializer(first_expr, ir_type)
-            or self._initializer_expr_matches_type(first_expr, ir_type)
-        ):
-            return 1
-
-        if getattr(ir_type, "is_union", False):
-            return 1
-
-        if isinstance(ir_type, ir.ArrayType):
-            consumed = 0
-            remaining = list(exprs)
-            for _ in range(ir_type.count):
-                if not remaining:
-                    break
-                step = self._initializer_expr_consumption(remaining, ir_type.element)
-                if step <= 0:
-                    break
-                consumed += step
-                remaining = remaining[step:]
-            return max(consumed, 1)
-
-        if _is_struct_ir_type(ir_type):
-            consumed = 0
-            remaining = list(exprs)
-            for member_type in self._aggregate_member_ir_types(ir_type):
-                if not remaining:
-                    break
-                step = self._initializer_expr_consumption(remaining, member_type)
-                if step <= 0:
-                    break
-                consumed += step
-                remaining = remaining[step:]
-            return max(consumed, 1)
-
-        return 1
-
-    def _is_char_array_string_initializer(self, init_node, ir_type):
-        return (
-            self._is_string_constant(init_node)
-            and not self._is_wide_string_constant(init_node)
-            and isinstance(ir_type, ir.ArrayType)
-            and isinstance(ir_type.element, ir.IntType)
-            and ir_type.element.width == 8
-        )
-
-    def _is_wchar_array_string_initializer(self, init_node, ir_type):
-        return (
-            self._is_wide_string_constant(init_node)
-            and isinstance(ir_type, ir.ArrayType)
-            and isinstance(ir_type.element, ir.IntType)
-            and ir_type.element.width == 32
-        )
-
-    def _is_array_string_initializer(self, init_node, ir_type):
-        return self._is_char_array_string_initializer(
-            init_node, ir_type
-        ) or self._is_wchar_array_string_initializer(init_node, ir_type)
-
-    def _normalize_array_init_list(self, init_node, elem_ir_type):
-        if not isinstance(init_node, c_ast.InitList):
-            return init_node
-
-        exprs = list(getattr(init_node, "exprs", None) or [])
-        if not exprs:
-            return init_node
-
-        if any(
-            isinstance(expr, (c_ast.InitList, c_ast.NamedInitializer))
-            or self._is_array_string_initializer(expr, elem_ir_type)
-            for expr in exprs
-        ):
-            return init_node
-
-        slots = self._initializer_slot_count(elem_ir_type)
-        if slots <= 1:
-            return init_node
-
-        grouped_exprs = []
-        cursor = 0
-        while cursor < len(exprs):
-            consumed = self._initializer_expr_consumption(exprs[cursor:], elem_ir_type)
-            if consumed <= 1:
-                grouped_exprs.append(exprs[cursor])
-                cursor += 1
-                continue
-            grouped_exprs.append(
-                c_ast.InitList(exprs[cursor : cursor + consumed], init_node.coord)
-            )
-            cursor += consumed
-        return c_ast.InitList(grouped_exprs, init_node.coord)
-
-    def _designator_index_bounds(self, designator):
-        if isinstance(designator, c_ast.RangeDesignator):
-            try:
-                start = int(self._eval_const_expr(designator.start))
-                end = int(self._eval_const_expr(designator.end))
-            except Exception:
-                return None
-            if end < start:
-                start, end = end, start
-            return start, end
-        try:
-            index = int(self._eval_const_expr(designator))
-        except Exception:
-            return None
-        return index, index
-
-    def _ordered_array_init_exprs(self, init_node, ir_type):
-        exprs = list(getattr(init_node, "exprs", None) or [])
-        if not exprs:
-            return exprs
-
-        if not any(isinstance(expr, c_ast.NamedInitializer) for expr in exprs):
-            return exprs
-
-        ordered = [None] * ir_type.count
-        cursor = 0
-
-        for expr in exprs:
-            target_expr = expr
-            if isinstance(expr, c_ast.NamedInitializer):
-                designators = getattr(expr, "name", None) or []
-                if not designators:
-                    continue
-                bounds = self._designator_index_bounds(designators[0])
-                if bounds is None:
-                    continue
-                start, end = bounds
-                if start < 0:
-                    continue
-                if end >= len(ordered):
-                    ordered.extend([None] * (end + 1 - len(ordered)))
-                cursor = start
-                if len(designators) > 1:
-                    target_expr = c_ast.InitList(
-                        [
-                            c_ast.NamedInitializer(
-                                designators[1:],
-                                expr.expr,
-                                expr.coord,
-                            )
-                        ],
-                        expr.coord,
-                    )
-                    normalized = self._normalize_initializer_for_type(
-                        target_expr, ir_type.element
-                    )
-                else:
-                    target_expr = expr.expr
-                    normalized = self._normalize_initializer_for_type(
-                        target_expr, ir_type.element
-                    )
-                for index in range(start, end + 1):
-                    if len(designators) == 1:
-                        ordered[index] = normalized
-                    elif ordered[index] is None:
-                        ordered[index] = normalized
-                    else:
-                        ordered[index] = self._merge_initializer_nodes(
-                            ordered[index],
-                            normalized,
-                            expr.coord,
-                        )
-                cursor = end + 1
-                continue
-
-            while cursor < len(ordered) and ordered[cursor] is not None:
-                cursor += 1
-            if cursor >= len(ordered):
-                break
-            ordered[cursor] = self._normalize_initializer_for_type(
-                target_expr, ir_type.element
-            )
-            cursor += 1
-
-        return ordered
-
-    def _merge_initializer_nodes(self, existing, new_expr, coord=None):
-        if existing is None:
-            return new_expr
-        if new_expr is None:
-            return existing
-
-        merged_exprs = []
-        if isinstance(existing, c_ast.InitList):
-            merged_exprs.extend(list(existing.exprs or ()))
-        else:
-            merged_exprs.append(existing)
-
-        if isinstance(new_expr, c_ast.InitList):
-            merged_exprs.extend(list(new_expr.exprs or ()))
-        else:
-            merged_exprs.append(new_expr)
-
-        merged_coord = (
-            coord
-            or getattr(existing, "coord", None)
-            or getattr(new_expr, "coord", None)
-        )
-        return c_ast.InitList(merged_exprs, merged_coord)
-
-    def _aggregate_member_ir_types(self, ir_type):
-        if getattr(ir_type, "is_union", False):
-            if getattr(ir_type, "elements", None):
-                return [self._aggregate_member_ir_type(ir_type, 0)]
-            return []
-
-        if getattr(ir_type, "has_custom_layout", False):
-            layouts = getattr(ir_type, "field_layouts_by_index", None) or []
-            if layouts:
-                return [layout.semantic_ir_type for layout in layouts]
-
-        if _is_struct_ir_type(ir_type):
-            return list(getattr(ir_type, "elements", ()) or [])
-
-        return []
-
-    def _normalize_struct_init_list(self, init_node, ir_type):
-        if not isinstance(init_node, c_ast.InitList):
-            return init_node
-
-        exprs = list(getattr(init_node, "exprs", None) or [])
-        if not exprs:
-            return init_node
-
-        if any(isinstance(expr, c_ast.NamedInitializer) for expr in exprs):
-            return init_node
-
-        member_types = self._aggregate_member_ir_types(ir_type)
-        if not member_types:
-            return init_node
-
-        normalized = []
-        cursor = 0
-        for member_type in member_types:
-            if cursor >= len(exprs):
-                break
-
-            expr = exprs[cursor]
-            if isinstance(expr, c_ast.InitList):
-                normalized.append(self._normalize_initializer_for_type(expr, member_type))
-                cursor += 1
-                continue
-
-            if self._is_array_string_initializer(expr, member_type):
-                normalized.append(expr)
-                cursor += 1
-                continue
-
-            if self._initializer_expr_matches_type(expr, member_type):
-                normalized.append(expr)
-                cursor += 1
-                continue
-
-            consumed = self._initializer_expr_consumption(exprs[cursor:], member_type)
-            if consumed <= 1:
-                normalized.append(expr)
-                cursor += 1
-                continue
-
-            member_init = c_ast.InitList(
-                exprs[cursor : cursor + consumed], init_node.coord
-            )
-            normalized.append(self._normalize_initializer_for_type(member_init, member_type))
-            cursor += consumed
-
-        if cursor < len(exprs):
-            normalized.extend(exprs[cursor:])
-
-        return c_ast.InitList(normalized, init_node.coord)
-
-    def _normalize_union_init_list(self, init_node, ir_type):
-        if not isinstance(init_node, c_ast.InitList):
-            return init_node
-
-        exprs = list(getattr(init_node, "exprs", None) or [])
-        if not exprs:
-            return init_node
-
-        field_index, field_type, member_init = self._select_union_initializer(
-            init_node, ir_type
-        )
-        if field_index is None or member_init is None:
-            return init_node
-
-        normalized_member = self._normalize_initializer_for_type(member_init, field_type)
-        if normalized_member is member_init:
-            return init_node
-
-        first_expr = exprs[0]
-        if isinstance(first_expr, c_ast.NamedInitializer):
-            rewritten = c_ast.NamedInitializer(
-                first_expr.name,
-                normalized_member,
-                first_expr.coord,
-            )
-            return c_ast.InitList([rewritten] + exprs[1:], init_node.coord)
-
-        return normalized_member
-
-    def _initializer_expr_matches_type(self, expr, ir_type):
-        if expr is None:
-            return False
-        try:
-            expr_ir_type = self._infer_sizeof_operand_ir_type(expr)
-        except Exception:
-            return False
-
-        if str(expr_ir_type) == str(ir_type):
-            return True
-
-        if isinstance(expr_ir_type, ir.ArrayType) and isinstance(ir_type, ir.ArrayType):
-            return self._are_compatible_object_ir_types(expr_ir_type, ir_type)
-
-        return False
-
-    def _normalize_initializer_for_type(self, init_node, ir_type):
-        if self._is_array_string_initializer(init_node, ir_type):
-            return init_node
-
-        if isinstance(init_node, c_ast.CompoundLiteral):
-            if self._initializer_expr_matches_type(init_node, ir_type):
-                return init_node
-            init_node = init_node.init
-
-        if not isinstance(init_node, c_ast.InitList):
-            if (
-                isinstance(ir_type, ir.ArrayType)
-                and not self._initializer_expr_matches_type(init_node, ir_type)
-            ):
-                return c_ast.InitList([init_node], getattr(init_node, "coord", None))
-            if (
-                (_is_struct_ir_type(ir_type) or getattr(ir_type, "is_union", False))
-                and not self._initializer_expr_matches_type(init_node, ir_type)
-            ):
-                return c_ast.InitList([init_node], getattr(init_node, "coord", None))
-            return init_node
-
-        exprs = list(getattr(init_node, "exprs", None) or [])
-        if (
-            len(exprs) == 1
-            and self._is_array_string_initializer(exprs[0], ir_type)
-        ):
-            return exprs[0]
-
-        if any(isinstance(expr, c_ast.NamedInitializer) for expr in exprs):
-            if (
-                isinstance(ir_type, ir.ArrayType)
-                or getattr(ir_type, "is_union", False)
-                or _is_struct_ir_type(ir_type)
-            ):
-                return init_node
-
-        if isinstance(ir_type, ir.ArrayType):
-            grouped = self._normalize_array_init_list(init_node, ir_type.element)
-            exprs = list(getattr(grouped, "exprs", None) or [])
-            normalized = []
-            for expr in exprs:
-                normalized.append(self._normalize_initializer_for_type(expr, ir_type.element))
-            return c_ast.InitList(normalized, grouped.coord)
-
-        if getattr(ir_type, "is_union", False):
-            return self._normalize_union_init_list(init_node, ir_type)
-
-        if _is_struct_ir_type(ir_type):
-            grouped = self._normalize_struct_init_list(init_node, ir_type)
-            exprs = list(getattr(grouped, "exprs", None) or [])
-            member_types = self._aggregate_member_ir_types(ir_type)
-            normalized = []
-            for index, expr in enumerate(exprs):
-                if index < len(member_types):
-                    normalized.append(
-                        self._normalize_initializer_for_type(expr, member_types[index])
-                    )
-                else:
-                    normalized.append(expr)
-            return c_ast.InitList(normalized, grouped.coord)
-
-        return init_node
-
-    def _struct_field_names(self, ir_type):
-        member_names = list(getattr(ir_type, "members", ()) or [])
-        if member_names:
-            return member_names
-        member_types = getattr(ir_type, "member_types", None)
-        if isinstance(member_types, dict):
-            return list(member_types.keys())
-        return []
-
-    def _ordered_struct_init_exprs(self, init_node, ir_type):
-        exprs = list(getattr(init_node, "exprs", None) or [])
-        field_names = self._struct_field_names(ir_type)
-        if not exprs or not field_names:
-            return exprs
-        if not any(isinstance(expr, c_ast.NamedInitializer) for expr in exprs):
-            return exprs
-
-        ordered = [None] * len(field_names)
-        cursor = 0
-        index_by_name = {name: i for i, name in enumerate(field_names)}
-
-        for expr in exprs:
-            if isinstance(expr, c_ast.NamedInitializer):
-                designators = getattr(expr, "name", None) or []
-                if designators and isinstance(designators[0], c_ast.ID):
-                    target = index_by_name.get(designators[0].name)
-                    if target is not None:
-                        if len(designators) == 1:
-                            ordered[target] = expr.expr
-                        else:
-                            target_expr = c_ast.InitList(
-                                [
-                                    c_ast.NamedInitializer(
-                                        designators[1:],
-                                        expr.expr,
-                                        expr.coord,
-                                    )
-                                ],
-                                expr.coord,
-                            )
-                            if ordered[target] is None:
-                                ordered[target] = target_expr
-                            else:
-                                ordered[target] = self._merge_initializer_nodes(
-                                    ordered[target],
-                                    target_expr,
-                                    expr.coord,
-                                )
-                        cursor = target + 1
-                continue
-
-            while cursor < len(ordered) and ordered[cursor] is not None:
-                cursor += 1
-            if cursor >= len(ordered):
-                break
-            ordered[cursor] = expr
-            cursor += 1
-
-        return ordered
-
-    def _build_const_address(self, init_node):
-        if isinstance(init_node, c_ast.ID):
-            try:
-                _, sym = self.lookup(init_node.name)
-            except Exception:
-                return None
-            if isinstance(sym, (ir.Function, ir.GlobalVariable)):
-                return sym
-            return None
-
-        if isinstance(init_node, c_ast.CompoundLiteral):
-            return self._materialize_global_compound_literal(
-                init_node.type.type,
-                init_node.init,
-            )
-
-        if isinstance(init_node, c_ast.Cast):
-            return self._build_const_address(init_node.expr)
-
-        # Plain string / wstring literal used as a const address base
-        # (e.g. `void *foo[] = {(void *)&("X"[0])};` in gcc_torture
-        # 921019-1.c). Return a pointer to the materialized global.
-        if isinstance(init_node, c_ast.Constant) and init_node.type in ("string", "wstring"):
-            gv = self._make_global_string_literal_constant(init_node, name_hint="ssastr")
-            return gv
-
-        if isinstance(init_node, c_ast.ArrayRef):
-            base_addr = self._build_const_address(init_node.name)
-            if base_addr is None or not isinstance(
-                getattr(base_addr, "type", None), ir.PointerType
-            ):
-                return None
-            try:
-                idx_val = int(self._eval_const_expr(init_node.subscript))
-            except Exception:
-                return None
-            idx0 = ir.Constant(int64_t, 0)
-            idx = ir.Constant(int64_t, idx_val)
-            pointee = base_addr.type.pointee
-            try:
-                if isinstance(pointee, ir.ArrayType):
-                    return base_addr.gep([idx0, idx])
-                return base_addr.gep([idx])
-            except Exception:
-                return None
-
-        if isinstance(init_node, c_ast.BinaryOp) and init_node.op in ("+", "-"):
-            base_addr = self._build_const_address(init_node.left)
-            offset_node = init_node.right
-            offset_sign = 1
-            if base_addr is None and init_node.op == "+":
-                base_addr = self._build_const_address(init_node.right)
-                offset_node = init_node.left
-            elif base_addr is None:
-                return None
-            if base_addr is None or not isinstance(
-                getattr(base_addr, "type", None), ir.PointerType
-            ):
-                return None
-            try:
-                idx_val = int(self._eval_const_expr(offset_node))
-            except Exception:
-                return None
-            if init_node.op == "-":
-                idx_val = -idx_val
-            idx0 = ir.Constant(int64_t, 0)
-            idx = ir.Constant(int64_t, idx_val)
-            pointee = base_addr.type.pointee
-            try:
-                if isinstance(pointee, ir.ArrayType):
-                    return base_addr.gep([idx0, idx])
-                return base_addr.gep([idx])
-            except Exception:
-                return None
-
-        if isinstance(init_node, c_ast.StructRef):
-            base_addr = self._build_const_address(init_node.name)
-            if base_addr is None or not isinstance(
-                getattr(base_addr, "type", None), ir.PointerType
-            ):
-                return None
-            if (
-                init_node.type == "->"
-                and isinstance(base_addr.type.pointee, ir.ArrayType)
-            ):
-                idx0 = ir.Constant(int64_t, 0)
-                try:
-                    base_addr = base_addr.gep([idx0, idx0])
-                except Exception:
-                    return None
-            aggregate_type = base_addr.type.pointee
-            try:
-                offset, field_type = self._get_aggregate_field_info(
-                    aggregate_type, init_node.field.name
-                )
-            except Exception:
-                return None
-
-            if (
-                hasattr(aggregate_type, "members")
-                and init_node.field.name in aggregate_type.members
-                and not getattr(aggregate_type, "has_custom_layout", False)
-                and not getattr(aggregate_type, "is_union", False)
-            ):
-                idx0 = ir.Constant(int64_t, 0)
-                field_index = aggregate_type.members.index(init_node.field.name)
-                try:
-                    return base_addr.gep(
-                        [idx0, ir.Constant(ir.IntType(32), field_index)]
-                    )
-                except Exception:
-                    return None
-
-            try:
-                byte_base = base_addr.bitcast(ir.PointerType(int8_t))
-                byte_addr = byte_base.gep([ir.Constant(int64_t, offset)])
-                return byte_addr.bitcast(ir.PointerType(field_type))
-            except Exception:
-                return None
-
-        return None
-
-    def _build_pointer_const(self, init_node, ir_type):
-        if isinstance(init_node, c_ast.InitList):
-            if init_node.exprs:
-                return self._build_pointer_const(init_node.exprs[0], ir_type)
-            return ir.Constant(ir_type, None)
-        if isinstance(init_node, c_ast.Cast):
-            return self._build_pointer_const(init_node.expr, ir_type)
-        if self._is_string_constant(init_node):
-            gv = self._make_global_string_literal_constant(init_node)
-            return self._const_pointer_to_first_elem(gv, ir_type)
-        if isinstance(init_node, c_ast.ID):
-            try:
-                _, sym = self.lookup(init_node.name)
-            except Exception:
-                sym = None
-            if isinstance(sym, ir.Function):
-                if sym.type == ir_type:
-                    return sym
-                try:
-                    return sym.bitcast(ir_type)
-                except AttributeError:
-                    # llvmlite Function values do not expose bitcast().
-                    # With opaque pointers, a function symbol is already a
-                    # valid ptr constant for object-pointer initializers such
-                    # as `void *p = fn` or `{ (void *)fn }`.
-                    if isinstance(ir_type, ir.PointerType):
-                        return sym
-                    return None
-            if isinstance(sym, ir.GlobalVariable):
-                if isinstance(sym.value_type, ir.ArrayType):
-                    return self._const_pointer_to_first_elem(sym, ir_type)
-                if sym.type == ir_type:
-                    return sym
-                if isinstance(sym.type, ir.PointerType):
-                    return sym.bitcast(ir_type)
-        if (
-            isinstance(init_node, c_ast.UnaryOp)
-            and init_node.op == "&&"
-            and isinstance(init_node.expr, c_ast.ID)
-        ):
-            return self._label_address_constant(init_node.expr.name, ir_type)
-        if isinstance(init_node, c_ast.ArrayRef):
-            addr = self._build_const_address(init_node)
-            if addr is not None:
-                if addr.type == ir_type:
-                    return addr
-                if isinstance(addr.type, ir.PointerType):
-                    return addr.bitcast(ir_type)
-        if (
-            isinstance(init_node, c_ast.UnaryOp)
-            and init_node.op == "&"
-        ):
-            addr = self._build_const_address(init_node.expr)
-            if addr is not None:
-                if addr.type == ir_type:
-                    return addr
-                if isinstance(addr.type, ir.PointerType):
-                    return addr.bitcast(ir_type)
-        try:
-            val = self._eval_const_expr(init_node)
-            if val == 0:
-                return ir.Constant(ir_type, None)
-        except Exception:
-            return None
-        return None
-
-    def _const_int_to_bytes(self, value, byte_width):
-        if byte_width <= 0:
-            return []
-        mask = (1 << (byte_width * 8)) - 1
-        raw = int(value) & mask
-        return [
-            ir.Constant(int8_t, b)
-            for b in raw.to_bytes(
-                byte_width,
-                byteorder="little" if self._is_little_endian() else "big",
-                signed=False,
-            )
-        ]
-
-    def _split_int_constant_to_bytes(self, int_const, byte_width):
-        if byte_width <= 0:
-            return []
-
-        raw_const = getattr(int_const, "constant", None)
-        if isinstance(raw_const, int):
-            return self._const_int_to_bytes(raw_const, byte_width)
-
-        int_bits = byte_width * 8
-        if int_const.type.width != int_bits:
-            if int_const.type.width < int_bits:
-                int_const = int_const.zext(ir.IntType(int_bits))
-            else:
-                int_const = int_const.trunc(ir.IntType(int_bits))
-
-        byte_values = []
-        for i in range(byte_width):
-            shift_bits = 8 * (i if self._is_little_endian() else (byte_width - 1 - i))
-            part = int_const
-            if shift_bits:
-                part = part.lshr(ir.Constant(part.type, shift_bits))
-            if part.type.width != 8:
-                part = part.trunc(int8_t)
-            byte_values.append(part)
-        return byte_values
-
-    def _pointer_const_to_bytes(self, ptr_const):
-        if (
-            isinstance(ptr_const, ir.Constant)
-            and getattr(ptr_const, "constant", None) is None
-        ):
-            return self._zero_bytes(self._ir_type_size(ptr_const.type))
-        return self._split_int_constant_to_bytes(
-            ptr_const.ptrtoint(int64_t), self._ir_type_size(ptr_const.type)
-        )
-
-    def _bytes_to_int_constant(self, byte_values, int_type):
-        byte_width = int_type.width // 8
-        values = list(byte_values[:byte_width])
-        if len(values) < byte_width:
-            values.extend(self._zero_bytes(byte_width - len(values)))
-
-        result = 0
-        for i, byte_val in enumerate(values):
-            shift_bits = 8 * (i if self._is_little_endian() else (byte_width - 1 - i))
-            raw = getattr(byte_val, "constant", getattr(byte_val, "value", 0))
-            if not isinstance(raw, int):
-                raw = 0
-            result |= (raw & 0xFF) << shift_bits
-
-        bits = int_type.width
-        mask = (1 << bits) - 1
-        result &= mask
-        sign_bit = 1 << (bits - 1)
-        if result & sign_bit:
-            result -= 1 << bits
-        return ir.Constant(int_type, result)
-
-    def _raw_bytes_to_unsigned_int(self, byte_values):
-        result = 0
-        width = len(byte_values)
-        for i, byte_val in enumerate(byte_values):
-            shift_bits = 8 * (i if self._is_little_endian() else (width - 1 - i))
-            raw = getattr(byte_val, "constant", getattr(byte_val, "value", 0))
-            if not isinstance(raw, int):
-                raw = 0
-            result |= (raw & 0xFF) << shift_bits
-        return result
-
-    def _const_init_bytes(self, init_node, ir_type):
-        if isinstance(init_node, c_ast.CompoundLiteral):
-            init_node = init_node.init
-        size = self._ir_type_size(ir_type)
-        if init_node is None:
-            return self._zero_bytes(size)
-
-        if getattr(ir_type, "is_union", False):
-            init_node = self._normalize_initializer_for_type(init_node, ir_type)
-            raw = self._zero_bytes(size)
-            field_index, member_type, member_init = self._select_union_initializer(
-                init_node, ir_type
-            )
-            if field_index is None:
-                return raw
-
-            member_bytes = self._const_init_bytes(member_init, member_type)
-            raw[: min(size, len(member_bytes))] = member_bytes[:size]
-            return raw
-
-        if isinstance(ir_type, ir.PointerType):
-            ptr_const = self._build_pointer_const(init_node, ir_type)
-            if ptr_const is None:
-                return self._zero_bytes(size)
-            return self._pointer_const_to_bytes(ptr_const)
-
-        if self._is_floating_ir_type(ir_type):
-            try:
-                scalar_node = self._scalar_init_node(init_node)
-                if scalar_node is None:
-                    value = 0.0
-                elif isinstance(scalar_node, c_ast.Constant):
-                    try:
-                        value = self._parse_float_constant(scalar_node.value)
-                    except ValueError:
-                        value = float(self._eval_const_expr(scalar_node))
-                else:
-                    value = float(self._eval_const_expr(scalar_node))
-                fmt = "d" if isinstance(ir_type, ir.DoubleType) else "f"
-                packed = struct.pack(
-                    ("<" if self._is_little_endian() else ">") + fmt,
-                    value,
-                )
-                return [ir.Constant(int8_t, b) for b in packed]
-            except Exception:
-                return self._zero_bytes(size)
-
-        if isinstance(ir_type, ir.IntType):
-            scalar_node = self._scalar_init_node(init_node)
-            if scalar_node is None:
-                return self._zero_bytes(size)
-            return self._const_int_to_bytes(self._eval_const_expr(scalar_node), size)
-
-        if isinstance(ir_type, ir.ArrayType):
-            if self._is_array_string_initializer(init_node, ir_type):
-                data = self._string_literal_data(init_node)
-                if len(data) < ir_type.count:
-                    data.extend([0] * (ir_type.count - len(data)))
-                else:
-                    data = data[: ir_type.count]
-                return [ir.Constant(ir_type.element, v) for v in data]
-
-            if isinstance(init_node, c_ast.InitList):
-                init_node = self._normalize_initializer_for_type(init_node, ir_type)
-                values = []
-                ordered_exprs = self._ordered_array_init_exprs(init_node, ir_type)
-                for i in range(ir_type.count):
-                    expr = ordered_exprs[i] if i < len(ordered_exprs) else None
-                    values.extend(self._const_init_bytes(expr, ir_type.element))
-                return values
-
-            return self._zero_bytes(size)
-
-        if _is_struct_ir_type(ir_type):
-            if getattr(ir_type, "has_custom_layout", False):
-                raw = self._zero_bytes(size)
-                if not isinstance(init_node, c_ast.InitList):
-                    return raw
-                init_node = self._normalize_initializer_for_type(init_node, ir_type)
-
-                exprs = self._ordered_struct_init_exprs(init_node, ir_type)
-                for i, field_name in enumerate(getattr(ir_type, "members", ())):
-                    if i >= len(exprs):
-                        break
-                    expr = exprs[i]
-                    layout = ir_type.field_layouts.get(field_name)
-                    if layout is None:
-                        continue
-
-                    if layout.is_bitfield:
-                        scalar_node = self._scalar_init_node(expr)
-                        if scalar_node is None:
-                            continue
-                        try:
-                            field_value = int(self._eval_const_expr(scalar_node))
-                        except Exception:
-                            continue
-                        storage_size = self._ir_type_size(layout.storage_ir_type)
-                        start = layout.storage_byte_offset
-                        current = self._raw_bytes_to_unsigned_int(
-                            raw[start : start + storage_size]
-                        )
-                        field_mask = self._bitfield_mask(layout.bit_width)
-                        clear_mask = ((1 << (storage_size * 8)) - 1) ^ (
-                            field_mask << layout.bit_offset
-                        )
-                        current = (current & clear_mask) | (
-                            (field_value & field_mask) << layout.bit_offset
-                        )
-                        raw[start : start + storage_size] = self._const_int_to_bytes(
-                            current, storage_size
-                        )
-                        continue
-
-                    field_size = self._ir_type_size(layout.semantic_ir_type)
-                    field_bytes = self._const_init_bytes(expr, layout.semantic_ir_type)
-                    start = layout.byte_offset
-                    raw[start : start + field_size] = field_bytes[:field_size]
-                return raw
-
-            raw = self._zero_bytes(size)
-            if not isinstance(init_node, c_ast.InitList):
-                return raw
-            init_node = self._normalize_initializer_for_type(init_node, ir_type)
-
-            exprs = self._ordered_struct_init_exprs(init_node, ir_type)
-            offset = 0
-            for i, member_type in enumerate(ir_type.elements):
-                align = self._ir_type_align(member_type)
-                offset = (offset + align - 1) & ~(align - 1)
-                expr = exprs[i] if i < len(exprs) else None
-                field_bytes = self._const_init_bytes(expr, member_type)
-                field_size = self._ir_type_size(member_type)
-                raw[offset : offset + field_size] = field_bytes[:field_size]
-                offset += field_size
-            return raw
-
-        scalar_node = self._scalar_init_node(init_node)
-        if scalar_node is None:
-            return self._zero_bytes(size)
-        try:
-            return self._const_int_to_bytes(self._eval_const_expr(scalar_node), size)
-        except Exception:
-            return self._zero_bytes(size)
-
-    def _build_const_init(self, init_node, ir_type):
-        if init_node is None:
-            return self._zero_initializer(ir_type)
-
-        if isinstance(init_node, c_ast.CompoundLiteral):
-            init_node = init_node.init
-
-        if getattr(ir_type, "is_union", False):
-            try:
-                init_node = self._normalize_initializer_for_type(init_node, ir_type)
-                raw = self._const_init_bytes(init_node, ir_type)
-                fields = []
-                head_type = ir_type.elements[0]
-                if not isinstance(head_type, ir.IntType):
-                    return self._zero_initializer(ir_type)
-                head_size = self._ir_type_size(head_type)
-                fields.append(self._bytes_to_int_constant(raw[:head_size], head_type))
-                if len(ir_type.elements) > 1:
-                    tail_type = ir_type.elements[1]
-                    tail_size = self._ir_type_size(tail_type)
-                    tail_bytes = raw[head_size : head_size + tail_size]
-                    fields.append(ir.Constant(tail_type, tail_bytes))
-                return ir.Constant(ir_type, fields)
-            except Exception:
-                return self._zero_initializer(ir_type)
-
-        if isinstance(ir_type, ir.PointerType):
-            ptr_const = self._build_pointer_const(init_node, ir_type)
-            if ptr_const is not None:
-                return ptr_const
-            return self._zero_initializer(ir_type)
-
-        if self._is_floating_ir_type(ir_type):
-            try:
-                scalar_node = self._scalar_init_node(init_node)
-                if scalar_node is None:
-                    return self._zero_initializer(ir_type)
-                if isinstance(scalar_node, c_ast.Constant):
-                    try:
-                        value = self._parse_float_constant(scalar_node.value)
-                    except ValueError:
-                        value = float(self._eval_const_expr(scalar_node))
-                else:
-                    value = float(self._eval_const_expr(scalar_node))
-                return self._ir_constant_from_value(ir_type, value)
-            except Exception:
-                return self._zero_initializer(ir_type)
-
-        if isinstance(ir_type, ir.ArrayType):
-            if self._is_array_string_initializer(init_node, ir_type):
-                data = self._string_literal_data(init_node)
-                if len(data) < ir_type.count:
-                    data.extend([0] * (ir_type.count - len(data)))
-                else:
-                    data = data[: ir_type.count]
-                try:
-                    if self._is_wide_string_constant(init_node):
-                        return ir.Constant(
-                            ir_type, [ir.Constant(ir_type.element, v) for v in data]
-                        )
-                    return ir.Constant(ir_type, data)
-                except Exception:
-                    return self._zero_initializer(ir_type)
-
-            if isinstance(init_node, c_ast.InitList):
-                init_node = self._normalize_initializer_for_type(init_node, ir_type)
-                values = []
-                ordered_exprs = self._ordered_array_init_exprs(init_node, ir_type)
-                for i in range(ir_type.count):
-                    expr = ordered_exprs[i] if i < len(ordered_exprs) else None
-                    values.append(self._build_const_init(expr, ir_type.element))
-                try:
-                    return ir.Constant(ir_type, values)
-                except Exception:
-                    return self._zero_initializer(ir_type)
-
-            return self._zero_initializer(ir_type)
-
-        if _is_struct_ir_type(ir_type):
-            if getattr(ir_type, "has_custom_layout", False):
-                try:
-                    if isinstance(init_node, c_ast.InitList):
-                        init_node = self._normalize_initializer_for_type(
-                            init_node, ir_type
-                        )
-                    storage_segments = getattr(ir_type, "storage_segments", None)
-                    if storage_segments is None:
-                        raw = self._const_init_bytes(init_node, ir_type)
-                        values = []
-                        offset = 0
-                        for member_type in ir_type.elements:
-                            field_size = self._ir_type_size(member_type)
-                            field_bytes = raw[offset : offset + field_size]
-                            if isinstance(member_type, ir.IntType):
-                                values.append(
-                                    self._bytes_to_int_constant(
-                                        field_bytes, member_type
-                                    )
-                                )
-                            elif (
-                                isinstance(member_type, ir.ArrayType)
-                                and isinstance(member_type.element, ir.IntType)
-                                and member_type.element.width == 8
-                            ):
-                                values.append(ir.Constant(member_type, field_bytes))
-                            else:
-                                values.append(self._zero_initializer(member_type))
-                            offset += field_size
-                        return ir.Constant(ir_type, values)
-                    values = []
-                    exprs = (
-                        self._ordered_struct_init_exprs(init_node, ir_type)
-                        if isinstance(init_node, c_ast.InitList)
-                        else []
-                    )
-                    field_layouts_by_index = getattr(
-                        ir_type, "field_layouts_by_index", None
-                    ) or []
-                    for segment in storage_segments:
-                        member_type = segment.ir_type
-                        if segment.kind == "padding":
-                            values.append(self._zero_initializer(member_type))
-                            continue
-                        if segment.kind == "field":
-                            expr = None
-                            if segment.field_index is not None and segment.field_index < len(exprs):
-                                expr = exprs[segment.field_index]
-                            values.append(self._build_const_init(expr, member_type))
-                            continue
-
-                        storage_size = self._ir_type_size(member_type)
-                        current = 0
-                        for field_index in segment.bitfield_indices:
-                            if field_index >= len(exprs):
-                                continue
-                            expr = exprs[field_index]
-                            if expr is None:
-                                continue
-                            scalar_node = self._scalar_init_node(expr)
-                            if scalar_node is None:
-                                continue
-                            try:
-                                field_value = int(self._eval_const_expr(scalar_node))
-                            except Exception:
-                                continue
-                            layout = field_layouts_by_index[field_index]
-                            field_mask = self._bitfield_mask(layout.bit_width)
-                            clear_mask = ((1 << (storage_size * 8)) - 1) ^ (
-                                field_mask << layout.bit_offset
-                            )
-                            current = (current & clear_mask) | (
-                                (field_value & field_mask) << layout.bit_offset
-                            )
-                        values.append(
-                            self._bytes_to_int_constant(
-                                self._const_int_to_bytes(current, storage_size),
-                                member_type,
-                            )
-                        )
-                    return ir.Constant(ir_type, values)
-                except Exception:
-                    return self._zero_initializer(ir_type)
-            if isinstance(init_node, c_ast.InitList):
-                init_node = self._normalize_initializer_for_type(init_node, ir_type)
-                exprs = self._ordered_struct_init_exprs(init_node, ir_type)
-                values = []
-                for i, member_type in enumerate(ir_type.elements):
-                    expr = exprs[i] if i < len(exprs) else None
-                    values.append(self._build_const_init(expr, member_type))
-                try:
-                    return ir.Constant(ir_type, values)
-                except Exception:
-                    return self._zero_initializer(ir_type)
-            return self._zero_initializer(ir_type)
-
-        if isinstance(init_node, c_ast.InitList):
-            if init_node.exprs:
-                return self._build_const_init(init_node.exprs[0], ir_type)
-            return self._zero_initializer(ir_type)
-
-        try:
-            val = self._eval_const_expr(init_node)
-            result = self._ir_constant_from_value(ir_type, val)
-            str(result)
-            return result
-        except Exception:
-            return self._zero_initializer(ir_type)
-
-    def _init_array(self, base_addr, init_list, elem_ir_type, prefix_idx):
-        """Recursively initialize array elements from an InitList."""
-        for i, expr in enumerate(init_list.exprs):
-            idx = prefix_idx + [ir.Constant(int64_t, i)]
-            if isinstance(expr, c_ast.InitList) and isinstance(elem_ir_type, ir.ArrayType):
-                self._init_array(base_addr, expr, elem_ir_type.element, idx)
-                continue
-            elem_ptr = self.builder.gep(base_addr, idx, inbounds=True)
-            self._init_runtime_value(elem_ptr, elem_ir_type, expr)
-
-    def _init_runtime_value(self, dest_ptr, target_type, init_node):
-        if dest_ptr is None or init_node is None:
-            return
-
-        if isinstance(init_node, c_ast.CompoundLiteral):
-            init_node = init_node.init
-
-        if isinstance(target_type, ir.ArrayType):
-            if self._is_array_string_initializer(init_node, target_type):
-                data = self._string_literal_data(init_node)
-                idx0 = ir.Constant(int64_t, 0)
-                for i, value in enumerate(data[: target_type.count]):
-                    elem_ptr = self.builder.gep(
-                        dest_ptr,
-                        [idx0, ir.Constant(int64_t, i)],
-                        inbounds=True,
-                    )
-                    self.builder.store(ir.Constant(target_type.element, value), elem_ptr)
-                return
-            if isinstance(init_node, c_ast.InitList):
-                init_node = self._normalize_initializer_for_type(init_node, target_type)
-                ordered_exprs = self._ordered_array_init_exprs(init_node, target_type)
-                self._init_array(
-                    dest_ptr,
-                    c_ast.InitList(ordered_exprs, init_node.coord),
-                    target_type.element,
-                    [ir.Constant(int64_t, 0)],
-                )
-                return
-
-        if getattr(target_type, "is_union", False) or _is_struct_ir_type(target_type):
-            if isinstance(init_node, c_ast.InitList):
-                self._init_runtime_aggregate(dest_ptr, init_node, target_type)
-                return
-            init_val, _ = self.codegen(init_node)
-            if init_val is not None:
-                if init_val.type != target_type:
-                    if getattr(target_type, "is_union", False):
-                        # A non-list scalar initializer for a union targets
-                        # its FIRST member (C99 6.7.9p17), not the whole
-                        # aggregate. Storing the scalar as the union type
-                        # emits invalid IR (`store <union> <int>`). Route the
-                        # already-evaluated value into the first member via a
-                        # bitcast, mirroring the InitList path's
-                        # _select_union_initializer behavior.
-                        first_type = target_type.elements[0]
-                        member_ptr = self.builder.bitcast(
-                            dest_ptr,
-                            ir.PointerType(first_type),
-                            name="unioninit",
-                        )
-                        if init_val.type != first_type:
-                            init_val = self._implicit_convert(init_val, first_type)
-                        self._safe_store(init_val, member_ptr)
-                        return
-                    init_val = self._implicit_convert(init_val, target_type)
-                self._safe_store(init_val, dest_ptr)
-            return
-
-        scalar_node = self._scalar_init_node(init_node)
-        if scalar_node is None:
-            return
-        init_val, _ = self.codegen(scalar_node)
-        if init_val is None:
-            return
-        if init_val.type != target_type:
-            init_val = self._implicit_convert(init_val, target_type)
-        self._safe_store(init_val, dest_ptr)
-
-    def _init_runtime_aggregate(self, base_addr, init_node, ir_type):
-        init_node = self._normalize_initializer_for_type(init_node, ir_type)
-        exprs = list(getattr(init_node, "exprs", None) or [])
-        if getattr(ir_type, "is_union", False):
-            field_index, field_type, member_init = self._select_union_initializer(
-                init_node, ir_type
-            )
-            if field_index is None or member_init is None:
-                return
-            field_ptr = self.builder.bitcast(
-                base_addr,
-                ir.PointerType(field_type),
-                name="unioninit",
-            )
-            self._init_runtime_value(field_ptr, field_type, member_init)
-            return
-
-        if getattr(ir_type, "has_custom_layout", False):
-            exprs = self._ordered_struct_init_exprs(init_node, ir_type)
-            for i, field_name in enumerate(getattr(ir_type, "members", ())):
-                if i >= len(exprs):
-                    break
-                expr = exprs[i]
-                layout = ir_type.field_layouts.get(field_name)
-                if layout is None:
-                    continue
-                if layout.is_bitfield:
-                    scalar_node = self._scalar_init_node(expr)
-                    if scalar_node is None:
-                        continue
-                    field_val, _ = self.codegen(scalar_node)
-                    if field_val is None:
-                        continue
-                    if field_val.type != layout.semantic_ir_type:
-                        field_val = self._implicit_convert(
-                            field_val,
-                            layout.semantic_ir_type,
-                        )
-                    ref = BitFieldRef(
-                        container_ptr=self._byte_offset_ptr(
-                            base_addr,
-                            layout.storage_byte_offset,
-                            ir.PointerType(layout.storage_ir_type),
-                            name="bitfieldptr",
-                        ),
-                        storage_ir_type=layout.storage_ir_type,
-                        bit_offset=layout.bit_offset,
-                        bit_width=layout.bit_width,
-                        semantic_ir_type=layout.semantic_ir_type,
-                        is_unsigned=layout.is_unsigned,
-                    )
-                    self._store_bitfield(field_val, ref)
-                    continue
-
-                field_ptr = self._byte_offset_ptr(
-                    base_addr,
-                    layout.byte_offset,
-                    ir.PointerType(layout.semantic_ir_type),
-                    name="fieldptr",
-                )
-                self._init_runtime_value(field_ptr, layout.semantic_ir_type, expr)
-            return
-
-        exprs = self._ordered_struct_init_exprs(init_node, ir_type)
-        for i, field_type in enumerate(ir_type.elements):
-            if i >= len(exprs):
-                break
-            expr = exprs[i]
-            field_addr = self.builder.gep(
-                base_addr,
-                [ir.Constant(int64_t, 0), ir.Constant(ir.IntType(32), i)],
-                inbounds=True,
-            )
-            semantic_field_type = self._refine_member_ir_type(ir_type, i, field_type)
-            typed_field_addr = field_addr
-            target_ptr_type = ir.PointerType(semantic_field_type)
-            if field_addr.type != target_ptr_type:
-                try:
-                    typed_field_addr = self.builder.bitcast(
-                        field_addr,
-                        target_ptr_type,
-                    )
-                except Exception:
-                    typed_field_addr = field_addr
-            self._init_runtime_value(typed_field_addr, semantic_field_type, expr)
-
-    def _select_union_initializer(self, init_node, ir_type):
-        member_names = self._aggregate_member_names(ir_type)
-        if not member_names:
-            return None, None, None
-
-        field_index = 0
-        field_type = self._refine_member_ir_type(
-            ir_type,
-            field_index,
-            self._aggregate_member_ir_type(ir_type, field_index),
-        )
-        member_init = init_node
-
-        if isinstance(init_node, c_ast.InitList):
-            exprs = init_node.exprs or []
-            if not exprs:
-                return field_index, field_type, None
-
-            first_expr = exprs[0]
-            if isinstance(first_expr, c_ast.NamedInitializer):
-                designators = getattr(first_expr, "name", None) or []
-                if len(designators) == 1 and isinstance(designators[0], c_ast.ID):
-                    candidate = designators[0].name
-                    named_member_indices = getattr(
-                        ir_type, "named_member_indices", None
-                    ) or {}
-                    if candidate in named_member_indices:
-                        field_index = named_member_indices[candidate]
-                        field_type = self._refine_member_ir_type(
-                            ir_type,
-                            field_index,
-                            self._aggregate_member_ir_type(ir_type, field_index),
-                        )
-                        return field_index, field_type, first_expr.expr
-                first_expr = first_expr.expr
-
-            if isinstance(field_type, (ir.ArrayType, ir.IdentifiedStructType, ir.LiteralStructType)):
-                member_init = (
-                    first_expr
-                    if len(exprs) == 1 and isinstance(first_expr, c_ast.InitList)
-                    else init_node
-                )
-            else:
-                member_init = first_expr
-
-        return field_index, field_type, member_init
-
-    def _build_array_ir_type(self, array_decl, init_node=None):
-        dims = []
-        node = array_decl
-        top_elem_ir_type = None
-        try:
-            if isinstance(node.type, c_ast.ArrayDecl):
-                top_elem_ir_type = self._build_array_ir_type(node.type)
-            else:
-                top_elem_ir_type = self._resolve_ast_type(node.type)
-        except Exception:
-            top_elem_ir_type = None
-        inferred_top_dim = self._infer_array_count_from_initializer(
-            init_node, top_elem_ir_type
-        )
-        is_top_level = True
-        while isinstance(node, c_ast.ArrayDecl):
-            dim = self._eval_dim(node.dim) if node.dim else 0
-            if dim == 0 and is_top_level and inferred_top_dim is not None:
-                dim = inferred_top_dim
-            dims.append(dim)
-            node = node.type
-            is_top_level = False
-        elem_ir_type = self._resolve_ast_type(node)
-        if isinstance(elem_ir_type, ir.VoidType):
-            elem_ir_type = int8_t
-        arr_ir_type = elem_ir_type
-        for dim in reversed(dims):
-            arr_ir_type = self._checked_array_ir_type(arr_ir_type, dim)
-        arr_ir_type.dim_array = dims
-        return arr_ir_type
-
     def _checked_array_ir_type(self, element_ir_type, dim):
         """Build an array type while matching clang's oversized-object rejection."""
         if dim < 0:
@@ -5990,13 +2813,23 @@ class LLVMCodeGenerator(object):
         if self._is_floating_ir_type(val.type) and self._is_floating_ir_type(
             target_type
         ):
-            if isinstance(val.type, ir.FloatType) and isinstance(
-                target_type, ir.DoubleType
-            ):
+            float_width = (
+                16
+                if isinstance(val.type, ir.HalfType)
+                else 32
+                if isinstance(val.type, ir.FloatType)
+                else 64
+            )
+            target_width = (
+                16
+                if isinstance(target_type, ir.HalfType)
+                else 32
+                if isinstance(target_type, ir.FloatType)
+                else 64
+            )
+            if float_width < target_width:
                 return self.builder.fpext(val, target_type)
-            if isinstance(val.type, ir.DoubleType) and isinstance(
-                target_type, ir.FloatType
-            ):
+            if float_width > target_width:
                 return self.builder.fptrunc(val, target_type)
             return val
         # int -> int (wider or narrower)
@@ -6138,6 +2971,8 @@ class LLVMCodeGenerator(object):
             return 1
         if isinstance(ir_type, ir.IntType):
             return integer_scalar_layout(ir_type.width).alignment
+        elif isinstance(ir_type, ir.HalfType):
+            return floating_scalar_layout(16).alignment
         elif isinstance(ir_type, ir.FloatType):
             return floating_scalar_layout(32).alignment
         elif isinstance(ir_type, ir.DoubleType):
@@ -6159,6 +2994,8 @@ class LLVMCodeGenerator(object):
             return custom_size
         if isinstance(ir_type, ir.IntType):
             return integer_scalar_layout(ir_type.width).size
+        elif isinstance(ir_type, ir.HalfType):
+            return floating_scalar_layout(16).size
         elif isinstance(ir_type, ir.FloatType):
             return floating_scalar_layout(32).size
         elif isinstance(ir_type, ir.DoubleType):
@@ -6883,8 +3720,14 @@ class LLVMCodeGenerator(object):
             if true_type == false_type:
                 return true_type
             if (
-                isinstance(true_type, (ir.IntType, ir.FloatType, ir.DoubleType))
-                and isinstance(false_type, (ir.IntType, ir.FloatType, ir.DoubleType))
+                isinstance(
+                    true_type,
+                    (ir.IntType, ir.HalfType, ir.FloatType, ir.DoubleType),
+                )
+                and isinstance(
+                    false_type,
+                    (ir.IntType, ir.HalfType, ir.FloatType, ir.DoubleType),
+                )
             ):
                 return self._usual_arithmetic_conversion_ir_type(
                     true_type, false_type
@@ -7489,422 +4332,9 @@ class LLVMCodeGenerator(object):
             func = self.module.globals.get("binary{0}".format(node.op))
             return self.builder.call(func, [lhs, rhs], "binop"), None
 
-    def _codegen_short_circuit_and(self, node):
-        """Short-circuit &&: if lhs is false, skip rhs."""
-        lhs, _ = self.codegen(node.left)
-        lhs_bool = self._to_bool(lhs, "and_lhs")
-
-        rhs_bb = self.builder.function.append_basic_block("and_rhs")
-        merge_bb = self.builder.function.append_basic_block("and_merge")
-        lhs_bb = self.builder.block
-
-        self.builder.cbranch(lhs_bool, rhs_bb, merge_bb)
-
-        self.builder.position_at_end(rhs_bb)
-        rhs, _ = self.codegen(node.right)
-        rhs_bool = self._to_bool(rhs, "and_rhs_bool")
-        rhs_result = self.builder.zext(rhs_bool, int64_t, "and_rhs_ext")
-        rhs_bb_end = self.builder.block
-        self.builder.branch(merge_bb)
-
-        self.builder.position_at_end(merge_bb)
-        phi = self.builder.phi(int64_t, "and_result")
-        phi.add_incoming(ir.Constant(int64_t, 0), lhs_bb)
-        phi.add_incoming(rhs_result, rhs_bb_end)
-        return phi, None
-
-    def _codegen_short_circuit_or(self, node):
-        """Short-circuit ||: if lhs is true, skip rhs."""
-        lhs, _ = self.codegen(node.left)
-        lhs_bool = self._to_bool(lhs, "or_lhs")
-
-        rhs_bb = self.builder.function.append_basic_block("or_rhs")
-        merge_bb = self.builder.function.append_basic_block("or_merge")
-        lhs_bb = self.builder.block
-
-        self.builder.cbranch(lhs_bool, merge_bb, rhs_bb)
-
-        self.builder.position_at_end(rhs_bb)
-        rhs, _ = self.codegen(node.right)
-        rhs_bool = self._to_bool(rhs, "or_rhs_bool")
-        rhs_result = self.builder.zext(rhs_bool, int64_t, "or_rhs_ext")
-        rhs_bb_end = self.builder.block
-        self.builder.branch(merge_bb)
-
-        self.builder.position_at_end(merge_bb)
-        phi = self.builder.phi(int64_t, "or_result")
-        phi.add_incoming(ir.Constant(int64_t, 1), lhs_bb)
-        phi.add_incoming(rhs_result, rhs_bb_end)
-        return phi, None
-
-    def codegen_If(self, node):
-
-        cond_val, _ = self.codegen(node.cond)
-        cmp = self._to_bool(cond_val)
-
-        then_bb = self.builder.function.append_basic_block("then")
-        else_bb = self.builder.function.append_basic_block("else")
-        merge_bb = self.builder.function.append_basic_block("ifend")
-
-        self.builder.cbranch(cmp, then_bb, else_bb)
-
-        with self.new_scope():
-            self.builder.position_at_end(then_bb)
-            self.codegen(node.iftrue)
-            if not self.builder.block.is_terminated:
-                self.builder.branch(merge_bb)
-
-        with self.new_scope():
-            self.builder.position_at_end(else_bb)
-            if node.iffalse:
-                self.codegen(node.iffalse)
-            if not self.builder.block.is_terminated:
-                self.builder.branch(merge_bb)
-        self.builder.position_at_end(merge_bb)
-        # self.builder.block = merge_bb
-
-        return None, None
-
     def codegen_NoneType(self, node):
         return None, None
 
-    def codegen_For(self, node):
-
-        saved_block = self.builder.block
-        self.builder.position_at_end(saved_block)  # why the save_block at the end
-
-        if node.init is not None:
-            self.codegen(node.init)
-
-        # The builder is what? loop is a block which begin with loop
-        test_bb = self.builder.function.append_basic_block("__pcc_for_test")
-        loop_bb = self.builder.function.append_basic_block("__pcc_for_loop")
-        next_bb = self.builder.function.append_basic_block("__pcc_for_next")
-
-        # append by name nor just add it
-        after_loop_label = self.new_label("__pcc_for_afterloop")
-        after_bb = self.builder.function.append_basic_block(after_loop_label)
-
-        self.builder.branch(test_bb)
-        self.builder.position_at_end(test_bb)
-
-        if node.cond is not None:
-            endcond, _ = self.codegen(node.cond)
-            cmp = self._to_bool(endcond, "loopcond")
-            self.builder.cbranch(cmp, loop_bb, after_bb)
-        else:
-            # for(;;) - infinite loop, always branch to body
-            self.builder.branch(loop_bb)
-
-        with self.new_scope():
-            self.define("break", after_bb)
-            self.define("continue", next_bb)
-            self.builder.position_at_end(loop_bb)
-            body_val, _ = self.codegen(node.stmt)  # if was ready codegen
-            if not self.builder.block.is_terminated:
-                self.builder.branch(next_bb)
-            self.builder.position_at_end(next_bb)
-            if node.next is not None:
-                self.codegen(node.next)
-            self.builder.branch(test_bb)
-        self.builder.position_at_end(after_bb)
-
-        return ir.values.Constant(ir.DoubleType(), 0.0), None
-
-    def codegen_While(self, node):
-
-        saved_block = self.builder.block
-        id_name = node.__class__.__name__
-        self.builder.position_at_end(saved_block)
-        # The builder is what? loop is a block which begin with loop
-        test_bb = self.builder.function.append_basic_block(
-            "test"
-        )  # just create some block need to be filled
-        loop_bb = self.builder.function.append_basic_block("loop")
-        after_bb = self.builder.function.append_basic_block("afterloop")
-
-        self.builder.branch(test_bb)
-        self.builder.position_at_start(test_bb)
-        endcond, _ = self.codegen(node.cond)
-        cmp = self._to_bool(endcond, "loopcond")
-        self.builder.cbranch(cmp, loop_bb, after_bb)
-
-        with self.new_scope():
-            self.define("break", after_bb)
-            self.define("continue", test_bb)
-            self.builder.position_at_end(loop_bb)
-            body_val, _ = self.codegen(node.stmt)
-            # after eval body we need to goto test_bb
-            # New code will be inserted into after_bb
-            if not self.builder.block.is_terminated:
-                self.builder.branch(test_bb)
-            self.builder.position_at_end(after_bb)
-
-        # The 'for' expression always returns 0
-        return ir.values.Constant(ir.DoubleType(), 0.0)
-
-    def codegen_Break(self, node):
-        target = self.lookup("break")
-        if isinstance(target, tuple):
-            target = target[1]
-        self.builder.branch(target)
-        return None, None
-
-    def codegen_Continue(self, node):
-        target = self.lookup("continue")
-        if isinstance(target, tuple):
-            target = target[1]
-        self.builder.branch(target)
-        return None, None
-
-    def codegen_DoWhile(self, node):
-
-        saved_block = self.builder.block
-        self.builder.position_at_end(saved_block)
-
-        loop_bb = self.builder.function.append_basic_block("dowhile_body")
-        test_bb = self.builder.function.append_basic_block("dowhile_test")
-        after_bb = self.builder.function.append_basic_block("dowhile_end")
-
-        self.builder.branch(loop_bb)
-
-        with self.new_scope():
-            self.define("break", after_bb)
-            self.define("continue", test_bb)
-            self.builder.position_at_end(loop_bb)
-            self.codegen(node.stmt)
-            if not self.builder.block.is_terminated:
-                self.builder.branch(test_bb)
-
-        self.builder.position_at_end(test_bb)
-        endcond, _ = self.codegen(node.cond)
-        cmp = self._to_bool(endcond, "loopcond")
-        self.builder.cbranch(cmp, loop_bb, after_bb)
-
-        self.builder.position_at_end(after_bb)
-        return ir.values.Constant(ir.DoubleType(), 0.0), None
-
-    def codegen_Switch(self, node):
-
-        cond_val, _ = self.codegen(node.cond)
-        # Switch requires integer condition
-        if isinstance(cond_val.type, ir.PointerType):
-            cond_val = self.builder.ptrtoint(cond_val, int64_t)
-        elif self._is_floating_ir_type(cond_val.type):
-            cond_val = self.builder.fptosi(cond_val, int64_t)
-        elif isinstance(cond_val.type, ir.IntType) and cond_val.type.width < int32_t.width:
-            cond_val = self._integer_promotion(cond_val)
-
-        after_bb = self.builder.function.append_basic_block("switch_end")
-
-        # Preserve C switch semantics: grouped case labels and fallthrough
-        # share code by jumping into the next label block, not directly to
-        # the switch epilogue.
-        if isinstance(node.stmt, c_ast.Compound):
-            switch_items = list(node.stmt.block_items or [])
-        elif node.stmt is not None:
-            switch_items = [node.stmt]
-        else:
-            switch_items = []
-        prelabel_items = []
-        hoisted_items = []
-        labels = []
-        label_bodies = {}
-
-        label_ids = set()
-
-        def contains_switch_label(item):
-            return self._stmt_contains_switch_label(item)
-
-        def add_label(item):
-            if id(item) in label_ids:
-                return
-            label_ids.add(id(item))
-            labels.append(item)
-            label_bodies.setdefault(id(item), [])
-
-        def collect_nested_labels(item):
-            if item is None or isinstance(item, c_ast.Switch):
-                return
-            if isinstance(item, (c_ast.Case, c_ast.Default)):
-                add_label(item)
-                for child in item.stmts or []:
-                    collect_nested_labels(child)
-                return
-            for _name, child in item.children():
-                if isinstance(child, list):
-                    for entry in child:
-                        collect_nested_labels(entry)
-                else:
-                    collect_nested_labels(child)
-
-        def collect_guarded_label_sequence(items, active_label=None):
-            active = active_label
-            for item in list(items or []):
-                if isinstance(item, (c_ast.Case, c_ast.Default)):
-                    add_label(item)
-                    active = collect_guarded_label_sequence(item.stmts or [], item)
-                    continue
-                if isinstance(item, c_ast.Compound):
-                    if contains_switch_label(item):
-                        active = collect_guarded_label_sequence(
-                            item.block_items or [], active
-                        )
-                    elif active is not None:
-                        label_bodies[id(active)].append(item)
-                    continue
-                if isinstance(item, c_ast.If) and contains_switch_label(item):
-                    if active is not None:
-                        label_bodies[id(active)].append(item)
-                    collect_guarded_label_bodies(item)
-                    continue
-                if contains_switch_label(item):
-                    if active is not None:
-                        label_bodies[id(active)].append(item)
-                    collect_nested_labels(item)
-                    continue
-                if active is not None:
-                    label_bodies[id(active)].append(item)
-            return active
-
-        def collect_guarded_label_bodies(item):
-            if item is None or isinstance(item, c_ast.Switch):
-                return None
-            if isinstance(item, (c_ast.Case, c_ast.Default)):
-                add_label(item)
-                return collect_guarded_label_sequence(item.stmts or [], item)
-            if isinstance(item, c_ast.Compound):
-                return collect_guarded_label_sequence(item.block_items or [], None)
-            if isinstance(item, c_ast.If):
-                active_true = collect_guarded_label_bodies(item.iftrue)
-                active_false = collect_guarded_label_bodies(item.iffalse)
-                return active_false or active_true
-            for _name, child in item.children():
-                if isinstance(child, list):
-                    for entry in child:
-                        collect_guarded_label_bodies(entry)
-                else:
-                    collect_guarded_label_bodies(child)
-            return None
-
-        def process_items(items, active_label):
-            active = active_label
-            items = list(items or [])
-            for idx, item in enumerate(items):
-                later_has_label = any(
-                    contains_switch_label(later) for later in items[idx + 1 :]
-                )
-                if isinstance(item, (c_ast.Case, c_ast.Default)):
-                    add_label(item)
-                    active = process_items(item.stmts or [], item)
-                    continue
-                if isinstance(item, c_ast.Compound) and contains_switch_label(item):
-                    active = process_items(item.block_items or [], active)
-                    continue
-                if isinstance(item, c_ast.If) and contains_switch_label(item):
-                    if active is None:
-                        prelabel_items.append(item)
-                    else:
-                        label_bodies[id(active)].append(item)
-                    collect_guarded_label_bodies(item)
-                    continue
-                if contains_switch_label(item):
-                    if active is None:
-                        prelabel_items.append(item)
-                    else:
-                        label_bodies[id(active)].append(item)
-                    collect_nested_labels(item)
-                    continue
-                if active is None:
-                    prelabel_items.append(item)
-                    continue
-                if isinstance(item, c_ast.Decl) and later_has_label:
-                    if item.init is not None:
-                        raise CodegenError(
-                            "switch-scope declaration before later case with initializer is not supported"
-                        )
-                    hoisted_items.append(item)
-                    continue
-                if later_has_label and isinstance(
-                    item, (c_ast.Typedef, c_ast.EmptyStatement)
-                ):
-                    hoisted_items.append(item)
-                    continue
-                label_bodies[id(active)].append(item)
-            return active
-
-        process_items(switch_items, None)
-
-        label_blocks = {}
-        default_bb = after_bb
-        for item in labels:
-            bb_name = (
-                "switch_default" if isinstance(item, c_ast.Default) else "switch_case"
-            )
-            bb = self.builder.function.append_basic_block(bb_name)
-            label_blocks[id(item)] = bb
-            if isinstance(item, c_ast.Default):
-                default_bb = bb
-
-        with self.new_scope():
-            self.define("break", after_bb)
-
-            for item in prelabel_items + hoisted_items:
-                if isinstance(item, c_ast.Decl):
-                    if item.init is not None:
-                        raise CodegenError(
-                            "switch-scope declaration before first case with initializer is not supported"
-                        )
-                    self.codegen(item)
-                elif isinstance(item, (c_ast.Typedef, c_ast.EmptyStatement)):
-                    self.codegen(item)
-
-            switch_inst = self.builder.switch(cond_val, default_bb)
-
-            for item in labels:
-                if not isinstance(item, c_ast.Case):
-                    continue
-                # Case values must be compile-time constants
-                try:
-                    const_int = self._eval_const_expr(item.expr)
-                    case_val = ir.Constant(cond_val.type, const_int)
-                except Exception:
-                    case_val, _ = self.codegen(item.expr)
-                    if case_val is None:
-                        continue
-                    if not isinstance(case_val, ir.Constant):
-                        # Non-constant case: skip (LLVM requires constants)
-                        continue
-                    if case_val.type != cond_val.type:
-                        case_val = ir.Constant(
-                            cond_val.type, self._constant_raw_value(case_val)
-                        )
-                switch_inst.add_case(case_val, label_blocks[id(item)])
-
-            self._switch_contexts.append({"blocks": label_blocks})
-            try:
-                for idx, item in enumerate(labels):
-                    self.builder.position_at_end(label_blocks[id(item)])
-                    for stmt in label_bodies.get(id(item), []):
-                        if self.builder.block.is_terminated:
-                            if isinstance(stmt, c_ast.Label):
-                                self.codegen(stmt)
-                            continue
-                        self.codegen(stmt)
-                    if not self.builder.block.is_terminated:
-                        next_bb = after_bb
-                        has_nested_switch_labels = any(
-                            self._stmt_contains_switch_label(stmt)
-                            for stmt in label_bodies.get(id(item), [])
-                        )
-                        if idx + 1 < len(labels) and not has_nested_switch_labels:
-                            next_bb = label_blocks[id(labels[idx + 1])]
-                        self.builder.branch(next_bb)
-            finally:
-                self._switch_contexts.pop()
-
-        self.builder.position_at_end(after_bb)
-        return None, None
 
     def codegen_TernaryOp(self, node):
         try:
@@ -7989,7 +4419,39 @@ class LLVMCodeGenerator(object):
                 return lhs.type if lhs.type.width >= rhs.type.width else rhs.type
             return lhs.type
 
-        target = pick_target_type(true_val, false_val)
+        integer_decision = None
+        if (
+            true_val is not None
+            and false_val is not None
+            and isinstance(true_val.type, ir.IntType)
+            and isinstance(false_val.type, ir.IntType)
+        ):
+            true_width = max(true_val.type.width, int32_t.width)
+            false_width = max(false_val.type.width, int32_t.width)
+            true_unsigned = (
+                self._is_unsigned_val(true_val)
+                if true_val.type.width >= int32_t.width
+                else False
+            )
+            false_unsigned = (
+                self._is_unsigned_val(false_val)
+                if false_val.type.width >= int32_t.width
+                else False
+            )
+            integer_decision = _decide_usual_integer_conversion(
+                true_width,
+                true_unsigned,
+                false_width,
+                false_unsigned,
+            )
+            if true_val.type.width == integer_decision.target_order:
+                target = true_val.type
+            elif false_val.type.width == integer_decision.target_order:
+                target = false_val.type
+            else:
+                target = ir.IntType(integer_decision.target_order)
+        else:
+            target = pick_target_type(true_val, false_val)
         incoming = []
         for branch_end, branch_val in (
             (true_bb_end, true_val),
@@ -7999,7 +4461,14 @@ class LLVMCodeGenerator(object):
                 continue
             self.builder.position_at_end(branch_end)
             value = branch_val if branch_val is not None else zero_value(target)
-            if value.type != target or isinstance(value.type, ir.ArrayType):
+            if integer_decision is not None and isinstance(value.type, ir.IntType):
+                value = self._integer_promotion(value)
+                value = self._convert_int_value(
+                    value,
+                    target,
+                    result_unsigned=integer_decision.is_unsigned,
+                )
+            elif value.type != target or isinstance(value.type, ir.ArrayType):
                 value = self._implicit_convert(value, target)
             incoming.append((self.builder.block, value))
             self.builder.branch(merge_bb)
@@ -8007,8 +4476,10 @@ class LLVMCodeGenerator(object):
         self.builder.position_at_end(merge_bb)
         if not incoming:
             return zero_value(target), None
-        result_is_unsigned = isinstance(target, ir.IntType) and any(
-            self._is_unsigned_val(value) for _pred, value in incoming
+        result_is_unsigned = isinstance(target, ir.IntType) and (
+            integer_decision.is_unsigned
+            if integer_decision is not None
+            else any(self._is_unsigned_val(value) for _pred, value in incoming)
         )
         result_has_unsigned_pointee = isinstance(target, ir.PointerType) and any(
             self._is_unsigned_pointee(value) for _pred, value in incoming
@@ -8112,6 +4583,10 @@ class LLVMCodeGenerator(object):
         return self._materialize_compound_literal(node.type.type, node.init)
 
     def codegen_FuncCall(self, node):
+        if isinstance(node.name, c_ast.ID):
+            _alias = self._BUILTIN_SYMBOL_ALIASES.get(node.name.name)
+            if _alias is not None and node.name.name not in self.env:
+                node.name = c_ast.ID(_alias, coord=node.name.coord)
 
         callee = None
         if isinstance(node.name, c_ast.ID):
@@ -8269,6 +4744,10 @@ class LLVMCodeGenerator(object):
                 return self._codegen_builtin_atomic_fetch_op(node, "and", return_new=False)
             if callee == "__atomic_fetch_xor":
                 return self._codegen_builtin_atomic_fetch_op(node, "xor", return_new=False)
+            if callee == "__atomic_exchange_n":
+                return self._codegen_builtin_atomic_fetch_op(
+                    node, "xchg", return_new=False
+                )
             if callee == "__atomic_compare_exchange_n":
                 return self._codegen_builtin_atomic_compare_exchange(node)
             if callee == "__atomic_test_and_set":
@@ -8444,6 +4923,14 @@ class LLVMCodeGenerator(object):
         ``n > smax`` rather than turning a bounded clear into an out-of-bounds
         volatile write."""
         if len(converted) < 2:
+            return None
+        # A translation unit that DEFINES a libc primitive must not have its
+        # memset-zero calls turned into llvm.memset: LLVM's Darwin lowering
+        # rewrites llvm.memset(p, 0, n) back into a `bzero` call, so libc's
+        # own bzero would tail-branch to itself and recurse forever
+        # (BUG-P1-SELF-MEM-INTRINSIC-LIBCALL-SELF-BRANCH). PCC_NO_BUILTIN=1 is
+        # pcc's -fno-builtin: keep the plain call the source wrote.
+        if _no_builtin_enabled():
             return None
 
         if callee == "memset":
@@ -8837,7 +5324,9 @@ class LLVMCodeGenerator(object):
     def _coerce_builtin_float_arg(self, expr, target_type=None):
         value, _ = self.codegen(expr)
         if target_type is None:
-            if isinstance(getattr(value, "type", None), ir.FloatType):
+            if isinstance(getattr(value, "type", None), ir.HalfType):
+                target_type = ir.HalfType()
+            elif isinstance(getattr(value, "type", None), ir.FloatType):
                 target_type = _float
             else:
                 target_type = _double
@@ -8904,7 +5393,10 @@ class LLVMCodeGenerator(object):
         if not node.args or not node.args.exprs:
             return ir.Constant(int32_t, 0), None
         value = self._coerce_builtin_float_arg(node.args.exprs[0])
-        if isinstance(value.type, ir.FloatType):
+        if isinstance(value.type, ir.HalfType):
+            int_type = ir.IntType(16)
+            sign_mask = ir.Constant(int_type, 0x8000)
+        elif isinstance(value.type, ir.FloatType):
             int_type = ir.IntType(32)
             sign_mask = ir.Constant(int_type, 0x80000000)
         else:
@@ -8949,7 +5441,11 @@ class LLVMCodeGenerator(object):
         magnitude = self._coerce_builtin_float_arg(node.args.exprs[0], target_type)
         sign = self._coerce_builtin_float_arg(node.args.exprs[1], target_type)
 
-        if isinstance(target_type, ir.FloatType):
+        if isinstance(target_type, ir.HalfType):
+            int_type = ir.IntType(16)
+            sign_mask = ir.Constant(int_type, 0x8000)
+            value_mask = ir.Constant(int_type, 0x7FFF)
+        elif isinstance(target_type, ir.FloatType):
             int_type = ir.IntType(32)
             sign_mask = ir.Constant(int_type, 0x80000000)
             value_mask = ir.Constant(int_type, 0x7FFFFFFF)
@@ -9164,30 +5660,39 @@ class LLVMCodeGenerator(object):
         self._clear_unsigned(result)
         return result, None
 
-    def _atomic_ordering(self, node, is_store):
+    def _atomic_order_value(self, node):
         try:
-            value = self._eval_const_expr(node)
+            # GCC reserves the upper bits for target-specific modifiers such
+            # as __ATOMIC_HLE_ACQUIRE.  The base memory model is always the
+            # low 16 bits.  A runtime order cannot be represented directly in
+            # LLVM IR, so conservatively use seq_cst rather than silently
+            # weakening it to monotonic.
+            return int(self._eval_const_expr(node)) & 0xFFFF
         except Exception:
-            return "monotonic"
+            return None
+
+    def _atomic_ordering(self, node, is_store):
+        value = self._atomic_order_value(node)
+        if value is None:
+            return "seq_cst"
         if is_store:
             return {
                 0: "monotonic",  # __ATOMIC_RELAXED
                 3: "release",    # __ATOMIC_RELEASE
                 4: "release",    # __ATOMIC_ACQ_REL
                 5: "seq_cst",    # __ATOMIC_SEQ_CST
-            }.get(value, "monotonic")
+            }.get(value, "seq_cst")
         return {
             0: "monotonic",  # __ATOMIC_RELAXED
             1: "acquire",    # __ATOMIC_CONSUME
             2: "acquire",    # __ATOMIC_ACQUIRE
             5: "seq_cst",    # __ATOMIC_SEQ_CST
-        }.get(value, "monotonic")
+        }.get(value, "seq_cst")
 
     def _atomic_rmw_ordering(self, node):
-        try:
-            value = self._eval_const_expr(node)
-        except Exception:
-            return "monotonic"
+        value = self._atomic_order_value(node)
+        if value is None:
+            return "seq_cst"
         return {
             0: "monotonic",  # __ATOMIC_RELAXED
             1: "acquire",    # __ATOMIC_CONSUME
@@ -9195,14 +5700,13 @@ class LLVMCodeGenerator(object):
             3: "release",    # __ATOMIC_RELEASE
             4: "acq_rel",    # __ATOMIC_ACQ_REL
             5: "seq_cst",    # __ATOMIC_SEQ_CST
-        }.get(value, "monotonic")
+        }.get(value, "seq_cst")
 
     def _codegen_builtin_atomic_thread_fence(self, node):
         if not node.args or not node.args.exprs:
             return ir.Constant(int64_t, 0), None
-        try:
-            order_value = self._eval_const_expr(node.args.exprs[0])
-        except Exception:
+        order_value = self._atomic_order_value(node.args.exprs[0])
+        if order_value is None:
             order_value = 5
         ordering = {
             0: None,       # __ATOMIC_RELAXED: no inter-thread ordering edge
@@ -9258,7 +5762,9 @@ class LLVMCodeGenerator(object):
         if not isinstance(getattr(ptr, "type", None), ir.PointerType):
             return ir.Constant(int64_t, 0), None
         pointee_type = ptr.type.pointee
-        if not isinstance(pointee_type, ir.IntType):
+        if not isinstance(pointee_type, ir.IntType) and not (
+            op == "xchg" and isinstance(pointee_type, ir.PointerType)
+        ):
             return ir.Constant(int64_t, 0), None
         if value.type != pointee_type:
             value = self._implicit_convert(value, pointee_type)
@@ -9385,7 +5891,7 @@ class LLVMCodeGenerator(object):
             return self._implicit_convert(arg, ir.PointerType(arg.type.element))
         if self._is_aggregate_ir_type(arg.type):
             return self._coerce_variadic_aggregate_arg(arg)
-        if isinstance(arg.type, ir.FloatType):
+        if isinstance(arg.type, (ir.HalfType, ir.FloatType)):
             return self.builder.fpext(arg, ir.DoubleType())
         if isinstance(arg.type, ir.IntType) and arg.type.width < int32_t.width:
             return self._integer_promotion(arg)
@@ -9413,705 +5919,6 @@ class LLVMCodeGenerator(object):
             return self.builder.bitcast(arg, expected)
         # Numeric conversions
         return self._implicit_convert(arg, expected)
-
-    def codegen_Decl(self, node):
-
-        type_str = ""
-
-        # Skip anonymous/unnamed declarations
-        if node.name is None and not isinstance(
-            node.type, (c_ast.Struct, c_ast.Union, c_ast.Enum, c_ast.FuncDecl)
-        ):
-            if not (
-                isinstance(node.type, c_ast.TypeDecl)
-                and isinstance(node.type.type, (c_ast.Struct, c_ast.Union, c_ast.Enum))
-            ):
-                return None, None
-
-        if node.name is not None:
-            self._record_decl_ast_type(node.name, node.type)
-
-        # Standalone tag definitions such as:
-        #   struct S { ... };
-        #   union U { ... };
-        #   enum E { ... };
-        # do not declare objects. Register the aggregate/enum type and stop.
-        if node.name is None and isinstance(node.type, c_ast.TypeDecl):
-            inner = node.type.type
-            if isinstance(inner, c_ast.Struct):
-                self.codegen_Struct(inner)
-                return None, None
-            if isinstance(inner, c_ast.Union):
-                self.codegen_Union(inner)
-                return None, None
-            if isinstance(inner, c_ast.Enum):
-                self.codegen_Enum(inner)
-                return None, None
-
-        # `extern T name;` inside a function body refers to the file-scope
-        # `name` (C11 6.2.2p4). Rebind the local scope so the declared name
-        # resolves to the global's storage rather than creating a fresh
-        # alloca that shadows the outer declaration (gcc_torture scope-1.c).
-        is_extern_local = (
-            not self.in_global
-            and node.storage and "extern" in node.storage
-            and node.name is not None
-            and not isinstance(node.type, c_ast.FuncDecl)
-            and node.init is None
-        )
-        if is_extern_local:
-            ir_type = self._extern_decl_ir_type(node.name, node.type)
-            self._bind_local_extern_object(node.name, ir_type)
-            return None, None
-
-        # Static local objects: stored as internal globals with function-scoped names
-        is_static = node.storage and "static" in node.storage
-        if is_static and not self.in_global and not isinstance(node.type, c_ast.FuncDecl):
-            ir_type = self._static_local_ir_type(node.type, init_node=node.init)
-            # Create unique global name
-            global_name = self._static_local_symbol_name(node.name)
-            gv = self._create_bound_global(node.name, ir_type, symbol_name=global_name)
-            gv.linkage = "internal"
-            if node.init:
-                gv.initializer = self._build_const_init(node.init, ir_type)
-            else:
-                gv.initializer = self._zero_initializer(ir_type)
-            return None, None
-
-        if self._is_global_extern_decl(node):
-            ir_type = self._extern_decl_ir_type(node.name, node.type)
-            self._prepare_file_scope_object(
-                node.name,
-                ir_type,
-                storage=node.storage,
-                has_initializer=False,
-            )
-            return None, None
-
-        if isinstance(node.type, c_ast.Enum):
-            return self.codegen_Enum(node.type)
-
-        # Forward function declaration: int foo(int x);
-        if isinstance(node.type, c_ast.FuncDecl):
-            funcname = node.name
-            function_type, ir_type = self._build_function_ir_type(node.type)
-            symbol_name = funcname
-            if self.in_global:
-                function_type = self._preferred_file_scope_function_ir_type(
-                    funcname,
-                    function_type,
-                    getattr(node.type, "args", None) is not None,
-                )
-                symbol_name = self._register_file_scope_function(
-                    funcname,
-                    function_type,
-                    storage=node.storage,
-                    funcspec=node.funcspec,
-                    is_definition=False,
-                )
-            # Skip if already exists (module globals, libc, or env)
-            existing = self.module.globals.get(symbol_name)
-            if existing:
-                if self._func_decl_returns_unsigned(node.type):
-                    self._mark_unsigned_return(existing)
-                self.define(funcname, (None, existing))
-                return None, None
-            try:
-                func = ir.Function(
-                    self.module,
-                    function_type,
-                    name=symbol_name,
-                )
-                if self._func_decl_returns_unsigned(node.type):
-                    self._mark_unsigned_return(func)
-                self.define(funcname, (ir_type, func))
-            except Exception:
-                # Already exists (libc or previous decl)
-                existing = self.module.globals.get(symbol_name)
-                if existing:
-                    if self._func_decl_returns_unsigned(node.type):
-                        self._mark_unsigned_return(existing)
-                    self.define(funcname, (ir_type, existing))
-            return None, None
-
-        # Bare struct/union/type definition
-        if isinstance(node.type, c_ast.Union):
-            if node.name is None:
-                self.codegen_Union(node.type)
-            return None, None
-
-        if isinstance(node.type, c_ast.Struct) and node.name is None:
-            self.codegen_Struct(node.type)
-            return None, None
-
-        if isinstance(node.type, c_ast.TypeDecl):
-            if isinstance(node.type.type, c_ast.IdentifierType):
-                # Check if the type resolves to a struct or pointer via typedef
-                resolved = self._resolve_type_str(node.type.type.names)
-                if isinstance(resolved, ir.FunctionType):
-                    funcname = node.type.declname
-                    symbol_name = funcname
-                    if self.in_global:
-                        symbol_name = self._register_file_scope_function(
-                            funcname,
-                            resolved,
-                            storage=node.storage,
-                            funcspec=node.funcspec,
-                            is_definition=False,
-                        )
-                    existing = self.module.globals.get(symbol_name)
-                    if existing:
-                        self.define(funcname, (resolved.return_type, existing))
-                        return None, None
-                    try:
-                        func = ir.Function(self.module, resolved, name=symbol_name)
-                        self.define(funcname, (resolved.return_type, func))
-                    except Exception:
-                        existing = self.module.globals.get(symbol_name)
-                        if existing:
-                            self.define(funcname, (resolved.return_type, existing))
-                    return None, None
-                if (
-                    isinstance(resolved, (ir.PointerType, ir.ArrayType))
-                    or _is_struct_ir_type(resolved)
-                    or getattr(resolved, "is_union", False)
-                ):
-                    name = node.type.declname
-                    ir_type = resolved
-                    if not self.in_global:
-                        ret = self._alloca_in_entry(ir_type, name)
-                        self.define(name, (ir_type, ret))
-                    else:
-                        ret, write_initializer = self._prepare_file_scope_object(
-                            name,
-                            ir_type,
-                            storage=node.storage,
-                            has_initializer=node.init is not None,
-                        )
-                        if ret is None:
-                            return None, None
-                    if node.init is not None:
-                        if self.in_global:
-                            if write_initializer:
-                                ret.initializer = self._build_const_init(
-                                    node.init, ir_type
-                                )
-                        else:
-                            if getattr(ir_type, "is_union", False):
-                                self._safe_store(self._zero_initializer(ir_type), ret)
-                                self._init_runtime_value(ret, ir_type, node.init)
-                            elif isinstance(node.init, c_ast.InitList) and _is_struct_ir_type(
-                                ir_type
-                            ):
-                                self._safe_store(self._zero_initializer(ir_type), ret)
-                                self._init_runtime_aggregate(ret, node.init, ir_type)
-                            else:
-                                init_val, _ = self.codegen(node.init)
-                                if init_val is not None:
-                                    if init_val.type != ir_type:
-                                        init_val = self._implicit_convert(
-                                            init_val, ir_type
-                                        )
-                                    self._safe_store(init_val, ret)
-                    elif self.in_global and write_initializer:
-                        ret.initializer = self._zero_initializer(ir_type)
-                    return None, None
-
-            if isinstance(node.type.type, (c_ast.Struct, c_ast.Union)):
-                name = node.type.declname
-                codegen_fn = (
-                    self.codegen_Union
-                    if isinstance(node.type.type, c_ast.Union)
-                    else self.codegen_Struct
-                )
-                if node.type.type.name is None or getattr(node.type.type, "decls", None) is not None:
-                    struct_type = codegen_fn(node.type.type)
-                    if self.in_global and node.name and node.type.type.name is None:
-                        # Preserve the repository's legacy behavior for
-                        # file-scope anonymous aggregates declared as:
-                        #   struct { ... } Name;
-                        # Existing tests rely on a later `struct Name`
-                        # resolving to the same aggregate type.
-                        self.define(self._tag_type_key(node.name), (struct_type, None))
-                    if not self.in_global:
-                        ret = self._alloca_in_entry(struct_type, name)
-                        self.define(name, (struct_type, ret))
-                    else:
-                        ret, write_initializer = self._prepare_file_scope_object(
-                            name,
-                            struct_type,
-                            storage=node.storage,
-                            has_initializer=node.init is not None,
-                        )
-                        if ret is None:
-                            return None, None
-                    if node.init is not None:
-                        if self.in_global:
-                            if write_initializer:
-                                ret.initializer = self._build_const_init(
-                                    node.init, struct_type
-                                )
-                        else:
-                            if getattr(struct_type, "is_union", False):
-                                self._safe_store(
-                                    self._zero_initializer(struct_type), ret
-                                )
-                                self._init_runtime_value(ret, struct_type, node.init)
-                            elif isinstance(node.init, c_ast.InitList):
-                                self._safe_store(
-                                    self._zero_initializer(struct_type), ret
-                                )
-                                self._init_runtime_aggregate(
-                                    ret, node.init, struct_type
-                                )
-                            else:
-                                init_val, _ = self.codegen(node.init)
-                                if init_val is not None:
-                                    if init_val.type != struct_type:
-                                        init_val = self._implicit_convert(
-                                            init_val, struct_type
-                                        )
-                                    self._safe_store(init_val, ret)
-                    elif self.in_global and write_initializer:
-                        ret.initializer = self._zero_initializer(struct_type)
-                    return None, None
-                else:
-                    struct_type = self.env[
-                        self._tag_type_key(node.type.type.name)
-                    ][0]
-                    if not self.in_global:
-                        ret = self._alloca_in_entry(struct_type, name)
-                        self.define(name, (struct_type, ret))
-                    else:
-                        ret, write_initializer = self._prepare_file_scope_object(
-                            name,
-                            struct_type,
-                            storage=node.storage,
-                            has_initializer=node.init is not None,
-                        )
-                        if ret is None:
-                            return None, None
-                    if node.init is not None:
-                        if self.in_global:
-                            if write_initializer:
-                                ret.initializer = self._build_const_init(
-                                    node.init, struct_type
-                                )
-                        else:
-                            if getattr(struct_type, "is_union", False):
-                                self._safe_store(
-                                    self._zero_initializer(struct_type), ret
-                                )
-                                self._init_runtime_value(ret, struct_type, node.init)
-                            elif isinstance(node.init, c_ast.InitList):
-                                self._safe_store(
-                                    self._zero_initializer(struct_type), ret
-                                )
-                                self._init_runtime_aggregate(
-                                    ret, node.init, struct_type
-                                )
-                            else:
-                                init_val, _ = self.codegen(node.init)
-                                if init_val is not None:
-                                    if init_val.type != struct_type:
-                                        init_val = self._implicit_convert(
-                                            init_val, struct_type
-                                        )
-                                    self._safe_store(init_val, ret)
-                    elif self.in_global and write_initializer:
-                        ret.initializer = self._zero_initializer(struct_type)
-                    return None, None
-            else:
-                if isinstance(node.type.type, c_ast.IdentifierType):
-                    type_str = node.type.type.names
-                    is_unsigned = self._is_unsigned_type_names(type_str)
-                    ir_type = self._get_ir_type(type_str)
-                    type_str = self._resolve_type_str(type_str)
-                    if isinstance(type_str, ir.Type):
-                        type_str = "int"  # fallback for alloca name
-                else:
-                    if isinstance(node.type.type, c_ast.Enum):
-                        self.codegen_Enum(node.type.type)
-                    type_str = "int"
-                    is_unsigned = False
-                    ir_type = self._resolve_ast_type(node.type)
-                if self._is_floating_ir_type(ir_type):
-                    init = 0.0
-                else:
-                    init = 0
-
-                if node.init is not None:
-                    if self.in_global:
-                        init_val = self._build_const_init(node.init, ir_type)
-                    else:
-                        # SSA promotion: skip alloca for single-def non-escaping scalars.
-                        # Inspired by clang's EmitAutoVarAlloca + Graal's PEA.
-                        _ssa_promote = self._should_ssa_promote(node.name)
-                        if not _ssa_promote:
-                            var_addr, var_ir_type = self.create_entry_block_alloca(
-                                node.name, type_str, 1, storage=node.storage
-                            )
-                            if is_unsigned:
-                                self._mark_unsigned(var_addr)
-                        init_val, _ = self.codegen(node.init)
-                else:
-                    init_val = self._zero_initializer(ir_type)
-                    _ssa_promote = False
-                if self.in_global:
-                    var_addr, write_initializer = self._prepare_file_scope_object(
-                        node.name,
-                        ir_type,
-                        storage=node.storage,
-                        has_initializer=node.init is not None,
-                    )
-                    if var_addr is None:
-                        return None, None
-                    var_ir_type = ir_type
-                    if write_initializer:
-                        var_addr.initializer = init_val
-                else:
-                    if _ssa_promote:
-                        # Direct SSA: define as value, no alloca/store
-                        init_val = self._implicit_convert(
-                            init_val,
-                            ir_type,
-                            target_unsigned=is_unsigned,
-                        )
-                        init_val = self._tag_value_from_decl_type(init_val, node.type)
-                        self.define(node.name, (ir_type, init_val))
-                        if is_unsigned:
-                            self._mark_unsigned(init_val)
-                        return None, None
-                    else:
-                        if node.init is None:
-                            var_addr, var_ir_type = self.create_entry_block_alloca(
-                                node.name, type_str, 1, storage=node.storage
-                            )
-                            if is_unsigned:
-                                self._mark_unsigned(var_addr)
-                        init_val = self._implicit_convert(
-                            init_val,
-                            ir_type,
-                            target_unsigned=is_unsigned,
-                        )
-                        init_val = self._tag_value_from_decl_type(init_val, node.type)
-                        self._safe_store(init_val, var_addr)
-                if self.in_global and is_unsigned:
-                    self._mark_unsigned(var_addr)
-
-        elif isinstance(node.type, c_ast.ArrayDecl):
-            array_list = []
-            array_node = node.type
-            var_addr = None
-            var_ir_type = None
-            elem_ir_type = None
-            write_initializer = True
-            inferred_elem_type = None
-            try:
-                if isinstance(node.type.type, c_ast.ArrayDecl):
-                    inferred_elem_type = self._build_array_ir_type(node.type.type)
-                else:
-                    inferred_elem_type = self._resolve_ast_type(node.type.type)
-            except Exception:
-                inferred_elem_type = None
-            inferred_top_dim = self._infer_array_count_from_initializer(
-                node.init, inferred_elem_type
-            )
-            while True:
-                array_next_type = array_node.type
-                if isinstance(array_next_type, c_ast.TypeDecl):
-                    dynamic_dim_val = None
-                    if array_node.dim:
-                        try:
-                            dim_val = self._eval_dim(array_node.dim)
-                        except CodegenError:
-                            dim_val = None
-                            dynamic_dim_val, _ = self.codegen(array_node.dim)
-                    else:
-                        dim_val = 0
-                    if (
-                        dim_val == 0
-                        and array_node is node.type
-                        and inferred_top_dim is not None
-                    ):
-                        dim_val = inferred_top_dim
-                    if dynamic_dim_val is not None:
-                        if self.in_global or array_node is not node.type:
-                            raise CodegenError(
-                                "only one-dimensional local VLAs are supported"
-                            )
-                        elem_ir_type = self._resolve_ast_type(array_next_type)
-                        if not isinstance(dynamic_dim_val.type, ir.IntType):
-                            dynamic_dim_val = self.builder.fptoui(
-                                dynamic_dim_val, ir.IntType(64)
-                            )
-                        elif dynamic_dim_val.type.width != 64:
-                            dynamic_dim_val = self._implicit_convert(
-                                dynamic_dim_val, ir.IntType(64)
-                            )
-                        var_addr = self.builder.alloca(
-                            elem_ir_type,
-                            size=dynamic_dim_val,
-                            name=node.name,
-                        )
-                        self.define(node.name, (ir.PointerType(elem_ir_type), var_addr))
-                        self._mark_vla_binding(var_addr)
-                        if self._has_unsigned_scalar_pointee(node.type):
-                            self._mark_unsigned_pointee(var_addr)
-                        return None, var_addr
-                    array_list.append(dim_val)
-                    elem_ir_type = self._resolve_ast_type(array_next_type)
-                    break
-
-                elif isinstance(array_next_type, c_ast.ArrayDecl):
-                    dim_val = self._eval_dim(array_node.dim)
-                    if (
-                        dim_val == 0
-                        and array_node is node.type
-                        and inferred_top_dim is not None
-                    ):
-                        dim_val = inferred_top_dim
-                    array_list.append(dim_val)
-                    array_node = array_next_type
-                    continue
-                elif isinstance(array_next_type, c_ast.PtrDecl):
-                    # Array of pointers: int *arr[3]
-                    dim = self._eval_dim(array_node.dim)
-                    if (
-                        dim == 0
-                        and array_node is node.type
-                        and inferred_top_dim is not None
-                    ):
-                        dim = inferred_top_dim
-                    elem_ir = self._resolve_ast_type(array_next_type)
-                    elem_ir_type = elem_ir
-                    dims = array_list + [dim]
-                    arr_ir = elem_ir
-                    for current_dim in reversed(dims):
-                        arr_ir = self._checked_array_ir_type(arr_ir, current_dim)
-                    arr_ir.dim_array = dims
-                    if not self.in_global:
-                        var_addr = self._alloca_in_entry(arr_ir, node.name)
-                        self.define(node.name, (arr_ir, var_addr))
-                    else:
-                        var_addr, write_initializer = self._prepare_file_scope_object(
-                            node.name,
-                            arr_ir,
-                            storage=node.storage,
-                            has_initializer=node.init is not None,
-                        )
-                        if var_addr is None:
-                            return None, None
-                    var_ir_type = arr_ir
-                    break
-                else:
-                    raise Exception("TODO implement")
-
-            if var_addr is None:
-                var_ir_type = elem_ir_type
-                for dim in reversed(array_list):
-                    var_ir_type = self._checked_array_ir_type(var_ir_type, dim)
-                var_ir_type.dim_array = array_list
-                if not self.in_global:
-                    var_addr = self._alloca_in_entry(var_ir_type, node.name)
-                else:
-                    var_addr, write_initializer = self._prepare_file_scope_object(
-                        node.name,
-                        var_ir_type,
-                        storage=node.storage,
-                        has_initializer=node.init is not None,
-                    )
-                    if var_addr is None:
-                        return None, None
-                self.define(node.name, (var_ir_type, var_addr))
-
-            if self._has_unsigned_scalar_pointee(node.type):
-                self._mark_unsigned_pointee(var_addr)
-
-            if self._has_unsigned_scalar_pointee(node.type):
-                self._mark_unsigned_pointee(var_addr)
-
-            # Handle array initialization: int a[3] = {1, 2, 3}; or
-            # char s[] = "hi"; or const char *names[] = {"a", helper};
-            if node.init is not None:
-                if self.in_global:
-                    if write_initializer:
-                        try:
-                            const_init = self._build_const_init(node.init, var_ir_type)
-                            str(const_init)
-                            var_addr.initializer = const_init
-                        except Exception:
-                            var_addr.initializer = self._zero_initializer(var_ir_type)
-                elif isinstance(node.init, c_ast.InitList):
-                    self._safe_store(self._zero_initializer(var_ir_type), var_addr)
-                    self._init_runtime_value(var_addr, var_ir_type, node.init)
-                elif self._is_array_string_initializer(node.init, var_ir_type):
-                    self._safe_store(self._zero_initializer(var_ir_type), var_addr)
-                    data = self._string_literal_data(node.init)
-                    idx0 = ir.Constant(int64_t, 0)
-                    for i, value in enumerate(data[: var_ir_type.count]):
-                        elem_ptr = self.builder.gep(
-                            var_addr,
-                            [idx0, ir.Constant(int64_t, i)],
-                            inbounds=True,
-                        )
-                        self.builder.store(ir.Constant(elem_ir_type, value), elem_ptr)
-            elif self.in_global and write_initializer:
-                var_addr.initializer = self._zero_initializer(var_ir_type)
-
-        elif isinstance(node.type, c_ast.PtrDecl):
-
-            point_level = 1
-            sub_node = node.type
-            resolved_pointee_type = None
-            write_initializer = True
-
-            while True:
-                sub_next_type = sub_node.type
-                if isinstance(sub_next_type, c_ast.TypeDecl):
-                    if isinstance(sub_next_type.type, c_ast.Struct):
-                        # pointer to struct: struct { int x; } *p
-                        resolved_pointee_type = self.codegen_Struct(sub_next_type.type)
-                        type_str = "struct"
-                    elif isinstance(sub_next_type.type, c_ast.Union):
-                        resolved_pointee_type = self.codegen_Union(sub_next_type.type)
-                        type_str = "union"
-                    elif isinstance(sub_next_type.type, c_ast.Enum):
-                        self.codegen_Enum(sub_next_type.type)
-                        resolved_pointee_type = int32_t
-                        type_str = "int"
-                    else:
-                        type_str = sub_next_type.type.names
-                        resolved = self._get_ir_type(type_str)
-                        if isinstance(resolved, ir.Type):
-                            resolved_pointee_type = resolved
-                        if _is_struct_ir_type(resolved):
-                            type_str = "struct"
-                    break
-                elif isinstance(sub_next_type, c_ast.PtrDecl):
-                    point_level += 1
-                    sub_node = sub_next_type
-                    continue
-                elif isinstance(sub_next_type, c_ast.ArrayDecl):
-                    resolved_pointee_type = self._build_array_ir_type(sub_next_type)
-                    type_str = "array"
-                    break
-                elif isinstance(sub_next_type, c_ast.FuncDecl):
-                    # Function pointer: int (*fp)(int, int)
-                    func_ir_type = self._build_func_ptr_type(sub_next_type)
-                    if not self.in_global:
-                        var_addr = self._alloca_in_entry(func_ir_type, node.name)
-                        self.define(node.name, (func_ir_type, var_addr))
-                    else:
-                        var_addr, write_initializer = self._prepare_file_scope_object(
-                            node.name,
-                            func_ir_type,
-                            storage=node.storage,
-                            has_initializer=node.init is not None,
-                        )
-                        if var_addr is None:
-                            return None, None
-                    if self._func_decl_returns_unsigned(sub_next_type):
-                        self._mark_unsigned_return(var_addr)
-                    if node.init is not None:
-                        init_val, _ = self.codegen(node.init)
-                        # For global scope, set as initializer directly
-                        if self.in_global and isinstance(var_addr, ir.GlobalVariable):
-                            # NULL (i64 0) → null pointer of correct type
-                            if (isinstance(init_val.type, ir.IntType)
-                                    and isinstance(init_val, ir.Constant)
-                                    and self._constant_raw_value(init_val) == 0):
-                                init_val = ir.Constant(
-                                    var_addr.value_type, None
-                                )
-                            var_addr.initializer = init_val
-                        else:
-                            if (
-                                isinstance(init_val, ir.Constant)
-                                and isinstance(init_val.type, ir.IntType)
-                                and self._constant_raw_value(init_val) == 0
-                            ):
-                                init_val = ir.Constant(func_ir_type, None)
-                            elif init_val.type != func_ir_type:
-                                init_val = self._implicit_convert(
-                                    init_val, func_ir_type
-                                )
-                            self._safe_store(init_val, var_addr)
-                    return None, var_addr
-                pass
-
-            if resolved_pointee_type is not None:
-                ir_type = resolved_pointee_type
-                if isinstance(ir_type, ir.VoidType):
-                    ir_type = int8_t
-                for _ in range(point_level):
-                    ir_type = ir.PointerType(ir_type)
-                if not self.in_global:
-                    var_addr = self._alloca_in_entry(ir_type, node.name)
-                    self.define(node.name, (ir_type, var_addr))
-                else:
-                    var_addr, write_initializer = self._prepare_file_scope_object(
-                        node.name,
-                        ir_type,
-                        storage=node.storage,
-                        has_initializer=node.init is not None,
-                    )
-                    if var_addr is None:
-                        return None, None
-                var_ir_type = ir_type
-            else:
-                if self.in_global:
-                    pointee_ir_type = get_ir_type(type_str)
-                    if isinstance(pointee_ir_type, ir.VoidType):
-                        pointee_ir_type = int8_t
-                    for _ in range(point_level):
-                        pointee_ir_type = ir.PointerType(pointee_ir_type)
-                    var_ir_type = pointee_ir_type
-                    var_addr, write_initializer = self._prepare_file_scope_object(
-                        node.name,
-                        var_ir_type,
-                        storage=node.storage,
-                        has_initializer=node.init is not None,
-                    )
-                    if var_addr is None:
-                        return None, None
-                else:
-                    var_addr, var_ir_type = self.create_entry_block_alloca(
-                        node.name,
-                        type_str,
-                        1,
-                        point_level=point_level,
-                        storage=node.storage,
-                    )
-
-            if self._has_unsigned_scalar_pointee(node.type):
-                self._mark_unsigned_pointee(var_addr)
-
-            if node.init is not None:
-                if self.in_global:
-                    if write_initializer:
-                        try:
-                            const_init = self._build_const_init(node.init, var_ir_type)
-                            str(const_init)
-                            var_addr.initializer = const_init
-                        except Exception:
-                            var_addr.initializer = ir.Constant(var_ir_type, None)
-                else:
-                    init_val, _ = self.codegen(node.init)
-                    init_val = self._decay_array_expr_to_pointer(
-                        node.init, init_val, f"{node.name}.initdecay"
-                    )
-                    if isinstance(init_val.type, ir.ArrayType) and isinstance(
-                        var_ir_type, ir.PointerType
-                    ):
-                        init_val = self._implicit_convert(init_val, var_ir_type)
-                    elif init_val.type != var_ir_type:
-                        init_val = self._implicit_convert(init_val, var_ir_type)
-                    self._safe_store(init_val, var_addr)
-        else:
-            return None, None
-
-        return None, var_addr
 
     def codegen_ID(self, node):
         if node.name in {"__func__", "__FUNCTION__", "__PRETTY_FUNCTION__"}:
@@ -10539,6 +6346,17 @@ class LLVMCodeGenerator(object):
                 self._mark_unsigned_return(self.function)
             # Add stack protector attribute for security hardening
             self.function.attributes.add("sspstrong")
+            # PCC_NO_BUILTIN=1 is the -fno-builtin equivalent, required when a
+            # translation unit DEFINES a libc primitive: without it LLVM turns
+            # the body's memset-zero back into a `bzero` call (Darwin TLI),
+            # so libc's own bzero tail-branches to itself and recurses
+            # forever (BUG-P1-SELF-MEM-INTRINSIC-LIBCALL-SELF-BRANCH).
+            if _no_builtin_enabled():
+                # clang's -fno-builtin emits the function-level string attr
+                # "no-builtins"; the bare `nobuiltin` keyword is a call-site
+                # attribute and does not stop InstCombine from recognizing
+                # libc calls inside the body.
+                self.function.attributes.add('"no-builtins"')
             # Attach DWARF debug info
             func_line = getattr(getattr(node, "coord", None), "line", 1) or 1
             self._di_create_function(self.function, funcname, ir_type, func_line)
@@ -10611,6 +6429,8 @@ class LLVMCodeGenerator(object):
                     self.builder.ret_void()
                 else:
                     self.builder.ret(self._zero_initializer(ir_type))
+
+            self._di_attach_function_call_locations(self.function, node)
 
             return None, None
 
@@ -11183,31 +7003,6 @@ class LLVMCodeGenerator(object):
             self.codegen(node.stmt)
         return None, None
 
-    def codegen_Case(self, node):
-        if not self._switch_contexts:
-            return None, None
-        label_bb = self._switch_contexts[-1]["blocks"].get(id(node))
-        if label_bb is None:
-            return None, None
-        if self.builder.block is not label_bb and not self.builder.block.is_terminated:
-            self.builder.branch(label_bb)
-        self.builder.position_at_end(label_bb)
-        for stmt in node.stmts or []:
-            self.codegen(stmt)
-        return None, None
-
-    def codegen_Default(self, node):
-        if not self._switch_contexts:
-            return None, None
-        label_bb = self._switch_contexts[-1]["blocks"].get(id(node))
-        if label_bb is None:
-            return None, None
-        if self.builder.block is not label_bb and not self.builder.block.is_terminated:
-            self.builder.branch(label_bb)
-        self.builder.position_at_end(label_bb)
-        for stmt in node.stmts or []:
-            self.codegen(stmt)
-        return None, None
 
     def codegen_Goto(self, node):
         target_bb = self._ensure_label_block(node.name)
@@ -11293,10 +7088,6 @@ class LLVMCodeGenerator(object):
                 return value
             return make_int(value)
 
-        def raw_bits(value):
-            value = coerce_int_value(value)
-            return int(value.value) & ((1 << value.width) - 1)
-
         def numeric_value(value):
             if is_int_value(value):
                 return value.value
@@ -11370,17 +7161,6 @@ class LLVMCodeGenerator(object):
                 return float(numeric_value(value))
             return value
 
-        def c_int_div(lhs, rhs):
-            lhs = int(lhs)
-            rhs = int(rhs)
-            quotient = abs(lhs) // abs(rhs)
-            if (lhs < 0) ^ (rhs < 0):
-                quotient = -quotient
-            return quotient
-
-        def c_int_mod(lhs, rhs):
-            return lhs - c_int_div(lhs, rhs) * rhs
-
         def c_float_div(lhs, rhs):
             if rhs == 0.0:
                 if lhs == 0.0:
@@ -11418,179 +7198,102 @@ class LLVMCodeGenerator(object):
                 offset, _ = self._eval_offsetof_structref(node.expr)
                 return make_int(offset, 64, True)
             val = self._eval_const_expr(node.expr)
+            if node.op in ("-", "+", "~", "!") and is_int_value(val):
+                promoted = integer_promotion(val)
+                status, folded = _fold_c_integer_unary(
+                    node.op,
+                    promoted.width,
+                    promoted.is_unsigned,
+                    numeric_value(promoted),
+                )
+                if status == _C_FOLD_POISON:
+                    raise CodegenError(
+                        f"undefined integer constant expression: {node.op}"
+                    )
+                if status == _C_FOLD_CONSTANT:
+                    if node.op == "!":
+                        return make_int(folded)
+                    return make_int(
+                        folded,
+                        promoted.width,
+                        promoted.is_unsigned,
+                    )
             if node.op == "-":
-                if is_int_value(val):
-                    val = integer_promotion(val)
-                    return make_int(-numeric_value(val), val.width, val.is_unsigned)
                 return -val
-            elif node.op == "+":
-                if is_int_value(val):
-                    return integer_promotion(val)
+            if node.op == "+":
                 return val
-            elif node.op == "~":
-                val = integer_promotion(coerce_int_value(val))
-                return make_int(~raw_bits(val), val.width, val.is_unsigned)
-            elif node.op == "!":
-                return 0 if numeric_value(val) else 1
+            if node.op == "!":
+                return make_int(0 if numeric_value(val) else 1)
+            if node.op == "~":
+                raise CodegenError("bitwise complement requires an integer operand")
         elif isinstance(node, c_ast.BinaryOp):
             l = self._eval_const_expr(node.left)
+            if node.op == "&&" and not numeric_value(l):
+                return make_int(0)
+            if node.op == "||" and numeric_value(l):
+                return make_int(1)
             r = self._eval_const_expr(node.right)
+            if node.op == "&&":
+                return make_int(1 if numeric_value(r) else 0)
+            if node.op == "||":
+                return make_int(1 if numeric_value(r) else 0)
             use_float = is_float_value(l) or is_float_value(r)
 
-            def c_shift_left(a, b):
-                a = integer_promotion(a)
-                return make_int(raw_bits(a) << int(numeric_value(b)), a.width, a.is_unsigned)
-
-            def c_shift_right(a, b):
-                a = integer_promotion(a)
-                shift = int(numeric_value(b))
-                if a.is_unsigned:
-                    return make_int(raw_bits(a) >> shift, a.width, True)
-                return make_int(int(numeric_value(a)) >> shift, a.width, False)
-
-            def c_arith(a, b, op):
-                if use_float:
-                    return op(float(numeric_value(a)), float(numeric_value(b)))
-                a, b, result_unsigned = usual_arithmetic_conversion(a, b)
-                return make_int(
-                    op(int(numeric_value(a)), int(numeric_value(b))),
-                    a.width,
-                    result_unsigned,
+            if use_float:
+                lhs = float(numeric_value(l))
+                rhs = float(numeric_value(r))
+                if node.op == "+":
+                    return lhs + rhs
+                if node.op == "-":
+                    return lhs - rhs
+                if node.op == "*":
+                    return lhs * rhs
+                if node.op == "/":
+                    return c_float_div(lhs, rhs)
+                if node.op in ("==", "!=", "<", "<=", ">", ">="):
+                    if node.op == "==":
+                        result = lhs == rhs
+                    elif node.op == "!=":
+                        result = lhs != rhs
+                    elif node.op == "<":
+                        result = lhs < rhs
+                    elif node.op == "<=":
+                        result = lhs <= rhs
+                    elif node.op == ">":
+                        result = lhs > rhs
+                    else:
+                        result = lhs >= rhs
+                    return make_int(1 if result else 0)
+                raise CodegenError(
+                    f"invalid floating constant-expression operator: {node.op}"
                 )
 
-            ops = {
-                "+": lambda a, b: c_arith(a, b, lambda x, y: x + y),
-                "-": lambda a, b: c_arith(a, b, lambda x, y: x - y),
-                "*": lambda a, b: c_arith(a, b, lambda x, y: x * y),
-                "/": lambda a, b: (
-                    c_float_div(float(numeric_value(a)), float(numeric_value(b)))
-                    if use_float
-                    else (
-                        lambda lhs, rhs, result_unsigned: make_int(
-                            (
-                                raw_bits(lhs) // raw_bits(rhs)
-                                if result_unsigned
-                                else c_int_div(
-                                    int(numeric_value(lhs)),
-                                    int(numeric_value(rhs)),
-                                )
-                            ),
-                            lhs.width,
-                            result_unsigned,
-                        )
-                    )(*usual_arithmetic_conversion(a, b))
-                ),
-                "%": lambda a, b: (
-                    float(numeric_value(a)) % float(numeric_value(b))
-                    if use_float
-                    else (
-                        lambda lhs, rhs, result_unsigned: make_int(
-                            (
-                                raw_bits(lhs) % raw_bits(rhs)
-                                if result_unsigned
-                                else c_int_mod(
-                                    int(numeric_value(lhs)),
-                                    int(numeric_value(rhs)),
-                                )
-                            ),
-                            lhs.width,
-                            result_unsigned,
-                        )
-                    )(*usual_arithmetic_conversion(a, b))
-                ),
-                "<<": lambda a, b: c_shift_left(a, b) if not use_float else 0,
-                ">>": lambda a, b: c_shift_right(a, b) if not use_float else 0,
-                "&": lambda a, b: (
-                    lambda lhs, rhs, result_unsigned: make_int(
-                        raw_bits(lhs) & raw_bits(rhs),
-                        lhs.width,
-                        result_unsigned,
-                    )
-                )(*usual_arithmetic_conversion(a, b)),
-                "|": lambda a, b: (
-                    lambda lhs, rhs, result_unsigned: make_int(
-                        raw_bits(lhs) | raw_bits(rhs),
-                        lhs.width,
-                        result_unsigned,
-                    )
-                )(*usual_arithmetic_conversion(a, b)),
-                "^": lambda a, b: (
-                    lambda lhs, rhs, result_unsigned: make_int(
-                        raw_bits(lhs) ^ raw_bits(rhs),
-                        lhs.width,
-                        result_unsigned,
-                    )
-                )(*usual_arithmetic_conversion(a, b)),
-                "==": lambda a, b: int(
-                    float(numeric_value(a)) == float(numeric_value(b))
-                    if use_float
-                    else (
-                        lambda lhs, rhs, result_unsigned: (
-                            raw_bits(lhs) == raw_bits(rhs)
-                            if result_unsigned
-                            else int(numeric_value(lhs)) == int(numeric_value(rhs))
-                        )
-                    )(*usual_arithmetic_conversion(a, b))
-                ),
-                "!=": lambda a, b: int(
-                    float(numeric_value(a)) != float(numeric_value(b))
-                    if use_float
-                    else (
-                        lambda lhs, rhs, result_unsigned: (
-                            raw_bits(lhs) != raw_bits(rhs)
-                            if result_unsigned
-                            else int(numeric_value(lhs)) != int(numeric_value(rhs))
-                        )
-                    )(*usual_arithmetic_conversion(a, b))
-                ),
-                "<": lambda a, b: int(
-                    float(numeric_value(a)) < float(numeric_value(b))
-                    if use_float
-                    else (
-                        lambda lhs, rhs, result_unsigned: (
-                            raw_bits(lhs) < raw_bits(rhs)
-                            if result_unsigned
-                            else int(numeric_value(lhs)) < int(numeric_value(rhs))
-                        )
-                    )(*usual_arithmetic_conversion(a, b))
-                ),
-                "<=": lambda a, b: int(
-                    float(numeric_value(a)) <= float(numeric_value(b))
-                    if use_float
-                    else (
-                        lambda lhs, rhs, result_unsigned: (
-                            raw_bits(lhs) <= raw_bits(rhs)
-                            if result_unsigned
-                            else int(numeric_value(lhs)) <= int(numeric_value(rhs))
-                        )
-                    )(*usual_arithmetic_conversion(a, b))
-                ),
-                ">": lambda a, b: int(
-                    float(numeric_value(a)) > float(numeric_value(b))
-                    if use_float
-                    else (
-                        lambda lhs, rhs, result_unsigned: (
-                            raw_bits(lhs) > raw_bits(rhs)
-                            if result_unsigned
-                            else int(numeric_value(lhs)) > int(numeric_value(rhs))
-                        )
-                    )(*usual_arithmetic_conversion(a, b))
-                ),
-                ">=": lambda a, b: int(
-                    float(numeric_value(a)) >= float(numeric_value(b))
-                    if use_float
-                    else (
-                        lambda lhs, rhs, result_unsigned: (
-                            raw_bits(lhs) >= raw_bits(rhs)
-                            if result_unsigned
-                            else int(numeric_value(lhs)) >= int(numeric_value(rhs))
-                        )
-                    )(*usual_arithmetic_conversion(a, b))
-                ),
-                "&&": lambda a, b: int(bool(numeric_value(a)) and bool(numeric_value(b))),
-                "||": lambda a, b: int(bool(numeric_value(a)) or bool(numeric_value(b))),
-            }
-            return ops[node.op](l, r)
+            if node.op in ("<<", ">>"):
+                lhs = integer_promotion(coerce_int_value(l))
+                rhs = integer_promotion(coerce_int_value(r))
+                result_width = lhs.width
+                result_unsigned = lhs.is_unsigned
+            else:
+                lhs, rhs, result_unsigned = usual_arithmetic_conversion(l, r)
+                result_width = lhs.width
+            status, folded = _fold_c_integer_binary(
+                node.op,
+                result_width,
+                result_unsigned,
+                numeric_value(lhs),
+                numeric_value(rhs),
+            )
+            if status == _C_FOLD_POISON:
+                raise CodegenError(
+                    f"undefined integer constant expression: {node.op}"
+                )
+            if status != _C_FOLD_CONSTANT:
+                raise CodegenError(
+                    f"unsupported integer constant-expression operator: {node.op}"
+                )
+            if node.op in ("==", "!=", "<", "<=", ">", ">="):
+                return make_int(folded)
+            return make_int(folded, result_width, result_unsigned)
         elif isinstance(node, c_ast.TernaryOp):
             cond = self._eval_const_expr(node.cond)
             if numeric_value(cond):

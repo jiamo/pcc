@@ -38,6 +38,53 @@ def test_owned_object_locals_are_registered_as_gc_frame_roots(tmp_path):
     assert "call void @pcc_gc_frame_leave" in ir_text
 
 
+def test_borrowed_class_method_parameters_are_rooted_before_calls(tmp_path):
+    from pcc.py_frontend.pipeline import compile_python
+
+    src = tmp_path / "method_parameter_roots.py"
+    out = tmp_path / "method_parameter_roots.ll"
+    src.write_text(
+        textwrap.dedent("""
+        def normalize(value: str) -> str:
+            return value
+
+        class Registry:
+            def register(self, namespace: str) -> str:
+                namespace = normalize(namespace)
+                return namespace
+        """).lstrip(),
+        encoding="utf-8",
+    )
+
+    compile_python(
+        str(src),
+        str(out),
+        emit_llvm_only=True,
+        libpython_mode="off",
+        ir_scaffold_mode="on",
+    )
+    ir_text = out.read_text(encoding="utf-8")
+    body_match = re.search(
+        r"define\s+[^@]*@user_[^(]*Registry_register[^{]*\{(?P<body>.*?)\n\}",
+        ir_text,
+        re.S,
+    )
+    assert body_match is not None, ir_text
+    body = body_match.group("body")
+    call_pos = body.index("@user_method_parameter_roots_normalize")
+    prefix = body[:call_pos]
+    assert re.search(
+        r"@\.pcc\.gc\.frame\.map\.borrowed\.1[^\n]*\n"
+        r"\s*%gc\.frame\.slots\.ptr\.[^\n]*%self\.addr",
+        prefix,
+    ), body
+    assert re.search(
+        r"@\.pcc\.gc\.frame\.map\.borrowed\.1[^\n]*\n"
+        r"\s*%gc\.frame\.slots\.ptr\.[^\n]*%namespace\.addr",
+        prefix,
+    ), body
+
+
 def test_owned_module_global_is_rooted_before_attribute_publication(tmp_path):
     from pcc.py_frontend.pipeline import compile_python
 
@@ -225,7 +272,7 @@ def test_dynamic_for_target_replaces_an_owned_gc_frame_root(tmp_path):
     assert "value.owned" in body
     assert re.search(
         r"@\.pcc\.gc\.frame\.map\.1[^\n]*\n"
-        r"\s*%gc\.frame\.slots\.ptr\.[^\n]*%value\.addr",
+        r"\s*%gc\.frame\.slots\.ptr\.[^\n]*%value(?:\.for\.obj)?\.addr",
         body,
     ), body
     # Each owned result from py_obj_next replaces (and releases) the prior

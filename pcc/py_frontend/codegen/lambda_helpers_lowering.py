@@ -431,10 +431,17 @@ class LambdaHelperLoweringMixin:
         saved_env_class_object_hint = getattr(self, "env_class_object_hint", {})
         saved_cpy_env_flags = dict(getattr(self, "_cpy_env_flags", {}))
         saved_cpy_values = set(getattr(self, "_cpy_values", set()))
+        saved_owned_cpy_values = set(getattr(self, "_owned_cpy_values", set()))
         saved_current_fn = self.current_function
         saved_current_fd = self.current_func_def
         saved_loops = getattr(self, "loop_stack", [])
         saved_entry_block = getattr(self, "_current_entry_block", None)
+        saved_try_err_block = getattr(self, "_try_err_block", None)
+        saved_cpy_operand_cleanup_block = getattr(
+            self,
+            "_cpy_operand_cleanup_block",
+            None,
+        )
 
         entry = adapter.append_basic_block(name="entry")
         self.builder = ir.IRBuilder(entry)
@@ -445,7 +452,10 @@ class LambdaHelperLoweringMixin:
         self.env_class_object_hint = {}
         self._cpy_env_flags = {}
         self._cpy_values = set()
+        self._owned_cpy_values = set()
         self.loop_stack = []
+        self._try_err_block = None
+        self._cpy_operand_cleanup_block = None
         # _alloca_in_entry targets _current_entry_block; without this switch
         # a comprehension inside the lambda body allocas its target slot in
         # the ENCLOSING function's entry (cross-function alloca reference ->
@@ -542,10 +552,13 @@ class LambdaHelperLoweringMixin:
             self.env_class_object_hint = saved_env_class_object_hint
             self._cpy_env_flags = saved_cpy_env_flags
             self._cpy_values = saved_cpy_values
+            self._owned_cpy_values = saved_owned_cpy_values
             self.current_function = saved_current_fn
             self.current_func_def = saved_current_fd
             self.loop_stack = saved_loops
             self._current_entry_block = saved_entry_block
+            self._try_err_block = saved_try_err_block
+            self._cpy_operand_cleanup_block = saved_cpy_operand_cleanup_block
             return None
 
         self.builder = saved_builder
@@ -554,10 +567,13 @@ class LambdaHelperLoweringMixin:
         self.env_class_object_hint = saved_env_class_object_hint
         self._cpy_env_flags = saved_cpy_env_flags
         self._cpy_values = saved_cpy_values
+        self._owned_cpy_values = saved_owned_cpy_values
         self.current_function = saved_current_fn
         self.current_func_def = saved_current_fd
         self.loop_stack = saved_loops
         self._current_entry_block = saved_entry_block
+        self._try_err_block = saved_try_err_block
+        self._cpy_operand_cleanup_block = saved_cpy_operand_cleanup_block
 
         captures = self.builder.call(
             self.runtime["py_tuple_new"],
@@ -572,45 +588,31 @@ class LambdaHelperLoweringMixin:
             raw = self._emit_name(
                 Name(span=expr.span, ty=cap_ty, ident=fv),
             )
-            if raw in getattr(self, "_cpy_values", ()):
-                obj = self.builder.call(
-                    self.runtime["py_cpy_to_pcc_obj"],
-                    [raw],
-                    name=self._fresh("lambda.cap.bridge"),
-                )
-                self.builder.call(self.runtime["py_cpy_decref"], [raw])
-            else:
-                obj = marshal.marshal_to_object(
-                    self.builder,
-                    self.module,
-                    self.runtime,
-                    raw,
-                    cap_ty,
-                )
+            raw_is_cpy = raw in getattr(self, "_cpy_values", ())
+            obj = self._emit_value_as_pcc_object_or_bridge(
+                raw,
+                cap_ty,
+                "lambda.cap.bridge",
+            )
             self.builder.call(
                 self.runtime["py_tuple_set_item"],
                 [captures, ir.Constant(_I64, i), obj],
             )
+            if raw_is_cpy:
+                # py_tuple_set_item retains rather than steals; the bridge
+                # result carries one pcc reference owned by this expression.
+                self._gc_release(obj)
         for default_i, (_param_i, param) in enumerate(default_params):
             default_expr = param.default
             if default_expr is None:
                 continue
             raw = self._emit_expr(default_expr)
-            if raw in getattr(self, "_cpy_values", ()):
-                obj = self.builder.call(
-                    self.runtime["py_cpy_to_pcc_obj"],
-                    [raw],
-                    name=self._fresh("lambda.default.bridge"),
-                )
-                self.builder.call(self.runtime["py_cpy_decref"], [raw])
-            else:
-                obj = marshal.marshal_to_object(
-                    self.builder,
-                    self.module,
-                    self.runtime,
-                    raw,
-                    default_expr.ty,
-                )
+            raw_is_cpy = raw in getattr(self, "_cpy_values", ())
+            obj = self._emit_value_as_pcc_object_or_bridge(
+                raw,
+                default_expr.ty,
+                "lambda.default.bridge",
+            )
             self.builder.call(
                 self.runtime["py_tuple_set_item"],
                 [
@@ -619,6 +621,8 @@ class LambdaHelperLoweringMixin:
                     obj,
                 ],
             )
+            if raw_is_cpy:
+                self._gc_release(obj)
         fn_obj = self.builder.call(
             self.runtime["py_func_new"],
             [adapter, captures],
@@ -889,10 +893,17 @@ class LambdaHelperLoweringMixin:
         saved_env_class_object_hint = getattr(self, "env_class_object_hint", {})
         saved_cpy_env_flags = dict(getattr(self, "_cpy_env_flags", {}))
         saved_cpy_values = set(getattr(self, "_cpy_values", set()))
+        saved_owned_cpy_values = set(getattr(self, "_owned_cpy_values", set()))
         saved_current_fn = self.current_function
         saved_current_fd = self.current_func_def
         saved_loops = getattr(self, "loop_stack", [])
         saved_entry_block = getattr(self, "_current_entry_block", None)
+        saved_try_err_block = getattr(self, "_try_err_block", None)
+        saved_cpy_operand_cleanup_block = getattr(
+            self,
+            "_cpy_operand_cleanup_block",
+            None,
+        )
 
         entry = fn_ir.append_basic_block(name="entry")
         setattr(self, "builder", ir.IRBuilder(entry))
@@ -903,7 +914,10 @@ class LambdaHelperLoweringMixin:
         setattr(self, "env_class_object_hint", {})
         setattr(self, "_cpy_env_flags", {})
         setattr(self, "_cpy_values", set())
+        setattr(self, "_owned_cpy_values", set())
         setattr(self, "loop_stack", [])
+        setattr(self, "_try_err_block", None)
+        setattr(self, "_cpy_operand_cleanup_block", None)
         # _alloca_in_entry targets _current_entry_block; keep it in sync with
         # the function being emitted or comprehension target slots land in
         # the enclosing function's entry (cross-function alloca reference).
@@ -963,15 +977,23 @@ class LambdaHelperLoweringMixin:
                 # expression as DynType; the trampoline still needs to
                 # hand CPython a real ``None`` object.
                 body_val = self._emit_none_literal()
-                cpy_val, _owned = self._marshal_to_cpython(
+                cpy_val, owned = self._marshal_to_cpython(
                     body_val,
                     NoneType(name="None"),
                 )
             else:
-                cpy_val, _owned = self._marshal_to_cpython(
+                cpy_val, owned = self._marshal_to_cpython_consuming_source(
                     body_val,
                     expr.body.ty,
+                    expr.body,
                 )
+            # The CPython trampoline follows the ordinary callable ABI: every
+            # non-NULL result is a new reference.  Transfer an already-owned
+            # result, or promote a borrowed parameter/global before returning.
+            if owned:
+                self._forget_owned_cpy_value(cpy_val)
+            else:
+                self.builder.call(self.runtime["py_cpy_incref"], [cpy_val])
             self.builder.ret(cpy_val)
         except NotImplementedError:
             # Restore outer state and drop this synthesized function
@@ -983,10 +1005,17 @@ class LambdaHelperLoweringMixin:
             setattr(self, "env_class_object_hint", saved_env_class_object_hint)
             setattr(self, "_cpy_env_flags", saved_cpy_env_flags)
             setattr(self, "_cpy_values", saved_cpy_values)
+            setattr(self, "_owned_cpy_values", saved_owned_cpy_values)
             setattr(self, "current_function", saved_current_fn)
             setattr(self, "current_func_def", saved_current_fd)
             setattr(self, "loop_stack", saved_loops)
             setattr(self, "_current_entry_block", saved_entry_block)
+            setattr(self, "_try_err_block", saved_try_err_block)
+            setattr(
+                self,
+                "_cpy_operand_cleanup_block",
+                saved_cpy_operand_cleanup_block,
+            )
             return None
 
         # Restore outer state now that the lambda body is fully emitted.
@@ -996,20 +1025,27 @@ class LambdaHelperLoweringMixin:
         setattr(self, "env_class_object_hint", saved_env_class_object_hint)
         setattr(self, "_cpy_env_flags", saved_cpy_env_flags)
         setattr(self, "_cpy_values", saved_cpy_values)
+        setattr(self, "_owned_cpy_values", saved_owned_cpy_values)
         setattr(self, "current_function", saved_current_fn)
         setattr(self, "current_func_def", saved_current_fd)
         setattr(self, "loop_stack", saved_loops)
         setattr(self, "_current_entry_block", saved_entry_block)
+        setattr(self, "_try_err_block", saved_try_err_block)
+        setattr(
+            self,
+            "_cpy_operand_cleanup_block",
+            saved_cpy_operand_cleanup_block,
+        )
 
         # Before wrapping, store each captured outer-scope value into
         # its dedicated lambda-capture global. Next time the lambda
         # body runs it will see the value current at wrap time — good
         # enough for one-shot ``sorted(xs, key=<fn>)`` semantics.
-        for fv, gv in capture_globals.items():
+        for fv, capture_gv in capture_globals.items():
             cpy_val = self._capture_value_as_cpython(fv)
             if cpy_val is None:
                 continue
-            self.builder.store(cpy_val, gv)
+            self.builder.store(cpy_val, capture_gv)
 
         # Bitcast the function to ``ptr`` (i8*) and wrap via the
         # arity-matched runtime helper. Returns a CPython callable
@@ -1030,5 +1066,4 @@ class LambdaHelperLoweringMixin:
             [fn_ptr],
             name=self._fresh(f"cpy.{sym_base}"),
         )
-        self._cpy_values.add(result)
-        return result
+        return self._mark_owned_cpy_value(result)

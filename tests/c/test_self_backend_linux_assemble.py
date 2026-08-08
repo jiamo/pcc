@@ -61,6 +61,29 @@ bb0:
   ret i32 %booltmp
 }
 """,
+    "initial_exec_tls": """
+target triple = "x86_64-unknown-linux-gnu"
+
+@tls_init = thread_local global i32 37, align 4
+@tls_zero = thread_local(initialexec) global ptr null, align 8
+
+define i32 @tls_read() {
+entry:
+  %value = load i32, ptr @tls_init, align 4
+  ret i32 %value
+}
+
+define void @tls_write(i32 %value) {
+entry:
+  store i32 %value, ptr @tls_init, align 4
+  ret void
+}
+
+define ptr @tls_zero_address() {
+entry:
+  ret ptr @tls_zero
+}
+""",
     "smul_with_overflow_i64": """
 target triple = "x86_64-unknown-linux-gnu"
 

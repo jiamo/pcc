@@ -1,13 +1,15 @@
 """Parity tests for InstSimplifyPass (subset)."""
 
-import shutil
+import pytest
 import unittest
 
 from pcc.ir_passes.instsimplify import InstSimplifyPass, simplify_module_text
 from pcc.ir_passes.parity import assert_ir_parity
 
 
-_OPT = shutil.which("opt")
+from pcc.passes.llvm_text_pipeline import find_opt_binary
+
+_OPT = find_opt_binary()
 
 
 def _fold(ir: str) -> str:
@@ -282,7 +284,7 @@ class FoldingTests(unittest.TestCase):
         self.assertIn("ret i32 %x", out)
 
 
-@unittest.skipUnless(_OPT, "requires LLVM opt")
+@pytest.mark.pcc_gate(unavailable=None if _OPT else "matching LLVM opt not installed")
 class UpstreamParityTests(unittest.TestCase):
     def _parity(self, ir: str):
         report = assert_ir_parity(ir, InstSimplifyPass(), "instsimplify")

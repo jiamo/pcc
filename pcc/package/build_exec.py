@@ -587,6 +587,37 @@ def _is_file_custom_target(target: str) -> bool:
     return path.suffix.lower() in _GENERATED_TARGET_SUFFIXES
 
 
+def _ninja_graph_host_python_command(build_dir: Path) -> str | None:
+    """Return the first generated command that can start a host interpreter."""
+    try:
+        lines = (build_dir / "build.ninja").read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeError):
+        return None
+    for line in lines:
+        stripped = line.strip()
+        if not stripped.startswith("command ="):
+            continue
+        command = stripped[len("command =") :].strip()
+        token_text = command
+        for separator in ("&&", "||", ";", "|", "(", ")"):
+            token_text = token_text.replace(separator, " ")
+        tokens = token_text.split()
+        for index, raw in enumerate(tokens):
+            token = raw.strip("'\"` ,")
+            base = Path(token).name.lower()
+            is_python = base == "python" or base.startswith("python3")
+            is_pypy = base == "pypy" or base.startswith("pypy3")
+            is_cython = base == "cython" or base.startswith("cython3")
+            is_env_python = base in {"$python", "${python}", "%python%"}
+            is_uv_python = base in {"uv", "uvx"} and (
+                base == "uvx"
+                or (index + 1 < len(tokens) and tokens[index + 1].lower() == "run")
+            )
+            if is_python or is_pypy or is_cython or is_env_python or is_uv_python:
+                return command
+    return None
+
+
 def _load_ninja_custom_targets(
     build_dir: Path,
     search_paths: list[str] | tuple[str, ...],
@@ -1451,8 +1482,32 @@ def execute_eager_meson_extensions(
     execute: bool = False,
     jobs: int = 1,
     timeout: int = 30,
+    build_mode: str = "host",
 ) -> dict[str, object]:
     """Configure Meson and replay the package's eager extension closure."""
+
+    if build_mode not in {"owned", "host"}:
+        return {
+            "ok": False,
+            "build_backend": "unresolved",
+            "build_mode_requested": build_mode,
+            "build_ownership": "unresolved",
+            "host_assisted": False,
+            "host_python": None,
+            "host_free_build_claim": False,
+            "actions": [],
+            "targets": [],
+            "diagnostics": [
+                {
+                    "code": "PCC-PKG-BUILD-MODE-INVALID",
+                    "message": "build mode must be owned or host",
+                }
+            ],
+        }
+    owned = build_mode == "owned"
+    backend = "pcc-native-build-exec" if owned else "host"
+    ownership = "owned" if owned else "host"
+    host_python = None if owned else sys.executable
 
     root = Path(path).expanduser().resolve()
     metadata = inspect_artifact(name, root)
@@ -1463,13 +1518,36 @@ def execute_eager_meson_extensions(
     wrappers = None
     search_paths: list[str] = []
     try:
-        if execute:
+        if execute and not owned:
             from .install import _build_requirement_tool_wrappers
 
             wrappers = _build_requirement_tool_wrappers(metadata.pyproject_requires)
             if wrappers is not None:
                 search_paths.append(wrappers.name)
         if not (build_dir / "build.ninja").is_file():
+            if owned:
+                diagnostics.append(
+                    {
+                        "code": "PCC-PKG-OWNED-MESON-GRAPH-REQUIRED",
+                        "message": (
+                            "owned target replay requires a graph generated "
+                            "by the native Meson tool"
+                        ),
+                    }
+                )
+                return {
+                    "ok": False,
+                    "build_backend": backend,
+                    "build_mode_requested": build_mode,
+                    "build_ownership": ownership,
+                    "host_assisted": False,
+                    "host_python": None,
+                    "host_free_build_claim": False,
+                    "selection": "module_scope_eager_import_closure",
+                    "actions": actions,
+                    "targets": target_reports,
+                    "diagnostics": diagnostics,
+                }
             setup_command = _meson_setup_command(root, build_dir, search_paths)
             setup = _run_action(
                 kind="meson_setup",
@@ -1493,8 +1571,38 @@ def execute_eager_meson_extensions(
                 )
                 return {
                     "ok": False,
-                    "build_backend": "host",
-                    "host_assisted": True,
+                    "build_backend": backend,
+                    "build_mode_requested": build_mode,
+                    "build_ownership": ownership,
+                    "host_assisted": not owned,
+                    "host_python": host_python,
+                    "host_free_build_claim": False,
+                    "selection": "module_scope_eager_import_closure",
+                    "actions": actions,
+                    "targets": target_reports,
+                    "diagnostics": diagnostics,
+                }
+        if owned:
+            host_command = _ninja_graph_host_python_command(build_dir)
+            if host_command is not None:
+                diagnostics.append(
+                    {
+                        "code": "PCC-PKG-OWNED-BUILD-GRAPH-HOST-PYTHON",
+                        "message": (
+                            "native Meson graph would execute a host Python "
+                            "build command"
+                        ),
+                        "command": host_command,
+                    }
+                )
+                return {
+                    "ok": False,
+                    "build_backend": backend,
+                    "build_mode_requested": build_mode,
+                    "build_ownership": ownership,
+                    "host_assisted": False,
+                    "host_python": None,
+                    "host_free_build_claim": False,
                     "selection": "module_scope_eager_import_closure",
                     "actions": actions,
                     "targets": target_reports,
@@ -1548,12 +1656,24 @@ def execute_eager_meson_extensions(
                 }
             )
         ok = all(bool(report["ok"]) for report in target_reports)
+        if owned and not target_reports:
+            ok = False
+            diagnostics.append(
+                {
+                    "code": "PCC-PKG-OWNED-MESON-TARGETS-MISSING",
+                    "message": "native Meson graph contains no eager extension targets",
+                }
+            )
         return {
             "ok": ok,
             "skipped": not bool(target_reports),
             "reason": None if target_reports else "no_eager_extension_targets",
-            "build_backend": "host",
-            "host_assisted": True,
+            "build_backend": backend,
+            "build_mode_requested": build_mode,
+            "build_ownership": ownership,
+            "host_assisted": not owned,
+            "host_python": host_python,
+            "host_free_build_claim": owned and ok,
             "selection": "module_scope_eager_import_closure",
             "actions": actions,
             "targets": target_reports,
@@ -1585,6 +1705,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--jobs", type=int, default=1)
     parser.add_argument("--timeout", type=int, default=30)
     parser.add_argument("--eager-meson-extensions", action="store_true")
+    parser.add_argument("--build-mode", choices=("owned", "host"), default="host")
     parser.add_argument("--report", default=None)
     parser.add_argument("--json", action="store_true")
     ns = parser.parse_args(argv)
@@ -1595,6 +1716,7 @@ def main(argv: list[str] | None = None) -> int:
             execute=ns.execute,
             jobs=ns.jobs,
             timeout=ns.timeout,
+            build_mode=ns.build_mode,
         )
     else:
         report = execute_build_actions(

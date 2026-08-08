@@ -4,11 +4,15 @@ The common list object member is pulled into most executables for
 ``py_list_new``/``py_list_get``/``py_list_append``. Keep set-slice in its own
 archive member so that ordinary list users do not pay for it.
 """
+from pcc.py_runtime.py.py_abi_constants import (
+    PY_TYPE_INT,
+    PY_TYPE_LIST,
+    PY_TYPE_TUPLE,
+)
 
 from pcc.extern import c_abi_export, c_int32, c_int64, c_ptr, c_void, extern
 from pcc.unsafe import (
     cstr,
-    getenv,
     global_load_ptr,
     is_tagged_int,
     load_i32,
@@ -19,6 +23,7 @@ from pcc.unsafe import (
     ptr_add,
     ptr_eq,
     ptr_is_null,
+    ptr_to_int,
     realloc,
     store_i64,
     store_ptr,
@@ -31,6 +36,7 @@ py_int_value_i64 = extern("py_int_value_i64", (c_ptr,), c_int64)
 pcc_gc_store_ptr = extern("pcc_gc_store_ptr", (c_ptr, c_ptr, c_ptr), c_void)
 pcc_gc_load_ptr = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_ptr)
 _pcc_debug_bad_incref = extern("pcc_debug_bad_incref", (c_ptr, c_int32), c_void)
+getenv = extern("pcc_platform_getenv", (c_ptr,), c_ptr)
 
 
 def _debug_bad_container(o, code: int) -> None:
@@ -38,25 +44,19 @@ def _debug_bad_container(o, code: int) -> None:
         _pcc_debug_bad_incref(o, code)
 
 
+pcc_gc_pointer_is_managed = extern(
+    "pcc_gc_pointer_is_managed", (c_ptr,), c_int64
+)
+
+
 def _ptr_can_have_header(o) -> bool:
-    if ptr_is_null(o) != 0:
-        return False
-    if is_tagged_int(o) != 0:
-        return False
-    bits: int = untag_int(o)
-    if bits < 2048:
-        return False
-    if (bits & 3) != 0:
-        return False
-    if bits >= 140737488355328:
-        return False
-    return True
+    return pcc_gc_pointer_is_managed(o) != 0
 
 
 def _ptr_is_list(o) -> bool:
     if not _ptr_can_have_header(o):
         return False
-    return load_i32(o, 8) == 5
+    return load_i32(o, 8) == PY_TYPE_LIST
 
 
 def _list_is_sane(lst, code: int) -> bool:
@@ -86,7 +86,7 @@ def _list_is_sane(lst, code: int) -> bool:
 def _type_of(obj) -> int:
     if not _ptr_can_have_header(obj):
         if is_tagged_int(obj):
-            return 2
+            return PY_TYPE_INT
         return -1
     return load_i32(obj, 8)
 
@@ -123,11 +123,11 @@ def _seq_len(seq) -> int:
     if ptr_is_null(seq):
         return -1
     tag: int = _type_of(seq)
-    if tag == 5:
+    if tag == PY_TYPE_LIST:
         if not _list_is_sane(seq, -114):
             return -1
         return load_i64(seq, 16)
-    if tag == 7:
+    if tag == PY_TYPE_TUPLE:
         n: int = load_i64(seq, 16)
         if n < 0 or n > 134217728:
             _debug_bad_container(seq, -115)
@@ -138,12 +138,12 @@ def _seq_len(seq) -> int:
 
 def _seq_get_borrowed(seq, i: int):
     tag: int = _type_of(seq)
-    if tag == 5:
+    if tag == PY_TYPE_LIST:
         if not _list_is_sane(seq, -116):
             return null()
         items = load_ptr(seq, 32)
         return pcc_gc_load_ptr(seq, ptr_add(items, i * 8))
-    if tag == 7:
+    if tag == PY_TYPE_TUPLE:
         items = ptr_add(seq, 24)
         return pcc_gc_load_ptr(seq, ptr_add(items, i * 8))
     return null()

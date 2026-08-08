@@ -22,6 +22,8 @@ Coverage:
 
 from __future__ import annotations
 
+import os
+import sys
 from typing import Optional
 
 from ..py_frontend import py_ast as pa
@@ -73,68 +75,8 @@ class LiftError(Exception):
     """Raised when a parser node has no py_ast equivalent yet."""
 
 
-def _pow10f_lift(exp: int) -> float:
-    out = float(int("1", 10))
-    ten = float(int("10", 10))
-    i = 0
-    while i < exp:
-        out = out * ten
-        i += 1
-    return out
-
-
-def _pow10i_lift(exp: int) -> int:
-    # 10**exp as an EXACT integer (bignum); scales the mantissa without float
-    # error. Mirrors _pow10i in py_parse.py.
-    out = 1
-    ten = 10
-    i = 0
-    while i < exp:
-        out = out * ten
-        i += 1
-    return out
-
-
 def _parse_float_literal_lift(text: str) -> float:
-    exp = 0
-    lower = text.lower()
-    e_idx = lower.find("e")
-    # WORKAROUND: don't alias the param into a local that scope-exit
-    # decrefs (pcc-py codegen miscounts ownership on `mantissa = text`
-    # — see docs/investigations/pcc1-self-host-parse-float-literal-uaf.md).
-    # Always materialize a new owned string via slice.
-    if e_idx >= 0:
-        mantissa = text[:e_idx]
-        exp = int(text[e_idx + 1 :], 10)
-    else:
-        mantissa = text[:]
-    dot_idx = mantissa.find(".")
-    frac_len = 0
-    if dot_idx >= 0:
-        frac_len = len(mantissa) - dot_idx - 1
-        digits = mantissa[:dot_idx] + mantissa[dot_idx + 1 :]
-    else:
-        digits = mantissa[:]
-    if not digits:
-        digits = "0"
-    # value = int(digits) * 10**(exp - frac_len), scaled in EXACT integer space
-    # for the common range (the old repeated float-mult lost precision:
-    # 1e100 -> 1.0000000000000006e+100). Stay within the double range so float()
-    # never raises; extreme tails fall back to the graceful float-mult.
-    # Mirrors _parse_float_literal in py_parse.py.
-    m = int(digits, 10)
-    net = exp - frac_len
-    ndig = len(digits)
-    if net >= 0 and ndig + net <= 308:
-        return float(m * _pow10i_lift(net))
-    if net < 0 and ndig <= 308 and -net <= 308:
-        return float(m) / float(_pow10i_lift(-net))
-    value = float(m)
-    if net > 0:
-        value = value * _pow10f_lift(net)
-    elif net < 0:
-        value = value / _pow10f_lift(-net)
-    return value
+    return float(text.replace("_", ""))
 
 
 def lift_module(mod: pp._Module, filename: str, module_name: str) -> pa.Module:
@@ -896,13 +838,16 @@ class _Lifter:
     def _e_Call(self, e: pp._Call) -> pa.Call:
         args: list[pa.Expr] = []
         kwargs: list[tuple[str, pa.Expr]] = []
+        operand_order: list[tuple[str, int]] = []
         for a in e.args:
             if isinstance(a, tuple) and len(a) == 4 and a[0] == "__pcc_kwarg__":
                 kwargs.append((a[1], self.lift_expr(a[2])))
+                operand_order.append(("kw", len(kwargs) - 1))
             elif isinstance(a, pp._Assign) and a.annotation is None:
                 # ``name=value`` kwarg encoded as _Assign.
                 name = _node_ident(a.target)
                 kwargs.append((name, self.lift_expr(a.value)))
+                operand_order.append(("kw", len(kwargs) - 1))
             elif isinstance(a, pp._Starred):
                 # Starred passes through as a Name("*<arg>") sentinel.
                 inner = self.lift_expr(a.value)
@@ -915,6 +860,7 @@ class _Lifter:
                         (),
                     )
                 )
+                operand_order.append(("arg", len(args) - 1))
             else:
                 try:
                     a_name = type(a).__name__
@@ -924,8 +870,14 @@ class _Lifter:
                     args.append(self._e_Comp(a))
                 else:
                     args.append(self.lift_expr(a))
+                operand_order.append(("arg", len(args) - 1))
         return pa.Call(
-            self._span(e.line), _DYN, self.lift_expr(e.func), tuple(args), tuple(kwargs)
+            self._span(e.line),
+            _DYN,
+            self.lift_expr(e.func),
+            tuple(args),
+            tuple(kwargs),
+            tuple(operand_order),
         )
 
     def _e_Attr(self, e: pp._Attr) -> pa.Attr:
@@ -1093,10 +1045,18 @@ _TYPE_NAME_MAP = {
     "i8": pa.IntType("int", 8, True),
     "i16": pa.IntType("int", 16, True),
     "i32": pa.IntType("int", 32, True),
-    "i64": pa.IntType("int", 64, True),
+    # Raw machine integers are a distinct semantic projection.  Do not fold
+    # them into Python ``int`` here: the type checker/codegen must be able to
+    # distinguish explicit wrapping machine arithmetic from arbitrary-
+    # precision Python integer arithmetic.
+    "i64": pa.IntType("pcc.i64", 64, True),
+    "u64": pa.IntType("pcc.u64", 64, False),
     "float": pa.FloatType("float", 64),
     "bool": pa.BoolType("bool"),
     "str": pa.StrType("str"),
+    "bytes": pa.BytesType("bytes"),
+    "bytearray": pa.ByteArrayType("bytearray"),
+    "memoryview": pa.MemoryViewType("memoryview"),
     "None": pa.NoneType("None"),
     "object": _DYN,
     "Any": _DYN,
@@ -1164,6 +1124,14 @@ def _lift_type(node) -> pa.Type:
                     _lift_type(element_node),
                     int(length_node.text, 0),
                 )
+            if base_name == "i64_buffer":
+                length_node = node.idx
+                if not isinstance(length_node, pp._Num) or not length_node.is_int:
+                    return _DYN
+                length = int(length_node.text, 0)
+                if length < 1 or length > 1_048_576:
+                    return _DYN
+                return pa.BytesType("pcc.i64_buffer[" + str(length) + "]")
             if base_name in ("tuple", "Tuple"):
                 inner = node.idx
                 # ``tuple[T, ...]`` — homogeneous variadic tuple.

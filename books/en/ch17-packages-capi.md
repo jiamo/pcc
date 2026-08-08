@@ -14,7 +14,7 @@ First split "supports a package" into levels: it can install, parse metadata, im
 
 ### 17.1.1 The Four-Level Gradient
 
-[codex-goal-prompt.md](../../codex-goal-prompt.md) §1.3 decomposes "replacing CPython" into a gradient that must always be distinguished explicitly:
+[goal-prompt.md](../../docs/goal/goal-prompt.md) §0.10 decomposes "replacing CPython" into a gradient that must always be distinguished explicitly:
 
 ```text
 source compatibility          user .py files, stdlib, packages, import,
@@ -157,6 +157,8 @@ A pcc-native extension that passes the ABI gate is resolved by `_resolve_pcc_nat
 In libpython mode, third-party imports lower to calls like `py_cpy_import`, entering the wrapper layer of `py_libpython.c`: `Py_Initialize` is called lazily on the first import, `Py_Finalize` is registered with `atexit`, and every CPython API call holds the GIL. The two-pointer-namespace discipline becomes an executable constraint here: a CPython reference held on the pcc side is a `void*`, and entering pcc's object graph requires either explicit conversion — `py_cpy_to_pcc_obj()` converts None/bool/int/float/str/list/tuple/dict/set recursively, with unsupported values degrading to `str(obj)` — or boxing (the CpyHandle of Section 17.6).
 
 ## 17.5 The C-API Shim: From Symbol Catalog to Object-Model Bridge
+
+**August 2026 implementation note.** The discussion of `src/py_capi_shim.c` below is retained as mechanism lineage and host-C oracle documentation, but that file is no longer the owner in the production pcc-Python archive. Current production implementation is distributed across `pcc/py_runtime/py/py_capi_*_runtime.py`: exception data, dict/object/type/unicode/capsule/buffer, module-state, descriptor, variadic-call, and visit surfaces each have Python owners; `py_extension_loader_runtime.py` owns native extension loading; and `py_obj_dealloc.py` owns the CpyHandle ABI. The `LIB_PCC_PY` rule in `pcc/py_runtime/Makefile` archives only `PCC_PY_OBJECTS`. The C-shim details that follow should therefore be read as ABI semantics and migration history, not as a claim that production still links one hand-written C shim. Chapter 14 gives the source-ownership and final no-C/zero-libc acceptance boundary.
 
 ### 17.5.1 An Executable Priority Map
 

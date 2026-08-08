@@ -10,6 +10,11 @@ Returned by: PyClassObject*. Recursive on parent chain.
 """
 
 from pcc.extern import extern, c_abi_export, c_ptr, c_int32
+from pcc.py_runtime.py.py_abi_constants import (
+    C_POINTER_SIZE,
+    PYOBJECTHEADER_FLAGS_OFFSET,
+    PY_FLAG_IMMORTAL,
+)
 from pcc.unsafe import (
     global_addr,
     load_i32,
@@ -27,15 +32,12 @@ py_class_new = extern(
     c_ptr,
 )
 
-# PyClassObject header.flags lives at offset 12 (refcount@0 +
-# type_tag@8), and PY_FLAG_IMMORTAL = 0x1. These literals are inlined
-# at the call site because pcc-Python initializes module-level
-# integers in the auto-generated main(), which the Makefile strips
-# for library .o builds.
+# Generated ABI constants are compile-time static exports in library-object
+# builds; no stripped module initializer is needed to consume them.
 
 
 def _exc_name(tag: int):
-    return load_ptr(global_addr("PY_EXC_BUILTIN_NAMES"), tag * 8)
+    return load_ptr(global_addr("PY_EXC_BUILTIN_NAMES"), tag * C_POINTER_SIZE)
 
 
 def _exc_parent(tag: int) -> int:
@@ -43,11 +45,11 @@ def _exc_parent(tag: int) -> int:
 
 
 def _exc_cache_get(tag: int):
-    return load_ptr(global_addr("py_exc_classes"), tag * 8)
+    return load_ptr(global_addr("py_exc_classes"), tag * C_POINTER_SIZE)
 
 
 def _exc_cache_set(tag: int, cls) -> None:
-    store_ptr(global_addr("py_exc_classes"), tag * 8, cls)
+    store_ptr(global_addr("py_exc_classes"), tag * C_POINTER_SIZE, cls)
 
 
 @c_abi_export("py_exc_builtin_class")
@@ -68,9 +70,9 @@ def py_exc_builtin_class(tag: int):
     bases_ptr = null()
     n_bases: int = 0
     if not ptr_is_null(base):
-        # 1-slot pointer array; py_class_new copies it. 8 bytes leak
-        # acceptable for once-per-process bootstrap.
-        bases_ptr = malloc(8)
+        # One-slot pointer array; py_class_new copies it. The once-per-process
+        # bootstrap allocation intentionally remains process-lifetime.
+        bases_ptr = malloc(C_POINTER_SIZE)
         store_ptr(bases_ptr, 0, base)
         n_bases = 1
 
@@ -78,8 +80,12 @@ def py_exc_builtin_class(tag: int):
     cls = py_class_new(name_cstr, bases_ptr, n_bases, null(), 0)
 
     if not ptr_is_null(cls):
-        flags: int = load_i32(cls, 12)  # OFFSET_FLAGS
-        store_i32(cls, 12, flags | 1)  # | PY_FLAG_IMMORTAL
+        flags: int = load_i32(cls, PYOBJECTHEADER_FLAGS_OFFSET)
+        store_i32(
+            cls,
+            PYOBJECTHEADER_FLAGS_OFFSET,
+            flags | PY_FLAG_IMMORTAL,
+        )
         _exc_cache_set(tag, cls)
 
     return cls

@@ -176,9 +176,13 @@ def test_default_off_mode_auto_routes_available_native_stdlib():
     assert "abcdefghijklmnopqrstuvwxyz" in ir_text
 
 
-def test_default_off_mode_auto_routes_warnings_native():
-    """``import warnings`` should route to the native stdlib shim instead
-    of emitting a CPython module import in no-libpython package closures."""
+def test_recursive_off_mode_routes_warnings_filter_calls_native():
+    """The closed stdlib graph must execute the pcc-owned warnings provider.
+
+    Emit-only requests deliberately do not auto-close their stdlib graph, so
+    request the recursive closure explicitly here.  Executable compilation
+    enables the same closure automatically.
+    """
     program = textwrap.dedent("""
         import warnings
         def f():
@@ -189,10 +193,13 @@ def test_default_off_mode_auto_routes_warnings_native():
     ir_text = _compile_to_ll(
         program,
         "rec_import_warnings_auto_native",
-        recursive=False,
+        recursive=True,
     )
     assert "call ptr @py_cpy_import" not in ir_text
     assert "@.cpy.mod.warnings" not in ir_text
+    assert "@user_warnings_warn" in ir_text
+    assert "@user_warnings_filterwarnings" in ir_text
+    assert "@user_warnings_simplefilter" in ir_text
 
 
 def test_contextvar_constructor_and_sys_maxsize_stay_native():

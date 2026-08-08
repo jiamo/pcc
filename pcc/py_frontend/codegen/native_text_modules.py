@@ -403,18 +403,30 @@ class NativeTextModulesLoweringMixin:
             or len(expr.args) != 1
         ):
             return None
-        # `json.dumps` supports `sort_keys=<literal bool>` natively: it lowers
-        # to `py_json_dumps_ex(obj, sort_flag)`, which sorts dict keys (at all
-        # nesting levels) by code point to match CPython. Any other kwarg — or
-        # a non-literal `sort_keys` value — falls back off the native path.
+        # Native strings are emitted as UTF-8, so literal
+        # `ensure_ascii=False` selects the existing native behavior. Literal
+        # `sort_keys` can be combined with it. Other keyword forms stay on the
+        # general path until the runtime can implement their exact semantics.
         sort_keys = False
-        if expr.kwargs:
-            if attr.name != "dumps" or len(expr.kwargs) != 1:
+        seen_sort_keys = False
+        seen_ensure_ascii = False
+        if len(expr.kwargs) > 0 and attr.name != "dumps":
+            return None
+        for key, value in expr.kwargs:
+            if key == "sort_keys" and not seen_sort_keys:
+                if not isinstance(value, BoolLit):
+                    return None
+                sort_keys = value.value
+                seen_sort_keys = True
+                continue
+            if key == "ensure_ascii" and not seen_ensure_ascii:
+                if not isinstance(value, BoolLit) or value.value:
+                    return None
+                seen_ensure_ascii = True
+                continue
+            if key != "sort_keys" and key != "ensure_ascii":
                 return None
-            key, value = expr.kwargs[0]
-            if key != "sort_keys" or not isinstance(value, BoolLit):
-                return None
-            sort_keys = value.value
+            return None
         if attr.name == "loads":
             return self.builder.call(
                 self.runtime["py_json_loads"],

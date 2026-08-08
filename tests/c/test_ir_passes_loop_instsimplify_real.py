@@ -1,6 +1,6 @@
 """Real-transform tests for LoopInstSimplifyPass (subset)."""
 
-import shutil
+import pytest
 import unittest
 
 from pcc.ir_passes.loop_instsimplify import (
@@ -10,7 +10,9 @@ from pcc.ir_passes.loop_instsimplify import (
 from pcc.ir_passes.parity import assert_ir_parity, run_pcc_ir_pass
 
 
-_OPT = shutil.which("opt")
+from pcc.passes.llvm_text_pipeline import find_opt_binary
+
+_OPT = find_opt_binary()
 
 
 class LoopInstSimplifyTests(unittest.TestCase):
@@ -93,7 +95,7 @@ exit:
         self.assertNotIn("%t = add i32 %i, 0", out)
 
 
-@unittest.skipUnless(_OPT, "requires LLVM opt")
+@pytest.mark.pcc_gate(unavailable=None if _OPT else "matching LLVM opt not installed")
 class UpstreamParityTests(unittest.TestCase):
     def test_loop_local_identity_matches_upstream(self):
         report = assert_ir_parity("""

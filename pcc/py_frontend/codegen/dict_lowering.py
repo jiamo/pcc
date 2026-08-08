@@ -17,6 +17,7 @@ from ..py_ast import (
     StrType,
 )
 from . import marshal
+from .freestanding_abi_constants import PY_TYPE_DICT, PY_TYPE_LIST
 
 
 _I1 = ir.IntType(1)
@@ -31,6 +32,7 @@ _DYN_DICT_METHOD_NATIVE = frozenset(
         "items",
         "setdefault",
         "pop",
+        "copy",
     }
 )
 
@@ -85,7 +87,7 @@ class DictLoweringMixin:
         is_list = self.builder.icmp_signed(
             "==",
             tag,
-            ir.Constant(_I64, 5),
+            ir.Constant(_I64, PY_TYPE_LIST),
             name=self._fresh("dyn.pop.recv.is_list"),
         )
 
@@ -108,6 +110,7 @@ class DictLoweringMixin:
                 [recv, idx_val],
                 name=self._fresh("dyn.pop.list.result"),
             )
+            self._emit_post_call_err_check(getattr(expr, "span", None))
         else:
             list_result = self._emit_generic_dyn_method_call_on_value(
                 recv,
@@ -121,7 +124,7 @@ class DictLoweringMixin:
         is_dict = self.builder.icmp_signed(
             "==",
             tag,
-            ir.Constant(_I64, 6),
+            ir.Constant(_I64, PY_TYPE_DICT),
             name=self._fresh("dyn.pop.recv.is_dict"),
         )
         self.builder.cbranch(is_dict, dict_bb, generic_bb)
@@ -142,6 +145,7 @@ class DictLoweringMixin:
                 [recv, k_obj],
                 name=self._fresh("dyn.pop.dict.get"),
             )
+            self._emit_post_call_err_check(expr.span)
             null_p = ir.Constant(_CSTR, None)
             is_missing = self.builder.icmp_signed(
                 "==",
@@ -161,6 +165,7 @@ class DictLoweringMixin:
                 [recv, k_obj],
                 name=self._fresh("dyn.pop.dict.del"),
             )
+            self._emit_post_call_err_check(expr.span)
             hit_exit = self.builder.block
             self.builder.branch(dict_join_bb)
             self.builder.position_at_end(miss_bb)
@@ -218,16 +223,27 @@ class DictLoweringMixin:
                 kwargs=expr.kwargs,
             )
 
+        if name == "copy":
+            if expr.args:
+                return None
+            return self.builder.call(
+                self.runtime["py_copy_copy"],
+                [recv],
+                name=self._fresh("dict.copy"),
+            )
+
         if name == "get":
             if len(expr.args) == 1:
                 default = self._emit_none_literal()
-                return self.builder.call(
+                result = self.builder.call(
                     self.runtime["py_dict_get_default"],
                     [recv, _dict_method_box(self, expr.args[0]), default],
                     name=self._fresh("dict.get"),
                 )
+                self._emit_post_call_err_check(expr.span)
+                return result
             if len(expr.args) == 2:
-                return self.builder.call(
+                result = self.builder.call(
                     self.runtime["py_dict_get_default"],
                     [
                         recv,
@@ -236,6 +252,8 @@ class DictLoweringMixin:
                     ],
                     name=self._fresh("dict.get.dflt"),
                 )
+                self._emit_post_call_err_check(expr.span)
+                return result
             return None
         if name == "keys":
             if expr.args:
@@ -294,6 +312,7 @@ class DictLoweringMixin:
                     [recv, _dict_method_box(self, expr.args[0])],
                     name=self._fresh("dict.update"),
                 )
+                self._emit_post_call_err_check(expr.span)
             for kname, kv in (expr.kwargs or ()):
                 self.builder.call(
                     self.runtime["py_dict_set"],
@@ -304,6 +323,7 @@ class DictLoweringMixin:
                     ],
                     name=self._fresh("dict.update.kw"),
                 )
+                self._emit_post_call_err_check(expr.span)
             return self._emit_none_literal()
         if name == "setdefault" and len(expr.args) in (1, 2):
             # ``d.setdefault(k, default)`` — if ``k`` exists, return
@@ -331,6 +351,9 @@ class DictLoweringMixin:
                 [recv, k_obj],
                 name=self._fresh("setdefault.get"),
             )
+            # NULL is also the hash-failure sentinel.  Preserve TypeError
+            # before the ordinary missing-key branch inserts the default.
+            self._emit_post_call_err_check(expr.span)
             null_p = ir.Constant(_CSTR, None)
             is_missing = self.builder.icmp_signed(
                 "==",
@@ -358,6 +381,7 @@ class DictLoweringMixin:
                 self.runtime["py_dict_set"],
                 [recv, k_obj, default_obj],
             )
+            self._emit_post_call_err_check(expr.span)
             miss_exit = self.builder._block
             self.builder.branch(join_bb)
             self.builder.position_at_end(join_bb)
@@ -385,6 +409,7 @@ class DictLoweringMixin:
                 [recv, k_obj],
                 name=self._fresh("dict.pop.get"),
             )
+            self._emit_post_call_err_check(expr.span)
             null_p = ir.Constant(_CSTR, None)
             is_missing = self.builder.icmp_signed(
                 "==",
@@ -402,6 +427,7 @@ class DictLoweringMixin:
                 [recv, k_obj],
                 name=self._fresh("dict.pop.del"),
             )
+            self._emit_post_call_err_check(expr.span)
             hit_exit = self.builder._block
             self.builder.branch(join_bb)
             self.builder.position_at_end(miss_bb)
@@ -448,6 +474,7 @@ class DictLoweringMixin:
                     self.runtime["py_dict_set"],
                     [new_dict, k_obj, v_obj],
                 )
+                self._emit_post_call_err_check(expr.span)
             return new_dict
         if not expr.args:
             return new_dict
@@ -513,10 +540,12 @@ class DictLoweringMixin:
                 [src_obj, k_elem],
                 name=self._fresh("dict.copy.val"),
             )
+            self._emit_post_call_err_check(expr.span)
             self.builder.call(
                 self.runtime["py_dict_set"],
                 [new_dict, k_elem, v_elem],
             )
+            self._emit_post_call_err_check(expr.span)
             self.builder.branch(step_bb)
             self.builder.position_at_end(step_bb)
             nxt = self.builder.add(

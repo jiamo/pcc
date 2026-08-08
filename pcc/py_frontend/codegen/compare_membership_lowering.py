@@ -34,6 +34,18 @@ from ..py_ast import (
     Type,
 )
 from . import marshal
+from .freestanding_abi_constants import (
+    PY_TYPE_BOOL,
+    PY_TYPE_BYTEARRAY,
+    PY_TYPE_BYTES,
+    PY_TYPE_DICT,
+    PY_TYPE_FLOAT,
+    PY_TYPE_INT,
+    PY_TYPE_LIST,
+    PY_TYPE_SET,
+    PY_TYPE_STR,
+    PY_TYPE_TUPLE,
+)
 
 _I1 = ir.IntType(1)
 _I32 = ir.IntType(32)
@@ -47,16 +59,16 @@ def _same_type_kind(a: Type, b: Type) -> bool:
 
 
 _BUILTIN_TYPE_TAGS = {
-    "bool": 1,
-    "int": 2,
-    "float": 3,
-    "str": 4,
-    "list": 5,
-    "dict": 6,
-    "tuple": 7,
-    "set": 8,
-    "bytes": 17,
-    "bytearray": 18,
+    "bool": PY_TYPE_BOOL,
+    "int": PY_TYPE_INT,
+    "float": PY_TYPE_FLOAT,
+    "str": PY_TYPE_STR,
+    "list": PY_TYPE_LIST,
+    "dict": PY_TYPE_DICT,
+    "tuple": PY_TYPE_TUPLE,
+    "set": PY_TYPE_SET,
+    "bytes": PY_TYPE_BYTES,
+    "bytearray": PY_TYPE_BYTEARRAY,
 }
 
 
@@ -117,6 +129,25 @@ class CompareMembershipLoweringMixin:
         if expr.op in ("in", "not in"):
             return self._emit_membership(expr)
 
+        if (
+            getattr(self, "_freestanding_module", False)
+            and expr.op in ("==", "!=", "<", "<=", ">", ">=")
+            and any(
+                isinstance(operand.ty, IntType)
+                and operand.ty.name == "int"
+                and not (
+                    isinstance(operand, IntLit)
+                    and -(1 << 63) <= operand.value <= (1 << 63) - 1
+                )
+                for operand in (expr.lhs, expr.rhs)
+            )
+        ):
+            raise RuntimeError(
+                "freestanding ordinary Python int comparison cannot preserve "
+                "arbitrary precision; annotate the machine boundary with "
+                "pcc.i64 or pcc.u64"
+            )
+
         # Complex ordering is a hard TypeError in CPython. ``==``/``!=`` on a
         # complex operand are valid (route to the equality paths below); only
         # the relational operators ``<``/``<=``/``>``/``>=`` must raise. Guard
@@ -135,6 +166,15 @@ class CompareMembershipLoweringMixin:
         if complex_eq is not None:
             return complex_eq
 
+        # Exact pointer-form ints need the source-aware ownership contract
+        # even when ordinary locals use the boxed-int ABI.  Check this before
+        # the generic boxed branch so fresh bignum operands are pinned across
+        # RHS evaluation and released after comparison; borrowed exact locals
+        # remain borrowed.
+        exact_int_cmp = self._emit_exact_int_compare(expr)
+        if exact_int_cmp is not None:
+            return exact_int_cmp
+
         if (
             self._int_exprs_are_boxed()
             and expr.op in ("==", "!=", "<", "<=", ">", ">=")
@@ -142,7 +182,36 @@ class CompareMembershipLoweringMixin:
             and isinstance(expr.rhs.ty, (IntType, BoolType))
         ):
             lhs = self._emit_expr(expr.lhs)
-            rhs = self._emit_expr(expr.rhs)
+            lhs_owned = (
+                isinstance(lhs.type, ir.PointerType)
+                and lhs not in getattr(self, "_cpy_values", ())
+                and self._pcc_pointer_source_is_owned(expr.lhs)
+            )
+            lhs_pinned = (
+                isinstance(lhs.type, ir.PointerType)
+                and lhs not in getattr(self, "_cpy_values", ())
+            )
+            lhs_cleanup = ()
+            if lhs_pinned:
+                self._gc_pin(lhs)
+                lhs_cleanup = ((lhs, lhs_owned),)
+            rhs = self._emit_expr_with_cpy_operand_cleanup(
+                expr.rhs,
+                (),
+                (),
+                lhs_cleanup,
+            )
+            rhs_owned = (
+                isinstance(rhs.type, ir.PointerType)
+                and rhs not in getattr(self, "_cpy_values", ())
+                and self._pcc_pointer_source_is_owned(expr.rhs)
+            )
+            rhs_pinned = (
+                isinstance(rhs.type, ir.PointerType)
+                and rhs not in getattr(self, "_cpy_values", ())
+            )
+            if rhs_pinned:
+                self._gc_pin(rhs)
             lhs_obj = marshal.marshal_to_object(
                 self.builder,
                 self.module,
@@ -162,16 +231,21 @@ class CompareMembershipLoweringMixin:
                 [lhs_obj, rhs_obj],
                 name=self._fresh("int.obj.cmp"),
             )
-            return self.builder.icmp_signed(
+            result = self.builder.icmp_signed(
                 expr.op,
                 cmp_i32,
                 ir.Constant(_I32, 0),
                 name=self._fresh("int.obj.cmp.i1"),
             )
-
-        exact_int_cmp = self._emit_exact_int_compare(expr)
-        if exact_int_cmp is not None:
-            return exact_int_cmp
+            if lhs_pinned:
+                self._gc_unpin(lhs)
+            if lhs_owned:
+                self._gc_release(lhs)
+            if rhs_pinned:
+                self._gc_unpin(rhs)
+            if rhs_owned:
+                self._gc_release(rhs)
+            return result
 
         valueclass_eq = self._emit_valueclass_payload_eq(expr)
         if valueclass_eq is not None:
@@ -246,37 +320,6 @@ class CompareMembershipLoweringMixin:
         rhs_looks_cpy = self._expr_looks_cpython(expr.rhs)
 
         if lhs_looks_cpy or rhs_looks_cpy:
-            if expr.op in ("==", "!=") and lhs_looks_cpy != rhs_looks_cpy:
-                cpy_expr = expr.lhs if lhs_looks_cpy else expr.rhs
-                other_expr = expr.rhs if lhs_looks_cpy else expr.lhs
-                if isinstance(
-                    other_expr.ty,
-                    (StrType, NoneType, IntType, BoolType, FloatType),
-                ):
-                    cpy_raw = self._emit_expr(cpy_expr)
-                    cpy_obj = self._emit_value_as_pcc_object_or_bridge(
-                        cpy_raw,
-                        cpy_expr.ty,
-                        "cpy.cmp.bridge",
-                    )
-                    other_obj = self._emit_as_object(other_expr)
-                    eq = self.builder.call(
-                        self.runtime["py_obj_eq"],
-                        [cpy_obj, other_obj],
-                        name=self._fresh("cpy.obj.eq"),
-                    )
-                    eq_i1 = self.builder.icmp_signed(
-                        "!=",
-                        eq,
-                        ir.Constant(_I32, 0),
-                        name=self._fresh("cpy.obj.eq.i1"),
-                    )
-                    if expr.op == "!=":
-                        return self.builder.not_(
-                            eq_i1,
-                            name=self._fresh("cpy.obj.ne"),
-                        )
-                    return eq_i1
             recv_expr = expr.lhs
             other_expr = expr.rhs
             recv_op = expr.op
@@ -300,26 +343,91 @@ class CompareMembershipLoweringMixin:
                 ">=": "__ge__",
             }.get(recv_op)
             if method_name is not None:
-                recv_val = self._emit_expr(recv_expr)
-                recv_cpy, recv_owned = self._marshal_to_cpython(
-                    recv_val,
-                    recv_expr.ty,
-                )
-                result = self._emit_cpy_method_call_src(
-                    recv_cpy,
-                    method_name,
-                    (other_expr,),
-                )
-                if recv_owned:
-                    self.builder.call(
-                        self.runtime["py_cpy_decref"],
-                        [recv_cpy],
+                if not lhs_looks_cpy and rhs_looks_cpy:
+                    # Reflected dispatch uses the RHS dunder, but operand
+                    # evaluation remains left-to-right.  Materialize the LHS
+                    # first and carry its owned CPython box through RHS
+                    # evaluation and method lookup cleanup.
+                    other_val = self._emit_expr(other_expr)
+                    other_cpy, other_owned = (
+                        self._marshal_to_cpython_consuming_source(
+                        other_val,
+                        other_expr.ty,
+                        other_expr,
+                        )
                     )
+                    self._guard_cpy_value_not_null(other_cpy)
+                    live_owned = (other_cpy,) if other_owned else ()
+                    recv_val = self._emit_expr_with_cpy_operand_cleanup(
+                        recv_expr,
+                        live_owned,
+                    )
+                    self._guard_cpy_value_not_null(recv_val, live_owned)
+                    recv_cpy, recv_owned = (
+                        self._marshal_to_cpython_consuming_source(
+                        recv_val,
+                        recv_expr.ty,
+                        recv_expr,
+                        live_owned,
+                        )
+                    )
+                    self._guard_cpy_value_not_null(recv_cpy, live_owned)
+                    result = self._emit_cpy_method_call1_value(
+                        recv_cpy,
+                        method_name,
+                        other_cpy,
+                        arg_owned=other_owned,
+                        receiver_owned=recv_owned,
+                    )
+                else:
+                    recv_val = self._emit_expr(recv_expr)
+                    self._guard_cpy_value_not_null(recv_val)
+                    recv_cpy, recv_owned = (
+                        self._marshal_to_cpython_consuming_source(
+                        recv_val,
+                        recv_expr.ty,
+                        recv_expr,
+                        )
+                    )
+                    self._guard_cpy_value_not_null(recv_cpy)
+                    receiver_live = (recv_cpy,) if recv_owned else ()
+                    other_val = self._emit_expr_with_cpy_operand_cleanup(
+                        other_expr,
+                        receiver_live,
+                    )
+                    if other_val in getattr(self, "_cpy_values", ()):
+                        self._guard_cpy_value_not_null(
+                            other_val,
+                            receiver_live,
+                        )
+                    other_cpy, other_owned = (
+                        self._marshal_to_cpython_consuming_source(
+                        other_val,
+                        other_expr.ty,
+                        other_expr,
+                        receiver_live,
+                        )
+                    )
+                    self._guard_cpy_value_not_null(
+                        other_cpy,
+                        receiver_live,
+                    )
+                    result = self._emit_cpy_method_call1_value(
+                        recv_cpy,
+                        method_name,
+                        other_cpy,
+                        arg_owned=other_owned,
+                        receiver_owned=recv_owned,
+                    )
+                self._guard_cpy_value_not_null(result)
                 as_i32 = self.builder.call(
                     self.runtime["py_cpy_truthy"],
                     [result],
                     name=self._fresh("cpy.cmp.i32"),
                 )
+                self._guard_cpy_status_not_negative(as_i32, (result,))
+                self.builder.call(self.runtime["py_cpy_decref"], [result])
+                self._forget_owned_cpy_value(result)
                 return self.builder.icmp_signed(
                     "!=",
                     as_i32,
@@ -493,6 +601,16 @@ class CompareMembershipLoweringMixin:
             return self._emit_runtime_object_compare(expr, lo, ro, "dyn")
         lv = self._to_int64(lhs, lhs_ty)
         rv = self._to_int64(rhs, rhs_ty)
+        if (
+            getattr(lhs_ty, "name", "") == "pcc.u64"
+            or getattr(rhs_ty, "name", "") == "pcc.u64"
+        ):
+            return self.builder.icmp_unsigned(
+                expr.op,
+                lv,
+                rv,
+                name=self._fresh("ucmp"),
+            )
         return self.builder.icmp_signed(expr.op, lv, rv, name=self._fresh("icmp"))
 
     def _emit_dyn_str_equality(self, expr: Compare) -> Optional[ir.Value]:
@@ -533,7 +651,7 @@ class CompareMembershipLoweringMixin:
         is_str = self.builder.icmp_signed(
             "==",
             dyn_tag,
-            ir.Constant(_I64, 4),
+            ir.Constant(_I64, PY_TYPE_STR),
             name=self._fresh("dyn.str.is_str"),
         )
 
@@ -922,6 +1040,63 @@ class CompareMembershipLoweringMixin:
                     name=self._fresh("os.environ.notin"),
                 )
             return contains
+        if self._expr_looks_cpython(expr.rhs):
+            # Python evaluates ``needle in container`` left-to-right even
+            # though dispatch ultimately targets container.__contains__.
+            # Materialize the needle first, carry its CPython ref through RHS
+            # evaluation, then invoke the one-value method helper without
+            # evaluating either source expression a second time.
+            lhs_value = self._emit_expr(expr.lhs)
+            lhs_cpy, lhs_owned = self._marshal_to_cpython_consuming_source(
+                lhs_value,
+                expr.lhs.ty,
+                expr.lhs,
+            )
+            self._guard_cpy_value_not_null(lhs_cpy)
+            lhs_live = (lhs_cpy,) if lhs_owned else ()
+            rhs_value = self._emit_expr_with_cpy_operand_cleanup(
+                expr.rhs,
+                lhs_live,
+            )
+            if rhs_value in getattr(self, "_cpy_values", ()):
+                self._guard_cpy_value_not_null(rhs_value, lhs_live)
+            container_cpy, container_owned = (
+                self._marshal_to_cpython_consuming_source(
+                    rhs_value,
+                    expr.rhs.ty,
+                    expr.rhs,
+                    lhs_live,
+                )
+            )
+            self._guard_cpy_value_not_null(container_cpy, lhs_live)
+            result = self._emit_cpy_method_call1_value(
+                container_cpy,
+                "__contains__",
+                lhs_cpy,
+                arg_owned=lhs_owned,
+                receiver_owned=container_owned,
+            )
+            self._guard_cpy_value_not_null(result)
+            as_i32 = self.builder.call(
+                self.runtime["py_cpy_truthy"],
+                [result],
+                name=self._fresh("cpy.contains.i32"),
+            )
+            self._guard_cpy_status_not_negative(as_i32, (result,))
+            self.builder.call(self.runtime["py_cpy_decref"], [result])
+            self._forget_owned_cpy_value(result)
+            contains = self.builder.icmp_signed(
+                "!=",
+                as_i32,
+                ir.Constant(_I32, 0),
+                name=self._fresh("cpy.contains.i1"),
+            )
+            if expr.op == "not in":
+                return self.builder.not_(
+                    contains,
+                    name=self._fresh("cpy.not_in"),
+                )
+            return contains
         container_ty = expr.rhs.ty
         weak_dict_kind = self._weak_dict_kind_for_expr(expr.rhs)
         rhs = self._emit_expr(expr.rhs)
@@ -934,17 +1109,17 @@ class CompareMembershipLoweringMixin:
                 container_cpy,
                 "__contains__",
                 (expr.lhs,),
+                receiver_owned=container_owned,
             )
-            if container_owned:
-                self.builder.call(
-                    self.runtime["py_cpy_decref"],
-                    [container_cpy],
-                )
+            self._guard_cpy_value_not_null(result)
             as_i32 = self.builder.call(
                 self.runtime["py_cpy_truthy"],
                 [result],
                 name=self._fresh("cpy.contains.i32"),
             )
+            self._guard_cpy_status_not_negative(as_i32, (result,))
+            self.builder.call(self.runtime["py_cpy_decref"], [result])
+            self._forget_owned_cpy_value(result)
             contains = self.builder.icmp_signed(
                 "!=",
                 as_i32,
@@ -967,6 +1142,7 @@ class CompareMembershipLoweringMixin:
                 [rhs, key],
                 name=self._fresh("weak.value.dict.in"),
             )
+            self._emit_post_call_err_check(getattr(expr, "span", None))
             result = self.builder.icmp_signed(
                 "!=",
                 res_i32,
@@ -1054,6 +1230,7 @@ class CompareMembershipLoweringMixin:
                 [rhs, key],
                 name=self._fresh("obj.in"),
             )
+            self._emit_post_call_err_check(getattr(expr, "span", None))
             result = self.builder.icmp_signed(
                 "!=",
                 res_i32,
@@ -1076,6 +1253,7 @@ class CompareMembershipLoweringMixin:
                 [rhs, key],
                 name=self._fresh("obj.in"),
             )
+            self._emit_post_call_err_check(getattr(expr, "span", None))
             result = self.builder.icmp_signed(
                 "!=",
                 res_i32,
@@ -1089,6 +1267,10 @@ class CompareMembershipLoweringMixin:
                 )
             return result
 
+        # The specialized contains helpers use -1/pending-error for failures.
+        # Check the exception channel before interpreting the status as a
+        # boolean; ``-1 != 0`` is not a successful membership result.
+        self._emit_post_call_err_check(getattr(expr, "span", None))
         res = self.builder.icmp_signed(
             "!=", res_i32, ir.Constant(_I32, 0), name=self._fresh("in.i1")
         )
@@ -1158,53 +1340,135 @@ class CompareMembershipLoweringMixin:
         fn = self.current_function
 
         lhs = self._emit_expr(expr.left)
+        lhs_is_cpy = lhs in getattr(self, "_cpy_values", ())
+        lhs_owned = False
+        if lhs_is_cpy:
+            self._guard_cpy_value_not_null(lhs)
+            lhs_owned = self._cpy_value_is_owned(lhs)
         lhs_b = self._truthy(lhs, expr.left.ty)
         result_ty = expr.ty
         lhs_val = None
         if not isinstance(result_ty, BoolType):
             lhs_val = self._coerce(lhs, expr.left.ty, result_ty)
+        elif lhs_is_cpy and lhs_owned:
+            # Bool-typed and/or keeps only truthiness, never the operand ref.
+            self.builder.call(self.runtime["py_cpy_decref"], [lhs])
+            self._forget_owned_cpy_value(lhs)
 
         rhs_bb = fn.append_basic_block(name=self._fresh("bool.rhs"))
+        short_bb = fn.append_basic_block(name=self._fresh("bool.short"))
         end_bb = fn.append_basic_block(name=self._fresh("bool.end"))
         entry_bb = self.builder._block
 
         if expr.op == "and":
             # if lhs then compute rhs else short-circuit false.
-            self.builder.cbranch(lhs_b, rhs_bb, end_bb)
+            self.builder.cbranch(lhs_b, rhs_bb, short_bb)
         elif expr.op == "or":
             # if lhs then short-circuit true else compute rhs.
-            self.builder.cbranch(lhs_b, end_bb, rhs_bb)
+            self.builder.cbranch(lhs_b, short_bb, rhs_bb)
         else:
             raise NotImplementedError(f"Layer 1 bool op {expr.op!r} not supported")
 
         if not isinstance(result_ty, BoolType):
+            # An owned lhs is now branch-managed: the short edge transfers it
+            # into the result phi, while the rhs edge discards it before the
+            # next source operand is evaluated.
+            if lhs_is_cpy and lhs_owned:
+                self._forget_owned_cpy_value(lhs)
+
+            self.builder.position_at_end(short_bb)
+            short_val = lhs_val
+            short_exit = self.builder._block
+
             self.builder.position_at_end(rhs_bb)
+            if lhs_is_cpy and lhs_owned:
+                self.builder.call(self.runtime["py_cpy_decref"], [lhs])
             rhs = self._emit_expr(expr.right)
+            rhs_is_cpy = rhs in getattr(self, "_cpy_values", ())
+            rhs_owned = False
+            if rhs_is_cpy:
+                self._guard_cpy_value_not_null(rhs)
+                rhs_owned = self._cpy_value_is_owned(rhs)
             rhs_val = self._coerce(rhs, expr.right.ty, result_ty)
             rhs_exit = self.builder._block
+
+            cpy_result = lhs_is_cpy or rhs_is_cpy
+            if cpy_result:
+                self.builder.position_at_end(short_exit)
+                if not lhs_is_cpy:
+                    short_val, short_owned = (
+                        self._marshal_to_cpython_consuming_source(
+                        short_val,
+                        expr.left.ty,
+                        expr.left,
+                        )
+                    )
+                    self._guard_cpy_value_not_null(short_val)
+                    if short_owned:
+                        self._forget_owned_cpy_value(short_val)
+                    else:
+                        self.builder.call(
+                            self.runtime["py_cpy_incref"],
+                            [short_val],
+                        )
+                elif not lhs_owned:
+                    self.builder.call(self.runtime["py_cpy_incref"], [short_val])
+                short_exit = self.builder._block
+
+                self.builder.position_at_end(rhs_exit)
+                if not rhs_is_cpy:
+                    rhs_val, rhs_owned = (
+                        self._marshal_to_cpython_consuming_source(
+                        rhs_val,
+                        expr.right.ty,
+                        expr.right,
+                        )
+                    )
+                    self._guard_cpy_value_not_null(rhs_val)
+                if rhs_owned:
+                    self._forget_owned_cpy_value(rhs_val)
+                else:
+                    self.builder.call(self.runtime["py_cpy_incref"], [rhs_val])
+                rhs_exit = self.builder._block
+
+            self.builder.position_at_end(short_exit)
+            self.builder.branch(end_bb)
+            self.builder.position_at_end(rhs_exit)
             self.builder.branch(end_bb)
 
             self.builder.position_at_end(end_bb)
             phi = self.builder.phi(
                 self._storage_ir_type(result_ty), name=self._fresh(expr.op)
             )
-            phi.add_incoming(lhs_val, entry_bb)
+            phi.add_incoming(short_val, short_exit)
             phi.add_incoming(rhs_val, rhs_exit)
+            if cpy_result:
+                return self._mark_owned_cpy_value(phi)
             return phi
+
+        self.builder.position_at_end(short_bb)
+        self.builder.branch(end_bb)
+        short_exit = self.builder._block
 
         self.builder.position_at_end(rhs_bb)
         rhs = self._emit_expr(expr.right)
+        rhs_is_cpy = rhs in getattr(self, "_cpy_values", ())
+        if rhs_is_cpy:
+            self._guard_cpy_value_not_null(rhs)
         rhs_b = self._truthy(rhs, expr.right.ty)
+        if rhs_is_cpy and self._cpy_value_is_owned(rhs):
+            self.builder.call(self.runtime["py_cpy_decref"], [rhs])
+            self._forget_owned_cpy_value(rhs)
         rhs_exit = self.builder._block
         self.builder.branch(end_bb)
 
         self.builder.position_at_end(end_bb)
         phi = self.builder.phi(_I1, name=self._fresh(expr.op))
         if expr.op == "and":
-            phi.add_incoming(ir.Constant(_I1, 0), entry_bb)
+            phi.add_incoming(ir.Constant(_I1, 0), short_exit)
             phi.add_incoming(rhs_b, rhs_exit)
         else:  # "or"
-            phi.add_incoming(ir.Constant(_I1, 1), entry_bb)
+            phi.add_incoming(ir.Constant(_I1, 1), short_exit)
             phi.add_incoming(rhs_b, rhs_exit)
         return phi
 

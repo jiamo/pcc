@@ -27,6 +27,8 @@ from pathlib import Path
 
 import pytest
 
+from pcc1_gate import find_current_pcc1
+
 REPO = Path(__file__).absolute().parents[2]
 _PCC1_CANDIDATES = [
     REPO / "build" / "bootstrap-pytest-self" / "pcc1",
@@ -65,6 +67,7 @@ def _pcc1_supports_pytest() -> bool:
 
 PCC1 = _find_pcc1()
 pytestmark = pytest.mark.pcc_gate(probe="pcc1")
+
 
 @pytest.fixture(scope="module", autouse=True)
 def _smoke_pcc1_present():
@@ -175,6 +178,35 @@ def test_pcc1_help_lists_bootstrap_cli_options():
     ):
         assert option in result.stdout
     assert "C/project inputs are" in result.stdout
+
+
+def test_pcc1_native_subprocess_preserves_child_returncode(tmp_path):
+    current_pcc1 = find_current_pcc1(REPO)
+    assert current_pcc1 is not None, "pcc1 provisioning produced no current binary"
+
+    src = tmp_path / "exit7.py"
+    src.write_text("import sys\nsys.exit(7)\n", encoding="utf-8")
+    result = subprocess.run(
+        [
+            str(current_pcc1),
+            "--backend",
+            "self",
+            "--python-libpython=off",
+            "--ir-scaffold=on",
+            str(src),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=180.0,
+    )
+
+    assert result.returncode == 7, (
+        f"pcc1 returned {result.returncode}, expected child exit 7\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    diagnostics = result.stdout + result.stderr
+    assert "AttributeError: returncode" not in diagnostics
+    assert "Traceback (most recent call last)" not in diagnostics
 
 
 def test_pcc1_compiles_time_monotonic_float_literal_mul(tmp_path):

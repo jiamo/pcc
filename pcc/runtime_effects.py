@@ -72,6 +72,7 @@ class RuntimeEffect(str, Enum):
     VTHREAD_RESUME = "vthread_resume"
     VTHREAD_CANCEL = "vthread_cancel"
     VTHREAD_COMPLETE = "vthread_complete"
+    VTHREAD_FAIL = "vthread_fail"
     HOST_DEVICE_TRANSFER = "host_device_transfer"
     GPU_LAUNCH = "gpu_launch"
     GPU_SYNC = "gpu_sync"
@@ -120,6 +121,8 @@ class ProductionVThreadEventKind(IntEnum):
     CANCEL_TIMER = 12
     CANCEL_IO = 13
     COMPLETE = 14
+    FAIL = 15
+    CANCEL_COMPLETE = 16
 
 
 @dataclass(frozen=True)
@@ -738,6 +741,10 @@ _PRODUCTION_VTHREAD_EVENT_EFFECTS: Mapping[
     ProductionVThreadEventKind.COMPLETE: frozenset(
         (RuntimeEffect.VTHREAD_COMPLETE,)
     ),
+    ProductionVThreadEventKind.FAIL: frozenset((RuntimeEffect.VTHREAD_FAIL,)),
+    ProductionVThreadEventKind.CANCEL_COMPLETE: frozenset(
+        (RuntimeEffect.VTHREAD_CANCEL, RuntimeEffect.VTHREAD_COMPLETE)
+    ),
 }
 
 
@@ -789,6 +796,8 @@ def check_production_vthread_events(
         ProductionVThreadEventKind.CANCEL_TIMER: 3,
         ProductionVThreadEventKind.CANCEL_IO: 3,
         ProductionVThreadEventKind.COMPLETE: 4,
+        ProductionVThreadEventKind.FAIL: 4,
+        ProductionVThreadEventKind.CANCEL_COMPLETE: 4,
     }
     root_balance = 0
     violations: list[RuntimeContractViolation] = []

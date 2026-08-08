@@ -1,3 +1,5 @@
+/* Host-C oracle for py/py_asyncio_io_runtime.py. The production pcc-Python
+ * archive deliberately excludes this object. */
 #include "py_internal.h"
 #include "py_io_waitset.h"
 
@@ -17,11 +19,31 @@
 #include <unistd.h>
 #endif
 
-#ifndef _WIN32
 static void asyncio_raise_oserror(const char *msg) {
     py_raise(py_exc_new(PY_EXC_OSERROR, msg));
 }
 
+static int asyncio_tcp_raw_close(int64_t fd) {
+#ifdef _WIN32
+    (void)fd;
+    return -1;
+#elif defined(PCC_USE_FREESTANDING_PLATFORM_SOCKET)
+    return pcc_platform_close(fd) == 0 ? 0 : -1;
+#else
+    return close((int)fd) == 0 ? 0 : -1;
+#endif
+}
+
+static int asyncio_tcp_register_fd(int64_t fd, const char *message) {
+    if (fd < 0 || py_virtual_thread_io_resource_register(fd) <= 0) {
+        if (fd >= 0) (void)asyncio_tcp_raw_close(fd);
+        asyncio_raise_oserror(message);
+        return -1;
+    }
+    return 0;
+}
+
+#ifndef _WIN32
 static const char *asyncio_host_cstr(PyObject *host) {
     if (host == NULL || host == py_None) return NULL;
     if (PY_IS_TAGGED_INT(host)) return NULL;
@@ -56,18 +78,54 @@ static void asyncio_prepare_socket(int fd) {
 #endif
 }
 
+#ifndef PCC_USE_FREESTANDING_PLATFORM_SOCKET
 static int asyncio_set_nonblocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0) return -1;
     if ((flags & O_NONBLOCK) != 0) return 0;
     return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
+#endif
 
 static int asyncio_set_blocking(int fd) {
     int flags = fcntl(fd, F_GETFL, 0);
     if (flags < 0) return -1;
     if ((flags & O_NONBLOCK) == 0) return 0;
     return fcntl(fd, F_SETFL, flags & ~O_NONBLOCK);
+}
+
+static ssize_t asyncio_socket_send(
+    int fd, const void *data, size_t size, int flags
+) {
+#ifdef PCC_USE_FREESTANDING_PLATFORM_SOCKET
+    int64_t result = pcc_platform_socket_send(
+        (int64_t)fd, data, (int64_t)size, (int64_t)flags
+    );
+    if (result < 0) {
+        errno = (int)-result;
+        return -1;
+    }
+    return (ssize_t)result;
+#else
+    return send(fd, data, size, flags);
+#endif
+}
+
+static ssize_t asyncio_socket_recv(
+    int fd, void *data, size_t size, int flags
+) {
+#ifdef PCC_USE_FREESTANDING_PLATFORM_SOCKET
+    int64_t result = pcc_platform_socket_recv(
+        (int64_t)fd, data, (int64_t)size, (int64_t)flags
+    );
+    if (result < 0) {
+        errno = (int)-result;
+        return -1;
+    }
+    return (ssize_t)result;
+#else
+    return recv(fd, data, size, flags);
+#endif
 }
 
 static int64_t asyncio_fd_value(PyObject *fd_obj) {
@@ -78,7 +136,7 @@ static int64_t asyncio_fd_value(PyObject *fd_obj) {
 static int asyncio_send_all_raw(int fd, const char *data, size_t n) {
     size_t sent = 0;
     while (sent < n) {
-        ssize_t rc = send(fd, data + sent, n - sent, 0);
+        ssize_t rc = asyncio_socket_send(fd, data + sent, n - sent, 0);
         if (rc < 0) {
             if (errno == EINTR) continue;
             if (errno == EAGAIN || errno == EWOULDBLOCK) {
@@ -138,7 +196,7 @@ static void asyncio_relay_drain_direction(
                 break;
             }
         }
-        ssize_t n = recv(fd_in, buf, buf_size, 0);
+        ssize_t n = asyncio_socket_recv(fd_in, buf, buf_size, 0);
         if (n > 0) {
             *made_progress = 1;
             chunks++;
@@ -181,6 +239,9 @@ static void asyncio_close_unique4(int fd1, int fd2, int fd3, int fd4) {
 }
 
 static int asyncio_socket_connect(const char *host, const char *port) {
+#ifdef PCC_USE_FREESTANDING_PLATFORM_SOCKET
+    return (int)pcc_platform_tcp_connect(host, port);
+#else
     struct addrinfo hints;
     struct addrinfo *result = NULL;
     memset(&hints, 0, sizeof(hints));
@@ -199,6 +260,7 @@ static int asyncio_socket_connect(const char *host, const char *port) {
     }
     freeaddrinfo(result);
     return fd;
+#endif
 }
 
 static const char *asyncio_bytes_data(PyObject *o, int64_t *n) {
@@ -271,6 +333,9 @@ PyObject *py_asyncio_tcp_listen(PyObject *host_obj, PyObject *port_obj, int64_t 
         return NULL;
     }
     const char *host = asyncio_host_cstr(host_obj);
+#ifdef PCC_USE_FREESTANDING_PLATFORM_SOCKET
+    int fd = (int)pcc_platform_tcp_listen(host, port, reuse_port);
+#else
     struct addrinfo hints;
     struct addrinfo *result = NULL;
     memset(&hints, 0, sizeof(hints));
@@ -307,6 +372,7 @@ PyObject *py_asyncio_tcp_listen(PyObject *host_obj, PyObject *port_obj, int64_t 
         fd = -1;
     }
     freeaddrinfo(result);
+#endif
     if (fd < 0) {
         asyncio_raise_oserror("TCP listen failed");
         return NULL;
@@ -371,6 +437,450 @@ PyObject *py_asyncio_tcp_connect(PyObject *host_obj, PyObject *port_obj) {
 #endif
 }
 
+int64_t py_virtual_thread_tcp_listen(
+    PyObject *host_obj,
+    PyObject *port_obj,
+    int64_t backlog
+) {
+#ifdef _WIN32
+    (void)host_obj;
+    (void)port_obj;
+    (void)backlog;
+    asyncio_raise_oserror("virtual-thread TCP is not available on Windows");
+    return -1;
+#else
+    char port[32];
+    if (backlog <= 0 || backlog > 65535) {
+        asyncio_raise_oserror("invalid TCP listen backlog");
+        return -1;
+    }
+    if (asyncio_port_cstr(port_obj, port, sizeof(port)) != 0) {
+        asyncio_raise_oserror("invalid TCP listen port");
+        return -1;
+    }
+    const char *host = asyncio_host_cstr(host_obj);
+#ifdef PCC_USE_FREESTANDING_PLATFORM_SOCKET
+    int64_t fd = pcc_platform_tcp_listen_with_backlog(host, port, 0, backlog);
+#else
+    struct addrinfo hints;
+    struct addrinfo *result = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    hints.ai_flags = AI_PASSIVE;
+    if (getaddrinfo(host, port, &hints, &result) != 0) {
+        asyncio_raise_oserror("TCP listen getaddrinfo failed");
+        return -1;
+    }
+    int64_t fd = -1;
+    for (struct addrinfo *rp = result; rp != NULL; rp = rp->ai_next) {
+        int candidate = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (candidate < 0) continue;
+        asyncio_prepare_socket(candidate);
+        int one = 1;
+        (void)setsockopt(candidate, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        if (
+            bind(candidate, rp->ai_addr, rp->ai_addrlen) == 0
+            && listen(candidate, (int)backlog) == 0
+            && asyncio_set_nonblocking(candidate) == 0
+        ) {
+            fd = (int64_t)candidate;
+            break;
+        }
+        close(candidate);
+    }
+    freeaddrinfo(result);
+#endif
+    if (fd < 0) {
+        asyncio_raise_oserror("TCP listen failed");
+        return -1;
+    }
+    if (asyncio_tcp_register_fd(fd, "TCP listen registration failed") != 0) {
+        return -1;
+    }
+    return fd;
+#endif
+}
+
+int64_t py_virtual_thread_tcp_accept_observe(
+    int64_t listener_fd,
+    int64_t generation,
+    int64_t *output_fd
+) {
+#ifdef _WIN32
+    (void)listener_fd;
+    (void)generation;
+    (void)output_fd;
+    asyncio_raise_oserror("virtual-thread TCP is not available on Windows");
+    return -1;
+#else
+    if (output_fd == NULL) {
+        asyncio_raise_oserror("invalid TCP accept output");
+        return -1;
+    }
+    *output_fd = -1;
+    if (py_virtual_thread_io_resource_operation_begin(
+            listener_fd, generation
+        ) != 0) {
+        return -1;
+    }
+#ifdef PCC_USE_FREESTANDING_PLATFORM_SOCKET
+    int64_t status;
+    do {
+        status = pcc_platform_tcp_accept_observe(listener_fd, output_fd);
+    } while (status == -EINTR);
+    py_virtual_thread_io_resource_operation_end();
+    if (status < 0) asyncio_raise_oserror("TCP accept failed");
+    return status;
+#else
+    for (;;) {
+        int accepted = accept((int)listener_fd, NULL, NULL);
+        if (accepted >= 0) {
+            asyncio_prepare_socket(accepted);
+            if (asyncio_set_nonblocking(accepted) != 0) {
+                close(accepted);
+                py_virtual_thread_io_resource_operation_end();
+                asyncio_raise_oserror("TCP accept set nonblocking failed");
+                return -1;
+            }
+            *output_fd = (int64_t)accepted;
+            py_virtual_thread_io_resource_operation_end();
+            return 0;
+        }
+        if (errno == EINTR) continue;
+        int saved_errno = errno;
+        py_virtual_thread_io_resource_operation_end();
+        if (saved_errno == EAGAIN || saved_errno == EWOULDBLOCK) return 1;
+        errno = saved_errno;
+        asyncio_raise_oserror("TCP accept failed");
+        return -1;
+    }
+#endif
+#endif
+}
+
+int64_t py_virtual_thread_tcp_register_accepted(int64_t fd) {
+    return asyncio_tcp_register_fd(fd, "TCP accept registration failed");
+}
+
+int64_t py_virtual_thread_tcp_connect_start(
+    PyObject *host_obj,
+    PyObject *port_obj,
+    int64_t *output_fd
+) {
+#ifdef _WIN32
+    (void)host_obj;
+    (void)port_obj;
+    (void)output_fd;
+    asyncio_raise_oserror("virtual-thread TCP is not available on Windows");
+    return -1;
+#else
+    if (output_fd == NULL) {
+        asyncio_raise_oserror("invalid TCP connect output");
+        return -1;
+    }
+    *output_fd = -1;
+    char port[32];
+    const char *host = asyncio_host_cstr(host_obj);
+    if (host == NULL) host = "127.0.0.1";
+    if (asyncio_port_cstr(port_obj, port, sizeof(port)) != 0) {
+        asyncio_raise_oserror("invalid TCP connect port");
+        return -1;
+    }
+#ifdef PCC_USE_FREESTANDING_PLATFORM_SOCKET
+    int64_t status = pcc_platform_tcp_connect_start(host, port, output_fd);
+    if (status < 0) {
+        asyncio_raise_oserror("TCP connect failed");
+    } else if (
+        *output_fd < 0
+        || asyncio_tcp_register_fd(
+            *output_fd, "TCP connect registration failed"
+        ) != 0
+    ) {
+        *output_fd = -1;
+        return -1;
+    }
+    return status;
+#else
+    struct addrinfo hints;
+    struct addrinfo *result = NULL;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(host, port, &hints, &result) != 0) {
+        asyncio_raise_oserror("TCP connect getaddrinfo failed");
+        return -1;
+    }
+    int64_t status = -1;
+    for (struct addrinfo *rp = result; rp != NULL; rp = rp->ai_next) {
+        int fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (fd < 0) continue;
+        asyncio_prepare_socket(fd);
+        if (asyncio_set_nonblocking(fd) != 0) {
+            close(fd);
+            continue;
+        }
+        int rc = connect(fd, rp->ai_addr, rp->ai_addrlen);
+        if (rc == 0) {
+            *output_fd = (int64_t)fd;
+            status = 3;
+            break;
+        }
+        if (errno == EINPROGRESS || errno == EALREADY || errno == EWOULDBLOCK) {
+            *output_fd = (int64_t)fd;
+            status = 1;
+            break;
+        }
+        close(fd);
+    }
+    freeaddrinfo(result);
+    if (status < 0) {
+        asyncio_raise_oserror("TCP connect failed");
+    } else if (
+        *output_fd < 0
+        || asyncio_tcp_register_fd(
+            *output_fd, "TCP connect registration failed"
+        ) != 0
+    ) {
+        *output_fd = -1;
+        return -1;
+    }
+    return status;
+#endif
+#endif
+}
+
+int64_t py_virtual_thread_tcp_connect_observe(
+    int64_t fd,
+    int64_t generation
+) {
+#ifdef _WIN32
+    (void)fd;
+    (void)generation;
+    asyncio_raise_oserror("virtual-thread TCP is not available on Windows");
+    return -1;
+#else
+    if (py_virtual_thread_io_resource_operation_begin(fd, generation) != 0) {
+        return -1;
+    }
+#ifdef PCC_USE_FREESTANDING_PLATFORM_SOCKET
+    int64_t status;
+    do {
+        status = pcc_platform_socket_connect_observe(fd, 0);
+    } while (status == -EINTR);
+    py_virtual_thread_io_resource_operation_end();
+    if (status < 0) asyncio_raise_oserror("TCP connect completion failed");
+    return status;
+#else
+    int error = 0;
+    socklen_t size = (socklen_t)sizeof(error);
+    int rc;
+    do {
+        rc = getsockopt((int)fd, SOL_SOCKET, SO_ERROR, &error, &size);
+    } while (rc < 0 && errno == EINTR);
+    int saved_errno = errno;
+    py_virtual_thread_io_resource_operation_end();
+    if (rc < 0) {
+        errno = saved_errno;
+        asyncio_raise_oserror("TCP connect completion failed");
+        return -1;
+    }
+    if (error == 0) return 3;
+    if (error == EINPROGRESS || error == EALREADY || error == EWOULDBLOCK) {
+        return 1;
+    }
+    errno = error;
+    asyncio_raise_oserror("TCP connect completion failed");
+    return -1;
+#endif
+#endif
+}
+
+PyObject *py_virtual_thread_tcp_recv_observe(
+    int64_t fd,
+    int64_t generation,
+    int64_t max_bytes,
+    int64_t *output_status
+) {
+#ifdef _WIN32
+    (void)fd;
+    (void)generation;
+    (void)max_bytes;
+    (void)output_status;
+    asyncio_raise_oserror("virtual-thread TCP is not available on Windows");
+    return NULL;
+#else
+    if (output_status == NULL || max_bytes <= 0 || max_bytes > 1048576) {
+        asyncio_raise_oserror("invalid TCP recv size");
+        return NULL;
+    }
+    *output_status = -1;
+    char *buffer = (char *)malloc((size_t)max_bytes);
+    if (buffer == NULL) {
+        asyncio_raise_oserror("TCP recv allocation failed");
+        return NULL;
+    }
+    if (py_virtual_thread_io_resource_operation_begin(fd, generation) != 0) {
+        free(buffer);
+        return NULL;
+    }
+    ssize_t count;
+    do {
+        count = asyncio_socket_recv((int)fd, buffer, (size_t)max_bytes, 0);
+    } while (count < 0 && errno == EINTR);
+    int saved_errno = errno;
+    py_virtual_thread_io_resource_operation_end();
+    if (count < 0 && (saved_errno == EAGAIN || saved_errno == EWOULDBLOCK)) {
+        free(buffer);
+        *output_status = 1;
+        return NULL;
+    }
+    if (count < 0) {
+        free(buffer);
+        errno = saved_errno;
+        asyncio_raise_oserror("TCP recv failed");
+        return NULL;
+    }
+    PyObject *result = py_bytes_new(buffer, (int64_t)count);
+    free(buffer);
+    if (result == NULL) return NULL;
+    *output_status = count == 0 ? 2 : 0;
+    return result;
+#endif
+}
+
+int64_t py_virtual_thread_tcp_send_observe(
+    int64_t fd,
+    int64_t generation,
+    PyObject *data_obj,
+    int64_t offset,
+    int64_t *output_count
+) {
+#ifdef _WIN32
+    (void)fd;
+    (void)generation;
+    (void)data_obj;
+    (void)offset;
+    (void)output_count;
+    asyncio_raise_oserror("virtual-thread TCP is not available on Windows");
+    return -1;
+#else
+    if (output_count == NULL) {
+        asyncio_raise_oserror("invalid TCP send count output");
+        return -1;
+    }
+    if (
+        data_obj == NULL
+        || PY_IS_TAGGED_INT(data_obj)
+        || (
+            py_type_of(data_obj) != PY_TYPE_BYTES
+            && py_type_of(data_obj) != PY_TYPE_BYTEARRAY
+        )
+    ) {
+        asyncio_raise_oserror("TCP send requires bytes");
+        return -1;
+    }
+    if (py_virtual_thread_io_resource_operation_begin(fd, generation) != 0) {
+        return -1;
+    }
+    int64_t length = 0;
+    const char *data = asyncio_bytes_data(data_obj, &length);
+    if (data == NULL || offset < 0 || offset > length) {
+        py_virtual_thread_io_resource_operation_end();
+        asyncio_raise_oserror("TCP send requires bytes and a valid offset");
+        return -1;
+    }
+    *output_count = 0;
+    if (offset == length) {
+        py_virtual_thread_io_resource_operation_end();
+        return 0;
+    }
+    ssize_t count;
+    do {
+        count = asyncio_socket_send(
+            (int)fd,
+            data + offset,
+            (size_t)(length - offset),
+            0
+        );
+    } while (count < 0 && errno == EINTR);
+    int saved_errno = errno;
+    py_virtual_thread_io_resource_operation_end();
+    if (count < 0 && (saved_errno == EAGAIN || saved_errno == EWOULDBLOCK)) {
+        return 1;
+    }
+    if (count < 0) {
+        errno = saved_errno;
+        asyncio_raise_oserror("TCP send failed");
+        return -1;
+    }
+    if (count == 0) {
+        asyncio_raise_oserror("TCP send made no progress");
+        return -1;
+    }
+    *output_count = (int64_t)count;
+    return 0;
+#endif
+}
+
+int64_t py_virtual_thread_tcp_close(int64_t fd) {
+#ifdef _WIN32
+    (void)fd;
+    asyncio_raise_oserror("virtual-thread TCP is not available on Windows");
+    return -1;
+#else
+    if (py_virtual_thread_io_resource_close_begin(fd) != 0) {
+        asyncio_raise_oserror("TCP descriptor is not open");
+        return -1;
+    }
+    int rc = asyncio_tcp_raw_close(fd);
+    py_virtual_thread_io_resource_operation_end();
+    if (rc != 0) {
+        asyncio_raise_oserror("TCP close failed");
+        return -1;
+    }
+    return 0;
+#endif
+}
+
+int64_t py_virtual_thread_tcp_close_quiet(int64_t fd) {
+#ifdef _WIN32
+    (void)fd;
+    return -1;
+#else
+    if (py_virtual_thread_io_resource_close_begin(fd) != 0) return -1;
+    int rc = asyncio_tcp_raw_close(fd);
+    py_virtual_thread_io_resource_operation_end();
+    return rc;
+#endif
+}
+
+int64_t py_virtual_thread_tcp_deadline(int64_t timeout_ms) {
+    if (timeout_ms < -1) {
+        asyncio_raise_oserror("invalid TCP timeout");
+        return -2;
+    }
+    if (timeout_ms < 0) return -1;
+    int64_t now_ms = pcc_runtime_monotonic_us() / 1000;
+    if (timeout_ms > INT64_MAX - now_ms) {
+        asyncio_raise_oserror("TCP timeout is too large");
+        return -2;
+    }
+    return now_ms + timeout_ms;
+}
+
+int64_t py_virtual_thread_tcp_remaining(int64_t deadline_ms) {
+    if (deadline_ms < 0) return -1;
+    int64_t now_ms = pcc_runtime_monotonic_us() / 1000;
+    if (now_ms >= deadline_ms) return 0;
+    return deadline_ms - now_ms;
+}
+
+int64_t py_virtual_thread_tcp_raise_timeout(void) {
+    asyncio_raise_oserror("TCP operation timed out");
+    return -1;
+}
+
 PyObject *py_asyncio_fd_recv(PyObject *fd_obj, int64_t max_bytes) {
 #ifdef _WIN32
     (void)fd_obj;
@@ -392,7 +902,7 @@ PyObject *py_asyncio_fd_recv(PyObject *fd_obj, int64_t max_bytes) {
     }
     ssize_t n;
     for (;;) {
-        n = recv((int)fd_value, buf, (size_t)max_bytes, 0);
+        n = asyncio_socket_recv((int)fd_value, buf, (size_t)max_bytes, 0);
         if (n >= 0) break;
         if (errno == EINTR) continue;
         free(buf);
@@ -425,7 +935,9 @@ int64_t py_asyncio_fd_send_all(PyObject *fd_obj, PyObject *data_obj) {
     }
     int64_t sent = 0;
     while (sent < n) {
-        ssize_t rc = send((int)fd_value, data + sent, (size_t)(n - sent), 0);
+        ssize_t rc = asyncio_socket_send(
+            (int)fd_value, data + sent, (size_t)(n - sent), 0
+        );
         if (rc < 0) {
             if (errno == EINTR) continue;
             asyncio_raise_oserror("TCP send failed");
@@ -484,7 +996,7 @@ int64_t py_asyncio_fd_relay(
             return -1;
         }
         if (active1 && FD_ISSET(fd1_in, &rfds)) {
-            ssize_t n = recv(fd1_in, buf, sizeof(buf), 0);
+            ssize_t n = asyncio_socket_recv(fd1_in, buf, sizeof(buf), 0);
             if (n > 0) {
                 if (asyncio_send_all_raw(fd1_out, buf, (size_t)n) != 0) {
                     active1 = 0;
@@ -500,7 +1012,7 @@ int64_t py_asyncio_fd_relay(
             }
         }
         if (active2 && FD_ISSET(fd2_in, &rfds)) {
-            ssize_t n = recv(fd2_in, buf, sizeof(buf), 0);
+            ssize_t n = asyncio_socket_recv(fd2_in, buf, sizeof(buf), 0);
             if (n > 0) {
                 if (asyncio_send_all_raw(fd2_out, buf, (size_t)n) != 0) {
                     active2 = 0;

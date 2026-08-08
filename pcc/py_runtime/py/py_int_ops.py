@@ -1,5 +1,16 @@
 """pcc-Python replacement for most public py_int_* operation dispatch."""
-from pcc.extern import extern, c_abi_export, c_double, c_int64, c_ptr, c_void
+from pcc.extern import extern, c_abi_export, c_double, c_int32, c_int64, c_ptr, c_void
+from pcc.py_runtime.py.py_abi_constants import (
+    PYFLOATOBJECT_VALUE_OFFSET,
+    PYINTOBJECT_DIGITS_OFFSET,
+    PYINTOBJECT_NDIGITS_OFFSET,
+    PYINTOBJECT_SIGN_OFFSET,
+    PYOBJECTHEADER_FLAGS_OFFSET,
+    PYOBJECTHEADER_REFCOUNT_OFFSET,
+    PYOBJECTHEADER_TYPE_TAG_OFFSET,
+    PY_TYPE_FLOAT,
+    PY_TYPE_INT,
+)
 from pcc.unsafe import (
     cstr,
     free,
@@ -17,7 +28,10 @@ from pcc.unsafe import (
 
 
 py_incref = extern("py_incref", (c_ptr,), c_void)
+py_decref = extern("py_decref", (c_ptr,), c_void)
 py_int_from_i64 = extern("py_int_from_i64", (c_int64,), c_ptr)
+py_int_cmp = extern("py_int_cmp", (c_ptr, c_ptr), c_int64)
+py_int_bit_length = extern("py_int_bit_length", (c_ptr,), c_int64)
 py_bigint_from_any = extern("py_bigint_from_any", (c_ptr,), c_ptr)
 py_bigint_to_pyobject = extern("py_bigint_to_pyobject", (c_ptr,), c_ptr)
 py_bigint_add = extern("py_bigint_add", (c_ptr, c_ptr), c_ptr)
@@ -35,6 +49,7 @@ py_bigint_shr = extern("py_bigint_shr", (c_ptr, c_int64), c_ptr)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 py_raise = extern("py_raise", (c_ptr,), c_void)
 pow_c = extern("pow", (c_double, c_double), c_double)
+pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
 
 
 def _load_u32(obj, offset: int) -> int:
@@ -82,20 +97,20 @@ def _binary_bigint(a, b, op: int):
 def _heap_int_fits_i64(o) -> bool:
     if ptr_is_null(o):
         return False
-    if load_i32(o, 8) != 2:
+    if load_i32(o, PYOBJECTHEADER_TYPE_TAG_OFFSET) != PY_TYPE_INT:
         return False
-    sign: int = load_i32(o, 16)
+    sign: int = load_i32(o, PYINTOBJECT_SIGN_OFFSET)
     if sign == 0:
         return True
-    ndigits: int = load_i32(o, 20)
+    ndigits: int = load_i32(o, PYINTOBJECT_NDIGITS_OFFSET)
     if ndigits <= 0:
         return True
     if ndigits > 2:
         return False
-    low: int = _load_u32(o, 24)
+    low: int = _load_u32(o, PYINTOBJECT_DIGITS_OFFSET)
     high: int = 0
     if ndigits == 2:
-        high = _load_u32(o, 28)
+        high = _load_u32(o, PYINTOBJECT_DIGITS_OFFSET + 4)
     if sign > 0:
         return high <= 2147483647
     if high < 2147483648:
@@ -104,16 +119,16 @@ def _heap_int_fits_i64(o) -> bool:
 
 
 def _heap_int_i64_value(o) -> int:
-    sign: int = load_i32(o, 16)
+    sign: int = load_i32(o, PYINTOBJECT_SIGN_OFFSET)
     if sign == 0:
         return 0
-    ndigits: int = load_i32(o, 20)
+    ndigits: int = load_i32(o, PYINTOBJECT_NDIGITS_OFFSET)
     if ndigits <= 0:
         return 0
-    low: int = _load_u32(o, 24)
+    low: int = _load_u32(o, PYINTOBJECT_DIGITS_OFFSET)
     high: int = 0
     if ndigits == 2:
-        high = _load_u32(o, 28)
+        high = _load_u32(o, PYINTOBJECT_DIGITS_OFFSET + 4)
     if sign > 0:
         return high * 4294967296 + low
     if high == 2147483648 and low == 0:
@@ -140,13 +155,10 @@ def _int_to_double(o) -> float:
 
 
 def _float_new(v: float):
-    f = malloc(24)
+    f = pcc_gc_alloc(24, PY_TYPE_FLOAT, 0)
     if ptr_is_null(f):
         return f
-    store_i64(f, 0, 1)
-    store_i32(f, 8, 3)
-    store_i32(f, 12, 0)
-    store_f64(f, 16, v)
+    store_f64(f, PYFLOATOBJECT_VALUE_OFFSET, v)
     return f
 
 
@@ -272,7 +284,7 @@ def py_int_truediv(a, b):
     if is_tagged_int(b):
         if untag_int(b) == 0:
             return null()
-    elif load_i32(b, 16) == 0:
+    elif load_i32(b, PYINTOBJECT_SIGN_OFFSET) == 0:
         return null()
     return _float_new(_int_to_double(a) / _int_to_double(b))
 
@@ -283,7 +295,7 @@ def py_int_pow(a, b):
         ev: int = untag_int(b)
         if ev < 0:
             return _float_new(pow_c(_int_to_double(a), float(ev)))
-    elif load_i32(b, 16) < 0:
+    elif load_i32(b, PYINTOBJECT_SIGN_OFFSET) < 0:
         return null()
 
     ba = py_bigint_from_any(a)
@@ -372,3 +384,147 @@ def py_int_shr(a, b):
     br = py_bigint_shr(ba, n)
     free(ba)
     return _wrap_bigint(br)
+
+
+@c_abi_export("py_int_pow_mod")
+def py_int_pow_mod(base, exp, mod):
+    if ptr_is_null(base) or ptr_is_null(exp) or ptr_is_null(mod):
+        return null()
+
+    one = py_int_from_i64(1)
+    zero = py_int_from_i64(0)
+    if ptr_is_null(one) or ptr_is_null(zero):
+        py_decref(one)
+        py_decref(zero)
+        return null()
+
+    if py_int_cmp(mod, zero) == 0:
+        py_raise(py_exc_new(2, cstr("pow() 3rd argument cannot be 0")))
+        py_decref(one)
+        py_decref(zero)
+        return null()
+    if py_int_cmp(exp, zero) < 0:
+        py_raise(
+            py_exc_new(
+                2,
+                cstr("pow() negative exponent with modulus not supported"),
+            )
+        )
+        py_decref(one)
+        py_decref(zero)
+        return null()
+
+    result = py_int_from_i64(1)
+    b = py_int_mod(base, mod)
+    e = exp
+    py_incref(e)
+    if ptr_is_null(result) or ptr_is_null(b):
+        py_decref(result)
+        py_decref(b)
+        py_decref(e)
+        py_decref(one)
+        py_decref(zero)
+        return null()
+
+    while py_int_cmp(e, zero) > 0:
+        bit = py_int_and(e, one)
+        odd: bool = False
+        if not ptr_is_null(bit):
+            odd = py_int_cmp(bit, zero) != 0
+        py_decref(bit)
+        if odd:
+            prod = py_int_mul(result, b)
+            nr = null()
+            if not ptr_is_null(prod):
+                nr = py_int_mod(prod, mod)
+            py_decref(prod)
+            py_decref(result)
+            result = nr
+            if ptr_is_null(result):
+                break
+
+        bsq = py_int_mul(b, b)
+        nb = null()
+        if not ptr_is_null(bsq):
+            nb = py_int_mod(bsq, mod)
+        py_decref(bsq)
+        py_decref(b)
+        b = nb
+        if ptr_is_null(b):
+            break
+
+        ne = py_int_shr(e, one)
+        py_decref(e)
+        e = ne
+        if ptr_is_null(e):
+            break
+
+    py_decref(b)
+    py_decref(e)
+    if not ptr_is_null(result):
+        reduced = py_int_mod(result, mod)
+        py_decref(result)
+        result = reduced
+    py_decref(one)
+    py_decref(zero)
+    return result
+
+
+@c_abi_export("py_int_isqrt")
+def py_int_isqrt(n):
+    if ptr_is_null(n):
+        return null()
+    zero = py_int_from_i64(0)
+    if ptr_is_null(zero):
+        return null()
+    if py_int_cmp(n, zero) < 0:
+        py_raise(py_exc_new(2, cstr("isqrt() argument must be nonnegative")))
+        py_decref(zero)
+        return null()
+    if py_int_cmp(n, zero) == 0:
+        return zero
+
+    one = py_int_from_i64(1)
+    two = py_int_from_i64(2)
+    if ptr_is_null(one) or ptr_is_null(two):
+        py_decref(one)
+        py_decref(two)
+        py_decref(zero)
+        return null()
+
+    bits: int = py_int_bit_length(n)
+    shift = py_int_from_i64((bits + 1) // 2)
+    x = null()
+    if not ptr_is_null(shift):
+        x = py_int_shl(one, shift)
+    py_decref(shift)
+    if ptr_is_null(x):
+        py_decref(one)
+        py_decref(two)
+        py_decref(zero)
+        return null()
+
+    while 1:
+        q = py_int_floordiv(n, x)
+        total = null()
+        if not ptr_is_null(q):
+            total = py_int_add(x, q)
+        py_decref(q)
+        y = null()
+        if not ptr_is_null(total):
+            y = py_int_floordiv(total, two)
+        py_decref(total)
+        if ptr_is_null(y):
+            py_decref(x)
+            x = null()
+            break
+        if py_int_cmp(y, x) >= 0:
+            py_decref(y)
+            break
+        py_decref(x)
+        x = y
+
+    py_decref(one)
+    py_decref(two)
+    py_decref(zero)
+    return x

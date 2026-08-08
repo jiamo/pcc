@@ -178,6 +178,7 @@ void py_set_add(PyObject *set, PyObject *item) {
     if (set == NULL || item == NULL) return;
     PySetObject *s = (PySetObject *)set;
     int64_t hash = py_obj_hash(item);
+    if (py_err_occurred()) return;
     int64_t slot;
     int found;
     py_set_lookup(s, hash, item, &slot, &found);
@@ -377,6 +378,7 @@ int64_t py_set_contains(PyObject *set, PyObject *item) {
     if (set == NULL || item == NULL) return 0;
     PySetObject *s = (PySetObject *)set;
     int64_t hash = py_obj_hash(item);
+    if (py_err_occurred()) return 0;
     int64_t slot;
     int found;
     py_set_lookup(s, hash, item, &slot, &found);
@@ -387,6 +389,7 @@ int64_t py_set_remove(PyObject *set, PyObject *item) {
     if (set == NULL || item == NULL) return -1;
     PySetObject *s = (PySetObject *)set;
     int64_t hash = py_obj_hash(item);
+    if (py_err_occurred()) return -1;
     int64_t slot;
     int found;
     py_set_lookup(s, hash, item, &slot, &found);

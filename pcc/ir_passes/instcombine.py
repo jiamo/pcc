@@ -39,6 +39,12 @@ import llvmlite.binding as llvm
 from .dce import dce_module_text
 from .instsimplify import simplify_module_text
 from .manager import AnalysisManager, ModulePass, PreservedAnalyses
+from .integer_fold_contract import (
+    FOLD_CONSTANT,
+    FOLD_POISON,
+    fold_llvm_integer_binary,
+    signed_value,
+)
 from .simplifycfg import _function_chunk_module, _module_context_for_function
 
 
@@ -109,34 +115,18 @@ def _int_width(ty: str) -> int | None:
     return width if width > 0 else None
 
 
-def _fold_const_binop(op: str, ty: str, lhs: str, rhs: str) -> int | None:
+def _fold_const_binop(op: str, ty: str, lhs: str, rhs: str, flags=""):
     lhs_i = _try_int(lhs)
     rhs_i = _try_int(rhs)
     width = _int_width(ty)
     if lhs_i is None or rhs_i is None or width is None:
         return None
-    mask = (1 << width) - 1
-    lhs_u = lhs_i & mask
-    rhs_u = rhs_i & mask
-    if op == "add":
-        raw = lhs_u + rhs_u
-    elif op == "sub":
-        raw = lhs_u - rhs_u
-    elif op == "mul":
-        raw = lhs_u * rhs_u
-    elif op == "xor":
-        raw = lhs_u ^ rhs_u
-    elif op == "and":
-        raw = lhs_u & rhs_u
-    elif op == "or":
-        raw = lhs_u | rhs_u
-    else:
-        return None
-    raw &= mask
-    sign_bit = 1 << (width - 1)
-    if raw & sign_bit:
-        return raw - (1 << width)
-    return raw
+    status, value = fold_llvm_integer_binary(op, width, lhs_i, rhs_i, flags)
+    if status == FOLD_POISON:
+        return "poison"
+    if status == FOLD_CONSTANT:
+        return signed_value(value, width)
+    return None
 
 
 def _is_pow2(n: int) -> int | None:
@@ -400,7 +390,7 @@ def _rewrite_function(
             ty = info["ty"]
             result = info["result"]
 
-            folded_const = _fold_const_binop(op, ty, lhs, rhs)
+            folded_const = _fold_const_binop(op, ty, lhs, rhs, flags)
             if folded_const is not None:
                 replacements[result] = str(folded_const)
                 lines[idx] = ""

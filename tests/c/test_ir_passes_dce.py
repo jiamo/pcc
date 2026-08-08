@@ -5,14 +5,16 @@ every case round-trips through upstream ``opt -passes=dce`` and pcc
 produces the same post-pass IR shape.
 """
 
-import shutil
+import pytest
 import unittest
 
 from pcc.ir_passes.dce import DCEPass, dce_module_text
 from pcc.ir_passes.parity import assert_ir_parity
 
 
-_OPT = shutil.which("opt")
+from pcc.passes.llvm_text_pipeline import find_opt_binary
+
+_OPT = find_opt_binary()
 
 
 class DCETests(unittest.TestCase):
@@ -324,7 +326,7 @@ join:
 ]
 
 
-@unittest.skipUnless(_OPT, "requires opt")
+@pytest.mark.pcc_gate(unavailable=None if _OPT else "matching LLVM opt not installed")
 class UpstreamParityTests(unittest.TestCase):
     def _parity(self, ir: str, tag: str = ""):
         report = assert_ir_parity(ir, DCEPass(), "dce")
@@ -361,7 +363,7 @@ define i32 @f(i32 %x) { entry:
 """)
 
 
-@unittest.skipUnless(_OPT, "requires opt")
+@pytest.mark.pcc_gate(unavailable=None if _OPT else "matching LLVM opt not installed")
 class CorpusParityTests(unittest.TestCase):
     """Every entry in :data:`_CORPUS` matches ``opt -passes=dce``.
 

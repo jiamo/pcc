@@ -1,5 +1,8 @@
 #include "py_runtime.h"
 
+/* Host-C oracle for the prebuilt bridge ABI.  The production pcc-Python
+ * archive owns these symbols in py/freestanding_metal_runtime.py. */
+
 #include <dlfcn.h>
 #include <stdbool.h>
 #include <stdint.h>

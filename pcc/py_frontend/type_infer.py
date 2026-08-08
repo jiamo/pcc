@@ -118,6 +118,8 @@ from .types import (
 )
 
 TYPE_INT: IntType = IntType(name="int", width=64, signed=True)
+TYPE_I64: IntType = IntType(name="pcc.i64", width=64, signed=True)
+TYPE_U64: IntType = IntType(name="pcc.u64", width=64, signed=False)
 TYPE_FLOAT: FloatType = FloatType(name="float", width=64)
 TYPE_COMPLEX: ComplexType = ComplexType(name="complex")
 TYPE_BOOL: BoolType = BoolType(name="bool")
@@ -130,6 +132,273 @@ TYPE_DYN: DynType = DynType(name="dyn")
 TYPE_SET: SetType = SetType(name="set", elem=TYPE_DYN)
 TYPE_FROZENSET: SetType = SetType(name="frozenset", elem=TYPE_DYN)
 
+_RAW_INT_NAMES = ("pcc.i64", "pcc.u64")
+
+
+def _is_raw_int_type(ty: Type) -> bool:
+    return isinstance(ty, IntType) and ty.name in _RAW_INT_NAMES
+
+
+def _raw_int_constant_value(expr: Expr) -> tuple[bool, int]:
+    """Return a source integer constant without treating variables as casts."""
+    if isinstance(expr, IntLit):
+        return (True, expr.value)
+    if isinstance(expr, UnaryOp) and expr.op in ("+", "-", "~"):
+        found, value = _raw_int_constant_value(expr.operand)
+        if found:
+            if expr.op == "-":
+                value = -value
+            elif expr.op == "~":
+                value = ~value
+            return (True, value)
+    if isinstance(expr, BinOp) and expr.op in (
+        "+",
+        "-",
+        "*",
+        "//",
+        "%",
+        "&",
+        "|",
+        "^",
+        "<<",
+        ">>",
+    ):
+        lhs_found, lhs = _raw_int_constant_value(expr.lhs)
+        rhs_found, rhs = _raw_int_constant_value(expr.rhs)
+        if lhs_found and rhs_found:
+            if expr.op == "+":
+                return (True, lhs + rhs)
+            if expr.op == "-":
+                return (True, lhs - rhs)
+            if expr.op == "*":
+                return (True, lhs * rhs)
+            if expr.op == "//" and rhs != 0:
+                return (True, lhs // rhs)
+            if expr.op == "%" and rhs != 0:
+                return (True, lhs % rhs)
+            if expr.op == "&":
+                return (True, lhs & rhs)
+            if expr.op == "|":
+                return (True, lhs | rhs)
+            if expr.op == "^":
+                return (True, lhs ^ rhs)
+            if expr.op == "<<" and 0 <= rhs <= 4096:
+                return (True, lhs << rhs)
+            if expr.op == ">>" and 0 <= rhs <= 4096:
+                return (True, lhs >> rhs)
+    return (False, 0)
+
+
+def _raw_int_bounds(ty: IntType) -> tuple[int, int]:
+    if ty.name == "pcc.u64":
+        return (0, (1 << 64) - 1)
+    return (-(1 << 63), (1 << 63) - 1)
+
+
+def _validate_freestanding_plain_int_expr(expr: Expr) -> None:
+    """Reject semantic ``int`` literals that cannot stay in the raw lane.
+
+    Raw ``pcc.i64``/``pcc.u64`` contexts are applied during inference before
+    this validation runs.  A remaining plain ``int`` literal therefore has no
+    fixed-width contract.  Values outside signed i64 would otherwise reach the
+    managed bignum constructor and only fail later in the freestanding IR
+    publication guard.
+    """
+    if isinstance(expr, IntLit):
+        if (
+            isinstance(expr.ty, IntType)
+            and expr.ty.name == "int"
+            and (expr.value < -(1 << 63) or expr.value > (1 << 63) - 1)
+        ):
+            _raise_frontend_error(
+                expr.span,
+                f"freestanding ordinary Python int literal {expr.value} "
+                "exceeds the proven i64 lane; use explicit pcc.i64 or pcc.u64",
+                "use an in-range literal or annotate the machine value explicitly",
+            )
+        return
+    if isinstance(expr, (BinOp, Compare)):
+        _validate_freestanding_plain_int_expr(expr.lhs)
+        _validate_freestanding_plain_int_expr(expr.rhs)
+        return
+    if isinstance(expr, BoolExpr):
+        _validate_freestanding_plain_int_expr(expr.left)
+        _validate_freestanding_plain_int_expr(expr.right)
+        return
+    if isinstance(expr, UnaryOp):
+        _validate_freestanding_plain_int_expr(expr.operand)
+        return
+    if isinstance(expr, Call):
+        _validate_freestanding_plain_int_expr(expr.func)
+        for arg in expr.args:
+            _validate_freestanding_plain_int_expr(arg)
+        for _name, value in expr.kwargs:
+            _validate_freestanding_plain_int_expr(value)
+        return
+    if isinstance(expr, Attr):
+        _validate_freestanding_plain_int_expr(expr.obj)
+        return
+    if isinstance(expr, Subscript):
+        _validate_freestanding_plain_int_expr(expr.obj)
+        _validate_freestanding_plain_int_expr(expr.idx)
+        return
+    if isinstance(expr, Slice):
+        for value in (expr.lo, expr.hi, expr.step):
+            if value is not None:
+                _validate_freestanding_plain_int_expr(value)
+        return
+    if isinstance(expr, (ListExpr, TupleExpr)):
+        for value in expr.elems:
+            _validate_freestanding_plain_int_expr(value)
+        return
+    if isinstance(expr, DictExpr):
+        for key, value in expr.pairs:
+            _validate_freestanding_plain_int_expr(key)
+            _validate_freestanding_plain_int_expr(value)
+        return
+    if isinstance(expr, IfExpr):
+        _validate_freestanding_plain_int_expr(expr.cond)
+        _validate_freestanding_plain_int_expr(expr.then_e)
+        _validate_freestanding_plain_int_expr(expr.else_e)
+        return
+    if isinstance(expr, Lambda):
+        for arg in expr.params:
+            if arg.default is not None:
+                _validate_freestanding_plain_int_expr(arg.default)
+        _validate_freestanding_plain_int_expr(expr.body)
+
+
+def _validate_freestanding_plain_int_stmts(body: tuple[Stmt, ...]) -> None:
+    for stmt in body:
+        if isinstance(stmt, Assign):
+            for target in stmt.targets:
+                _validate_freestanding_plain_int_expr(target)
+            _validate_freestanding_plain_int_expr(stmt.value)
+        elif isinstance(stmt, AugAssign):
+            _validate_freestanding_plain_int_expr(stmt.target)
+            _validate_freestanding_plain_int_expr(stmt.value)
+        elif isinstance(stmt, ExprStmt):
+            _validate_freestanding_plain_int_expr(stmt.expr)
+        elif isinstance(stmt, (If, While)):
+            _validate_freestanding_plain_int_expr(stmt.cond)
+            _validate_freestanding_plain_int_stmts(stmt.body)
+            _validate_freestanding_plain_int_stmts(stmt.else_body)
+        elif isinstance(stmt, For):
+            _validate_freestanding_plain_int_expr(stmt.target)
+            _validate_freestanding_plain_int_expr(stmt.iter)
+            _validate_freestanding_plain_int_stmts(stmt.body)
+            _validate_freestanding_plain_int_stmts(stmt.else_body)
+        elif isinstance(stmt, Return) and stmt.value is not None:
+            _validate_freestanding_plain_int_expr(stmt.value)
+        elif isinstance(stmt, Raise):
+            if stmt.exc is not None:
+                _validate_freestanding_plain_int_expr(stmt.exc)
+            if stmt.cause is not None:
+                _validate_freestanding_plain_int_expr(stmt.cause)
+        elif isinstance(stmt, Try):
+            _validate_freestanding_plain_int_stmts(stmt.body)
+            for handler in stmt.handlers:
+                if handler.exc_type is not None:
+                    _validate_freestanding_plain_int_expr(handler.exc_type)
+                _validate_freestanding_plain_int_stmts(handler.body)
+            _validate_freestanding_plain_int_stmts(stmt.else_body)
+            _validate_freestanding_plain_int_stmts(stmt.finally_body)
+        elif isinstance(stmt, With):
+            for context, target in stmt.items:
+                _validate_freestanding_plain_int_expr(context)
+                if target is not None:
+                    _validate_freestanding_plain_int_expr(target)
+            _validate_freestanding_plain_int_stmts(stmt.body)
+        elif isinstance(stmt, Delete):
+            for target in stmt.targets:
+                _validate_freestanding_plain_int_expr(target)
+        elif isinstance(stmt, FuncDef):
+            for arg in stmt.args:
+                if arg.default is not None:
+                    _validate_freestanding_plain_int_expr(arg.default)
+            for decorator in stmt.decorators:
+                _validate_freestanding_plain_int_expr(decorator)
+            _validate_freestanding_plain_int_stmts(stmt.body)
+        elif isinstance(stmt, ClassDef):
+            for base in stmt.bases:
+                _validate_freestanding_plain_int_expr(base)
+            for _name, value in stmt.keywords:
+                _validate_freestanding_plain_int_expr(value)
+            for decorator in stmt.decorators:
+                _validate_freestanding_plain_int_expr(decorator)
+            _validate_freestanding_plain_int_stmts(stmt.body)
+
+
+def _contextualize_raw_int_constant(expr: Expr, ty: IntType) -> Expr:
+    """Give an in-range integer literal the surrounding raw lane type."""
+    if isinstance(expr, IfExpr):
+        then_e = _contextualize_raw_int_constant(expr.then_e, ty)
+        else_e = _contextualize_raw_int_constant(expr.else_e, ty)
+        if _is_raw_int_type(then_e.ty) and _is_raw_int_type(else_e.ty):
+            return replace(expr, then_e=then_e, else_e=else_e, ty=ty)
+        return expr
+    found, value = _raw_int_constant_value(expr)
+    if not found:
+        return expr
+    low, high = _raw_int_bounds(ty)
+    if value < low or value > high:
+        _raise_frontend_error(
+            expr.span,
+            f"integer literal {value} does not fit {ty.name}",
+            f"use a value in the inclusive range [{low}, {high}]",
+        )
+    if isinstance(expr, BinOp):
+        lhs = _contextualize_raw_int_constant(expr.lhs, ty)
+        rhs = _contextualize_raw_int_constant(expr.rhs, ty)
+        if _is_raw_int_type(lhs.ty) and _is_raw_int_type(rhs.ty):
+            return replace(expr, lhs=lhs, rhs=rhs, ty=ty)
+        return expr
+    if isinstance(expr, UnaryOp):
+        operand = expr.operand
+        if not isinstance(operand, IntLit):
+            operand = _contextualize_raw_int_constant(operand, ty)
+        return replace(
+            expr,
+            operand=replace(operand, ty=ty),
+            ty=ty,
+        )
+    return replace(expr, ty=ty)
+
+
+def _contextualize_raw_int_operands(
+    lhs: Expr,
+    rhs: Expr,
+    span: SourceSpan,
+) -> tuple[Expr, Expr]:
+    """Permit raw/literal arithmetic, reject implicit Python-int conversion."""
+    lhs_raw = _is_raw_int_type(lhs.ty)
+    rhs_raw = _is_raw_int_type(rhs.ty)
+    if not lhs_raw and not rhs_raw:
+        return (lhs, rhs)
+    if lhs_raw and rhs_raw:
+        if lhs.ty.name != rhs.ty.name:
+            _raise_frontend_error(
+                span,
+                f"cannot mix {lhs.ty.name} and {rhs.ty.name} without an explicit conversion",
+                "use one fixed-width signedness for the whole operation",
+            )
+        return (lhs, rhs)
+    if lhs_raw and isinstance(rhs.ty, (IntType, BoolType)):
+        typed_rhs = _contextualize_raw_int_constant(rhs, lhs.ty)
+        if _is_raw_int_type(typed_rhs.ty):
+            return (lhs, typed_rhs)
+    if rhs_raw and isinstance(lhs.ty, (IntType, BoolType)):
+        typed_lhs = _contextualize_raw_int_constant(lhs, rhs.ty)
+        if _is_raw_int_type(typed_lhs.ty):
+            return (typed_lhs, rhs)
+    raw_ty = lhs.ty if lhs_raw else rhs.ty
+    _raise_frontend_error(
+        span,
+        f"{raw_ty.name} does not implicitly convert ordinary Python int values",
+        "annotate the other value with the same raw type or use an in-range literal",
+    )
+    return (lhs, rhs)
+
 _CLASS_LOWERING_HOST_METHODS = (
     "_find_method_def",
     "_load_bases_array",
@@ -137,8 +406,10 @@ _CLASS_LOWERING_HOST_METHODS = (
     "declare_extern_class",
     "emit_class_attr_load",
     "emit_class_attr_store",
+    "emit_class_statement_init",
     "emit_instantiate",
     "emit_isinstance",
+    "emit_local_class_statement_init",
     "emit_methods",
     "emit_module_init",
     "emit_self_attr_load",
@@ -336,21 +607,45 @@ _UNSAFE_INTRINSIC_RETURN_TYPES: dict[str, Type] = {
     "malloc": TYPE_DYN,
     "cstr": TYPE_DYN,
     "global_addr": TYPE_DYN,
+    "function_addr": TYPE_DYN,
     "global_load_ptr": TYPE_DYN,
     "global_store_ptr": TYPE_NONE,
+    "abi_constant": TYPE_INT,
     "define_global_i8": TYPE_NONE,
     "define_global_i32": TYPE_NONE,
+    "define_global_i64": TYPE_NONE,
     "define_global_header": TYPE_NONE,
     "define_global_ptr_null": TYPE_NONE,
+    "define_thread_local_ptr_null": TYPE_NONE,
+    "define_thread_local_i32": TYPE_NONE,
     "define_global_ptr_to_global": TYPE_NONE,
     "define_global_cstr": TYPE_NONE,
     "define_global_ptr_array": TYPE_NONE,
     "define_global_null_ptr_array": TYPE_NONE,
     "define_global_i32_array": TYPE_NONE,
+    "define_global_i64_array": TYPE_NONE,
+    "define_global_struct_words": TYPE_NONE,
     "calloc": TYPE_DYN,
     "realloc": TYPE_DYN,
     "free": TYPE_NONE,
     "ptr_add": TYPE_DYN,
+    "ptr_diff": TYPE_INT,
+    "int_to_ptr": TYPE_DYN,
+    "ptr_to_int": TYPE_INT,
+    "wrapping_mul_i64": TYPE_INT,
+    "logical_shift_right_i64": TYPE_INT,
+    "unsigned_div_i64": TYPE_INT,
+    "unsigned_rem_i64": TYPE_INT,
+    "unsigned_greater_i64": TYPE_BOOL,
+    "mul_overflow_i64": TYPE_BOOL,
+    "float_to_i64": TYPE_INT,
+    "i64_to_float": TYPE_FLOAT,
+    "f64_div": TYPE_FLOAT,
+    "f64_signbit": TYPE_INT,
+    "f64_bits": TYPE_INT,
+    "f64_pair_make": TYPE_COMPLEX,
+    "f64_pair_first": TYPE_FLOAT,
+    "f64_pair_second": TYPE_FLOAT,
     "null": TYPE_DYN,
     "ptr_eq": TYPE_BOOL,
     "ptr_is_null": TYPE_BOOL,
@@ -371,17 +666,123 @@ _UNSAFE_INTRINSIC_RETURN_TYPES: dict[str, Type] = {
     "memcpy": TYPE_DYN,
     "memmove": TYPE_DYN,
     "write": TYPE_INT,
+    "read": TYPE_INT,
+    "close": TYPE_INT,
+    "seek_file": TYPE_INT,
+    "open_readonly": TYPE_INT,
+    "darwin_current_rss_bytes": TYPE_INT,
+    "darwin_peak_rss_bytes": TYPE_INT,
+    "open_file": TYPE_INT,
+    "rename_file": TYPE_INT,
+    "chmod_file": TYPE_INT,
+    "sync_file": TYPE_INT,
+    "socket_open": TYPE_INT,
+    "socket_connect": TYPE_INT,
+    "socket_bind": TYPE_INT,
+    "socket_listen": TYPE_INT,
+    "socket_setsockopt": TYPE_INT,
+    "socket_getsockopt": TYPE_INT,
+    "fd_control": TYPE_INT,
+    "eventfd_create": TYPE_INT,
+    "socket_send": TYPE_INT,
+    "socket_recv": TYPE_INT,
+    "socket_accept": TYPE_INT,
+    "socket_shutdown": TYPE_INT,
+    "socket_sockname": TYPE_INT,
+    "socket_peername": TYPE_INT,
+    "poll_fd": TYPE_INT,
+    "poll_readable_pair": TYPE_INT,
+    "getpid": TYPE_INT,
+    "getcwd": TYPE_DYN,
+    "readlink": TYPE_INT,
+    "mkdir": TYPE_INT,
+    "unlinkat": TYPE_INT,
+    "uname": TYPE_INT,
+    "uname_field": TYPE_DYN,
+    "cpu_query": TYPE_INT,
+    "clock_gettime": TYPE_INT,
+    "nanosleep": TYPE_INT,
+    "waitpid": TYPE_INT,
+    "kill": TYPE_INT,
+    "process_exit": TYPE_NONE,
+    "spawn_process": TYPE_INT,
+    "spawn_process_pipe": TYPE_INT,
+    "stack_alloc": TYPE_DYN,
     "strlen": TYPE_INT,
     "getenv": TYPE_DYN,
     "setenv": TYPE_INT,
     "unsetenv": TYPE_INT,
+    "initial_environ": TYPE_DYN,
     "access": TYPE_INT,
     "stat_kind": TYPE_INT,
     "stat_mtime": TYPE_FLOAT,
     "target_sys_platform": TYPE_DYN,
     "target_platform_machine": TYPE_DYN,
+    "darwin_errno_location": TYPE_DYN,
     "call_ptr1": TYPE_DYN,
+    "call_ptr0": TYPE_DYN,
+    "call_void_ptr0": TYPE_NONE,
+    "call_void_ptr1": TYPE_NONE,
+    "call_void_ptr_i64_ptr": TYPE_NONE,
     "call_ptr2": TYPE_DYN,
+    "call_ptr4": TYPE_DYN,
+    "call_ptr3": TYPE_DYN,
+    "call_i64_i64_ptr": TYPE_INT,
+    "call_i32_ptr1": TYPE_INT,
+    "call_i32_ptr_i64": TYPE_INT,
+    "call_i32_ptr_i32": TYPE_INT,
+    "call_i32_ptr_i32_i32": TYPE_INT,
+    "call_i32_ptr_i32_i32_i32": TYPE_INT,
+    "call_i32_ptr_i32_i32_i32_i32_i32_ptr_i32": TYPE_INT,
+    "call_i32_i32_ptr_i64": TYPE_INT,
+    "call_i32_i64_i64_ptr": TYPE_INT,
+    "call_i32_i64_i32_i64": TYPE_INT,
+    "call_i64_ptr1": TYPE_INT,
+    "call_i64_ptr2": TYPE_INT,
+    "call_i64_ptr_i64_ptr": TYPE_INT,
+    "call_i64_ptr_i64_i64": TYPE_INT,
+    "call_variadic_i64_ptr_i64_ptr": TYPE_INT,
+    "call_variadic_i64_ptr_i64_i64": TYPE_INT,
+    "call_variadic_i32_ptr_i32_ptr": TYPE_INT,
+    "call_variadic_i32_ptr_i32_i64": TYPE_INT,
+    "call_i64_ptr_i64_ptr_i64": TYPE_INT,
+    "call_i64_ptr_i64_i64_ptr": TYPE_INT,
+    "call_i64_ptr_i64_ptr_ptr_ptr_ptr_bool": TYPE_INT,
+    "call_i64_ptr_ptr_ptr_ptr_ptr_bool": TYPE_INT,
+    "dynamic_library_open": TYPE_DYN,
+    "dynamic_library_open_global": TYPE_DYN,
+    "dynamic_library_symbol": TYPE_DYN,
+    "darwin_libsystem_symbol": TYPE_DYN,
+    "dynamic_library_close": TYPE_INT,
+    "kqueue_create": TYPE_INT,
+    "kevent_call": TYPE_INT,
+    "epoll_create1": TYPE_INT,
+    "epoll_ctl": TYPE_INT,
+    "epoll_wait": TYPE_INT,
+    "thread_safepoint": TYPE_NONE,
+    "gc_backend_current": TYPE_INT,
+    "atomic_load_i32": TYPE_INT,
+    "atomic_load_i64": TYPE_INT,
+    "atomic_store_i32": TYPE_NONE,
+    "atomic_store_i64": TYPE_NONE,
+    "atomic_rmw_i32": TYPE_INT,
+    "atomic_rmw_i64": TYPE_INT,
+    "atomic_cas_i32": TYPE_INT,
+    "atomic_cas_i64": TYPE_INT,
+    "atomic_fence": TYPE_NONE,
+    "atomic_test_and_set": TYPE_INT,
+    "atomic_clear": TYPE_NONE,
+    "syscall6": TYPE_INT,
+    "page_alloc": TYPE_DYN,
+    "page_free": TYPE_INT,
+    "va_start": TYPE_DYN,
+    "va_arg_i64": TYPE_INT,
+    "va_arg_i32": TYPE_INT,
+    "va_arg_u32": TYPE_INT,
+    "va_arg_ptr": TYPE_DYN,
+    "va_arg_f64": TYPE_FLOAT,
+    "va_cursor": TYPE_DYN,
+    "va_end": TYPE_NONE,
 }
 
 
@@ -441,6 +842,7 @@ class _InferCtx:
 
     module: Module
     module_name: str
+    freestanding: bool
     globals: _Scope
     func_types: dict[str, FuncType]
     external_exports: dict
@@ -449,6 +851,11 @@ class _InferCtx:
     dataclasses_replace_aliases: set[str]
     functools_module_aliases: set[str]
     weakref_value_aliases: set[str]
+    pcc_module_aliases: set[str]
+    pcc_i64_buffer_aliases: set[str]
+    unsafe_intrinsic_aliases: set[str]
+    pcc_guarded_i64_dot_aliases: set[str]
+    pcc_guarded_loop_counter_aliases: set[str]
     class_types: dict[str, ClassType]
     _l1_codegen_host_type: Optional[ClassType]
 
@@ -464,6 +871,15 @@ class _InferCtx:
             self.module_name = module.name or ""
         except AttributeError:
             self.module_name = ""
+        self.freestanding = False
+        for module_stmt in module.body:
+            if not isinstance(module_stmt, Assign):
+                continue
+            if not isinstance(module_stmt.value, BoolLit) or not module_stmt.value.value:
+                continue
+            for target in module_stmt.targets:
+                if isinstance(target, Name) and target.ident == "__pcc_freestanding__":
+                    self.freestanding = True
         # Module-level globals (functions, top-level vars).
         self.globals: _Scope = _Scope(parent=None)
         # Map from function name to its (possibly refined) ``FuncType``.
@@ -517,6 +933,11 @@ class _InferCtx:
         # only imports resolved to the real weakref module so ordinary
         # user functions named ``ref`` are not treated specially.
         self.weakref_value_aliases: set[str] = set()
+        self.pcc_module_aliases: set[str] = set()
+        self.pcc_i64_buffer_aliases: set[str] = set()
+        self.unsafe_intrinsic_aliases: set[str] = set()
+        self.pcc_guarded_i64_dot_aliases: set[str] = set()
+        self.pcc_guarded_loop_counter_aliases: set[str] = set()
         # Locals of the function currently being inferred that receive a
         # 1-arg ``d.setdefault(k)`` call somewhere in its body. CPython
         # inserts ``None`` for a missing key, so an *inferred* scalar-valued
@@ -656,6 +1077,16 @@ class _InferCtx:
                     return _make_dict_type(TYPE_DYN, TYPE_DYN)
                 if ty.name == "tuple":
                     return _make_tuple_type("tuple_variadic", (TYPE_DYN,))
+                if ty.name == "bytes":
+                    return TYPE_BYTES
+                if ty.name == "bytearray":
+                    return TYPE_BYTEARRAY
+                if ty.name == "memoryview":
+                    return TYPE_MEMORYVIEW
+                if ty.name == "set":
+                    return TYPE_SET
+                if ty.name == "frozenset":
+                    return TYPE_FROZENSET
             if ty_module:
                 found = self.class_types.get(f"{ty_module}.{ty.name}")
                 if found is not None:
@@ -792,6 +1223,51 @@ def _build_balanced_typed_bool_expr(
     )
 
 
+def _is_walrus_sentinel_call(expr: Expr) -> bool:
+    return (
+        isinstance(expr, Call)
+        and isinstance(expr.func, Name)
+        and _name_ident(expr.func) in ("_walrus", "__walrus__")
+        and len(expr.args) == 2
+    )
+
+
+def _infer_walrus_assignment_target(
+    ctx: _InferCtx,
+    scope: _Scope,
+    target: Expr,
+    bind_ty: Type,
+) -> Expr:
+    """Type one real or chained walrus target from its already-typed RHS."""
+    if isinstance(target, Name):
+        ident = _name_ident(target)
+        if ident is not None:
+            scope.update(ident, bind_ty)
+        return _with_ty(target, bind_ty)
+    if _is_walrus_sentinel_call(target):
+        # ``a = b = c`` represents the hidden targets as a sentinel tree.
+        # Both arguments here are targets; neither is a value expression.
+        left = _infer_walrus_assignment_target(
+            ctx,
+            scope,
+            target.args[0],
+            bind_ty,
+        )
+        right = _infer_walrus_assignment_target(
+            ctx,
+            scope,
+            target.args[1],
+            bind_ty,
+        )
+        return replace(
+            target,
+            func=_with_ty(target.func, TYPE_DYN),
+            args=(left, right),
+            ty=bind_ty,
+        )
+    return _infer_expr(ctx, scope, target)
+
+
 def _infer_expr(ctx: _InferCtx, scope: _Scope, expr: Expr) -> Expr:
     # Literals -----------------------------------------------------------
     if isinstance(expr, IntLit):
@@ -833,6 +1309,7 @@ def _infer_expr(ctx: _InferCtx, scope: _Scope, expr: Expr) -> Expr:
     if isinstance(expr, BinOp):
         lhs = _infer_expr(ctx, scope, expr.lhs)
         rhs = _infer_expr(ctx, scope, expr.rhs)
+        lhs, rhs = _contextualize_raw_int_operands(lhs, rhs, expr.span)
         op = expr.op
         ty = _binop_result(op, lhs.ty, rhs.ty, expr.span)
         return replace(expr, lhs=lhs, rhs=rhs, ty=ty)
@@ -859,6 +1336,8 @@ def _infer_expr(ctx: _InferCtx, scope: _Scope, expr: Expr) -> Expr:
     if isinstance(expr, Compare):
         lhs = _infer_expr(ctx, scope, expr.lhs)
         rhs = _infer_expr(ctx, scope, expr.rhs)
+        if expr.op not in ("is", "is not", "in", "not in"):
+            lhs, rhs = _contextualize_raw_int_operands(lhs, rhs, expr.span)
         op = expr.op
         if op in ("is", "is not") and (
             _is_valueclass_type(lhs.ty) or _is_valueclass_type(rhs.ty)
@@ -876,9 +1355,54 @@ def _infer_expr(ctx: _InferCtx, scope: _Scope, expr: Expr) -> Expr:
 
     # Calls --------------------------------------------------------------
     if isinstance(expr, Call):
+        if _is_walrus_sentinel_call(expr):
+            # The lift encodes both ``x := rhs`` and chained assignment with
+            # a Dyn-typed sentinel.  Infer the RHS first (Python evaluation
+            # order), bind every hidden target to that semantic type, and
+            # make the expression itself return the same type.
+            value = _infer_expr(ctx, scope, expr.args[1])
+            target = _infer_walrus_assignment_target(
+                ctx,
+                scope,
+                expr.args[0],
+                value.ty,
+            )
+            return replace(
+                expr,
+                func=_with_ty(expr.func, TYPE_DYN),
+                args=(target, value),
+                ty=value.ty,
+            )
         callee = _infer_expr(ctx, scope, expr.func)
         new_args = tuple(_infer_expr(ctx, scope, a) for a in expr.args)
         new_kwargs = tuple((k, _infer_expr(ctx, scope, v)) for (k, v) in expr.kwargs)
+        callee_ident = _name_ident(expr.func) if isinstance(expr.func, Name) else None
+        if ctx.freestanding and callee_ident in ctx.unsafe_intrinsic_aliases:
+            new_args = tuple(
+                _contextualize_raw_int_constant(arg, TYPE_I64)
+                for arg in new_args
+            )
+        if isinstance(callee.ty, FuncType):
+            contextual_args: list[Expr] = []
+            for index, arg in enumerate(new_args):
+                param_ty = (
+                    callee.ty.params[index]
+                    if index < len(callee.ty.params)
+                    else TYPE_DYN
+                )
+                if _is_raw_int_type(param_ty):
+                    arg = _contextualize_raw_int_constant(arg, param_ty)
+                    if (
+                        isinstance(arg.ty, (IntType, BoolType))
+                        and not _is_raw_int_type(arg.ty)
+                    ):
+                        _raise_frontend_error(
+                            arg.span,
+                            f"argument {index + 1} for {param_ty.name} is an ordinary Python int",
+                            "annotate the argument with the same raw type or pass an in-range literal",
+                        )
+                contextual_args.append(arg)
+            new_args = tuple(contextual_args)
         value_array_ty = _value_array_type_from_surface(ctx, expr.func)
         if value_array_ty is not None:
             if new_kwargs:
@@ -908,6 +1432,87 @@ def _infer_expr(ctx: _InferCtx, scope: _Scope, expr: Expr) -> Expr:
                 args=new_args,
                 kwargs=new_kwargs,
                 ty=value_array_ty,
+            )
+        i64_buffer_ty = _i64_buffer_type_from_surface(ctx, expr.func)
+        if i64_buffer_ty is not None:
+            length = _i64_buffer_length_from_type(i64_buffer_ty)
+            if new_kwargs:
+                _raise_frontend_error(
+                    expr.span,
+                    "pcc.i64_buffer construction does not accept keyword arguments",
+                    "pass exactly the declared number of positional int elements",
+                )
+            if len(new_args) != length:
+                _raise_frontend_error(
+                    expr.span,
+                    f"pcc.i64_buffer[{length}] expects exactly {length} elements",
+                    "make the constructor argument count match its literal length",
+                )
+            for index, arg in enumerate(new_args):
+                if not isinstance(ctx.resolve_type_refs(arg.ty), IntType):
+                    _raise_frontend_error(
+                        arg.span,
+                        f"pcc.i64_buffer element {index + 1} must be an exact int",
+                        "convert the value to int before constructing the typed buffer",
+                    )
+            return replace(
+                expr,
+                func=callee,
+                args=new_args,
+                kwargs=new_kwargs,
+                ty=i64_buffer_ty,
+            )
+
+        pcc_intrinsic = _pcc_intrinsic_call_kind(ctx, expr.func)
+        if pcc_intrinsic == "guarded_i64_dot":
+            if new_kwargs or len(new_args) != 2:
+                _raise_frontend_error(
+                    expr.span,
+                    "pcc.guarded_i64_dot expects two positional typed buffers",
+                    "pass two pcc.i64_buffer[N] values with the same N",
+                )
+            left_n = _i64_buffer_length_from_type(new_args[0].ty)
+            right_n = _i64_buffer_length_from_type(new_args[1].ty)
+            if left_n < 1 or right_n < 1 or left_n != right_n:
+                _raise_frontend_error(
+                    expr.span,
+                    "pcc.guarded_i64_dot requires matching pcc.i64_buffer[N] operands",
+                    "construct both operands with the same literal buffer length",
+                )
+            return replace(
+                expr,
+                func=callee,
+                args=new_args,
+                kwargs=new_kwargs,
+                ty=IntType(name="int"),
+            )
+        if pcc_intrinsic == "guarded_loop_counter":
+            valid_counters = (
+                "candidate",
+                "guard_hit",
+                "guard_miss",
+                "overflow",
+                "scalar_fallback",
+                "fast_result",
+            )
+            if (
+                new_kwargs
+                or len(new_args) != 1
+                or not isinstance(new_args[0], StrLit)
+                or new_args[0].value not in valid_counters
+            ):
+                _raise_frontend_error(
+                    expr.span,
+                    "pcc.guarded_loop_counter requires one known counter literal",
+                    "use candidate, guard_hit, guard_miss, overflow, "
+                    "scalar_fallback, or fast_result",
+                )
+            return replace(
+                expr,
+                func=callee,
+                args=new_args,
+                kwargs=new_kwargs,
+                ty=IntType(name="int"),
             )
         # Valhalla projection rule: value projections are identity-free,
         # and weak references are an identity-lifetime observation (the
@@ -1526,6 +2131,11 @@ def _infer_expr(ctx: _InferCtx, scope: _Scope, expr: Expr) -> Expr:
         cond = _infer_expr(ctx, scope, expr.cond)
         then_e = _infer_expr(ctx, scope, expr.then_e)
         else_e = _infer_expr(ctx, scope, expr.else_e)
+        then_e, else_e = _contextualize_raw_int_operands(
+            then_e,
+            else_e,
+            expr.span,
+        )
         ty = common_type(then_e.ty, else_e.ty)
         return replace(expr, cond=cond, then_e=then_e, else_e=else_e, ty=ty)
 
@@ -1606,6 +2216,9 @@ def _binop_result(op: str, a: Type, b: Type, span: SourceSpan) -> Type:
     if op in ("&", "|", "^", "<<", ">>"):
         if isinstance(a, (IntType, BoolType)) and isinstance(b, (IntType, BoolType)):
             # Bool <<>> anything else returns int (Python promotes).
+            promoted = common_type(a, b)
+            if _is_raw_int_type(promoted):
+                return promoted
             return TYPE_INT
         return TYPE_DYN
 
@@ -1614,6 +2227,9 @@ def _binop_result(op: str, a: Type, b: Type, span: SourceSpan) -> Type:
         if isinstance(a, FloatType) or isinstance(b, FloatType):
             return TYPE_FLOAT
         if is_numeric(a) and is_numeric(b):
+            promoted = common_type(a, b)
+            if _is_raw_int_type(promoted):
+                return promoted
             return TYPE_INT
 
     # Default arithmetic promotion.
@@ -1692,10 +2308,18 @@ def _extern_factory_call_type(
     if isinstance(restype_expr, Name):
         marker_name = _name_ident(restype_expr)
         restype_name = ctx.extern_ctype_aliases.get(marker_name or "", "")
+    ret_ty = _extern_ctype_value_type(restype_name)
+    if ctx.freestanding:
+        raw_params = []
+        for param in params:
+            raw_params.append(TYPE_I64 if type_eq(param, TYPE_INT) else param)
+        params = raw_params
+        if type_eq(ret_ty, TYPE_INT):
+            ret_ty = TYPE_I64
     return FuncType(
         name="callable",
         params=tuple(params),
-        ret=_extern_ctype_value_type(restype_name),
+        ret=ret_ty,
     )
 
 
@@ -2050,6 +2674,11 @@ def _infer_stmt(ctx: _InferCtx, scope: _Scope, stmt: Stmt) -> Stmt:
     if isinstance(stmt, AugAssign):
         target = _infer_expr(ctx, scope, stmt.target)
         value = _infer_expr(ctx, scope, stmt.value)
+        target, value = _contextualize_raw_int_operands(
+            target,
+            value,
+            stmt.span,
+        )
         # Re-bind the target's type to the promoted result so subsequent
         # statements see the refined type.
         if isinstance(stmt.target, Name):
@@ -2108,12 +2737,36 @@ def _infer_stmt(ctx: _InferCtx, scope: _Scope, stmt: Stmt) -> Stmt:
         elem_ty = ctx.resolve_type_refs(
             _element_type_of(ctx.resolve_type_refs(iter_e.ty))
         )
+        if (
+            isinstance(iter_e, Call)
+            and isinstance(iter_e.func, Name)
+            and _name_ident(iter_e.func) in ("range", "xrange")
+        ):
+            # ``range`` is represented as Dyn at the builtin-call boundary,
+            # but its iteration value is always a Python int.  Preserve that
+            # semantic fact here so an ordinary pre-bound int target keeps
+            # the native-i64 loop lane.
+            elem_ty = TYPE_INT
         target = _infer_expr(ctx, scope, stmt.target)
         if isinstance(stmt.target, Name):
             target_ident = _name_ident(stmt.target)
             if target_ident is not None:
-                scope.update(target_ident, elem_ty)
-            target = _with_ty(stmt.target, elem_ty)
+                pre_loop_ty = scope.lookup(target_ident)
+                target_ty = elem_ty
+                if pre_loop_ty is not None and not type_eq(pre_loop_ty, elem_ty):
+                    # A Python for-target is unchanged when the iterable is
+                    # empty and rebound on every non-empty iteration.  Those
+                    # two control-flow edges therefore need one representation
+                    # join.  Dyn is the honest boxed projection when the
+                    # incoming value and element type differ; lowering must
+                    # migrate the pre-loop value into that slot rather than
+                    # replacing it with NULL or storing a pointer into the old
+                    # scalar alloca.
+                    target_ty = TYPE_DYN
+                scope.update(target_ident, target_ty)
+            else:
+                target_ty = elem_ty
+            target = _with_ty(stmt.target, target_ty)
         body = tuple(_infer_stmt(ctx, scope, s) for s in stmt.body)
         else_body = tuple(_infer_stmt(ctx, scope, s) for s in stmt.else_body)
         return replace(
@@ -2234,6 +2887,11 @@ def _infer_stmt(ctx: _InferCtx, scope: _Scope, stmt: Stmt) -> Stmt:
     # Import/Global/Nonlocal/Pass/Break/Continue — mostly pass through.
     if isinstance(stmt, Import):
         for mod_name, as_name in stmt.names:
+            if mod_name == "pcc":
+                local_name = as_name or "pcc"
+                ctx.pcc_module_aliases.add(local_name)
+                scope.update(local_name, DynType(name="module:pcc"))
+                continue
             if mod_name == "math":
                 local_name = as_name or mod_name.split(".", 1)[0]
                 scope.update(local_name, DynType(name="module:math"))
@@ -2332,7 +2990,10 @@ def _infer_stmt(ctx: _InferCtx, scope: _Scope, stmt: Stmt) -> Stmt:
                 ret_ty = _UNSAFE_INTRINSIC_RETURN_TYPES.get(attr_name)
                 if ret_ty is None:
                     continue
+                if ctx.freestanding and type_eq(ret_ty, TYPE_INT):
+                    ret_ty = TYPE_I64
                 local_name = as_name or attr_name
+                ctx.unsafe_intrinsic_aliases.add(local_name)
                 ft = FuncType(
                     name="callable",
                     params=(TYPE_DYN,),
@@ -2340,6 +3001,30 @@ def _infer_stmt(ctx: _InferCtx, scope: _Scope, stmt: Stmt) -> Stmt:
                 )
                 scope.update(local_name, ft)
                 ctx.func_types[local_name] = ft
+        if resolved == "pcc":
+            for attr_name, as_name in stmt.names:
+                local_name = as_name or attr_name
+                if attr_name == "i64_buffer":
+                    ctx.pcc_i64_buffer_aliases.add(local_name)
+                    scope.update(local_name, TYPE_DYN)
+                elif attr_name == "guarded_i64_dot":
+                    ctx.pcc_guarded_i64_dot_aliases.add(local_name)
+                    ft = FuncType(
+                        name="callable",
+                        params=(TYPE_BYTES, TYPE_BYTES),
+                        ret=TYPE_INT,
+                    )
+                    scope.update(local_name, ft)
+                    ctx.func_types[local_name] = ft
+                elif attr_name == "guarded_loop_counter":
+                    ctx.pcc_guarded_loop_counter_aliases.add(local_name)
+                    ft = FuncType(
+                        name="callable",
+                        params=(TYPE_STR,),
+                        ret=TYPE_INT,
+                    )
+                    scope.update(local_name, ft)
+                    ctx.func_types[local_name] = ft
         if resolved == "pcc.extern":
             for attr_name, as_name in stmt.names:
                 local_name = as_name or attr_name
@@ -2804,6 +3489,81 @@ def _value_array_type_from_surface(
     return None
 
 
+_I64_BUFFER_TYPE_PREFIX = "pcc.i64_buffer["
+
+
+def _i64_buffer_length_from_type(ty: Type) -> int:
+    if not isinstance(ty, BytesType):
+        return -1
+    name = ty.name
+    if not name.startswith(_I64_BUFFER_TYPE_PREFIX) or not name.endswith("]"):
+        return -1
+    digits = name[len(_I64_BUFFER_TYPE_PREFIX) : -1]
+    if not digits:
+        return -1
+    value = 0
+    for ch in digits:
+        code = ord(ch) - 48
+        if code < 0 or code > 9:
+            return -1
+        value = value * 10 + code
+    if value < 1 or value > 1_048_576:
+        return -1
+    return value
+
+
+def _pcc_surface_attr(ctx: _InferCtx, surface: Expr) -> Optional[str]:
+    if isinstance(surface, Name):
+        ident = _name_ident(surface)
+        if ident in ctx.pcc_i64_buffer_aliases:
+            return "i64_buffer"
+        if ident in ctx.pcc_guarded_i64_dot_aliases:
+            return "guarded_i64_dot"
+        if ident in ctx.pcc_guarded_loop_counter_aliases:
+            return "guarded_loop_counter"
+        return None
+    if isinstance(surface, Attr) and isinstance(surface.obj, Name):
+        root = _name_ident(surface.obj)
+        if root in ctx.pcc_module_aliases and surface.name in (
+            "i64_buffer",
+            "guarded_i64_dot",
+            "guarded_loop_counter",
+        ):
+            return surface.name
+    return None
+
+
+def _pcc_intrinsic_call_kind(ctx: _InferCtx, surface: Expr) -> Optional[str]:
+    kind = _pcc_surface_attr(ctx, surface)
+    if kind in ("guarded_i64_dot", "guarded_loop_counter"):
+        return kind
+    return None
+
+
+def _i64_buffer_type_from_surface(
+    ctx: _InferCtx,
+    surface: Expr,
+) -> Optional[BytesType]:
+    if not isinstance(surface, Subscript):
+        return None
+    if _pcc_surface_attr(ctx, surface.obj) != "i64_buffer":
+        return None
+    if not isinstance(surface.idx, IntLit):
+        _raise_frontend_error(
+            surface.idx.span,
+            "pcc.i64_buffer length must be an integer literal",
+            "write a literal length between 1 and 1048576",
+        )
+    length = int(surface.idx.value)
+    if length < 1 or length > 1_048_576:
+        _raise_frontend_error(
+            surface.idx.span,
+            "pcc.i64_buffer length must be between 1 and 1048576",
+            "choose a bounded fixed-length specialization candidate",
+        )
+    return BytesType(name=_I64_BUFFER_TYPE_PREFIX + str(length) + "]")
+
+
 def _valueclass_type_refs(
     ty: Type,
     valueclass_names: set[str],
@@ -3072,7 +3832,12 @@ def _class_fields_from_def(
                 init_annotation = _annotation_or_none(init_stmt)
                 if init_annotation is not None:
                     explicit_ty = ctx.resolve_annotation(init_annotation)
-                for target in init_stmt.targets:
+                pending_targets = list(reversed(init_stmt.targets))
+                while pending_targets:
+                    target = pending_targets.pop()
+                    if isinstance(target, (TupleExpr, ListExpr)):
+                        pending_targets.extend(reversed(target.elems))
+                        continue
                     if (
                         not isinstance(target, Attr)
                         or not isinstance(target.obj, Name)
@@ -3788,7 +4553,10 @@ def _bind_external_import_exports(
             if value_kind == "str":
                 scope.update(local_name, TYPE_STR)
             elif value_kind == "int":
-                scope.update(local_name, TYPE_INT)
+                scope.update(
+                    local_name,
+                    TYPE_I64 if ctx.freestanding else TYPE_INT,
+                )
             elif value_kind == "bool":
                 scope.update(local_name, TYPE_BOOL)
             elif value_kind == "none":
@@ -3867,6 +4635,27 @@ def _preload_unique_external_classes(ctx: _InferCtx) -> None:
 def _infer_assign(ctx: _InferCtx, scope: _Scope, stmt: Assign) -> Assign:
     value = _infer_expr(ctx, scope, stmt.value)
     ann_ty = ctx.resolve_annotation(stmt.annotation)
+    existing_raw_ty: Optional[IntType] = None
+    if stmt.annotation is None:
+        for target in stmt.targets:
+            if not isinstance(target, Name):
+                continue
+            current_ty = scope.lookup(target.ident)
+            if not _is_raw_int_type(current_ty):
+                continue
+            if existing_raw_ty is None:
+                existing_raw_ty = current_ty
+            elif existing_raw_ty.name != current_ty.name:
+                _raise_frontend_error(
+                    stmt.span,
+                    "one assignment cannot rebind mixed raw integer lanes",
+                    "split the assignment or use one explicit raw type",
+                )
+        if existing_raw_ty is not None:
+            value = _contextualize_raw_int_constant(value, existing_raw_ty)
+            _check_assign_compatible(existing_raw_ty, value.ty, stmt.span)
+    if _is_raw_int_type(ann_ty):
+        value = _contextualize_raw_int_constant(value, ann_ty)
     extern_marker_annotation = (
         isinstance(value.ty, FuncType)
         and isinstance(ann_ty, ClassType)
@@ -3879,6 +4668,8 @@ def _infer_assign(ctx: _InferCtx, scope: _Scope, stmt: Assign) -> Assign:
         # ``x: extern = extern(...)`` uses ``extern`` as a declaration marker,
         # not as the runtime result type of calling ``x``.
         bind_ty = value.ty
+    elif existing_raw_ty is not None:
+        bind_ty = existing_raw_ty
     elif stmt.annotation is None or isinstance(ann_ty, DynType):
         # An absent annotation is a syntax-level fact and must not depend on
         # runtime class identity.  In a self-hosted fixed-layout compiler the
@@ -4448,17 +5239,14 @@ def _infer_funcdef(
             and index in arg_overrides
         ):
             ty = ctx.resolve_type_refs(arg_overrides[index])
-        new_args.append(
-            replace(
-                a,
-                annotation=ty,
-                default=(
-                    _infer_expr(ctx, param_scope, a.default)
-                    if a.default is not None
-                    else None
-                ),
-            )
+        default = (
+            _infer_expr(ctx, param_scope, a.default)
+            if a.default is not None
+            else None
         )
+        if default is not None and _is_raw_int_type(ty):
+            default = _contextualize_raw_int_constant(default, ty)
+        new_args.append(replace(a, annotation=ty, default=default))
         param_scope.define(a.name, ty)
 
     ret_ty = ctx.resolve_annotation(fn.return_ty)
@@ -4493,6 +5281,8 @@ def _infer_funcdef(
         new_body_items.append(_infer_stmt(ctx, param_scope, body_stmt))
     new_body = tuple(new_body_items)
     ctx.setdefault_none_widen_names = saved_widen_names
+
+    new_body = _contextualize_raw_int_returns(new_body, ret_ty)
 
     # Type-check ``return`` against ``ret_ty``.
     if not fn.is_async and not isinstance(ret_ty, DynType):
@@ -4577,6 +5367,8 @@ def _container_method_return_type(
         if method == "sqrt":
             return TYPE_FLOAT
     if isinstance(recv_ty, ListType):
+        if method == "copy":
+            return recv_ty
         if method == "pop":
             return recv_ty.elem
         if method == "index":
@@ -4584,6 +5376,8 @@ def _container_method_return_type(
         if method in ("append", "extend", "insert", "remove", "sort"):
             return NoneType(name="None")
     if isinstance(recv_ty, DictType):
+        if method == "copy":
+            return recv_ty
         if method in ("get", "pop", "setdefault"):
             return recv_ty.value
         if method == "keys":
@@ -4599,6 +5393,8 @@ def _container_method_return_type(
                 ),
             )
     if isinstance(recv_ty, SetType):
+        if method == "copy":
+            return recv_ty
         if method in ("issubset", "issuperset"):
             return BoolType(name="bool")
     return None
@@ -4790,6 +5586,93 @@ def _class_type_assignable(declared: ClassType, got: ClassType) -> bool:
         if _class_type_assignable(declared, base):
             return True
     return False
+
+
+def _contextualize_raw_int_returns(
+    body: tuple[Stmt, ...],
+    ret_ty: Type,
+) -> tuple[Stmt, ...]:
+    if not _is_raw_int_type(ret_ty):
+        return body
+    out: list[Stmt] = []
+    for stmt in body:
+        if isinstance(stmt, Return) and stmt.value is not None:
+            out.append(
+                replace(
+                    stmt,
+                    value=_contextualize_raw_int_constant(stmt.value, ret_ty),
+                )
+            )
+        elif isinstance(stmt, If):
+            out.append(
+                replace(
+                    stmt,
+                    body=_contextualize_raw_int_returns(stmt.body, ret_ty),
+                    else_body=_contextualize_raw_int_returns(
+                        stmt.else_body,
+                        ret_ty,
+                    ),
+                )
+            )
+        elif isinstance(stmt, While):
+            out.append(
+                replace(
+                    stmt,
+                    body=_contextualize_raw_int_returns(stmt.body, ret_ty),
+                    else_body=_contextualize_raw_int_returns(
+                        stmt.else_body,
+                        ret_ty,
+                    ),
+                )
+            )
+        elif isinstance(stmt, For):
+            out.append(
+                replace(
+                    stmt,
+                    body=_contextualize_raw_int_returns(stmt.body, ret_ty),
+                    else_body=_contextualize_raw_int_returns(
+                        stmt.else_body,
+                        ret_ty,
+                    ),
+                )
+            )
+        elif isinstance(stmt, Try):
+            handlers = []
+            for handler in stmt.handlers:
+                handlers.append(
+                    replace(
+                        handler,
+                        body=_contextualize_raw_int_returns(
+                            handler.body,
+                            ret_ty,
+                        ),
+                    )
+                )
+            out.append(
+                replace(
+                    stmt,
+                    body=_contextualize_raw_int_returns(stmt.body, ret_ty),
+                    handlers=tuple(handlers),
+                    else_body=_contextualize_raw_int_returns(
+                        stmt.else_body,
+                        ret_ty,
+                    ),
+                    finally_body=_contextualize_raw_int_returns(
+                        stmt.finally_body,
+                        ret_ty,
+                    ),
+                )
+            )
+        elif isinstance(stmt, With):
+            out.append(
+                replace(
+                    stmt,
+                    body=_contextualize_raw_int_returns(stmt.body, ret_ty),
+                )
+            )
+        else:
+            out.append(stmt)
+    return tuple(out)
 
 
 def _check_returns(body: tuple[Stmt, ...], ret_ty: Type) -> None:
@@ -5032,6 +5915,8 @@ def infer_module(
         typed_stmt = _infer_stmt(ctx, ctx.globals, stmt)
         new_body.append(typed_stmt)
     new_body = tuple(new_body)
+    if ctx.freestanding:
+        _validate_freestanding_plain_int_stmts(new_body)
     return replace(m, body=new_body)
 
 

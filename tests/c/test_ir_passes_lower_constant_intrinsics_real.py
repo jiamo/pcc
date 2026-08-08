@@ -1,6 +1,6 @@
 """Real-transform tests for LowerConstantIntrinsicsPass (subset)."""
 
-import shutil
+import pytest
 import unittest
 
 from pcc.ir_passes.lower_constant_intrinsics import (
@@ -10,7 +10,9 @@ from pcc.ir_passes.lower_constant_intrinsics import (
 from pcc.ir_passes.parity import assert_ir_parity, run_pcc_ir_pass
 
 
-_OPT = shutil.which("opt")
+from pcc.passes.llvm_text_pipeline import find_opt_binary
+
+_OPT = find_opt_binary()
 
 
 class LowerConstantIntrinsicsTests(unittest.TestCase):
@@ -71,7 +73,7 @@ entry:
         self.assertIn("ret i1 true", out)
 
 
-@unittest.skipUnless(_OPT, "requires LLVM opt")
+@pytest.mark.pcc_gate(unavailable=None if _OPT else "matching LLVM opt not installed")
 class UpstreamParityTests(unittest.TestCase):
     def test_constant_operand_matches_upstream(self):
         report = assert_ir_parity("""

@@ -17,6 +17,9 @@ import subprocess
 from pathlib import Path
 
 
+REPO = Path(__file__).resolve().parents[2]
+
+
 def _run_pcc_program(tmp_path: Path, source: str) -> str:
     src = tmp_path / "prog.py"
     src.write_text(source, encoding="utf-8")
@@ -41,6 +44,14 @@ def _run_pcc_program(tmp_path: Path, source: str) -> str:
 def test_dict_fromkeys_native_no_libpython(tmp_path):
     out = _run_pcc_program(
         tmp_path,
+        "class BadIter:\n"
+        "    def __iter__(self):\n"
+        "        raise ValueError('iter boom')\n"
+        "class BadNext:\n"
+        "    def __iter__(self):\n"
+        "        return self\n"
+        "    def __next__(self):\n"
+        "        raise ValueError('next boom')\n"
         "def main():\n"
         "    print(dict.fromkeys(['a', 'b', 'c'], 0))\n"       # {'a': 0, 'b': 0, 'c': 0}
         "    print(dict.fromkeys([1, 2]))\n"                   # {1: None, 2: None} (default None)
@@ -50,9 +61,19 @@ def test_dict_fromkeys_native_no_libpython(tmp_path):
         "    print(dict.fromkeys(['x', 'y', 'x', 'z']))\n"     # dup key + default None -> single entry
         "    print(dict.fromkeys(['x', 'y', 'x', 'z'], 7))\n"  # dup key + explicit value
         "    print(dict.fromkeys([1, 1, 1]))\n"                # all-dup -> {1: None}
+        "    try:\n"
+        "        dict.fromkeys(BadIter())\n"
+        "        print('iter-missed')\n"
+        "    except ValueError:\n"
+        "        print('iter-error')\n"
+        "    try:\n"
+        "        dict.fromkeys(BadNext())\n"
+        "        print('next-missed')\n"
+        "    except ValueError:\n"
+        "        print('next-error')\n"
         "main()\n",
     )
-    assert out.split("\n")[:8] == [
+    assert out.split("\n")[:10] == [
         "{'a': 0, 'b': 0, 'c': 0}",
         "{1: None, 2: None}",
         "{'a': 1, 'b': 1}",
@@ -61,4 +82,29 @@ def test_dict_fromkeys_native_no_libpython(tmp_path):
         "{'x': None, 'y': None, 'z': None}",
         "{'x': 7, 'y': 7, 'z': 7}",
         "{1: None}",
+        "iter-error",
+        "next-error",
     ], out
+
+
+def test_dict_fromkeys_mirrors_reject_iterator_errors_before_returning_dict():
+    c_source = (REPO / "pcc" / "py_runtime" / "src" / "py_dict.c").read_text(
+        encoding="utf-8"
+    )
+    py_source = (
+        REPO / "pcc" / "py_runtime" / "py" / "py_dict.py"
+    ).read_text(encoding="utf-8")
+
+    c_body = c_source.split("PyObject *py_dict_fromkeys", 1)[1].split(
+        "PyObject *py_dict_pop", 1
+    )[0]
+    py_body = py_source.split("def py_dict_fromkeys", 1)[1].split(
+        "def py_dict_pop", 1
+    )[0]
+
+    for body in (c_body, py_body):
+        assert "py_runtime_error_if_unset" in body
+        assert "dict.fromkeys could not create an iterator" in body
+        assert "dict.fromkeys iterator returned NULL without an exception" in body
+        assert body.count("py_err_occurred()") >= 2
+        assert body.index("py_runtime_error_if_unset") < body.index("py_decref(d)")

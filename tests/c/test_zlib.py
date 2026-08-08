@@ -1,4 +1,5 @@
 import os
+import sys
 
 import pytest
 
@@ -6,7 +7,9 @@ from pcc.evaluater.c_evaluator import CEvaluator
 from pcc.project import collect_translation_units, translation_unit_include_dirs
 from tests.parallel_jobs import translation_unit_jobs
 
-PROJECT_DIR = os.path.dirname(os.path.dirname(__file__))
+PROJECT_DIR = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
 PROJECTS_DIR = os.path.join(PROJECT_DIR, "projects")
 ZLIB_DIR = os.path.join(PROJECTS_DIR, "zlib-1.3.1")
 ZLIB_TEST_MAIN = os.path.join(PROJECTS_DIR, "test_zlib_main.c")
@@ -133,3 +136,40 @@ def test_zlib_runtime_with_self_backend_system_link_depends_on(
     assert "deflate/inflate: hello, hello!" in result.stdout
     assert "OK" in result.stdout
     assert len(emitter_calls) == len(compiled_units)
+
+
+@pytest.mark.pcc_gate(unavailable=None if os.path.isdir(ZLIB_DIR) else "zlib-1.3.1 not found")
+def test_zlib_runtime_with_self_backend_freestanding_libc(
+    zlib_compiled_units_self,
+    tmp_path,
+):
+    compiled_units, base_dir = zlib_compiled_units_self
+    link_map = tmp_path / "zlib-freestanding.map"
+    map_flag = (
+        "-Wl,-map," + str(link_map)
+        if sys.platform == "darwin"
+        else "-Wl,-Map," + str(link_map)
+    )
+
+    result = CEvaluator(
+        backend="self",
+        allow_unimplemented_backend=True,
+    ).run_compiled_translation_units_with_system_cc(
+        compiled_units,
+        optimize=True,
+        base_dir=base_dir,
+        link_args=[map_flag],
+        freestanding_libc=True,
+    )
+
+    assert result.returncode == 0, (
+        "zlib freestanding-libc runtime failed:\n"
+        f"{result.stdout}\n{result.stderr}"
+    )
+    assert "compress/uncompress: hello, hello!" in result.stdout
+    assert "deflate/inflate: hello, hello!" in result.stdout
+    assert "OK" in result.stdout
+    ownership = link_map.read_text(encoding="utf-8")
+    assert "freestanding_mem_str.o" in ownership
+    assert "freestanding_allocator.o" in ownership
+    assert "vendor_" not in ownership

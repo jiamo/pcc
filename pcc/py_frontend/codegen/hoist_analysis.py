@@ -294,7 +294,7 @@ _FIELD_NAMES_BY_KIND = {
     "UnaryOp": ("span", "ty", "op", "operand"),
     "Compare": ("span", "ty", "op", "lhs", "rhs"),
     "BoolExpr": ("span", "ty", "op", "left", "right"),
-    "Call": ("span", "ty", "func", "args", "kwargs"),
+    "Call": ("span", "ty", "func", "args", "kwargs", "operand_order"),
     "Attr": ("span", "ty", "obj", "name"),
     "Subscript": ("span", "ty", "obj", "idx"),
     "Slice": ("span", "ty", "lo", "hi", "step"),

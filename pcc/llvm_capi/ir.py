@@ -11,8 +11,7 @@ method signatures — so codegen call sites are **zero-change** when
 switching via ``PCC_USE_LLVMCAPI=1``.
 
 **Scope exclusions** (β4.3 work, not here):
-- Debug info (``DIToken``, ``module.add_debug_info``): raises NotImplementedError
-- Metadata ``!N`` auto-numbering: skeleton only, not byte-perfect to llvmlite
+- Metadata canonicalization is semantic rather than byte-identical to llvmlite
 - Rare ir.* long-tail: use ``__getattr__`` shim that raises clear errors
 
 The implementation philosophy matches ``pcc.parse.py_parse`` /
@@ -26,6 +25,13 @@ import os
 import sys
 from typing import Iterable, Optional
 
+from pcc.stdlib._float_bits import (
+    _bits_to_float64 as _shared_bits_to_float64,
+    _float64_to_bits as _shared_float64_to_bits,
+    _round_to_float16 as _shared_round_to_float16,
+    _round_to_float32 as _shared_round_to_float32,
+)
+
 
 def _hex64(value: int) -> str:
     digits = "0123456789ABCDEF"
@@ -38,37 +44,8 @@ def _hex64(value: int) -> str:
 
 
 def _float64_to_bits_ir(f: float) -> int:
-    """Return the IEEE 754 binary64 bit pattern using pcc-friendly ops."""
-    if f != f:
-        return 0x7FF8000000000000
-    inf = 1e309
-    if f == inf:
-        return 0x7FF0000000000000
-    if f == -inf:
-        return 0xFFF0000000000000
-    if f == 0.0:
-        text = str(f)
-        if len(text) > 0 and text[0] == "-":
-            return 0x8000000000000000
-        return 0
-    sign = 0
-    if f < 0.0:
-        sign = 1
-        f = -f
-    exp = 0
-    while f >= 2.0:
-        f = f * 0.5
-        exp += 1
-    while f < 1.0:
-        f = f * 2.0
-        exp -= 1
-    mantissa_bits = int((f - 1.0) * 4503599627370496.0)
-    biased_exp = exp + 1023
-    if biased_exp <= 0:
-        return sign << 63
-    if biased_exp >= 0x7FF:
-        return (sign << 63) | 0x7FF0000000000000
-    return (sign << 63) | (biased_exp << 52) | mantissa_bits
+    """Return the canonical IEEE 754 binary64 bit pattern."""
+    return _shared_float64_to_bits(f)
 
 
 def _coerce_float64_ir(value) -> float:
@@ -77,38 +54,7 @@ def _coerce_float64_ir(value) -> float:
 
 
 def _bits_to_float64_ir(bits: int) -> float:
-    sign = (bits >> 63) & 1
-    biased_exp = (bits >> 52) & 0x7FF
-    mantissa = bits & ((1 << 52) - 1)
-    inf = 1e309
-    if biased_exp == 0x7FF:
-        if mantissa == 0:
-            return -inf if sign else inf
-        return inf - inf
-    if biased_exp == 0:
-        if mantissa == 0:
-            return -0.0 if sign else 0.0
-        f = mantissa / 4503599627370496.0
-        i = 0
-        while i < 11:
-            f = f * 0.0009765625
-            i += 1
-        f = f * 2.0
-        return -f if sign else f
-    m_frac = 1.0 + mantissa / 4503599627370496.0
-    exp = biased_exp - 1023
-    f = m_frac
-    if exp >= 0:
-        i = 0
-        while i < exp:
-            f = f * 2.0
-            i += 1
-    else:
-        i = 0
-        while i < -exp:
-            f = f * 0.5
-            i += 1
-    return -f if sign else f
+    return _shared_bits_to_float64(bits)
 
 
 def _env_flag_enabled(name: str) -> bool:
@@ -190,63 +136,11 @@ def _join_text(parts, sep: str) -> str:
 
 
 def _round_to_float32_ir(f: float) -> float:
-    inf = 1e309
-    if f != f or f == inf or f == -inf or f == 0.0:
-        return f
-    bits = _float64_to_bits_ir(f)
-    sign = (bits >> 63) & 1
-    biased_exp = (bits >> 52) & 0x7FF
-    mantissa = bits & ((1 << 52) - 1)
-    f32_exp = biased_exp - 1023 + 127
-    bits_to_drop = 52 - 23
-    keep = mantissa >> bits_to_drop
-    halfway = 1 << (bits_to_drop - 1)
-    remainder = mantissa & ((1 << bits_to_drop) - 1)
-    if remainder > halfway:
-        keep += 1
-    elif remainder == halfway and (keep & 1):
-        keep += 1
-    if keep >= (1 << 23):
-        keep = 0
-        f32_exp += 1
-    if f32_exp >= 255:
-        return -inf if sign else inf
-    if f32_exp <= 0:
-        return -0.0 if sign else 0.0
-    new_biased_exp = f32_exp - 127 + 1023
-    new_mantissa = keep << bits_to_drop
-    new_bits = (sign << 63) | (new_biased_exp << 52) | new_mantissa
-    return _bits_to_float64_ir(new_bits)
+    return _shared_round_to_float32(f)
 
 
 def _round_to_float16_ir(f: float) -> float:
-    inf = 1e309
-    if f != f or f == inf or f == -inf or f == 0.0:
-        return f
-    bits = _float64_to_bits_ir(f)
-    sign = (bits >> 63) & 1
-    biased_exp = (bits >> 52) & 0x7FF
-    mantissa = bits & ((1 << 52) - 1)
-    f16_exp = biased_exp - 1023 + 15
-    bits_to_drop = 52 - 10
-    keep = mantissa >> bits_to_drop
-    halfway = 1 << (bits_to_drop - 1)
-    remainder = mantissa & ((1 << bits_to_drop) - 1)
-    if remainder > halfway:
-        keep += 1
-    elif remainder == halfway and (keep & 1):
-        keep += 1
-    if keep >= (1 << 10):
-        keep = 0
-        f16_exp += 1
-    if f16_exp >= 31:
-        return -inf if sign else inf
-    if f16_exp <= 0:
-        return -0.0 if sign else 0.0
-    new_biased_exp = f16_exp - 15 + 1023
-    new_mantissa = keep << bits_to_drop
-    new_bits = (sign << 63) | (new_biased_exp << 52) | new_mantissa
-    return _bits_to_float64_ir(new_bits)
+    return _shared_round_to_float16(f)
 
 
 # ---------------------------------------------------------------------------
@@ -891,6 +785,159 @@ Undefined = Undefined()  # module-level singleton instance
 
 
 # ---------------------------------------------------------------------------
+# Metadata — the finite surface used by C ``-g`` debug information.
+# ---------------------------------------------------------------------------
+
+
+def _escape_metadata_string(value: str) -> str:
+    out = []
+    digits = "0123456789ABCDEF"
+    for byte in value.encode("utf-8"):
+        if 32 <= byte <= 126 and byte not in (34, 92):
+            out.append(chr(byte))
+        else:
+            out.append("\\" + digits[(byte >> 4) & 15] + digits[byte & 15])
+    return _join_text(out, "")
+
+
+class DIToken:
+    """Bare DWARF enumeration token such as ``DW_LANG_C99``."""
+
+    def __init__(self, value: str) -> None:
+        self.value = value
+
+
+class MetaDataString:
+    """String operand in a generic ``!{...}`` metadata node."""
+
+    def __init__(self, parent: "Module", string: str) -> None:
+        self.parent = parent
+        self.string = string
+
+    def render_operand(self) -> str:
+        return '!"' + _escape_metadata_string(self.string) + '"'
+
+
+class _MetadataNode:
+    def __init__(self, parent: "Module", name: int) -> None:
+        self.parent = parent
+        self.name = name
+
+    def get_reference(self) -> str:
+        return "!" + str(self.name)
+
+    def __str__(self) -> str:
+        return self.get_reference()
+
+
+def _render_metadata_operand(value) -> str:
+    if isinstance(value, _MetadataNode):
+        return value.get_reference()
+    if isinstance(value, MetaDataString):
+        return value.render_operand()
+    if isinstance(value, Constant):
+        return str(value.type) + " " + str(value)
+    if value is None:
+        return "null"
+    raise TypeError("invalid generic metadata operand: " + repr(value))
+
+
+class _MetadataTuple(_MetadataNode):
+    def __init__(self, parent: "Module", name: int, operands) -> None:
+        super().__init__(parent, name)
+        self.operands = tuple(operands)
+
+    def render(self) -> str:
+        rendered = [_render_metadata_operand(value) for value in self.operands]
+        return self.get_reference() + " = !{ " + _join_text(rendered, ", ") + " }"
+
+
+def _render_di_operand(value) -> str:
+    if value is None:
+        return "null"
+    if value is True:
+        return "true"
+    if value is False:
+        return "false"
+    if isinstance(value, DIToken):
+        return str(value.value)
+    if isinstance(value, str):
+        return '"' + _escape_metadata_string(value) + '"'
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, Constant):
+        return str(value.type) + " " + str(value)
+    if isinstance(value, _MetadataNode):
+        return value.get_reference()
+    raise TypeError("invalid debug metadata operand: " + repr(value))
+
+
+class _DebugMetadataNode(_MetadataNode):
+    def __init__(
+        self,
+        parent: "Module",
+        name: int,
+        kind: str,
+        fields: dict,
+        is_distinct: bool,
+    ) -> None:
+        super().__init__(parent, name)
+        self.kind = kind
+        self.fields = tuple(sorted(fields.items()))
+        self.is_distinct = is_distinct
+
+    def render(self) -> str:
+        operands = []
+        for key, value in self.fields:
+            operands.append(str(key) + ": " + _render_di_operand(value))
+        distinct = "distinct " if self.is_distinct else ""
+        return (
+            self.get_reference()
+            + " = "
+            + distinct
+            + "!"
+            + str(self.kind)
+            + "("
+            + _join_text(operands, ", ")
+            + ")"
+        )
+
+
+def _render_metadata_definition(node: _MetadataNode) -> str:
+    """Render one member of ``Module.metadata`` without dynamic fallback.
+
+    ``Module.metadata`` is deliberately a closed collection in this IR
+    implementation: ``add_metadata`` appends ``_MetadataTuple`` and
+    ``add_debug_info`` appends ``_DebugMetadataNode``.  Calling
+    ``node.render()`` through the common base loses that concrete type in the
+    typed frontend and would pull in CPython merely to choose between these
+    two native implementations.  Keep the closed dispatch explicit, and fail
+    if a future metadata kind is added without extending the renderer.
+    """
+    if isinstance(node, _MetadataTuple):
+        return node.render()
+    if isinstance(node, _DebugMetadataNode):
+        return node.render()
+    raise TypeError("unsupported metadata definition: " + repr(node))
+
+
+class _NamedMetadata:
+    def __init__(self, parent: "Module", name: str) -> None:
+        self.parent = parent
+        self.name = name
+        self.operands = []
+
+    def add(self, node: _MetadataNode) -> None:
+        if not isinstance(node, _MetadataNode):
+            raise TypeError("named metadata requires a metadata node")
+        self.operands.append(node)
+
+    def render(self) -> str:
+        refs = [node.get_reference() for node in self.operands]
+        return "!" + self.name + " = !{ " + _join_text(refs, ", ") + " }"
+
+
+# ---------------------------------------------------------------------------
 # Function + Block containers
 # ---------------------------------------------------------------------------
 
@@ -937,9 +984,33 @@ class InstructionRecord:
         self.text = text
         self.opname = opname
         self.block = block
+        self._metadata: dict[str, _MetadataNode] = {}
 
     def __str__(self) -> str:
         return self.text
+
+    def set_metadata(self, name: str, node: "_MetadataNode") -> None:
+        """Attach instruction metadata using llvmlite's public API shape.
+
+        C debug lowering adds locations only after the function body is
+        complete, so the instruction text is stable here.  Keep the node map
+        nevertheless: a repeated attachment replaces the prior suffix instead
+        of emitting two ``!dbg`` operands.
+        """
+        if not isinstance(node, _MetadataNode):
+            raise TypeError("instruction metadata requires a metadata node")
+        prior = self._metadata.get(name)
+        text = self.text
+        if prior is not None:
+            old_suffix = ", !" + str(name) + " " + prior.get_reference()
+            if not text.endswith(old_suffix):
+                raise ValueError(
+                    "instruction metadata text is out of sync: " + str(name)
+                )
+            text = text[: -len(old_suffix)]
+        self._metadata[name] = node
+        text += ", !" + str(name) + " " + node.get_reference()
+        self.block._replace_record_text(self, text)
 
 
 def _opname_of(line: str) -> str:
@@ -1243,6 +1314,7 @@ class Function(Value):
         self.linkage = ""
         self.attributes = FunctionAttributes()
         self.calling_convention = ""
+        self._metadata: dict[str, _MetadataNode] = {}
         # Mark external if no blocks ever appended — subset of llvmlite's
         # behavior (``declare`` vs ``define``).
         module._functions.append(self)
@@ -1312,6 +1384,11 @@ class Function(Value):
         """All basic blocks — matches llvmlite's attribute."""
         return list(self.blocks)
 
+    def set_metadata(self, name: str, node: _MetadataNode) -> None:
+        if not isinstance(node, _MetadataNode):
+            raise TypeError("function metadata requires a metadata node")
+        self._metadata[name] = node
+
     def render(self) -> str:
         """Render the function as LLVM IR text."""
         fty = self.ftype
@@ -1338,12 +1415,18 @@ class Function(Value):
         # Personality + attributes (declarations don't carry them).
         pers_text = ""
         attrs_text = ""
+        metadata_text = ""
         if self.attributes.personality is not None:
             pers = self.attributes.personality
             pers_ty = PointerType(pers.ftype)
             pers_text = " personality " + str(pers_ty) + " @" + str(pers.name)
         if self.attributes._attrs:
             attrs_text = " " + _join_text(sorted(self.attributes._attrs), " ")
+        if self._metadata:
+            metadata_parts = []
+            for key, node in self._metadata.items():
+                metadata_parts.append("!" + str(key) + " " + node.get_reference())
+            metadata_text = " " + _join_text(metadata_parts, " ")
 
         if not self.blocks:
             arg_type_parts = []
@@ -1365,6 +1448,7 @@ class Function(Value):
                 + arg_type_only
                 + ")"
                 + attrs_text
+                + metadata_text
                 + "\n"
             )
         if (
@@ -1436,6 +1520,7 @@ class Function(Value):
                 ")",
                 attrs_text,
                 pers_text,
+                metadata_text,
                 " {\n",
                 body,
                 "}\n",
@@ -1560,6 +1645,7 @@ class GlobalVariable(Value):
         self.value_type = stable_type
         self.name = stable_name
         self.linkage = ""
+        self.storage_class = ""
         self.global_constant = False
         self.initializer: Optional[Value] = None
         self.addrspace = addrspace
@@ -1601,6 +1687,9 @@ class GlobalVariable(Value):
 
     def render(self) -> str:
         linkage = str(self.linkage) + " " if self.linkage else ""
+        storage_class = (
+            str(self.storage_class) + " " if self.storage_class else ""
+        )
         kind = "constant" if self.global_constant else "global"
         init_text = ""
         if self.initializer is not None:
@@ -1613,6 +1702,7 @@ class GlobalVariable(Value):
             + str(self.name)
             + " = "
             + linkage
+            + storage_class
             + kind
             + " "
             + str(self.value_type)
@@ -1641,7 +1731,9 @@ class Module:
         self._globals: list[GlobalVariable] = []
         self.globals: dict = {}
         # Named metadata (e.g. ``!llvm.dbg.cu = !{!0}``) — β4.3 surface.
-        self._named_metadata: dict[str, list] = {}
+        self._named_metadata: dict[str, _NamedMetadata] = {}
+        self.namedmetadata = self._named_metadata
+        self.metadata: list[_MetadataNode] = []
         self.context = context or global_context
         self._name_counters: dict[str, int] = {}
 
@@ -1672,19 +1764,45 @@ class Module:
             self._globals.append(gv)
         self.globals[gv.name] = gv
 
-    def add_named_metadata(self, name: str, node=None) -> None:
-        """β4.3 placeholder — collect named metadata nodes."""
-        if name not in self._named_metadata:
-            self._named_metadata[name] = []
-        if node is not None:
-            self._named_metadata[name].append(node)
+    def add_metadata(self, operands):
+        if not isinstance(operands, (list, tuple)):
+            raise TypeError("expected a list or tuple of metadata values")
+        normalized = []
+        for value in operands:
+            if isinstance(value, str):
+                normalized.append(MetaDataString(self, value))
+            else:
+                normalized.append(value)
+        node = _MetadataTuple(self, len(self.metadata), normalized)
+        self.metadata.append(node)
+        return node
 
-    def add_debug_info(self, node_type: str, fields: dict, is_distinct: bool = False):
-        """β4.3 surface — raises for now."""
-        raise NotImplementedError(
-            "pcc.llvm_capi.ir debug info (DIFile/DISubprogram/...) "
-            "is a β4.3 scope item. Currently hit via emit_debug=True."
+    def add_named_metadata(self, name: str, node=None) -> _NamedMetadata:
+        named = self._named_metadata.get(name)
+        if named is None:
+            named = _NamedMetadata(self, name)
+            self._named_metadata[name] = named
+        if node is not None:
+            if not isinstance(node, _MetadataNode):
+                node = self.add_metadata(node)
+            named.add(node)
+        return named
+
+    def add_debug_info(
+        self,
+        node_type: str,
+        fields: dict,
+        is_distinct: bool = False,
+    ):
+        node = _DebugMetadataNode(
+            self,
+            len(self.metadata),
+            node_type,
+            fields,
+            is_distinct,
         )
+        self.metadata.append(node)
+        return node
 
     def __str__(self) -> str:
         parts: list[str] = []
@@ -1739,6 +1857,13 @@ class Module:
                 except Exception:
                     pass
             parts.append(rendered_fn)
+            i += 1
+        if self._named_metadata:
+            for named in self._named_metadata.values():
+                parts.append(named.render())
+        i = 0
+        while i < len(self.metadata):
+            parts.append(_render_metadata_definition(self.metadata[i]))
             i += 1
         out = _join_text(parts, "\n")
         if _debug_ir_render_enabled():
@@ -2658,6 +2783,37 @@ class IRBuilder:
         )
         return v
 
+    def syscall6(
+        self,
+        nr: Value,
+        a1: Value,
+        a2: Value,
+        a3: Value,
+        a4: Value,
+        a5: Value,
+        a6: Value,
+        name: str = "",
+    ) -> Value:
+        """Raw Linux x86_64 syscall as an inline-asm call (musl ABI).
+
+        One fixed shape so the self backend can recognize it exactly:
+        rax=nr, args in rdi/rsi/rdx/r10/r8/r9, rcx/r11/memory clobbered.
+        """
+        v = self._next(name, IntType(64))
+        args = [nr, a1, a2, a3, a4, a5, a6]
+        arg_parts = []
+        for arg in args:
+            arg_parts.append("i64 " + _value_ref(arg))
+        self._emit(
+            str(v)
+            + ' = call i64 asm sideeffect "syscall", '
+            + '"={rax},{rax},{rdi},{rsi},{rdx},{r10},{r8},{r9},'
+            + '~{rcx},~{r11},~{memory}"('
+            + _join_text(arg_parts, ", ")
+            + ")"
+        )
+        return v
+
     def landingpad(
         self,
         ty: Type,
@@ -2804,6 +2960,11 @@ class PhiInstr(Value):
         self.type = ty
         self._ref = "%" + str(name)
         self._builder = builder
+        # A phi is owned by the block in which it was created.  Incoming
+        # edges are commonly added only after the builder has emitted a
+        # backedge in another block, so refreshing through builder._block
+        # would silently edit the wrong block (and leave the phi incomplete).
+        self._parent_block = builder._block
         self._incomings: list[tuple[Value, Block]] = []
         self._placeholder_line = ""
         self._refresh()
@@ -2829,7 +2990,7 @@ class PhiInstr(Value):
             self._placeholder_line = str(self) + " = phi " + str(self.type)
         # Update the emitted line in-place — scan records for the
         # prior placeholder and replace its text field.
-        blk: Block = self._builder._block
+        blk: Block = self._parent_block
         if blk is None:
             return
         i = 0
@@ -3080,6 +3241,43 @@ def FunctionType___init__2(return_type, arg0, arg1):
     return FunctionType(return_type, (arg0, arg1))
 
 
+def FunctionType___init__3(return_type, arg0, arg1, arg2):
+    return FunctionType(return_type, (arg0, arg1, arg2))
+
+
+def FunctionType___init__4(return_type, arg0, arg1, arg2, arg3):
+    return FunctionType(return_type, (arg0, arg1, arg2, arg3))
+
+
+def FunctionType___init__5(return_type, arg0, arg1, arg2, arg3, arg4):
+    return FunctionType(return_type, (arg0, arg1, arg2, arg3, arg4))
+
+
+def FunctionType___init__6(return_type, arg0, arg1, arg2, arg3, arg4, arg5):
+    return FunctionType(return_type, (arg0, arg1, arg2, arg3, arg4, arg5))
+
+
+def FunctionType___init__7(return_type, arg0, arg1, arg2, arg3, arg4, arg5, arg6):
+    return FunctionType(return_type, (arg0, arg1, arg2, arg3, arg4, arg5, arg6))
+
+
+def FunctionType___init__8(
+    return_type,
+    arg0,
+    arg1,
+    arg2,
+    arg3,
+    arg4,
+    arg5,
+    arg6,
+    arg7,
+):
+    return FunctionType(
+        return_type,
+        (arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7),
+    )
+
+
 def FunctionType___init___dyn(return_type, args, var_arg):
     return FunctionType(return_type, args, var_arg=bool(var_arg))
 
@@ -3166,6 +3364,33 @@ def IRBuilder_call7(builder, fn, arg0, arg1, arg2, arg3, arg4, arg5, arg6):
     return _irbuilder_call_from_args_list(
         builder, fn, [arg0, arg1, arg2, arg3, arg4, arg5, arg6]
     )
+
+
+def IRBuilder_call8(
+    builder,
+    fn,
+    arg0,
+    arg1,
+    arg2,
+    arg3,
+    arg4,
+    arg5,
+    arg6,
+    arg7,
+):
+    return _irbuilder_call_from_args_list(
+        builder,
+        fn,
+        [arg0, arg1, arg2, arg3, arg4, arg5, arg6, arg7],
+    )
+
+
+def LiteralStructType_dyn(elements):
+    """Dynamic-list constructor for the closed-world LiteralStructType
+    scaffold path.  Mirrors ``IRBuilder_call_dyn``: a literal per-arity
+    extern is impossible when the element count is only known at runtime,
+    so the caller passes a pre-built list handle."""
+    return LiteralStructType(tuple(elements))
 
 
 def IRBuilder_call_dyn(builder, fn, args):

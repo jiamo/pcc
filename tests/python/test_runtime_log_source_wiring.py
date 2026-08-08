@@ -47,3 +47,18 @@ def test_integer_coded_runtime_log_api_is_declared_for_pcc_python_ports():
     impl = _read("src/pcc_runtime_log.c")
     assert "pcc_runtime_log_event_code" in header
     assert "pcc_runtime_log_category_from_code" in impl
+
+
+def test_runtime_log_init_suppresses_reentrant_events_before_first_getenv():
+    c_src = _read("src/pcc_runtime_log.c")
+    py_src = _read("py/py_runtime_log.py")
+
+    c_init = c_src.split("static void pcc_runtime_log_init_once(void)", 1)[1]
+    assert c_init.index("&pcc_runtime_log_fast_state") < c_init.index(
+        'pcc_runtime_getenv("PCC_LOG")'
+    )
+
+    py_init = py_src.split("def _init_once() -> None:", 1)[1]
+    assert py_init.index('global_addr("pcc_runtime_log_fast_state")') < py_init.index(
+        'pcc_platform_getenv(cstr("PCC_LOG"))'
+    )

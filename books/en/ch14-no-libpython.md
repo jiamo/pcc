@@ -1,175 +1,212 @@
-# Chapter 14: No-libpython — Shrinking the Runtime to a Kernel
+# Chapter 14: No-libpython and Zero-libc — Making the Runtime pcc-Python
 
-No-libpython is the most frequently misread word in the pcc thesis. It does not mean "there is no C in the binary," and it certainly does not mean "the runtime has been eliminated." Its precise meaning fits in one sentence: **the compiled artifact does not depend on the CPython runtime.** This chapter covers all of the machinery pcc has built to make that sentence true: the four-layer runtime model (a C kernel kept and minimized, a C semantic runtime shrinking, a pcc-Python runtime growing, a C-API shim kept and specified); the two doors that let pcc-Python write low-level code ([pcc/extern/](../../pcc/extern) and [pcc/unsafe/](../../pcc/unsafe)); the mirror discipline between the dual C and pcc-Python implementations, together with a build fact most people get wrong on first guess — the default build links the pcc-Python ports, not the C sources; and finally the fallback ratchet ([tests/fallback_baseline.json](../../tests/fallback_baseline.json)), which turns "how much is left" into a one-way gate. The three case studies all come from real investigations in May 2026: the false confidence handed out by cc mode, the four paths of float repr, and the idiom-diff method that powers this entire front. The bootstrap fixed point itself — pcc1→pcc2→pcc3 — belongs to Chapter 15; this chapter answers only one question: where does a runtime without libpython come from, and where is the boundary guarded?
+No-libpython excludes the CPython runtime. Zero-libc goes further by excluding the C standard library and its dynamic-link closure. “The production runtime is authored in pcc-Python” is a third statement, about implementation ownership. The three are related but not interchangeable. This chapter uses the August 2026 source and evidence state. It explains why pcc no longer treats a permanent hand-written C kernel as the destination: allocation, threads, safepoints, all five collectors, platform wrappers, C-API entry points, and the libc-like substrate are moving into a strict freestanding pcc-Python subset. The compiler retains only machine intrinsics for raw memory, atomics, system calls, and ABI operations; C and vendored-libc sources become differential oracles. On Linux, the target is a supported static closure with no production C/libc objects, `PT_INTERP`, `DT_NEEDED`, or undefined symbols. Darwin deliberately enters the operating system through named libSystem ABI calls and must never be labeled zero-libc.
 
-## Chapter Overview: No-libpython Does Not Mean "No C"
+## 14.1 The Problem and Design Space: Four Non-Interchangeable Claims
 
-Start by removing one misconception: no-libpython means leaving the CPython runtime behind, not deleting every low-level C boundary. pcc still needs a small, stable C-level kernel for platform, ABI, allocation, threading, and GC primitives; the layer to shrink is the hand-written C semantic runtime.
+A native Python artifact can remove bytecode interpretation while still linking libpython. It can avoid libpython while depending on libc, the system dynamic loader, and a collection of hand-written C runtime objects. It can even close a static tracer without carrying the complete object model, extension ABI, and five collectors into that closure. The phrase “standalone binary” erases all of these boundaries.
 
-- The C-level kernel is the machine boundary and should stay small and explicit.
-- The C semantic runtime is the migration target: high-level containers, dunder behavior, exceptions, and other Python semantics should move out of it.
-- The pcc-Python runtime is the growth direction, because it makes semantics self-hostable, testable, and compilable by pcc.
+This book uses four claim levels:
 
-## 14.1 The Problem and the Design Space: Independent of CPython, Not Zero C
+| Claim | Exact meaning | Does not imply |
+|---|---|---|
+| no-libpython | The artifact neither links nor loads CPython, and strict lowering has no `py_cpy_*` escape | No libc or hand-written C |
+| pcc-Python-owned runtime | Production archive members are objects compiled by pcc from `pcc/py_runtime/py/*.py` | No platform dynamic dependency in the final executable |
+| Linux zero-libc tracer | The named Linux x86_64 tracer is static, with no interpreter, dynamic dependency, or undefined symbol | The full Python runtime is zero-libc |
+| Linux production zero-libc | The supported complete static closure has no production C/libc object, `PT_INTERP`, `DT_NEEDED`, or undefined symbol | The same boundary applies to Darwin |
 
-Every project that compiles Python to native code must answer the same question: where does the runtime come from? The design space holds three candidates.
-
-**Alternative one: link libpython and keep CPython as the permanent runtime.** This is the fastest compatibility route: object model, GC, strings, import — everything is already there. The price is that execution ownership stays with CPython. You cannot swap the GC, cannot change the object header, cannot audit import semantics; the five-GC laboratory (Chapter 10) and the value model (Chapter 16) become impossible to even discuss. pcc does not reject this surface: it still exists under `--python-libpython=on/auto`, and it is the foundation of the C-extension compatibility work in Chapter 17. What pcc rejects is treating it as the **default** and the **destination**.
-
-**Alternative two: rewrite a complete Python runtime in C.** The traditional route. It yields an independent artifact, but it manufactures a C semantic runtime that grows without bound: list, dict, str, dunders, exceptions, coroutines — every piece hand-written C, running directly against the self-hosting goal of "write the compiler in Python and have it compile itself." Worse, the moment the pcc-Python side also needs a copy (the bootstrap closure requires one), you have two parallel semantic implementations, and drift is only a matter of time.
-
-**pcc's choice: shrink to a kernel.** The Runtime layering section of [AGENTS.md](../../AGENTS.md) states the target in one sentence: minimize the C-level runtime into a small ABI kernel — allocation, object headers, atomics and refcount barriers, platform syscalls, threading primitives, dynamic loading, C-extension entrypoints, safepoints and stack maps, GC primitives — while Python *semantics* migrate into pcc-Python and are compiled by pcc itself. The C kernel remains as the machine boundary; it **must not** become a second, hand-maintained C version of the Python semantic runtime running in parallel with the pcc-Python one. The same section pins down the meaning of this chapter's title: no-libpython means not depending on the CPython runtime, **not** that the final binary contains zero C-level runtime.
-
-The choice is enforced by a tri-state flag on the CLI. `--python-libpython` defaults to `off`: any code generation that would require a CPython fallback is a hard error; `auto` links only when the fallback is genuinely needed; `on` always permits it. The teeth of `off` live in `_finalize_libpython_mode()` in [pcc/py_frontend/pipeline.py](../../pcc/py_frontend/pipeline.py): when the mode is `off` and a fallback need is detected, it raises `PyPipelineError` outright, with a message beginning `Python pipeline requires libpython fallback for ...` and a hint to use `--python-libpython=auto/on` instead. Failure must be loud — this is the strict-mode philosophy of Chapter 5 extended to the link boundary. (A diagnostic bypass, `PCC_DEBUG_LIBPYTHON_GATE_BYPASS`, exists, but it announces itself on stderr — a bypass, not a disguise.)
-
-"Needs a fallback" has a countable shape at the IR level: `py_cpy_*` calls. This symbol family is the CPython bridge ABI, implemented in [pcc/py_runtime/src/py_libpython.c](../../pcc/py_runtime/src/py_libpython.c) — `py_cpy_import` goes through `PyImport_ImportModule`, `py_cpy_getattr` through `PyObject_GetAttr`, and so on. One decision from that file's design comments is worth transcribing: CPython's `PyObject *` and pcc's own `PyObject *` (the tagged small-int plus user-class layout defined in `py_internal.h`) are **different types**, exposed to code generation as opaque `void *` — "the two pointer namespaces never alias." The entire file sits behind `#ifdef PCC_WITH_LIBPYTHON`; the runtime archive of a default build contains no real implementation at all. Claim hygiene thereby gets a mechanical criterion: an artifact that claims no-libpython is not allowed a single `py_cpy_*` call in its IR — the ratchet of Section 14.5 is built on exactly this criterion.
-
-## 14.2 The Four-Layer Model: One Verb per Layer
-
-[AGENTS.md](../../AGENTS.md) assigns each of the four layers a verb. This is not rhetoric; it is task assignment:
+These levels form an evidence ladder, not a vocabulary list:
 
 ```text
-C-level kernel        KEEP (minimize): platform/ABI, alloc, atomics, threads,
-                      dlopen, syscalls, safepoints, GC slot/root primitives.
-                      Knows no high-level Python semantics (no list/dict/dunder/
-                      valueclass/import policy; no `if package == "numpy"`).
-C semantic runtime    SHRINK: hand-written C list/dict/str/dunder/exception
-                      semantics -> migrate to pcc-Python.
-pcc-Python runtime    GROW: the migration target; Python semantics authored in
-                      pcc-Python, self-hostable, testable, compiled by pcc.
-C-API shim            KEEP but spec/generate: the ABI surface extensions see;
-                      != CPython/libpython.
+strict lowering
+     |
+     v
+no py_cpy_* / no libpython
+     |
+     v
+pcc-Python-owned runtime archive
+     |
+     +---- Darwin: named libSystem ABI (not zero-libc)
+     |
+     +---- Linux tracer: raw syscalls + static ELF (proven slice)
+                    |
+                    v
+          full production zero-libc closure (final gate open)
 ```
 
-Each layer has concrete members in the repository. The **C kernel**'s members are scattered through [pcc/py_runtime/src/](../../pcc/py_runtime/src): `pcc_threads.c` (threading primitives), `py_os_native.c` (the syscall boundary), `py_gc_index_table.c` (GC index primitives), `pcc_runtime_log.c`. The criterion is not file size but a knowledge boundary: the kernel may know about "pointers, atomics, pages"; it may not know "this is a dict." Special-casing of the `if package == "numpy"` variety is banned by repository rule at every layer, but at the kernel layer it is uniquely fatal — it welds policy into the machine boundary.
+The easier alternative is to stop at a small permanent C kernel: C owns allocation, threads, GC, and ABI machinery, while pcc-Python owns only containers and dunder semantics. That design is simpler, but it cannot satisfy the stronger execution-ownership thesis. The compiler still needs a second implementation language to produce its own runtime; collector policy retains two potential owners across C and Python; and the Linux zero-libc claim fails before archive composition is even considered. The present direction is therefore not “minimize the C kernel.” It is **remove production C implementation while retaining compiler-owned machine intrinsics and explicit operating-system ABI boundaries**.
 
-The **C semantic runtime** is most of the rest of `src/`: `py_list.c`, `py_dict.c`, `py_str.c`, `py_dunder.c`, the `py_exc_*.c` family — these are the objects of shrinkage. The **pcc-Python runtime** is the fifty-plus port files under [pcc/py_runtime/py/](../../pcc/py_runtime/py) — `py_list.py`, `py_dict.py`, `py_obj.py`, `py_gc_backend.py` — mirroring the C implementations file by file (the mirror discipline is Section 14.4's subject). The **C-API shim** is `src/py_capi_shim.c`: roughly 286 `Py*` symbols implemented over pcc's own object model with no libpython dependency, through which C extensions see an ABI surface that "looks like CPython"; its full treatment is Chapter 17.
+## 14.2 The New Runtime Layers: Implementation Knowledge, Not File Extensions
 
-Why "shrink" rather than "eliminate"? Because of the four layers, only the kernel holds things pcc-Python cannot express. Chapter 9 showed a concrete example: the refcount logic of `py_obj.c` can be wholesale replaced by its port, but the type-specific deallocators must touch flexible array members and stay in C. By the same token, there is no Python beneath `malloc`. The honest goal is to make the stock of C decrease monotonically, with every remaining piece of C able to say why it must be C — rather than to proclaim a zero that cannot be reached.
-
-What prevents "a second set of rules" is not a wish but a contract: the five GC backends, the C kernel, and the pcc-Python mirror all consume **one** slot-level trace/update contract (`py_obj_visit_slots` / `py_obj_update_slot` / root and frame registration; see Chapter 10). There is exactly one set of object-graph rules; anyone who tries to keep a private copy runs straight into the Production Equality Rule.
-
-## 14.3 Two Doors: pcc.extern and pcc.unsafe
-
-Before semantics can migrate into pcc-Python, a mechanical question needs an answer: how does Python code call `malloc`? How does it read an object header at a byte offset? pcc opens two doors, one for each side of the question.
-
-**[pcc/extern/](../../pcc/extern) governs "calling out."** The `extern()` factory returns a frozen `ExternFn` dataclass: symbol name, a tuple of C argument types, the return type, and whether the call is variadic. The type markers (`c_int64`, `c_ptr`, `c_str`, ...) are `_CType` instances mapping one-to-one onto LLVM IR types. The module docstring's example:
-
-```python
-from pcc.extern import extern, c_int, c_str
-
-printf: extern = extern(
-    "printf", argtypes=(c_str,), restype=c_int, variadic=True,
-)
-```
-
-The crux is the lowering semantics: the frontend (the `ExternScaffoldMixin` in [pcc/py_frontend/codegen/extern_lowering.py](../../pcc/py_frontend/codegen/extern_lowering.py), together with layer1's extern-call emission) rewrites every call site that goes through an `ExternFn` into a **direct LLVM `call`** to the named external symbol — no Python trampoline, no `py_obj_*` detour; the emitted machine code is just a `bl <symbol>` plus the necessary integer truncations and extensions. The body of `ExternFn.__call__` is a runtime trap: it is reachable only when CPython is interpreting the code (that is, while developing pcc itself), and on arrival it loudly raises `NotImplementedError`. The method is deliberately written with no parameters — a `*args` signature would trip the self-host audit (the pcc frontend does not lower variadic defs), and since the frontend rewrites every call site anyway, the runtime signature is irrelevant. A small design made to be "legal in both worlds": a textbook instance of the self-hosting tax.
-
-`extern` also ships a reverse decorator, `c_abi_export(symbol)`: it forces pcc to emit the decorated function under the given, unmangled C ABI symbol name instead of the usual `user_<module>_<name>` mangled form. This is the hook by which a port replaces C — the function decorated `@c_abi_export("py_str_len")` in `py_str_accessors.py`, once compiled, supersedes the identically named symbol exported by `py_str_accessors.c` at link time. At the Python level the decorator is a no-op, present only so port files remain importable under CPython.
-
-**[pcc/unsafe/](../../pcc/unsafe) governs "touching memory."** It is "deliberately not a normal runtime library" (the module docstring's own words): the frontend recognizes imports from `pcc.unsafe` at compile time and lowers each call into a bare LLVM/platform operation — `malloc`/`free`, the full fixed-width read/write spectrum from `load_i8` to `store_f64`, `ptr_add`/`ptr_diff`, the tagged-integer operations `is_tagged_int`/`tag_int`/`untag_int`, `memcpy`, even indirect-call primitives such as `call_ptr1`. The recognition machinery lives in [pcc/py_frontend/codegen/unsafe_lowering.py](../../pcc/py_frontend/codegen/unsafe_lowering.py): a frozen set named `UNSAFE_INTRINSICS` enumerates every intrinsic by name. Under CPython, every one of these functions falls into `_trap()`, refusing execution just as loudly.
-
-Together, the two doors make a port file "C semantics written in Python syntax." Look at the battle-tested form of [pcc/py_runtime/py/py_str_accessors.py](../../pcc/py_runtime/py/py_str_accessors.py): the file header first transcribes the `PyStrObject` layout as a contract in comments (`byte_len` at offset 16, `cp_len` at 24, `hash` at 32, UTF-8 data starting at 40), and then:
-
-```python
-@c_abi_export("py_str_len")
-def py_str_len(s) -> int:
-    if ptr_is_null(s) != 0:
-        return 0
-    cp: int = load_i64(s, 24)
-    if cp < 0:
-        cp = _utf8_codepoint_count(ptr_add(s, 40), load_i64(s, 16))
-        store_i64(s, 24, cp)
-    return cp
-```
-
-Read the codepoint-count cache at offset 24; if uncomputed (-1), count the UTF-8 once and write it back — step-for-step parallel with the C version, including the lazy-cache side effect. The layout comment is not documentary politeness; it is the carrier of the mirror discipline: the moment the C struct changes, the port's magic offsets silently read the wrong field, and the layout-drift class of bug discussed in Chapter 7 is born exactly this way.
-
-The honest part: this door still has known sharp edges, and the docstring of [pcc/extern/__init__.py](../../pcc/extern/__init__.py) lists them itself. In the `c_str` **argument** position, pcc's `str` value is a `PyStrObject*` while the extern declaration expects a raw `char*`; current code generation passes it through unchanged — wrong for libc symbols that read bytes directly, and most callers work around it via a helper that first materializes a NUL-terminated buffer. In the `c_str` **return** position (e.g. `getenv`), the caller gets back a raw `i8*`, and there is as yet no runtime helper that wraps it into a `PyStrObject`. And errno is not mapped to Python exceptions: a wrapper that wants `OSError` semantics must inspect errno itself. These are written into the source as open problems, not pretended out of existence.
-
-## 14.4 The Build Fact: The Default Links the Ports, Not the C Sources
-
-This is the highest-leverage section of the chapter, because it corrects an assumption almost everyone walks in with: since `src/*.c` holds a "real" runtime, surely the default build links it? **It does not.**
-
-[pcc/py_runtime/Makefile](../../pcc/py_runtime/Makefile) maintains four archives:
+The current contract has four layers, each with a different verb:
 
 ```text
-libpy_runtime.a                cc baseline: src/*.c built by the host C compiler
-libpy_runtime_pcc.a            the same C sources, compiled by pcc's C frontend (second oracle)
-libpy_runtime_pcc_py.a         pcc-Python ports + C-only helper objects (the default)
-libpy_runtime_pcc_py_libpython.a   the above plus the CPython bridge (compat fallback)
+semantic pcc-Python
+  list / dict / str / dunder / exception / import / C-API semantics
+                          |
+                          v
+freestanding pcc-Python
+  allocator / threads / safepoints / GC / libc-like substrate / ABI shims
+                          |
+                          v
+compiler intrinsics
+  raw memory / atomics / syscall / host ABI / machine operations
+                          |
+                          v
+OS boundary
+  Linux raw syscalls             Darwin named libSystem entries
+
+C and vendored-libc sources: differential oracle only; not production input
 ```
 
-The recipe for the third archive is the heart of this section. The Makefile's `PY_MODULES` variable lists 55 module names — `py_obj`, `py_dict`, `py_list`, `py_str_accessors`, `py_gc_backend`, the whole `py_int_*` family — each name corresponding to one port file under `py/`. The build rule runs two steps per port: `pcc --python-library --emit-llvm` compiles the `.py` into library-form LLVM IR (without synthesizing a program `@main`), and then `pcc.tools.ir_to_obj` lowers it to a relocatable object. The archive is built directly from these Python-born `.o` files; the comment states the reason: the no-C closure must not depend on successfully compiling the replaced C runtime sources on every target. The companion variable `PY_REPLACED_C_MODULES` lists one extra entry, `py_bytes` — `py_obj_stubs.py` owns the exported bytes helpers, so the C `py_bytes.o` must be removed from that archive to avoid a symbol collision.
+“Freestanding” does not merely mean “C rewritten with Python syntax.” These modules are implementing the heap, error substrate, threads, or collector; they cannot call back into ordinary Python objects, boxing, allocating exception paths, or the collector they are bootstrapping. `__pcc_freestanding__ = True` marks the closure for the build and validator. `pcc.unsafe` supplies raw pointers, fixed-width loads and stores, atomics, and system calls. Export decorators from `pcc.extern` assign stable C ABI names to the generated object.
 
-Which archive is chosen is decided by two functions in [pcc/py_frontend/pipeline.py](../../pcc/py_frontend/pipeline.py), and their defaults are this section's title: `_runtime_cc_mode()` reads `PCC_RUNTIME_CC` and defaults to `"pcc"`; `_runtime_high_mode()` reads `PCC_RUNTIME_HIGH` and defaults to `"py"`. With both defaults in effect, `_ensure_runtime()` selects `libpy_runtime_pcc_py.a`. The docstring says it plainly: the default is the bootstrap-safe path, and `PCC_RUNTIME_CC=cc` is set only when you **explicitly want the host-cc oracle archive**.
+The `memcpy` implementation in `pcc/py_runtime/py/freestanding_mem_str.py` shows the subset. It creates no `bytes` object and does not call the host `memcpy`:
 
-This fact gives the mirror discipline its teeth. The rule in [AGENTS.md](../../AGENTS.md) is "Mirror C and pcc-Python runtimes" — most GC/runtime code has a C file in `src/` and a port in `py/`, and the two must stay in sync. We can now restate it in build language: **for files on the PY_MODULES list, editing the C source is a no-op in default mode.** The C version lives only in the cc/oracle archives; the binary that default mode links runs the port's code. The reverse holds symmetrically: editing only the port lets the oracle archive go stale. The first case study in Section 14.6 is the complete record of this discipline being violated.
+```python
+# pcc/py_runtime/py/freestanding_mem_str.py
+@c_abi_export("memcpy")
+def pcc_memcpy(dst, src, size: int) -> c_ptr:
+    i: int = 0
+    while i < size:
+        store_i8(dst, i, load_i8(src, i))
+        i = i + 1
+    return dst
+```
 
-Which C is allowed to go **un**mirrored? The Makefile's `OBJ_PY_CC_HELPERS` list answers: `py_format.o`, `py_capi_shim.o`, `py_extension_loader.o`, `pcc_threads.o`, `py_gc_index_table.o`, `py_os_native.o`, `py_re_engine.o`, `py_cpy_handle.o`, and a couple dozen more objects, compiled by the host cc and **inserted directly into the port archive**. They are C-only helpers: a single C implementation, no port mirror, one set of semantics shared by both archive flavors. The repository's selection rule: when a new no-libpython runtime helper would be awkward for a port to reimplement (it needs C library loops, a platform boundary, or symbiosis with the shim), add a C-only file rather than a C-plus-port double write. This is not a loophole in the mirror discipline but its complement — the cost of mirroring is spent only on files whose semantics genuinely need to migrate. The float-repr story in Section 14.6 shows a textbook application.
+The compiler-intrinsic boundary is drawn by knowledge, not by how inconvenient a function is to write in Python. `page_alloc` may be intrinsic because it denotes a machine-level page mapping. Size classes, free lists, metrics, and locking are allocator policy and therefore belong to `freestanding_allocator.py`. Likewise, raw `syscall` encoding belongs in the backend, while cross-platform `open`/`read`/`write` behavior and errno publication belong in freestanding modules. This division prevents every difficult semantic operation from becoming a new compiler special case—and thus a second, unauditable runtime.
 
-The boundary is only complete once the last archive is told. `libpy_runtime_pcc_py_libpython.a` is copied from the port archive and gains `py_libpython.o`, but it simultaneously **deletes** `py_capi_shim.o`. The Makefile comment explains why: in libpython mode, the real libpython provides the CPython C-API; dlopen'd extensions are built with `-undefined dynamic_lookup`, so their `Py*` calls resolve from the executable's global symbols — if the shim were still present, it would **shadow** the real C-API and mishandle genuine CPython objects with pcc's object model, shattering extension initialization of the `import numpy` kind. One archive may contain exactly one C-API provider: this is the mode boundary (libpython vs no-libpython) materialized at the linker level.
+## 14.3 The Production Archive: Python Source Becomes the Low-Level Object
 
-## 14.5 The Fallback Ratchet: Turning "How Much Is Left" into a One-Way Gate
+The `libpy_runtime_pcc_py.a` production target takes two sets of Python-born objects: semantic `PY_MODULES` and strict `FREESTANDING_PY_MODULES`. The current Makefile archives only `PCC_PY_OBJECTS` and preserves a provenance receipt for each member. C rules remain for the host-C oracle, differential testing, and other explicitly labeled modes; they are not member sources for this production archive.
 
-Shrinkage is a long campaign, and a long campaign needs a progress meter that cannot lie. pcc's answer is to make the fallback **countable, explainable, and lockable** — three properties, three mechanisms.
+```makefile
+# pcc/py_runtime/Makefile
+$(LIB_PCC_PY): $(PCC_PY_OBJECTS) $(PCC_PY_RECEIPTS)
+	@set -eu; \
+	rm -f "$@.tmp"; \
+	rm -f "$@.capi_syms.nm.tmp"; \
+	rm -f "$@.capi_syms.tmp"; \
+	rm -f "$@.provenance.json.tmp"; \
+	$(AR) rcs $@.tmp $(PCC_PY_OBJECTS); \
+	$(RANLIB) "$@.tmp"; \
+```
 
-**Countable.** [scripts/probe_stage1_closure.py](../../scripts/probe_stage1_closure.py) computes the tight stage1 closure starting from the entry [pcc/__main__.py](../../pcc/__main__.py) (the baseline records 27 files), runs two kinds of code generation over the closure — each module compiled independently, and all files compiled together as a multi-file unit — and then counts occurrences of `call ... @py_cpy_` in the IR text with a regex. The counter treats every `py_cpy_*` call site identically: as Section 14.1 established, the presence of this symbol family means the CPython bridge is required.
+This rule is stronger than “a same-named `.py` file exists.” Source ownership, archive membership, and provenance must close together. Renaming `py_capi_shim.o` to `py_capi_compat.o` cannot turn a C object into Python output. The archive-source ratchet asks whether every member maps to `pcc/py_runtime/py/<stem>.py`, rather than maintaining a blacklist that an object rename can evade.
 
-**Lockable.** [tests/python/test_fallback_baseline.py](../../tests/python/test_fallback_baseline.py) turns the count into a ratchet. The rules are all in the source: `_RATCHET_PERCENT = 5.0`; `_within_ratchet()` permits noise growth of at most 5% over baseline (minimum +1), and shrinkage always passes; after a successful migration, the baseline JSON is recaptured at the lower number — the ratchet is one-way, "allow shrink, forbid growth." There is a per-module ratchet as well, carrying an implicit-zero rule: a module absent from the baseline counts as 0 and must stay 0, with "a previously-clean module regressed" as an explicit failure message — territory already won may not quietly be lost again.
+The five collectors are the migration's most consequential test. Production collector policy is now split across `freestanding_gc_*` modules: root and frame registration, object-slot access, common marking, incremental and concurrent scheduling, promotion, forwarding indexes, and ZPage lifecycle each have named owners. Even hash indexes once treated as permanent C-kernel material have moved into `freestanding_gc_index_table.py`; its module documentation identifies `src/py_gc_index_table.c` as a differential oracle.
 
-The finest stroke is the **split accounting**. The bridge symbols `py_cpy_to_pcc_obj` / `py_cpy_to_pcc_str` (the temporary bridge ferrying CPython values back into pcc objects) are counted separately from all other `py_cpy_*`, and in ON mode both accounts are asserted with a strict `<=`, with no 5% allowance. The failure message of `test_on_mode_bridge_calls_do_not_regress` compresses the motivation into a maxim: bridge calls still require libpython, so reducing non-bridge `py_cpy_*` by adding bridge calls is not progress on Issue 1. Without this split, the metric could be gamed green by renaming fallbacks into bridges.
+```python
+# pcc/py_runtime/py/freestanding_gc_index_table.py
+@c_abi_export("pcc_gc_index_py_next_pow2")
+def pcc_gc_index_py_next_pow2(value: int) -> int:
+    if value < 8:
+        return 8
+    power: int = 1
+    while power < value:
+        power = power * 2
+    return power
+```
 
-[tests/fallback_baseline.json](../../tests/fallback_baseline.json) itself deserves reading as primary history. It simultaneously locks the multi-file totals, the per-module independent counts, and diagnostic aggregates by action (`call`/`getattr`/`setattr`/...) and by symbol; and its `_recapture_log` array is a dated chronicle of the reduction: the OFF-mode multi-file total starts at 27853 on 2026-04-28, falls through wave after wave of slices — native os.path dispatch, the cpy→pcc literal bridge, cross-module class dispatch, native file objects — reaches ON-mode zero on 2026-04-29, and multi-file all-zero on 2026-05-01, whose entry reads: "Issue 1 strict bootstrap closure: pcc1/pcc2/pcc3 no longer link libpython." Every record carries a delta and a reason; reading it gets you closer to the real rhythm of this campaign than any narrative document. Today's total field is `fallbacks_total: 0`, and the JSON's header comment states outright: it must now stay zero.
+This changes the equality contract described in Chapter 10. The five backends no longer consume “one C collector plus one Python mirror.” They consume **one production pcc-Python slot/root contract**; the C implementation answers only whether identical inputs produce identical behavior in oracle tests. Completing a migration does not mean deleting the C file. Deletion would destroy the independent oracle. The correct move is to remove the C implementation from production linking while retaining its provenance and differential entry point.
 
-**Explainable.** A count tells you how much, not why. [pcc/fallback_routes.py](../../pcc/fallback_routes.py) converts the pipeline's import-classification decisions into events with stable reasons: `compile_time_only` (erased at compile time), `native_user_module` (compiled into the source closure), `builtin_native_dispatch` (built-in native dispatch), `native_stdlib` (resolved to a [pcc/py_stdlib](../../pcc/py_stdlib) provider), `cpython_fallback` ("no native provider found; libpython required unless disabled"). [pcc/fallback_explainer.py](../../pcc/fallback_explainer.py)'s `FallbackReason` adds phase, suggestion (for example "add pcc/py_stdlib port or enable --python-libpython=auto"), and source, serializable as `pcc.fallback.v1` JSON. The CLI flag `--explain-fallback` is wired in both [pcc/cli_core.py](../../pcc/cli_core.py) and [pcc/cli_bootstrap.py](../../pcc/cli_bootstrap.py). The design stance descends from Chapter 1's claim hygiene: a fallback is not a disgrace — an **invisible** fallback is. Every fallback is either explained or forbidden.
+## 14.4 Linux and Darwin: One Source, Different Machine Boundaries
 
-## 14.6 History and Lessons
+Zero-libc must name a target. The Linux x86_64 self backend can lower supported system operations to raw syscalls, provide `_start`, and link statically. Darwin enters the kernel and platform frameworks through stable named libSystem ABI calls, so its Mach-O artifact retains a system dynamic boundary. This is not an incomplete Linux route; it is a different platform contract.
 
-Three stories, told in dependency order: first the method that produces the slices, then the two lessons left behind when that method collided with this chapter's machinery. The material comes from the evidence records of 2026-05-29/30 in [docs/current-goal-state.md](../../docs/current-goal-state.md) and the related investigations.
+`freestanding_platform_io.py` keeps one pcc-Python API across both targets:
 
-### 14.6.1 The idiom-diff method: where bounded slices come from
+```python
+# pcc/py_runtime/py/freestanding_platform_io.py
+@c_abi_export("pcc_platform_read")
+def pcc_platform_read(fd: int, buffer, size: int) -> int:
+    return read(fd, buffer, size)
 
-The most dangerous way to work the no-libpython front is "hunting for the next hole by feel." The replacement, solidified from 2026-05-29 onward, is the **CPython idiom-diff**: write a batch of common idioms (float format specs, `%` formatting, `bin()/hex()/oct()`, `round()`, str methods, `set ^`, `divmod`, tuple unpacking, every shape of `sorted`, ...), compile and run them under `--backend self --python-libpython=off`, and diff each output against `python3`. Every mismatch is a **bounded slice**: a clear symptom, a small fix surface, independently verifiable. The discipline: one slice at a time, a minimal regression test per slice, and — because these paths all lie on the bootstrap closure — the full three-stage bootstrap gate must pass before a slice counts as done (what the bootstrap gate entails is Chapter 15's subject).
 
-In a single session this method delivered 9 bootstrap-verified slices (float width/precision, `%` specs, bin/hex/oct, banker's rounding in `round`, str case methods, set symmetric difference, float divmod, float tuple-unpack typing, `sorted` over dicts and iterables). Equally valuable were two **failures**: adding a new runtime symbol each for `list(generator)` and list out-of-bounds IndexError (`py_obj_to_list`, `py_list_get_checked`) and having code generation call them — both failed at stage2 in the identical way: the default port archive does not reliably pick up new symbols. Against the same session's uniformly successful "modify an existing runtime function" slices, this left a practice rule: **modifying an existing function is bootstrap-safe; adding a new symbol for codegen to call is a bootstrap risk** that needs build-system-level handling. There was also a measurement-discipline lesson: the OOB attempt was first misdiagnosed as a "stale runtime link," when the real cause was editing the wrong frontend path — subscript reads on typed lists lower through `exact_int_lowering.py`, not `subscript_lowering.py` (the dual-path problem of Chapter 6). The way to locate that is not to guess at caches but to dump the IR and see which symbol is actually being called.
+@c_abi_export("pcc_platform_write")
+def pcc_platform_write(fd: int, buffer, size: int) -> int:
+    return write(fd, buffer, size)
+```
 
-### 14.6.2 The false confidence of PCC_RUNTIME_CC=cc (2026-05-30)
+Here `read` and `write` are compiler-recognized machine boundaries. Linux lowering emits raw syscalls; Darwin lowering emits named ABI calls. Higher file, stdio, socket, and process modules should neither duplicate platform branches nor quietly fall back to glibc on Linux.
 
-**Symptom.** All 9 slices above were green on their regression tests and green on the bootstrap gate. Then a default-mode probe calling `bin(5)` failed to link: `undefined _py_builtin_bin`.
+The Linux tracer connects this route to process entry. `freestanding_linux_start.py` decodes the initial stack supplied to `_start`, writes a fixed message, and terminates via `exit_group`, with no C or assembly startup object:
 
-**Wrong assumption.** "Regression tests plus a green bootstrap = the slice works in the target mode." Each of the two gates had a blind spot nobody had spelled out.
+```python
+# pcc/py_runtime/py/freestanding_linux_start.py
+@c_abi_export("_start")
+def pcc_linux_start(initial_stack: c_ptr) -> None:
+    argc: int = load_i64(initial_stack, 0)
+    argv0 = load_ptr(initial_stack, 8)
+    status: int = 0
+    if argc < 1 or ptr_is_null(argv0):
+        status = 64
 
-**Evidence chain.** Item-by-item checking found that 4 of the 9 slices were effective only in cc mode: bin/hex/oct (new symbols added to `py_dunder.c`, absent from the port `py_dunder.py`); str title/swapcase/casefold (new symbols in `py_str_accessors.c`, port missing); `set ^` (`py_set_symmetric_difference` in `py_set.c`, port missing); and `sorted` over dicts/iterables (`py_obj_sorted` in `py_obj_ops_compare.c` was changed while the port kept the old integer-subscript version — the most insidious of the four: in default mode it is not a link failure but **silent retention of the old wrong behavior**). All four files are on the `PY_MODULES` list; and every regression test had pinned `PCC_RUNTIME_CC=cc`, validating only the oracle archive. Why was the bootstrap green too? Because pcc's own code calls neither `bin` nor set symmetric difference — **a gate passing proves the paths the gate covers, not the existence of the feature.**
+    message = cstr("pcc zero-libc ok\n")
+    if write(1, message, 17) != 17:
+        status = 74
+    process_exit(status)
+```
 
-**Actual root cause.** The build fact of Section 14.4: default mode links the port archive, so C modifications to `PY_MODULES` files are invisible to default mode. The mirror rule in [AGENTS.md](../../AGENTS.md) had been there all along; in a workflow whose tests pin cc mode, it had no teeth.
+The [2026-08-03 Linux zero-libc tracer evidence](../../docs/goal/evidence/2026-08-03-linux-zero-libc-python-start.md) is mode-labeled host-pcc0 Python frontend, x86_64 Linux, self backend, no-libpython. Its ELF is static; `readelf -l` has no `PT_INTERP`, `readelf -d` has no `DT_NEEDED`, `nm -u` is empty, and the link map contains only the object generated from that Python source. The evidence deliberately does not claim the full runtime, complete C frontend, five-GC closure, or pcc1 cross-target execution.
 
-**Fix and invariants.** Mirror them one by one in the port-mirror pattern: str-case first (swapcase/title/casefold written into the port with `load_i8`/`store_i8` in the style of `py_str_upper`), default-mode probe aligned with CPython, regression tests **switched to default mode** (the `PCC_RUNTIME_CC=cc` pin deleted), bootstrap passed in 48.47 seconds — the first cc-only slice "made real." The invariants left behind: (1) no-libpython tests and probes must run in default mode; cc is the oracle, not the target; (2) a runtime fix in a `PY_MODULES` file must mirror C and port within the same change; (3) before trusting any "green," first ask which mode it ran in — which is precisely Chapter 1's mode-labeled claims, transposed into test engineering.
+## 14.5 Landed Ownership and the Still-Open Final Claim
 
-### 14.6.3 Float repr's four paths and C-only convergence (2026-05-29)
+Several bounded slices have `DONE_STRONG` evidence at this snapshot:
 
-**Symptom.** The idiom-diff flagged `print(10/3)`: CPython prints `3.3333333333333335`, pcc prints `3.333333`. It looks like a small formatting-precision fix.
+- Fifteen memory/string ABI functions are uniquely owned by `freestanding_mem_str.o`; vendored musl is oracle-only.
+- The allocator is owned by `freestanding_allocator.py`, with Linux raw-syscall execution, a Darwin import ratchet, and five-GC long-run measurements.
+- IO, filesystem, environment, process, time, socket, RSS, and errno wrappers are freestanding pcc-Python.
+- GC0 through GC4 production collector policy is entirely freestanding pcc-Python; the production link map has no C collector definition, and all five fixed points have recorded evidence.
+- The C and Python frontends have a supported shared link route through the freestanding pcc-Python libc.
+- The current production-archive recipe accepts Python-born objects and provenance only.
 
-**Wrong assumption.** "Fix the C print formatting and be done." The first attempt made a shortest-round-trip fix in `py_print_fmt.c` and `py_dunder.c` — and was promptly reverted.
+Yet `LIBC-P3-FREESTANDING-RUNTIME-CLOSURE` remains `TODO_READY`. The reason is no longer a stated intent to preserve a permanent C kernel. The acceptance surface is larger: freeze current source identity, audit the complete production link, run default, integration, five-GC, and pcc1→pcc2→pcc3 gates; for Linux, combine `file`, `readelf`, `nm`, and link-map evidence; for Darwin, enumerate the residual libSystem ABI. A source tree that says “all members are from Python” is not itself a release proof.
 
-**Evidence chain.** The investigation confirmed that float→string has **at least four sites** in the runtime, split along runtime modes: in default mode (`PCC_RUNTIME_HIGH=py`), print goes through `_format_float` in the port `py_print_fmt.py` — fixed 6 decimal places, and garbage for non-finite values (inf prints as `9223372036854.775807`); cc mode goes through the C `py_print_fmt.c`'s `%g` (6 significant digits) — the two modes do not even share the same way of being wrong. `str()`/`repr()` have a further port site, `_float_str` in `py_obj_stubs.py` (also fixed 6), plus `py_dunder.c` on the C side. Fixing only the C means fixing only the oracle mode while the highest-priority default mode does not move — the same build fact as 14.6.2 wearing another face, and worse: the correct algorithm (incremental-precision probing with an `strtod` round-trip check) would have to be rewritten with `pcc.unsafe` inside every port, both clumsy and guaranteed to drift.
+The book therefore uses these status labels:
 
-**Actual root cause and fix.** The problem was never one site's format string; it was **one semantic scattered across four implementation points**. The fix used exactly the C-only helper rule of Section 14.4: a single implementation, `py_float_repr_shortest()`, added in [pcc/py_runtime/src/py_format.c](../../pcc/py_runtime/src/py_format.c) (a member of `OBJ_PY_CC_HELPERS`, shared by both archive flavors) — special cases for nan, ±inf, and signed zero; formatting with `%.*e` from 1 to 17 significant digits and checking each with `strtod`, taking the first digit count that round-trips exactly (17 digits always round-trip an IEEE-754 double); choosing notation by CPython's threshold (fixed-point when the exponent lies in [-4, 16)); appending `.0` for integral floats. The function comment states the contract: str/repr/print at **both runtime tiers** route through it; the ports `py_print_fmt.py` and `py_obj_stubs.py` each declare it with a single line — `extern("py_float_repr_shortest", (c_ptr,), c_ptr)` — and call it, retiring the old fixed-6 paths.
+```text
+source ownership       present: production archive recipe is Python-only
+bounded subsystems     proven: mem/str, allocator, wrappers, five GC, tracer
+full Linux runtime     acceptance pending: final broad/link closure gates
+Darwin zero-libc       inapplicable: named libSystem boundary is intentional
+```
 
-**Invariant.** Count the paths before fixing the semantics: when one semantic has N implementation points, fixing 1 of them is not 1/N of a fix — it is the introduction of an (N+1)-th behavior. Choose the convergence vehicle by layer: semantics that ought to migrate to Python get mirrored; an algorithm that is heavy and layer-independent gets a single C-only point plus an extern declaration. Float repr is the latter.
+## 14.6 The No-libpython Fallback Ratchet Still Matters
 
-## 14.7 Summary
+Removing C and libc does not remove CPython fallback automatically. `--python-libpython=off` constrains the frontend and link closure: any lowering that needs a `py_cpy_*` symbol must fail before publishing an artifact. `tests/fallback_baseline.json` and `tests/python/test_fallback_baseline.py` make that boundary a one-way ratchet; `fallback_routes.py` and `fallback_explainer.py` give each fallback a stable phase, reason, and suggestion.
 
-No-libpython is a boundary claim, not a zeroing claim: the artifact does not depend on the CPython runtime, while C legitimately persists in the role of a kernel. This chapter's machinery is organized around three boundary-keeping moves. **Layering**: the four-layer model gives every layer a verb (KEEP-minimize / SHRINK / GROW / KEEP-spec); the C kernel is defined by a knowledge boundary, not a code-volume budget; the `py_cpy_*` bridge is quarantined behind the `#ifdef` in `py_libpython.c`, and the two pointer namespaces never alias. **Migration**: `pcc.extern` and `pcc.unsafe` let pcc-Python write low-level code; `c_abi_export` lets a port supersede a C symbol at link time; the Makefile's `PY_MODULES` compiles 55 ports into the default archive — the default links the ports, not the C sources, and this build fact is both the teeth of the mirror discipline and the shared root of the two case studies. **Locking**: the fallback ratchet turns "how much is left" into a gate with a 5% noise cap, one-way movement, and split bridge/non-bridge accounting; the `_recapture_log` preserves the chronicle from 27853 to 0; `--explain-fallback` guarantees that every fallback is either explained or forbidden. The common denominator of the three stories is measurement discipline: a gate proves only the mode it covers, and green is not the same as true — ask "which mode did this run in" before deciding what to believe. How pcc1→pcc2→pcc3 closes the fixed point on top of this runtime is Chapter 15.
+The two dimensions must be measured independently:
+
+```text
+frontend closure:  Python source -> no py_cpy_* -> no libpython
+runtime closure:   runtime archive -> pcc-Python owners -> OS boundary
+```
+
+If the first is green and the second red, the artifact is no-libpython but still C/libc-dependent. If the second is green and the first red, pcc owns its runtime but still requires the CPython bridge. Only when both close does the complete Linux zero-libc/no-libpython claim hold.
+
+## 14.7 History and Lessons
+
+### 14.7.1 The False Confidence of `PCC_RUNTIME_CC=cc` (2026-05-30)
+
+Early no-libpython work maintained both C implementations and pcc-Python ports. Nine idiom slices appeared green under regressions and bootstrap, but a default-mode `bin(5)` probe failed to link. Four slices had modified only C files while their tests forced `PCC_RUNTIME_CC=cc`; default production mode linked the Python ports. The C change was therefore either invisible or left the old wrong behavior in place. Bootstrap did not call `bin` or set symmetric difference, so a green bootstrap did not cover those paths.
+
+The rule left at the time was “update both mirrors.” The present migration advances it: production has one pcc-Python owner and C is an independent oracle. That removes ambiguity about which semantics default mode links, but it does not remove differential testing. The lesson remains: a green result proves only its mode, and an oracle cannot stand in for the product path.
+
+### 14.7.2 Renaming `py_capi_shim.o` to `py_capi_compat.o` Produced a False Closure (2026-08-08)
+
+The terminal no-C ratchet once asserted only that no archive member was named `py_capi_shim.o`. After the object was renamed to `py_capi_compat.o`, the assertion passed even though production still contained hand-written C. The supposed closed symbol set had also drifted to nineteen globals. Expanding the allowlist would have “completed” the task without changing ownership.
+
+The investigation rejected that route and changed the predicate to source ownership: every production member must correspond to `pcc/py_runtime/py/<stem>.py`. The C-API families were subsequently split among `py_capi_*_runtime.py` owners, and the current production recipe no longer adds a compat object. The invariant is general: **a terminal test must assert the desired property, not a historical filename.** A zero-libc gate likewise cannot merely search for the string `libc.so`; it must inspect the interpreter segment, dynamic dependencies, undefined symbols, and complete link map.
+
+## 14.8 Summary
+
+pcc's runtime direction has moved from “retain and minimize a permanent C kernel” to “author the production runtime in pcc-Python and express the machine boundary through compiler intrinsics.” Both semantic and freestanding pcc-Python grow. C and vendored libc remain valuable differential oracles but leave the production dependency. No-libpython, Python-owned runtime, and zero-libc are separate claim axes. Linux has a proven raw-syscall `_start` tracer, and memory/string, allocation, platform wrappers, and all five collectors have bounded ownership evidence. The final full-runtime Linux link and gate acceptance remains open. Darwin's correct label is always “named libSystem ABI,” never zero-libc.
 
 ## Exercises
 
-1. **Read and verify.** Read [pcc/py_runtime/Makefile](../../pcc/py_runtime/Makefile): count the modules in the `PY_MODULES` list; explain why `PY_REPLACED_C_MODULES` has one more entry, `py_bytes`, and which port file the corresponding bytes helpers live in. Then read `_runtime_cc_mode()` and `_runtime_high_mode()` in [pcc/py_frontend/pipeline.py](../../pcc/py_frontend/pipeline.py) and write down what each returns when the environment variable is unset, set to an illegal value, and set to `"host"`.
-
-2. **Read and verify.** Compare `py_str_len` in [pcc/py_runtime/py/py_str_accessors.py](../../pcc/py_runtime/py/py_str_accessors.py) against the `PyStrObject` layout in `py_internal.h`: which field does `load_i64(s, 24)` read? Why does this function have a write side effect (`store_i64`)? If someone inserted a new 8-byte field before `byte_len` in the C struct without touching the port, what would happen, and which bug class from which chapter would surface first?
-
-3. **Ratchet design argument.** [tests/python/test_fallback_baseline.py](../../tests/python/test_fallback_baseline.py) applies `_within_ratchet` to the ON-mode total (which, at a baseline of 0, mathematically tolerates actual=1), yet uses a strict `<=` for the two split accounts, bridge and non-bridge. Argue why this combination still holds the "multi-file zero fallbacks" line — and identify which two classes of regression would slip through if there were **only** the percentage-ratcheted total with no split accounting.
-
-4. **Design tradeoff.** [pcc/extern/__init__.py](../../pcc/extern/__init__.py) documents its own gap in the `c_str` return position: `getenv` hands back a raw `i8*` that nobody wraps into a `PyStrObject`. Propose two fix directions — (a) add a runtime helper function (C-only? port-mirrored?) that wraps after the call; (b) have code generation automatically insert a wrapping call at every `c_str` return position — and, using the archive structure of 14.4 and the layer boundaries of 14.2, argue where each belongs and what each risks: which archives would the new symbol land in? Which direction comes closer to the "new-symbol bootstrap risk" of 14.6.1?
-
-5. **Case-study rehearsal.** Suppose you must add `py_set_symmetric_difference` to `py_set.c` and have the frontend lower `a ^ b` to call it. Following this chapter and the lessons of 14.6, write out the complete checklist of steps for making it genuinely take effect in **default mode** (runtime C, the port, the `runtime_abi` declaration, the mode choice for the regression test, the bootstrap gate) — and mark, for each step, which of the four false-confidence shapes from 14.6.2 (link failure vs. silently retained old behavior) is exactly reproduced when that step is omitted.
+1. Read [pcc/py_runtime/Makefile](../../pcc/py_runtime/Makefile) and trace `PCC_PY_OBJECTS`, `PY_MODULES`, `FREESTANDING_PY_MODULES`, and `LIB_PCC_PY` into an archive-membership diagram. Explain why retained `src/*.c` rules do not imply membership in the production archive.
+2. Read [freestanding_linux_start.py](../../pcc/py_runtime/py/freestanding_linux_start.py) and the [Linux tracer evidence](../../docs/goal/evidence/2026-08-03-linux-zero-libc-python-start.md). Build a checklist of everything a complete-runtime zero-libc claim needs beyond the tracer.
+3. Compare [freestanding_allocator.py](../../pcc/py_runtime/py/freestanding_allocator.py) with `pcc.unsafe.page_alloc/page_free`. Argue why size-class policy belongs to the freestanding runtime while page mapping belongs to the machine boundary.
+4. Design an archive-provenance ratchet that an object rename cannot evade. Include source ownership, member order, the C-API inventory, and atomic publication.
+5. Write a mode-labeled Darwin release claim that enumerates its allowed libSystem boundary, and explain why calling it zero-libc would weaken the later Linux acceptance.

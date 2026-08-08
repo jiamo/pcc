@@ -37,6 +37,13 @@ import re
 import llvmlite.binding as llvm
 
 from .manager import AnalysisManager, ModulePass, PreservedAnalyses
+from .integer_fold_contract import (
+    FOLD_CONSTANT,
+    FOLD_POISON,
+    fold_llvm_integer_binary,
+    fold_llvm_integer_compare,
+    signed_value,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -139,7 +146,13 @@ def _is_neg_one(token: str, ty: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def _fold_constant_binop(op: str, ty: str, lhs: str, rhs: str) -> str | None:
+def _fold_constant_binop(
+    op: str,
+    ty: str,
+    lhs: str,
+    rhs: str,
+    flags="",
+) -> str | None:
     li = _try_int(lhs)
     ri = _try_int(rhs)
     if li is None or ri is None:
@@ -149,67 +162,23 @@ def _fold_constant_binop(op: str, ty: str, lhs: str, rhs: str) -> str | None:
     if width <= 0:
         return None
 
-    lu = _normalize_unsigned(li, ty)
-    ru = _normalize_unsigned(ri, ty)
-    ls = _normalize_signed(li, ty)
-    rs = _normalize_signed(ri, ty)
-
-    if op == "add":
-        return str(_normalize_signed(lu + ru, ty))
-    if op == "sub":
-        return str(_normalize_signed(lu - ru, ty))
-    if op == "mul":
-        return str(_normalize_signed(lu * ru, ty))
-    if op == "and":
-        return str(_normalize_signed(lu & ru, ty))
-    if op == "or":
-        return str(_normalize_signed(lu | ru, ty))
-    if op == "xor":
-        return str(_normalize_signed(lu ^ ru, ty))
-
-    if op in ("shl", "lshr", "ashr"):
-        if ri < 0 or ri >= width:
-            return "poison"
-        if op == "shl":
-            return str(_normalize_signed(lu << ri, ty))
-        if op == "lshr":
-            return str(_normalize_signed(lu >> ri, ty))
-        return str(_normalize_signed(ls >> ri, ty))
-
-    if op == "udiv":
-        if ru == 0:
-            return None
-        return str(_normalize_signed(lu // ru, ty))
-    if op == "sdiv":
-        if rs == 0:
-            return None
-        if ls == -(1 << (width - 1)) and rs == -1:
-            return "poison"
-        quot = abs(ls) // abs(rs)
-        if (ls < 0) ^ (rs < 0):
-            quot = -quot
-        return str(_normalize_signed(quot, ty))
-    if op == "urem":
-        if ru == 0:
-            return None
-        return str(_normalize_signed(lu % ru, ty))
-    if op == "srem":
-        if rs == 0:
-            return None
-        if ls == -(1 << (width - 1)) and rs == -1:
-            return "poison"
-        quot = abs(ls) // abs(rs)
-        if (ls < 0) ^ (rs < 0):
-            quot = -quot
-        rem = ls - quot * rs
-        return str(_normalize_signed(rem, ty))
-
+    status, value = fold_llvm_integer_binary(op, width, li, ri, flags)
+    if status == FOLD_POISON:
+        return "poison"
+    if status == FOLD_CONSTANT:
+        return str(signed_value(value, width))
     return None
 
 
-def _simplify_binop(op: str, ty: str, lhs: str, rhs: str) -> str | None:
+def _simplify_binop(
+    op: str,
+    ty: str,
+    lhs: str,
+    rhs: str,
+    flags="",
+) -> str | None:
     l, r = lhs.strip(), rhs.strip()
-    const_folded = _fold_constant_binop(op, ty, l, r)
+    const_folded = _fold_constant_binop(op, ty, l, r, flags)
     if const_folded is not None:
         return const_folded
 
@@ -289,22 +258,10 @@ def _simplify_icmp(pred: str, ty: str, lhs: str, rhs: str) -> str | None:
     except ValueError:
         return None
     w = _bit_width(ty) or 32
-    mask = (1 << w) - 1
-    lu = li & mask
-    ru = ri & mask
-    ls = lu if lu < (1 << (w - 1)) else lu - (1 << w)
-    rs = ru if ru < (1 << (w - 1)) else ru - (1 << w)
-    if pred == "eq": return "true" if lu == ru else "false"
-    if pred == "ne": return "true" if lu != ru else "false"
-    if pred == "ult": return "true" if lu < ru else "false"
-    if pred == "ule": return "true" if lu <= ru else "false"
-    if pred == "ugt": return "true" if lu > ru else "false"
-    if pred == "uge": return "true" if lu >= ru else "false"
-    if pred == "slt": return "true" if ls < rs else "false"
-    if pred == "sle": return "true" if ls <= rs else "false"
-    if pred == "sgt": return "true" if ls > rs else "false"
-    if pred == "sge": return "true" if ls >= rs else "false"
-    return None
+    status, value = fold_llvm_integer_compare(pred, w, li, ri)
+    if status != FOLD_CONSTANT:
+        return None
+    return "true" if value else "false"
 
 
 def _simplify_select(cond: str, tval: str, fval: str) -> str | None:
@@ -370,7 +327,7 @@ def _rewrite_function_text(fn_text: str) -> tuple[str, bool]:
         if m:
             rep = _simplify_binop(
                 m.group("op"), m.group("ty"),
-                m.group("lhs"), m.group("rhs"),
+                m.group("lhs"), m.group("rhs"), m.group("flags"),
             )
             if rep is not None:
                 replacements[m.group("result")] = rep

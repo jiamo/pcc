@@ -98,3 +98,31 @@ def test_subprocess_runtime_wrapper_symbols_are_wired():
     assert "py_subprocess_check_output" in src
     assert "py_subprocess_run" in src
     assert "CompletedProcess" in src
+
+
+def test_subprocess_called_process_error_export_matches_raw_int_scaffold_abi():
+    from pcc.py_frontend.pipeline import build_closed_world_context
+    from pcc.py_frontend.codegen.layer1_support import (
+        _default_native_module_exports,
+    )
+
+    provider = Path("pcc/py_stdlib/subprocess.py")
+    _modules, exports, _derived = build_closed_world_context(
+        [str(provider)],
+        ["subprocess"],
+    )
+    provider_export = exports["subprocess"]["CalledProcessError"]
+    methods = provider_export["methods"]
+    init_export = next(method for method in methods if method["name"] == "__init__")
+    assert init_export["box_int_abi"] is False
+
+    static_exports = _default_native_module_exports("pcc.cli_bootstrap")
+    static_export = static_exports["subprocess"]["CalledProcessError"]
+    for key in ("class_name", "base_names", "field_names", "field_types"):
+        assert static_export[key] == provider_export[key]
+    static_init = static_export["methods"][0]
+    for key in ("symbol", "return_ty", "param_types", "box_int_abi"):
+        if key == "param_types":
+            assert tuple(static_init[key]) == tuple(init_export[key])
+        else:
+            assert static_init[key] == init_export[key]

@@ -2,12 +2,19 @@
 
 import unittest
 
+import pytest
+
 from pcc.dependency_verdict import probe_executable_dependency
 from pcc.ir_passes.lower_expect import LowerExpectPass, lower_expect_text
 from pcc.ir_passes.parity import assert_ir_parity, run_pcc_ir_pass
+from pcc.passes.llvm_text_pipeline import find_opt_binary
 
 
-_OPT_VERDICT = probe_executable_dependency("opt")
+_OPT_VERDICT = probe_executable_dependency(
+    "opt",
+    resolver=lambda _name: find_opt_binary(),
+)
+_OPT = _OPT_VERDICT.resolved_path
 
 
 class LowerExpectTests(unittest.TestCase):
@@ -137,7 +144,9 @@ else:
         self.assertIn("br i1 %cond, label %then, label %else", out)
 
 
-@unittest.skipUnless(_OPT_VERDICT.available, _OPT_VERDICT.skip_reason())
+@pytest.mark.pcc_gate(
+    unavailable=None if _OPT_VERDICT.available else _OPT_VERDICT.skip_reason()
+)
 class UpstreamParityTests(unittest.TestCase):
     def test_expect_branch_matches_upstream_shape(self):
         report = assert_ir_parity("""

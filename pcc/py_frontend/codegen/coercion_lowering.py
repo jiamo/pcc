@@ -159,6 +159,12 @@ class CoercionLoweringMixin:
                     v,
                     FloatType(name="float"),
                 )
+            if ty.name == "pcc.u64":
+                return self.builder.uitofp(
+                    v,
+                    _DOUBLE,
+                    name=self._fresh("u2f"),
+                )
             return self.builder.sitofp(v, _DOUBLE, name=self._fresh("i2f"))
         if isinstance(ty, BoolType):
             if self._ir_type_matches(v.type, _I1):
@@ -212,6 +218,26 @@ class CoercionLoweringMixin:
         raise NotImplementedError(f"Layer 1 cannot coerce {type(ty).__name__} to float")
 
     def _truthy(self, v: ir.Value, ty: Type) -> ir.Value:
+        # Domain wins over the inferred semantic type.  A CPython fallback
+        # can produce a real PyObject* while retaining an IntType/BoolType
+        # annotation; native truth helpers would read that foreign pointer as
+        # a pcc header.  Guard and dispatch through PyObject_IsTrue first.
+        if v in getattr(self, "_cpy_values", ()):
+            self._guard_cpy_value_not_null(v)
+            i32 = self.builder.call(
+                self.runtime["py_cpy_truthy"],
+                [v],
+                name=self._fresh("cpy.truthy"),
+            )
+            self._guard_cpy_status_not_negative(
+                i32,
+                (v,) if self._cpy_value_is_owned(v) else (),
+            )
+            return self.builder.trunc(
+                i32,
+                _I1,
+                name=self._fresh("cpy.truthy.i1"),
+            )
         if isinstance(ty, BoolType):
             if self._ir_type_matches(v.type, _I1):
                 return v
@@ -227,12 +253,16 @@ class CoercionLoweringMixin:
             )
         if isinstance(ty, IntType):
             if isinstance(v.type, ir.PointerType):
-                i64 = marshal.marshal_from_object(
-                    self.builder, self.module, self.runtime, v, ty
+                truth = self.builder.call(
+                    self.runtime["py_obj_truthy"],
+                    [v],
+                    name=self._fresh("truthy_int_obj"),
                 )
-                zero = ir.Constant(_I64, 0)
                 return self.builder.icmp_signed(
-                    "!=", i64, zero, name=self._fresh("truthy_i")
+                    "!=",
+                    truth,
+                    ir.Constant(truth.type, 0),
+                    name=self._fresh("truthy_i"),
                 )
             zero = ir.Constant(_I64, 0)
             return self.builder.icmp_signed("!=", v, zero, name=self._fresh("truthy_i"))
@@ -245,13 +275,6 @@ class CoercionLoweringMixin:
             # CPython-backed values must go through py_cpy_truthy
             # (PyObject_IsTrue) — the pcc py_obj_truthy only knows
             # about pcc's own PyObject layout.
-            if v in getattr(self, "_cpy_values", ()):
-                i32 = self.builder.call(
-                    self.runtime["py_cpy_truthy"],
-                    [v],
-                    name=self._fresh("cpy.truthy"),
-                )
-                return self.builder.trunc(i32, _I1, name=self._fresh("cpy.truthy.i1"))
             # Any object: route through py_obj_truthy, which honours
             # container emptiness, None == False, etc.
             obj = marshal.marshal_to_object(
@@ -309,6 +332,17 @@ class CoercionLoweringMixin:
             # Same pcc_py type class. IR-level representations are
             # usually identical — but watch out for inference lying
             # about the payload.
+            if (
+                isinstance(to_ty, IntType)
+                and isinstance(v.type, ir.IntType)
+                and not self._ir_type_matches(v.type, _I64)
+            ):
+                # A typed C-ABI boundary can represent semantic Python
+                # ``int`` as i8/i16/i32.  Normalize that physical projection
+                # before it enters an i64 expression join (notably a ternary
+                # phi); semantic type equality alone does not make the LLVM
+                # widths interchangeable.
+                return self._to_int64(v, from_ty)
             if self._is_valueclass_payload_type(to_ty):
                 payload = self._emit_object_to_valueclass_payload(v, to_ty)
                 if payload is not None:

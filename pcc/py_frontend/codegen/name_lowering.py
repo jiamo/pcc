@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 from pcc.llvm_capi.compat import ir
@@ -25,6 +26,19 @@ from ..py_ast import (
     Type,
 )
 from .builtin_exceptions import BUILTIN_EXC_TAG as _BUILTIN_EXC_TAG
+from .freestanding_abi_constants import (
+    PY_TYPE_BOOL,
+    PY_TYPE_BYTEARRAY,
+    PY_TYPE_BYTES,
+    PY_TYPE_COMPLEX,
+    PY_TYPE_DICT,
+    PY_TYPE_FLOAT,
+    PY_TYPE_INT,
+    PY_TYPE_LIST,
+    PY_TYPE_MEMORYVIEW,
+    PY_TYPE_STR,
+    PY_TYPE_TUPLE,
+)
 from .runtime_abi import declare_runtime_global
 
 _I1 = ir.IntType(1)
@@ -350,17 +364,17 @@ class NameLoweringMixin:
         if canonical_name == "range":
             return self._emit_native_range_callable_value()
         builtin_tags = {
-            "bool": 1,
-            "int": 2,
-            "float": 3,
-            "str": 4,
-            "list": 5,
-            "dict": 6,
-            "tuple": 7,
-            "bytes": 17,
-            "bytearray": 18,
-            "memoryview": 19,
-            "complex": 16,
+            "bool": PY_TYPE_BOOL,
+            "int": PY_TYPE_INT,
+            "float": PY_TYPE_FLOAT,
+            "str": PY_TYPE_STR,
+            "list": PY_TYPE_LIST,
+            "dict": PY_TYPE_DICT,
+            "tuple": PY_TYPE_TUPLE,
+            "bytes": PY_TYPE_BYTES,
+            "bytearray": PY_TYPE_BYTEARRAY,
+            "memoryview": PY_TYPE_MEMORYVIEW,
+            "complex": PY_TYPE_COMPLEX,
             # ``py_builtin_type_for_tag`` maps unknown tags to the runtime's
             # canonical object class. There is deliberately no object-instance
             # tag in the object header enum: ordinary instances carry their
@@ -584,7 +598,7 @@ class NameLoweringMixin:
                 is_int = builder.icmp_signed(
                     "==",
                     tag,
-                    ir.Constant(_I64, 2),
+                    ir.Constant(_I64, PY_TYPE_INT),
                     name="int.is_int",
                 )
                 int_bb = adapter.append_basic_block("int.from_int")
@@ -598,7 +612,7 @@ class NameLoweringMixin:
                 is_bool = builder.icmp_signed(
                     "==",
                     tag,
-                    ir.Constant(_I64, 1),
+                    ir.Constant(_I64, PY_TYPE_BOOL),
                     name="int.is_bool",
                 )
                 bool_bb = adapter.append_basic_block("int.from_bool")
@@ -623,7 +637,7 @@ class NameLoweringMixin:
                 is_float = builder.icmp_signed(
                     "==",
                     tag,
-                    ir.Constant(_I64, 3),
+                    ir.Constant(_I64, PY_TYPE_FLOAT),
                     name="int.is_float",
                 )
                 float_bb = adapter.append_basic_block("int.from_float")
@@ -649,7 +663,7 @@ class NameLoweringMixin:
                 is_str = builder.icmp_signed(
                     "==",
                     tag,
-                    ir.Constant(_I64, 4),
+                    ir.Constant(_I64, PY_TYPE_STR),
                     name="int.is_str",
                 )
                 str_bb = adapter.append_basic_block("int.from_str")
@@ -774,14 +788,41 @@ class NameLoweringMixin:
                     return self._emit_str_literal(self.ast_module.name)
                 return self._emit_str_literal("__main__")
             if expr.ident == "__file__":
-                # Compile-time approximation — CPython sets ``__file__``
-                # to the absolute path of the compiled script. pcc
-                # doesn't have the source path here at codegen time;
-                # return the sanitized module name instead so code that
-                # logs / path-derives from ``__file__`` keeps working.
-                return self._emit_str_literal(
-                    (self.ast_module.name or "pcc_py_module") + ".py"
-                )
+                # Source spans retain the parser input path. Use the same
+                # value published on the compiled module object so code inside
+                # a module and ``module.__file__`` agree.
+                source_filename = getattr(self, "_module_source_path", "") or ""
+                if source_filename:
+                    source_filename = os.path.abspath(source_filename)
+                else:
+                    for stmt in self.ast_module.body:
+                        span = getattr(stmt, "span", None)
+                        filename = getattr(span, "file", "")
+                        if filename and not filename.startswith("<"):
+                            source_filename = os.path.abspath(filename)
+                            break
+                if source_filename == "":
+                    source_filename = (
+                        (self.ast_module.name or "pcc_py_module") + ".py"
+                    )
+                return self._emit_str_literal(source_filename)
+            if expr.ident == "__package__":
+                if not self._skip_program_main:
+                    return self._emit_str_literal("")
+                module_name = self.ast_module.name or ""
+                source_filename = getattr(self, "_module_source_path", "") or ""
+                if source_filename == "":
+                    for stmt in self.ast_module.body:
+                        span = getattr(stmt, "span", None)
+                        filename = getattr(span, "file", "")
+                        if filename and not filename.startswith("<"):
+                            source_filename = filename
+                            break
+                if os.path.basename(source_filename) == "__init__.py":
+                    return self._emit_str_literal(module_name)
+                if "." in module_name:
+                    return self._emit_str_literal(module_name.rsplit(".", 1)[0])
+                return self._emit_str_literal("")
             if expr.ident == "__doc__":
                 module_global = self._module_globals.get("__doc__")
                 if module_global is not None:
@@ -1145,10 +1186,7 @@ class NameLoweringMixin:
                         [fn_ptr],
                         name=self._fresh(f"cpy.{expr.ident}"),
                     )
-                    if not hasattr(self, "_cpy_values"):
-                        self._cpy_values = set()
-                    self._cpy_values.add(result)
-                    return result
+                    return self._mark_owned_cpy_value(result)
             # ``globals()[dynamic_name] = value`` writes the shared module
             # namespace even when no statically declared LLVM global exists.
             # Python's LOAD_GLOBAL observes those writes before consulting

@@ -1,6 +1,6 @@
 """Real-transform tests for CalledValuePropagationPass (subset)."""
 
-import shutil
+import pytest
 import unittest
 
 from pcc.ir_passes.called_value_prop import (
@@ -10,7 +10,9 @@ from pcc.ir_passes.called_value_prop import (
 from pcc.ir_passes.parity import assert_ir_parity, run_pcc_ir_pass
 
 
-_OPT = shutil.which("opt")
+from pcc.passes.llvm_text_pipeline import find_opt_binary
+
+_OPT = find_opt_binary()
 
 
 class CVPropTests(unittest.TestCase):
@@ -99,7 +101,7 @@ entry:
         self.assertIn("!0 = !{ptr @target}", out)
 
 
-@unittest.skipUnless(_OPT, "requires LLVM opt")
+@pytest.mark.pcc_gate(unavailable=None if _OPT else "matching LLVM opt not installed")
 class UpstreamParityTests(unittest.TestCase):
     def test_internal_global_known_callee_matches_upstream_shape(self):
         report = assert_ir_parity("""

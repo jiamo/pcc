@@ -341,20 +341,29 @@ PyClassObject *py_object_root_cache = (PyClassObject *)0;
 
 void *py_subs_object_root(void) {
     if (py_object_root_cache != (PyClassObject *)0) return (void *)py_object_root_cache;
+    PyClassObject **mro =
+        (PyClassObject **)malloc(sizeof(PyClassObject *));
+    if (mro == (PyClassObject **)0) return (void *)0;
+    /* The cache is a raw process-global pointer, so this immortal root must
+     * keep a stable address rather than enter the relocating heap. */
     PyClassObject *r = (PyClassObject *)calloc(1, sizeof(PyClassObject));
-    if (r == (PyClassObject *)0) return (void *)0;
+    if (r == (PyClassObject *)0) {
+        free(mro);
+        return (void *)0;
+    }
     r->h.refcount = 1;
     r->h.type_tag = PY_TYPE_CLASS;
-    r->h.flags    = PY_FLAG_IMMORTAL;
+    r->h.flags = PY_FLAG_IMMORTAL | PY_FLAG_GC_MALLOC_ALLOC;
+    if (pcc_gc_pointer_register((PyObject *)r) < 0) {
+        free(r);
+        free(mro);
+        return (void *)0;
+    }
     r->name       = "object";
     r->n_bases    = 0;
     r->bases      = (PyClassObject **)0;
     r->n_mro      = 1;
-    r->mro        = (PyClassObject **)malloc(sizeof(PyClassObject *));
-    if (r->mro == (PyClassObject **)0) {
-        free(r);
-        return (void *)0;
-    }
+    r->mro        = mro;
     r->mro[0]     = r;
     r->n_fields   = 0;
     r->field_names = (const char **)0;

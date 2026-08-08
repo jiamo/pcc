@@ -2,14 +2,38 @@
 
 This module defines the stable runtime storage symbols that used to live
 in py_substrate.c, plus the small C ABI helper functions retained for
-older runtime call sites.  The top-level define_global_* calls are
-compile-time pcc.unsafe intrinsics: they create data symbols in the
-object file and do not depend on the stripped synthetic main().
+older runtime call sites.  The top-level define_global_* and
+define_thread_local_* calls are compile-time pcc.unsafe intrinsics: they
+create storage symbols in the object file and do not depend on the
+stripped synthetic main().
 """
 
-from pcc.extern import c_abi_export
+from pcc.extern import c_abi_export, c_int32, c_int64, c_ptr, c_void, extern
+from pcc.py_runtime.py.py_abi_constants import (
+    C_POINTER_SIZE,
+    PYCLASSOBJECT_BASES_OFFSET,
+    PYCLASSOBJECT_FIELD_NAMES_OFFSET,
+    PYCLASSOBJECT_INSTANCE_SIZE_OFFSET,
+    PYCLASSOBJECT_METHODS_OFFSET,
+    PYCLASSOBJECT_MRO_OFFSET,
+    PYCLASSOBJECT_NAME_OFFSET,
+    PYCLASSOBJECT_N_BASES_OFFSET,
+    PYCLASSOBJECT_N_FIELDS_OFFSET,
+    PYCLASSOBJECT_N_METHODS_OFFSET,
+    PYCLASSOBJECT_N_MRO_OFFSET,
+    PYCLASSOBJECT_SIZE,
+    PYCLASSOBJECT_TYPE_TAG_ALLOC_OFFSET,
+    PYINSTANCEOBJECT_SIZE,
+    PYOBJECTHEADER_FLAGS_OFFSET,
+    PYOBJECTHEADER_REFCOUNT_OFFSET,
+    PYOBJECTHEADER_TYPE_TAG_OFFSET,
+    PY_FLAG_GC_MALLOC_ALLOC,
+    PY_FLAG_IMMORTAL,
+    PY_TYPE_CLASS,
+    PY_TYPE_INSTANCE,
+    PY_TYPE_USER_CLASS_START,
+)
 from pcc.unsafe import (
-    access,
     define_global_cstr,
     define_global_header,
     define_global_i8,
@@ -19,8 +43,8 @@ from pcc.unsafe import (
     define_global_ptr_array,
     define_global_ptr_null,
     define_global_ptr_to_global,
+    define_thread_local_ptr_null,
     free,
-    getenv,
     global_addr,
     global_load_ptr,
     global_store_ptr,
@@ -38,20 +62,37 @@ from pcc.unsafe import (
     ptr_eq,
     ptr_is_null,
     realloc,
-    setenv,
     store_i32,
     store_i8,
     store_i64,
     store_ptr,
     strlen,
-    unsetenv,
-    write,
 )
 
-define_global_header("py_none_storage", 1, 0, 1)
-define_global_header("py_notimplemented_storage", 1, 0, 1)
-define_global_header("py_true_storage", 1, 1, 1)
-define_global_header("py_false_storage", 1, 1, 1)
+access = extern("pcc_platform_access", (c_ptr, c_int64), c_int64)
+getenv = extern("pcc_platform_getenv", (c_ptr,), c_ptr)
+setenv = extern("pcc_platform_setenv", (c_ptr, c_ptr, c_int64), c_int64)
+unsetenv = extern("pcc_platform_unsetenv", (c_ptr,), c_int64)
+write = extern("pcc_platform_write", (c_int64, c_ptr, c_int64), c_int64)
+pcc_gc_scheduler_root_register_handle = extern(
+    "pcc_gc_scheduler_root_register_handle", (c_ptr,), c_ptr
+)
+pcc_gc_scheduler_root_unregister_handle = extern(
+    "pcc_gc_scheduler_root_unregister_handle", (c_ptr,), c_void
+)
+pcc_gc_note_slot_write_barrier = extern(
+    "pcc_gc_note_slot_write_barrier", (c_ptr, c_ptr, c_ptr), c_void
+)
+pcc_platform_abort = extern("pcc_platform_abort", (), c_void)
+pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
+pcc_gc_pointer_register = extern(
+    "pcc_gc_pointer_register", (c_ptr,), c_int64
+)
+
+define_global_header("py_none_storage", 1, 0, PY_FLAG_IMMORTAL)
+define_global_header("py_notimplemented_storage", 1, 0, PY_FLAG_IMMORTAL)
+define_global_header("py_true_storage", 1, 1, PY_FLAG_IMMORTAL)
+define_global_header("py_false_storage", 1, 1, PY_FLAG_IMMORTAL)
 define_global_ptr_to_global("py_None", "py_none_storage")
 define_global_ptr_to_global("py_NotImplemented", "py_notimplemented_storage")
 define_global_ptr_to_global("py_True", "py_true_storage")
@@ -133,19 +174,7 @@ define_global_null_ptr_array("py_exc_classes", 22)
 
 define_global_i8("py_set_dummy_storage", 0)
 define_global_ptr_to_global("py_set_dummy", "py_set_dummy_storage")
-define_global_i32("py_next_user_tag", 104)
-define_global_i32("py_gc_enabled", 1)
-define_global_i32("py_gc_threshold0", 700)
-define_global_i32("py_gc_threshold1", 10)
-define_global_i32("py_gc_threshold2", 10)
-define_global_i32("py_gc_freeze_count", 0)
-define_global_ptr_null("py_gc_head")
-define_global_ptr_null("pcc_gc_backend4_parked_head")
-define_global_i32("pcc_gc_forwarding_population", 0)
-define_global_i32("py_gc_tracked_count", 0)
-define_global_i32("py_gc_collecting", 0)
-define_global_ptr_null("py_gc_callbacks")
-define_global_i32("py_gc_callbacks_firing", 0)
+define_global_i32("py_next_user_tag", PY_TYPE_USER_CLASS_START)
 define_global_ptr_null("py_weakref_head")
 define_global_ptr_null("py_object_root_cache")
 define_global_i32("py_class_attr_cache_epoch", 0)
@@ -165,125 +194,8 @@ define_global_i32("py_inst_field_cache_epoch0", -1)
 define_global_i32("py_inst_field_cache_epoch1", -1)
 define_global_i32("py_inst_field_cache_epoch2", -1)
 define_global_i32("py_inst_field_cache_epoch3", -1)
-define_global_ptr_null("py_tls_current_exc_storage")
-define_global_i32("pcc_gc_backend_selected", 0)
-define_global_i32("pcc_gc_metric_alloc", 0)
-define_global_i32("pcc_gc_metric_store", 0)
-define_global_i32("pcc_gc_metric_load", 0)
-define_global_i32("pcc_gc_metric_safepoint", 0)
-define_global_i32("pcc_gc_metric_pin", 0)
-define_global_i32("pcc_gc_metric_step", 0)
-define_global_i32("pcc_gc_metric_max_pause_us", 0)
-define_global_i32("pcc_gc_metric_pause_count", 0)
-define_global_i32("pcc_gc_metric_pause_sum_us", 0)
-define_global_i32("pcc_gc_metric_pause_hist0", 0)
-define_global_i32("pcc_gc_metric_pause_hist1", 0)
-define_global_i32("pcc_gc_metric_pause_hist2", 0)
-define_global_i32("pcc_gc_metric_pause_hist3", 0)
-define_global_i32("pcc_gc_debt_bytes", 0)
-define_global_i32("pcc_gc_last_alloc_bytes", 0)
-define_global_i32("pcc_gc_live_bytes", 0)
-define_global_i32("pcc_gc_pause", 1000)
-define_global_i32("pcc_gc_stepmul", 10000)
-define_global_i32("pcc_gc_debt_threshold_override", 0)
-define_global_i32("pcc_gc_config_initialized", 0)
-define_global_i32("pcc_gc_read_barrier_enabled", 1)
-define_global_i32("pcc_gc_backend0_frame_roots_enabled", 0)
-define_global_i32("pcc_gc_in_auto_step", 0)
-define_global_i32("pcc_gc_explicit_collect_active", 0)
-define_global_i32("pcc_gc_gray_count", 0)
-define_global_i32("pcc_gc_minor_heap_size", 1048576)
-define_global_i32("pcc_gc_minor_alloc_max", 256)
-define_global_i32("pcc_gc_minor_allocations", 0)
-define_global_i32("pcc_gc_minor_collections", 0)
-define_global_i32("pcc_gc_minor_bytes", 0)
-define_global_i32("pcc_gc_cms_worker_started", 0)
-define_global_i32("pcc_gc_cms_worker_starts", 0)
-define_global_i32("pcc_gc_cms_queue_pushes", 0)
-define_global_i32("pcc_gc_cms_worker_drains", 0)
-define_global_i32("pcc_gc_cms_mutator_assists", 0)
-define_global_i32("pcc_gc_cms_worker_traces", 0)
-define_global_i32("pcc_gc_minor_arena_refills", 0)
-define_global_i32("pcc_gc_minor_arena_bumps", 0)
-define_global_i32("pcc_gc_minor_arena_fallbacks", 0)
-define_global_i32("pcc_gc_cms_worker_stops", 0)
-define_global_i32("pcc_gc_cms_wb_flushes", 0)
-define_global_ptr_null("pcc_gc_minor_blocks")
-define_global_ptr_null("pcc_gc_minor_current")
-define_global_ptr_null("pcc_gc_pending_minor_block")
-define_global_i32("pcc_gc_relocation_forwards", 0)
-define_global_i32("pcc_gc_relocation_barrier_forwards", 0)
-define_global_i32("pcc_gc_relocation_pin_rejects", 0)
-define_global_i32("pcc_gc_backend4_genzgc_store_barriers", 0)
-define_global_i32("pcc_gc_backend4_store_buffer_entries_count", 0)
-define_global_i32("pcc_gc_backend4_young_promotions", 0)
-define_global_i32("pcc_gc_backend4_evacuation_candidates", 0)
-define_global_i32("pcc_gc_backend4_evacuated_bytes_count", 0)
-define_global_i32("pcc_gc_backend4_large_object_defers", 0)
-define_global_i32("pcc_gc_backend4_large_object_deferred_bytes_count", 0)
-define_global_i32("pcc_gc_backend4_large_object_reconsiderations_count", 0)
-define_global_i32("pcc_gc_backend4_small_page_candidates", 0)
-define_global_i32("pcc_gc_backend4_medium_page_candidates", 0)
-define_global_i32("pcc_gc_backend4_evacuation_candidate_bytes_count", 0)
-define_global_i32("pcc_gc_backend4_small_page_candidate_bytes_count", 0)
-define_global_i32("pcc_gc_backend4_medium_page_candidate_bytes_count", 0)
-define_global_i32("pcc_gc_backend4_evacuation_candidate_zpage_bytes_count", 0)
-define_global_i32("pcc_gc_backend4_small_page_candidate_zpage_bytes_count", 0)
-define_global_i32("pcc_gc_backend4_medium_page_candidate_zpage_bytes_count", 0)
-define_global_i32("pcc_gc_backend4_store_buffer_drain_batches_count", 0)
-define_global_i32("pcc_gc_backend4_store_buffer_drained_entries_count", 0)
-define_global_i32("pcc_gc_backend4_store_buffer_duplicate_skips_count", 0)
-define_global_i32("pcc_gc_backend4_store_buffer_high_water_count", 0)
-define_global_i32("pcc_gc_backend4_store_buffer_owner_fanout_high_water_count", 0)
-define_global_i32("pcc_gc_backend4_store_buffer_owner_count_high_water_count", 0)
-define_global_i32("pcc_gc_backend4_store_buffer_incomplete_drains_count", 0)
-define_global_i32("pcc_gc_backend4_evacuation_incomplete_batches_count", 0)
-define_global_i32("pcc_gc_backend4_store_buffer_max_batch_size_count", 0)
-define_global_i32("pcc_gc_backend4_store_buffer_full_batches_count", 0)
-define_global_i32("pcc_gc_backend4_store_buffer_medium_count", 0)
-define_global_i32("pcc_gc_backend4_store_buffer_medium_flushes_count", 0)
-define_global_i32("pcc_gc_backend4_store_buffer_medium_flushed_entries_count", 0)
-define_global_i32("pcc_gc_backend4_store_buffer_medium_full_flushes_count", 0)
-define_global_i32("pcc_gc_backend4_remembered_set_entries_count", 0)
-define_global_i32("pcc_gc_backend4_remembered_set_duplicate_skips_count", 0)
-define_global_i32("pcc_gc_backend4_remembered_set_high_water_count", 0)
-define_global_i32("pcc_gc_backend3_remembered_overflow", 0)
-define_global_i32("pcc_gc_next_object_id", 1)
-define_global_ptr_null("pcc_gc_last_alloc")
-define_global_ptr_null("pcc_gc_forwarding_head")
-define_global_ptr_null("pcc_gc_identity_head")
-define_global_ptr_null("pcc_gc_relocation_set_head")
-define_global_ptr_null("pcc_gc_backend3_remembered_owner_head")
-define_global_ptr_null("pcc_gc_backend4_store_buffer_head")
-define_global_ptr_null("pcc_gc_backend4_store_buffer_medium_head")
-define_global_ptr_null("pcc_gc_backend4_zpage_head")
-define_global_ptr_null("pcc_gc_backend4_zpage_payload_span_head")
-define_global_ptr_null("pcc_gc_backend4_page_head")
-define_global_ptr_null("pcc_gc_backend4_free_page_head")
-define_global_ptr_null("pcc_gc_backend4_retained_page_head")
-define_global_ptr_null("pcc_gc_backend4_evacuation_page_head")
-define_global_ptr_null("pcc_gc_backend4_active_small_young_page")
-define_global_ptr_null("pcc_gc_backend4_active_small_old_page")
-define_global_ptr_null("pcc_gc_backend4_active_medium_young_page")
-define_global_ptr_null("pcc_gc_backend4_active_medium_old_page")
-define_global_ptr_null("pcc_gc_backend4_remembered_slots_head")
-define_global_ptr_null("pcc_gc_object_node_free_head")
-define_global_i32("pcc_gc_object_node_free_count", 0)
-define_global_ptr_null("pcc_gc_backend4_zpage_node_free_head")
-define_global_i32("pcc_gc_backend4_zpage_node_free_count", 0)
-define_global_i32("pcc_gc_mark_active", 0)
-define_global_i32("pcc_gc_cycle_requested", 0)
-define_global_i32("pcc_gc_root_count", 0)
-define_global_ptr_null("pcc_gc_root_slots")
-define_global_ptr_null("pcc_gc_frame_head")
-define_global_ptr_null("pcc_gc_frame_node_pool_heads")
-define_global_ptr_null("pcc_gc_frame_node_pool_counts")
-define_global_ptr_null("pcc_gc_continuation_root_head")
-define_global_ptr_null("pcc_gc_scheduler_root_head")
-define_global_ptr_null("pcc_gc_object_head")
-define_global_ptr_null("pcc_gc_trace_cursor")
-define_global_ptr_null("pcc_gc_backend3_young_head")
-define_global_ptr_null("pcc_gc_relocate_slot_pairs_ctx")
+define_thread_local_ptr_null("py_tls_current_exc_storage")
+define_thread_local_ptr_null("py_tls_current_exc_root_handle")
 
 
 @c_abi_export("py_mem_alloc")
@@ -374,7 +286,33 @@ def py_tls_exc_get():
 
 @c_abi_export("py_tls_exc_set")
 def py_tls_exc_set(exc) -> None:
-    global_store_ptr("py_tls_current_exc_storage", exc)
+    handle = global_load_ptr("py_tls_current_exc_root_handle")
+    if ptr_is_null(exc) == 0:
+        if ptr_is_null(handle) != 0:
+            handle = pcc_gc_scheduler_root_register_handle(
+                global_addr("py_tls_current_exc_storage")
+            )
+            if ptr_is_null(handle) != 0:
+                # An active exception may outlive the current native frame.
+                # Continuing without publishing its TLS slot to the common
+                # root registry would make a concurrent collector unsound.
+                pcc_platform_abort()
+                return
+            global_store_ptr("py_tls_current_exc_root_handle", handle)
+        pcc_gc_note_slot_write_barrier(
+            null(), global_addr("py_tls_current_exc_storage"), exc
+        )
+        global_store_ptr("py_tls_current_exc_storage", exc)
+        return
+
+    # Publish the empty slot before unlinking its root node so a collector can
+    # never retain the value through a node that is being retired.  Clearing
+    # also makes raw-pthread exit safe without a platform-specific TLS
+    # destructor: normal exception teardown leaves no address into dead TLS.
+    global_store_ptr("py_tls_current_exc_storage", null())
+    if ptr_is_null(handle) == 0:
+        pcc_gc_scheduler_root_unregister_handle(handle)
+        global_store_ptr("py_tls_current_exc_root_handle", null())
 
 
 @c_abi_export("py_subs_none")
@@ -539,34 +477,45 @@ def py_subs_object_root():
     if ptr_is_null(root) == 0:
         return root
 
-    # sizeof(PyClassObject); verified mechanically against py_internal.h by
-    # test_pyclass_layout_matches_pcc_python_mirror.
-    r = malloc(120)
-    if ptr_is_null(r):
-        return null()
-    memset(r, 0, 120)
-
-    store_i64(r, 0, 1)
-    store_i32(r, 8, 10)
-    store_i32(r, 12, 1)
-    store_ptr(r, 16, global_addr("PY_OBJECT_NAME"))
-    store_i32(r, 24, 0)
-    store_ptr(r, 32, null())
-    store_i32(r, 40, 1)
-
-    mro = malloc(8)
+    mro = malloc(C_POINTER_SIZE)
     if ptr_is_null(mro):
-        free(r)
         return null()
-    store_ptr(mro, 0, r)
-    store_ptr(r, 48, mro)
+    # This root is cached in a raw global pointer, not a relocation-updated
+    # root slot.  Give it stable storage and register exact provenance.
+    r = malloc(PYCLASSOBJECT_SIZE)
+    if ptr_is_null(r):
+        free(mro)
+        return null()
+    memset(r, 0, PYCLASSOBJECT_SIZE)
+    store_i64(r, PYOBJECTHEADER_REFCOUNT_OFFSET, 1)
+    store_i32(r, PYOBJECTHEADER_TYPE_TAG_OFFSET, PY_TYPE_CLASS)
+    store_i32(
+        r,
+        PYOBJECTHEADER_FLAGS_OFFSET,
+        PY_FLAG_IMMORTAL | PY_FLAG_GC_MALLOC_ALLOC,
+    )
+    if pcc_gc_pointer_register(r) < 0:
+        free(r)
+        free(mro)
+        return null()
+    store_ptr(r, PYCLASSOBJECT_NAME_OFFSET, global_addr("PY_OBJECT_NAME"))
+    store_i32(r, PYCLASSOBJECT_N_BASES_OFFSET, 0)
+    store_ptr(r, PYCLASSOBJECT_BASES_OFFSET, null())
+    store_i32(r, PYCLASSOBJECT_N_MRO_OFFSET, 1)
 
-    store_i32(r, 56, 0)
-    store_ptr(r, 64, null())
-    store_i32(r, 72, 0)
-    store_ptr(r, 80, null())
-    store_i32(r, 88, 24)
-    store_i32(r, 92, 11)
+    store_ptr(mro, 0, r)
+    store_ptr(r, PYCLASSOBJECT_MRO_OFFSET, mro)
+
+    store_i32(r, PYCLASSOBJECT_N_METHODS_OFFSET, 0)
+    store_ptr(r, PYCLASSOBJECT_METHODS_OFFSET, null())
+    store_i32(r, PYCLASSOBJECT_N_FIELDS_OFFSET, 0)
+    store_ptr(r, PYCLASSOBJECT_FIELD_NAMES_OFFSET, null())
+    store_i32(
+        r,
+        PYCLASSOBJECT_INSTANCE_SIZE_OFFSET,
+        PYINSTANCEOBJECT_SIZE + C_POINTER_SIZE,
+    )
+    store_i32(r, PYCLASSOBJECT_TYPE_TAG_ALLOC_OFFSET, PY_TYPE_INSTANCE)
 
     global_store_ptr("py_object_root_cache", r)
     return r

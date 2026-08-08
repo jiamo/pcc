@@ -38,6 +38,7 @@ def test_pcc1_pip_install_numpy_from_network_then_array_add(tmp_path):
     cache = tmp_path / "cache"
     install_env = os.environ.copy()
     install_env.pop("LC_ALL", None)
+    install_env["PCC_HOST_PYTHON"] = "/usr/bin/false"
     install = subprocess.run(
         [
             str(pcc1),
@@ -52,7 +53,7 @@ def test_pcc1_pip_install_numpy_from_network_then_array_add(tmp_path):
         ],
         text=True,
         capture_output=True,
-        timeout=480,
+        timeout=780,
         env=install_env,
     )
     assert install.returncode == 0, install.stdout + install.stderr
@@ -60,13 +61,28 @@ def test_pcc1_pip_install_numpy_from_network_then_array_add(tmp_path):
     assert report["ok"] is True, json.dumps(report, sort_keys=True)
     acquisition = report["acquisitions"][0]
     assert acquisition["acquire_mode_requested"] == "auto"
-    assert acquisition["acquire_mode"] == "host"
-    assert acquisition["host_assisted"] is True
+    assert acquisition["acquire_mode"] == "owned"
+    assert acquisition["host_assisted"] is False
+    assert acquisition["host_python"] is None
     assert acquisition["target_python"] == "3.11"
     resolved_version = str(acquisition["resolved_version"])
     assert resolved_version.startswith("2.4.")
     assert acquisition["sha256"]
     assert Path(str(acquisition["artifact_path"])).is_file()
+    build = report["installs"][0]["build_report"]
+    assert report["build_mode_requested"] == "owned"
+    assert build["build_mode_requested"] == "owned"
+    assert build["build_backend"] == "pcc-native-meson"
+    assert build["build_ownership"] == "owned"
+    assert build["host_assisted"] is False
+    assert build["host_python"] is None
+    assert build["host_free_build_claim"] is True
+    assert [action["kind"] for action in build["actions"]] == [
+        "owned_meson_compile",
+        "owned_meson_setup",
+        "owned_build_exec_compile",
+        "owned_meson_target_replay",
+    ]
 
     extensions = list(site.glob("numpy/**/*.pcc*-pcc_native-*.so"))
     assert extensions, "install produced no pcc-native NumPy extension"
@@ -84,11 +100,10 @@ def test_pcc1_pip_install_numpy_from_network_then_array_add(tmp_path):
     compile_env.pop("LC_ALL", None)
     compile_env["PCC_PACKAGE_SITE"] = str(site)
     compile_env["PYTHONPATH"] = ""
-    # This gate intentionally exercises the explicitly host-assisted
-    # acquisition mode.  Compilation may use that same host interpreter to
-    # locate stdlib source (for example copyreg); the produced artifact is
-    # independently checked below with host Python and the package site both
-    # unavailable.
+    # Acquisition and source build are both pcc-owned.  Keep the host query
+    # disabled during application compilation too; a missing stdlib provider
+    # must fail this gate instead of silently consulting CPython.
+    compile_env["PCC_HOST_PYTHON"] = "/usr/bin/false"
     compile_proc = subprocess.run(
         [
             str(pcc1),

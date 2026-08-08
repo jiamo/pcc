@@ -244,11 +244,16 @@ class SubscriptLoweringMixin:
     def _emit_index_expr_as_i64(self, expr: Expr) -> ir.Value:
         value = self._emit_expr(expr)
         if value in getattr(self, "_cpy_values", ()):
-            return self.builder.call(
+            self._guard_cpy_value_not_null(value)
+            result = self.builder.call(
                 self.runtime["py_cpy_to_i64"],
                 [value],
                 name=self._fresh("cpy.index.to_i64"),
             )
+            if self._cpy_value_is_owned(value):
+                self.builder.call(self.runtime["py_cpy_decref"], [value])
+                self._forget_owned_cpy_value(value)
+            return result
         if isinstance(expr.ty, (IntType, BoolType)):
             return self._to_int64(value, expr.ty)
         obj = marshal.marshal_to_object(
@@ -365,6 +370,12 @@ class SubscriptLoweringMixin:
                         self.runtime["py_obj_set_slice"],
                         [obj, lo_obj, hi_obj, step_obj, rhs_obj],
                     )
+                    # Extension mp_ass_subscript/sq_ass_item failures are
+                    # reported through the pending-exception channel.  Check
+                    # it before continuing so a rejected slice store cannot
+                    # leave a partially initialized numerical container in
+                    # use by later code.
+                    self._emit_post_call_err_check(target.span)
                     release_rhs()
                     return
                 raise NotImplementedError(
@@ -484,6 +495,11 @@ class SubscriptLoweringMixin:
         if isinstance(obj_ty, DictType):
             key_obj = self._emit_subscript_key_object(idx_expr)
             self.builder.call(self.runtime["py_dict_set"], [obj, key_obj, rhs_obj])
+            # ``py_dict_set`` has a void ABI and reports rejected keys through
+            # the pending-exception channel.  Branch before the next source
+            # statement so an unhashable key is catchable instead of leaving
+            # a stale TypeError behind a seemingly successful assignment.
+            self._emit_post_call_err_check(target.span)
             release_rhs()
             return
         if isinstance(obj_ty, TupleType):
@@ -556,47 +572,92 @@ class SubscriptLoweringMixin:
         obj = self._emit_expr(expr.obj)
         slice_log("emit obj end")
         if obj in getattr(self, "_cpy_values", ()):
+            live_owned = self._begin_cpy_operand_evaluation(obj)
+            obj_owned = bool(live_owned)
 
-            def _bound_cpy(e: Optional[Expr]) -> ir.Value:
+            # Loading the internal ``slice`` callable can itself fail.  Chain
+            # that failure through cleanup of a fresh receiver and any outer
+            # CPython operand scope rather than bypassing both.
+            previous_cpy_cleanup = getattr(
+                self,
+                "_cpy_operand_cleanup_block",
+                None,
+            )
+            if live_owned:
+                cleanup_target = previous_cpy_cleanup
+                if cleanup_target is None:
+                    cleanup_target = self._ensure_fn_err_exit()
+                self._cpy_operand_cleanup_block = (
+                    self._make_cpy_operand_cleanup_block(
+                        tuple(live_owned),
+                        (),
+                        cleanup_target,
+                        "cpy.slice.callable.cleanup",
+                    )
+                )
+            try:
+                slice_fn = self._load_cpython_builtin("slice")
+            finally:
+                self._cpy_operand_cleanup_block = previous_cpy_cleanup
+            self._guard_cpy_value_not_null(slice_fn, tuple(live_owned))
+            live_owned.append(slice_fn)
+
+            def _bound_cpy(e: Optional[Expr]) -> tuple[ir.Value, bool]:
                 if e is None:
                     gv = declare_runtime_global(self.module, "py_None")
                     none = self.builder.load(gv, name=self._fresh("none"))
-                    return self.builder.call(
-                        self.runtime["py_cpy_from_pcc_obj"],
-                        [none],
-                        name=self._fresh("cpy.none"),
+                    value = self._mark_owned_cpy_value(
+                        self.builder.call(
+                            self.runtime["py_cpy_from_pcc_obj"],
+                            [none],
+                            name=self._fresh("cpy.none"),
+                        )
                     )
-                v = self._emit_expr(e)
-                boxed = marshal.marshal_to_object(
-                    self.builder,
-                    self.module,
-                    self.runtime,
-                    v,
-                    e.ty,
-                )
-                if boxed in getattr(self, "_cpy_values", ()):
-                    return boxed
-                return self.builder.call(
-                    self.runtime["py_cpy_from_pcc_obj"],
-                    [boxed],
-                    name=self._fresh("cpy.slice.bound"),
+                    self._guard_cpy_value_not_null(value, tuple(live_owned))
+                    live_owned.append(value)
+                    return value, True
+                return self._emit_checked_cpython_call_arg(
+                    e,
+                    live_owned,
                 )
 
-            slice_fn = self._load_cpython_builtin("slice")
-            lo_cpy = _bound_cpy(sl.lo)
-            hi_cpy = _bound_cpy(sl.hi)
-            step_cpy = _bound_cpy(sl.step)
+            lo_cpy, lo_owned = _bound_cpy(sl.lo)
+            hi_cpy, hi_owned = _bound_cpy(sl.hi)
+            step_cpy, step_owned = _bound_cpy(sl.step)
             slice_obj = self.builder.call(
                 self.runtime["py_cpy_call3"],
                 [slice_fn, lo_cpy, hi_cpy, step_cpy],
                 name=self._fresh("cpy.slice"),
+            )
+            if lo_owned:
+                self.builder.call(self.runtime["py_cpy_decref"], [lo_cpy])
+                self._forget_owned_cpy_value(lo_cpy)
+            if hi_owned:
+                self.builder.call(self.runtime["py_cpy_decref"], [hi_cpy])
+                self._forget_owned_cpy_value(hi_cpy)
+            if step_owned:
+                self.builder.call(self.runtime["py_cpy_decref"], [step_cpy])
+                self._forget_owned_cpy_value(step_cpy)
+            self.builder.call(self.runtime["py_cpy_decref"], [slice_fn])
+            self._forget_owned_cpy_value(slice_fn)
+            self._mark_owned_cpy_value(slice_obj)
+            self._guard_cpy_value_not_null(
+                slice_obj,
+                (obj,) if obj_owned else (),
             )
             result = self.builder.call(
                 self.runtime["py_cpy_getitem"],
                 [obj, slice_obj],
                 name=self._fresh("cpy.slice.getitem"),
             )
-            return self._mark_cpy_value(result)
+            self.builder.call(self.runtime["py_cpy_decref"], [slice_obj])
+            self._forget_owned_cpy_value(slice_obj)
+            if obj_owned:
+                self.builder.call(self.runtime["py_cpy_decref"], [obj])
+                self._forget_owned_cpy_value(obj)
+            self._mark_owned_cpy_value(result)
+            self._guard_cpy_value_not_null(result)
+            return result
         slice_log("obj ty begin")
         obj_ty = expr.obj.ty
         slice_log("obj ty end")
@@ -735,12 +796,18 @@ class SubscriptLoweringMixin:
 
         obj = self._emit_expr(expr.obj)
         if obj in getattr(self, "_cpy_values", ()):
+            live_owned = self._begin_cpy_operand_evaluation(obj)
+            obj_owned = bool(live_owned)
             literal_key = self._maybe_emit_cpython_subscript_key_literal(expr.idx)
             if literal_key is not None:
-                cpy_key, owned = literal_key, False
+                cpy_key, owned = literal_key, True
+                self._guard_cpy_value_not_null(cpy_key, tuple(live_owned))
+                live_owned.append(cpy_key)
             else:
-                key_val = self._emit_expr(expr.idx)
-                cpy_key, owned = self._marshal_to_cpython(key_val, expr.idx.ty)
+                cpy_key, owned = self._emit_checked_cpython_call_arg(
+                    expr.idx,
+                    live_owned,
+                )
             result = self.builder.call(
                 self.runtime["py_cpy_getitem"],
                 [obj, cpy_key],
@@ -748,10 +815,12 @@ class SubscriptLoweringMixin:
             )
             if owned:
                 self.builder.call(self.runtime["py_cpy_decref"], [cpy_key])
-            if not hasattr(self, "_cpy_values"):
-                self._cpy_values = set()
-            self._cpy_values.add(result)
-            self._gc_release_if_owned(obj, expr.obj)
+                self._forget_owned_cpy_value(cpy_key)
+            if obj_owned:
+                self.builder.call(self.runtime["py_cpy_decref"], [obj])
+                self._forget_owned_cpy_value(obj)
+            self._mark_owned_cpy_value(result)
+            self._guard_cpy_value_not_null(result)
             return result
         obj_ty = expr.obj.ty
         exact_container = self._emit_exact_container_subscript_load_object(expr, obj)

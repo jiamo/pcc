@@ -2,6 +2,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import sys
 
 import pytest
 
@@ -233,6 +234,42 @@ def test_sqlite_runtime_with_system_link_depends_on(tmp_path, sqlite_compiled_un
     assert "OK" in result.stdout
     assert db_path.exists()
     _assert_sqlite_db_contents(db_path)
+
+
+@pytest.mark.pcc_gate(unavailable=None if os.path.isdir(SQLITE_DIR) else "sqlite-amalgamation-3490100 not found")
+@pytest.mark.integration
+def test_sqlite_runtime_with_freestanding_libc(tmp_path, sqlite_compiled_units):
+    compiled_units, base_dir = sqlite_compiled_units
+    db_path = tmp_path / "freestanding-runtime.sqlite3"
+    link_map = tmp_path / "sqlite-freestanding.map"
+    map_flag = (
+        "-Wl,-map," + str(link_map)
+        if sys.platform == "darwin"
+        else "-Wl,-Map," + str(link_map)
+    )
+
+    result = CEvaluator().run_compiled_translation_units_with_system_cc(
+        compiled_units,
+        optimize=True,
+        base_dir=base_dir,
+        prog_args=[str(db_path)],
+        link_args=[map_flag],
+        freestanding_libc=True,
+    )
+
+    assert result.returncode == 0, (
+        "sqlite freestanding-libc runtime failed:\n"
+        f"{result.stdout}\n{result.stderr}"
+    )
+    assert "selected row: world 20" in result.stdout
+    assert "persisted score: 17" in result.stdout
+    assert "OK" in result.stdout
+    _assert_sqlite_db_contents(db_path)
+    ownership = link_map.read_text(encoding="utf-8")
+    assert "freestanding_mem_str.o" in ownership
+    assert "freestanding_allocator.o" in ownership
+    assert "freestanding_stdio.o" in ownership
+    assert "vendor_" not in ownership
 
 
 @pytest.mark.pcc_gate(unavailable=None if os.path.isdir(SQLITE_DIR) else "sqlite-amalgamation-3490100 not found")

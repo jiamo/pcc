@@ -8,20 +8,25 @@ Coercion: keys/values may be any py object; non-str gets routed
 through py_obj_str() to realize a PyStrObject before reading its
 UTF-8 bytes.
 """
+from pcc.py_runtime.py.py_abi_constants import (
+    PY_TYPE_INT,
+    PY_TYPE_STR,
+)
 
 from pcc.extern import extern, c_abi_export, c_ptr, c_int64, c_void
 from pcc.unsafe import (
     cstr,
-    getenv,
     global_load_ptr,
     is_tagged_int,
     load_i32,
     null,
     ptr_is_null,
-    setenv,
     strlen,
-    unsetenv,
 )
+
+getenv = extern("pcc_platform_getenv", (c_ptr,), c_ptr)
+setenv = extern("pcc_platform_setenv", (c_ptr, c_ptr, c_int64), c_int64)
+unsetenv = extern("pcc_platform_unsetenv", (c_ptr,), c_int64)
 
 py_decref = extern("py_decref", (c_ptr,), c_void)
 py_str_new = extern("py_str_new", (c_ptr, c_int64), c_ptr)
@@ -39,7 +44,7 @@ py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 
 def _type_of(obj) -> int:
     if is_tagged_int(obj):
-        return 2  # PY_TYPE_INT
+        return PY_TYPE_INT  # PY_TYPE_INT
     return load_i32(obj, 8)
 
 
@@ -48,7 +53,7 @@ def _coerce_to_str(o):
     # is the temporary we must decref after, or NULL.
     if ptr_is_null(o):
         return null(), null()
-    if _type_of(o) == 4:  # PY_TYPE_STR
+    if _type_of(o) == PY_TYPE_STR:  # PY_TYPE_STR
         return o, null()
     new_s = py_obj_str(o)
     return new_s, new_s
@@ -80,7 +85,7 @@ def py_os_environ_contains(key) -> int:
     if ptr_is_null(key) != 0:
         py_raise_owned(py_exc_new(3, cstr("str expected")))  # PY_EXC_TYPEERROR
         return -1
-    if _type_of(key) != 4:  # PY_TYPE_STR
+    if _type_of(key) != PY_TYPE_STR:  # PY_TYPE_STR
         py_raise_owned(py_exc_new(3, cstr("str expected")))  # PY_EXC_TYPEERROR
         return -1
     name = py_str_utf8(key)
@@ -130,7 +135,7 @@ def py_os_environ_getitem(key):
     if ptr_is_null(key) != 0:
         py_raise_owned(py_exc_new(3, cstr("str expected")))  # PY_EXC_TYPEERROR
         return null()
-    if _type_of(key) != 4:  # PY_TYPE_STR
+    if _type_of(key) != PY_TYPE_STR:  # PY_TYPE_STR
         py_raise_owned(py_exc_new(3, cstr("str expected")))  # PY_EXC_TYPEERROR
         return null()
     name = py_str_utf8(key)
@@ -155,13 +160,13 @@ def py_os_environ_setitem(key, value):
     if ptr_is_null(key) != 0:
         py_raise_owned(py_exc_new(3, cstr("str expected")))  # PY_EXC_TYPEERROR
         return null()
-    if _type_of(key) != 4:  # PY_TYPE_STR
+    if _type_of(key) != PY_TYPE_STR:  # PY_TYPE_STR
         py_raise_owned(py_exc_new(3, cstr("str expected")))  # PY_EXC_TYPEERROR
         return null()
     if ptr_is_null(value) != 0:
         py_raise_owned(py_exc_new(3, cstr("str expected")))  # PY_EXC_TYPEERROR
         return null()
-    if _type_of(value) != 4:  # PY_TYPE_STR
+    if _type_of(value) != PY_TYPE_STR:  # PY_TYPE_STR
         py_raise_owned(py_exc_new(3, cstr("str expected")))  # PY_EXC_TYPEERROR
         return null()
     k_raw = py_str_utf8(key)

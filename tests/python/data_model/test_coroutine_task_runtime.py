@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import subprocess
 import textwrap
+from pathlib import Path
 
 
 def test_coroutine_and_task_done_result_runtime(tmp_path, c_runtime_archive):
@@ -17,6 +18,11 @@ def test_coroutine_and_task_done_result_runtime(tmp_path, c_runtime_archive):
             static PyObject *entry(PyObject *captures, PyObject *args) {
                 (void)captures; (void)args;
                 return py_int_from_i64(42);
+            }
+
+            static PyObject *silent_entry(PyObject *captures, PyObject *args) {
+                (void)captures; (void)args;
+                return NULL;
             }
 
             int main(void) {
@@ -34,6 +40,14 @@ def test_coroutine_and_task_done_result_runtime(tmp_path, c_runtime_archive):
                 PyObject *task_result = py_task_step(task);
                 if (py_int_to_i64(task_result, NULL) != 42) return 6;
                 if (py_task_is_done(task) != 1) return 7;
+                PyObject *silent = py_coroutine_new_native(
+                    "silent-coro", (void *)silent_entry, NULL, NULL
+                );
+                if (py_coroutine_run(silent) != NULL) return 8;
+                if (!py_err_occurred()) return 9;
+                py_clear_exception();
+                if (py_await(NULL) != NULL || !py_err_occurred()) return 10;
+                py_clear_exception();
                 printf("coro-task-ok\\n");
                 return 0;
             }
@@ -52,3 +66,44 @@ def test_coroutine_and_task_done_result_runtime(tmp_path, c_runtime_archive):
     )
     proc = subprocess.run([str(exe)], check=True, text=True, capture_output=True)
     assert proc.stdout.strip() == "coro-task-ok"
+
+
+def test_coroutine_pointer_results_guard_silent_null_before_cleanup():
+    c_source = Path("pcc/py_runtime/src/py_coroutine.c").read_text(
+        encoding="utf-8"
+    )
+    py_source = Path("pcc/py_runtime/py/py_coroutine.py").read_text(
+        encoding="utf-8"
+    )
+    messages = (
+        "coroutine construction could not allocate coroutine state",
+        "coroutine construction could not allocate captures tuple",
+        "coroutine construction could not allocate arguments tuple",
+        "coroutine entry returned NULL without setting an exception",
+        "py_await received NULL awaitable",
+        "__await__ could not allocate its argument tuple",
+        "__await__ returned NULL without setting an exception",
+    )
+    for source in (c_source, py_source):
+        assert "coroutine_require_result" in source
+        for message in messages:
+            assert message in source
+
+    for source, call, guard, cleanup in (
+        (
+            c_source,
+            "PyObject *iter = py_obj_call(method, args, py_None);",
+            "coroutine_require_result(",
+            "py_decref(args);",
+        ),
+        (
+            py_source,
+            "iterator = py_obj_call(method, args, global_load_ptr(\"py_None\"))",
+            "_coroutine_require_result(",
+            "py_decref(args)",
+        ),
+    ):
+        call_pos = source.index(call)
+        guard_pos = source.index(guard, call_pos)
+        cleanup_pos = source.index(cleanup, call_pos)
+        assert call_pos < guard_pos < cleanup_pos

@@ -5,7 +5,7 @@ direct libcalls exercised here, so the current pcc IR subset models it
 as an honest no-op boundary.
 """
 
-import shutil
+import pytest
 import unittest
 
 from pcc.ir_passes.libcalls_shrinkwrap import (
@@ -15,7 +15,9 @@ from pcc.ir_passes.libcalls_shrinkwrap import (
 from pcc.ir_passes.parity import assert_ir_parity, run_pcc_ir_pass
 
 
-_OPT = shutil.which("opt")
+from pcc.passes.llvm_text_pipeline import find_opt_binary
+
+_OPT = find_opt_binary()
 
 
 class LibcallsShrinkwrapTests(unittest.TestCase):
@@ -93,7 +95,7 @@ entry:
         self.assertEqual(repr(pa), "PreservedAnalyses.all()")
 
 
-@unittest.skipUnless(_OPT, "requires LLVM opt")
+@pytest.mark.pcc_gate(unavailable=None if _OPT else "matching LLVM opt not installed")
 class UpstreamParityTests(unittest.TestCase):
     def _assert_noop_parity(self, ir: str):
         report = assert_ir_parity(ir, LibcallsShrinkwrapPass(), "libcalls-shrinkwrap")

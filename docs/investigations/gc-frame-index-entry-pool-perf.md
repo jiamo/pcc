@@ -824,3 +824,138 @@ path, with high RSS in workers. The next serious optimization should reduce
 the frontend's short-lived frame-root scopes or consolidate generated rooting
 regions; another hash-table-only tweak is unlikely to move the bootstrap
 critical path enough.
+
+## Update (2026-08-07): pcc-Python index engine — find_slot dominates GC3/GC4 again; primary clustering from identity-like hash
+
+Context: the user reports gc3/gc4 bootstrap "too slow" again after the
+2026-08-03/04 migration of the GC index engine to
+`pcc/py_runtime/py/freestanding_gc_index_table.py`.
+
+Measured with a 12-line allocation-churn program (200 rounds x 500 dict/list/str
+rows), compiled by the current gc4-dir pcc1:
+
+```
+PCC_GC_BACKEND=0  0.32s
+PCC_GC_BACKEND=3  0.71s   (2.2x)
+PCC_GC_BACKEND=4  3.98s   (12.4x)
+```
+
+`sample` on the GC4 run: ~70% of samples in `pcc_gc_index_py_find_slot`
+(probe loop offsets), ~25% in `memset` (rehash calloc zeroing). Bootstrap
+mirror of the same cost: gc3 stage3 wall 231s vs gc1/gc2 48s on 2026-08-06.
+
+Analysis:
+- The engine is open-addressing + linear probing + tombstones. The insert
+  path DOES gate on `used + 1 > cap/2` with `used` counting EMPTY->occupied
+  transitions (tombstones included), matching the C oracle
+  (`src/py_gc_index_table.c`), so tombstone-full lookup livelock is not
+  reachable through this engine's own insert path.
+- The hash is `(ptr>>3) ^ (v>>17) ^ (v>>33)` in BOTH tiers. For bump/arena
+  allocation the keys are consecutive; this hash maps consecutive keys to
+  consecutive slots, which is the worst case for linear probing (primary
+  clustering: giant contiguous runs, probe cost ~run/2 per absent-key lookup).
+  The C comment explicitly chose to avoid multiplies; that trade-off is what
+  the migration re-amplified (pcc-compiled probe iterations are also more
+  expensive than the C loop).
+
+Planned fix (both tiers in lockstep, differential-equal): Fibonacci hashing —
+one 64-bit multiply (`v * 0x9E3779B97F4A7C15`, then fold high bits) breaks
+consecutive-key clustering; expected to collapse the probe-loop share on both
+the object index and the frame index. Held until the in-flight gc4 deadlock
+instrumentation builds land (see
+gc4-pcc2-graph-lock-deadlock-stage2-miscompile.md), then measured with the
+churn reproducer + one explicitly chosen backend bootstrap stage before any
+matrix run.
+
+Also observed while differentialing: `PCC_RUNTIME_CC=cc` no longer links for
+this configuration (undefined symbols) — the C tier of the runtime is
+currently not buildable as a differential control for these paths; separate
+follow-up needed.
+
+## Update (2026-08-07, later): Fibonacci hash landed in both tiers — GC4 churn 5.5x faster
+
+Applied the planned fix (identical bits in `src/py_gc_index_table.c::py_gc_index_hash_ptr`
+and `py/freestanding_gc_index_table.py::pcc_gc_index_py_hash_ptr`):
+`v = (ptr>>3) * 0x9E3779B97F4A7C15; v ^= v>>32` (port uses the two's-complement
+literal -7046029254386353131 with wrapping_mul_i64).
+
+Churn reproducer, same binary shape as the 2026-08-07 baseline:
+
+```
+            old hash    fibonacci
+GC0         0.32s       0.26s
+GC3         0.71s       0.43s   (1.65x)
+GC4         3.98s       0.73s   (5.5x; 12.4x-vs-GC0 -> 2.8x)
+```
+
+Not yet run: focused gc3/gc4 bootstrap stage timing and the scheduler/GC test
+gates — required before claiming the bootstrap-level win. The frame index and
+all pcc_gc_index_py_* consumers share this hash, so both the object-tracking
+and frame-registry probe costs drop together.
+
+## Update (2026-08-07, session 3): longrun remeasured post-hash (GC4 40k -> 294k median); profile still index-dominated; backward-shift deletion lands (294k -> 321k median, GC4 now 8.0x the 08-03 baseline)
+
+Pinned longrun (100k-round churn, strict no-libpython/self,
+`scripts/run_gc_longrun_gate.py`) remeasured with the Fibonacci hash in the
+runtime (the 2026-08-03 baselines predate it):
+
+```text
+            2026-08-03     post-hash (3 runs, median)
+GC0         443,581        560,665
+GC1         262,984        385,844
+GC2         260,257        370,928
+GC3         252,475        358,021
+GC4          40,047        294,320   (7.3x; zero drift; RSS 9.50MB)
+```
+
+GC4 still slowest; `sample` on the churn binary attributed the remaining time:
+`pcc_gc_index_py_find_slot` 536 samples + `memset` 375 + `calloc` 231 +
+`rehash_slots` 60 + `find` 88 — i.e. the index ENGINE again, but now the
+tombstone-clearing rehash storm: the steady-live-set churn turns every
+remove into a tombstone, `used` (occupied+tombstones) hits the `cap/2`
+insert gate every ~N remove/insert pairs, and each rehash pays a fresh
+`calloc` + zeroing + full reinsert.
+
+Fix (both tiers in lockstep, differential-equal): **backward-shift deletion**
+in `src/py_gc_index_table.c::pcc_gc_index_remove_slot` and
+`py/freestanding_gc_index_table.py::pcc_gc_index_py_remove` — on remove,
+close the probe-chain gap by shifting cluster entries whose home lies
+cyclically outside (hole, probe]; no tombstone state is ever written, so
+`used == count == live`, the insert gate only fires on real growth, and
+steady-state churn performs ZERO rehashes. `find_slot` drops the
+`first_deleted` branch in both tiers. The generic remove gained a
+`used_cell`/`used` parameter (decrement on delete); all 8 instance wrappers
+and 4 C call sites updated. Safety audit: no engine caller iterates raw
+slots across removes (enumeration everywhere walks node lists), so shifting
+slots cannot skip entries for any of the 9 index instances.
+
+Post-shift longrun (same pinned workload):
+
+```text
+GC4 3 runs: 330,595 / 321,333 / 319,233  -> median 321,333 ops/s (+9% over
+            post-hash; 8.0x the 08-03 baseline), zero drift, RSS 9.09MB
+            (down from 9.50MB), zpage retained gap unchanged at 508,840.
+GC0-3:      604,514 / 383,739 / 376,891 / 369,110 — no regressions.
+```
+
+Gates: `test_freestanding_gc_index_table.py` 5 passed (includes the C-vs-port
+differential run), `test_gc_backend_generational.py` 80 passed (the
+tombstone-design pin updated to pin gap-free backward-shift instead),
+freestanding GC battery 197 passed (7 failures pre-existing, see below), and
+the GC4 full bootstrap gate re-run at this tree state.
+
+Attribution guard for the pre-existing reds hit while gating: GC4
+`test_gc_trashcan.py` segfaults and GC3 `gc.collect()` undercounts reproduce
+IDENTICALLY with the HEAD engine swapped back in (control rebuild of
+`libpy_runtime_pcc_py.a`), the crash cycle contains only
+trashcan/dealloc/`__del__` frames (stack-scrape via lldb), and GC1/GC3 pass
+the same trashcan binary — separate investigations:
+[gc4-trashcan-del-chain-dealloc-recursion-overflow.md](gc4-trashcan-del-chain-dealloc-recursion-overflow.md),
+[gc3-cycle-collect-undercount-10k-cycles.md](gc3-cycle-collect-undercount-10k-cycles.md).
+
+NOT fixed (recorded, needs owner decision): `zpage retained gap` measures
+508,840 vs the 08-03-pinned 504,992 (structure: one extra 4KB zpage page +
+248B live delta at the final sample). It is deterministic across every run,
+identical before and after both engine slices, so it predates the engine
+work — left for the PERF-P1-GC4-FREESTANDING-LONGRUN owner decision rather
+than silently re-pinning the threshold.

@@ -14,7 +14,7 @@
 
 ### 17.1.1 四级梯度
 
-[codex-goal-prompt.md](../../codex-goal-prompt.md) §1.3 把"替代 CPython"拆成一个必须显式区分的梯度:
+[goal-prompt.md](../../docs/goal/goal-prompt.md) §0.10 把"替代 CPython"拆成一个必须显式区分的梯度:
 
 ```text
 source compatibility          用户 .py、stdlib、包、import、异常、描述符、
@@ -152,6 +152,8 @@ PyObject *py_extension_load_native_so(const char *so_path, const char *mod_name)
 在 libpython 模式下,第三方 import 低层化为 `py_cpy_import` 等调用,进入 `py_libpython.c` 的包装层:`Py_Initialize` 在首次 import 时惰性调用,`atexit` 注册 `Py_Finalize`,全部 CPython API 调用持 GIL。两个指针命名空间的纪律在这里变成可执行约束——pcc 侧拿到的 CPython 引用是 `void*`,要进入 pcc 对象图必须经过显式转换(`py_cpy_to_pcc_obj()` 递归转换 None/bool/int/float/str/list/tuple/dict/set,不支持的退化为 `str(obj)`)或装箱(17.6 节的 CpyHandle)。
 
 ## 17.5 C-API shim:从符号目录到对象模型桥
+
+**2026-08 当前实现注。** 本章初稿中的 `src/py_capi_shim.c` 叙述保留下来作为机制来源与 host-C oracle 说明,但它不再是生产 pcc-Python 归档的 owner。当前生产实现分拆在 `pcc/py_runtime/py/py_capi_*_runtime.py`:exception/data symbols、dict/object/type/unicode/capsule/buffer、module state、descriptor、variadic call 与 visit surface 各有 Python owner;`py_extension_loader_runtime.py` 拥有原生扩展加载;CpyHandle ABI 由 `py_obj_dealloc.py` 拥有。`pcc/py_runtime/Makefile` 的 `LIB_PCC_PY` 只归档 `PCC_PY_OBJECTS`。因此下列 C shim 细节应读作 ABI 语义与迁移历史,不是“当前生产仍链接一个手写 C shim”的声明;第 14 章给出 source-ownership 与最终 no-C/zero-libc 验收边界。
 
 ### 17.5.1 可执行的优先级地图
 

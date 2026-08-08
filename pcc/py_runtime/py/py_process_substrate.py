@@ -17,12 +17,11 @@ from pcc.extern import (
     c_void,
 )
 from pcc.unsafe import (
-    access,
     cstr,
     free,
-    getenv,
     global_load_ptr,
     load_i8,
+    load_i32,
     load_i64,
     load_ptr,
     malloc,
@@ -32,6 +31,7 @@ from pcc.unsafe import (
     ptr_is_null,
     realloc,
     store_i8,
+    store_i32,
     store_i64,
     store_ptr,
     strlen,
@@ -39,11 +39,22 @@ from pcc.unsafe import (
 
 fgetc = extern("fgetc", (c_ptr,), c_int32)
 fread = extern("fread", (c_ptr, c_size_t, c_size_t, c_ptr), c_size_t)
-mkdtemp = extern("mkdtemp", (c_ptr,), c_ptr)
+mkdtemp = extern("pcc_platform_mkdtemp", (c_ptr,), c_ptr)
+access = extern("pcc_platform_access", (c_ptr, c_int64), c_int64)
 pclose = extern("pclose", (c_ptr,), c_int32)
 popen = extern("popen", (c_ptr, c_ptr), c_ptr)
-system = extern("system", (c_ptr,), c_int32)
-getpid = extern("getpid", (), c_int32)
+getpid = extern("pcc_platform_getpid", (), c_int64)
+getenv = extern("pcc_platform_getenv", (c_ptr,), c_ptr)
+platform_env_snapshot = extern("pcc_platform_env_snapshot", (), c_ptr)
+platform_env_snapshot_free = extern(
+    "pcc_platform_env_snapshot_free", (c_ptr,), c_void
+)
+platform_spawnp = extern(
+    "pcc_platform_spawnp", (c_ptr, c_ptr, c_int64), c_int64
+)
+platform_waitpid = extern(
+    "pcc_platform_waitpid", (c_int64, c_ptr, c_int64), c_int64
+)
 
 py_decref = extern("py_decref", (c_ptr,), c_void)
 py_int_from_i64 = extern("py_int_from_i64", (c_int64,), c_ptr)
@@ -53,11 +64,15 @@ py_obj_getitem = extern("py_obj_getitem", (c_ptr, c_ptr), c_ptr)
 py_obj_len = extern("py_obj_len", (c_ptr,), c_int64)
 py_obj_str = extern("py_obj_str", (c_ptr,), c_ptr)
 py_program_argv = extern("py_program_argv", (c_int64,), c_ptr)
+py_program_executable = extern("py_program_executable", (), c_ptr)
 py_bytes_new = extern("py_bytes_new", (c_ptr, c_int64), c_ptr)
 py_str_new = extern("py_str_new", (c_ptr, c_int64), c_ptr)
 py_str_utf8 = extern("py_str_utf8", (c_ptr,), c_ptr)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+py_process_normalize_wait_status = extern(
+    "py_process_normalize_wait_status", (c_int64,), c_int64
+)
 
 
 def _none():
@@ -175,6 +190,40 @@ def _build_shell_command(argv):
     return _buf_detach(st)
 
 
+def _run_shell_command(command, capture_output: int) -> int:
+    """Execute one already-built shell command through the owned process ABI."""
+    items = malloc(32)
+    status = malloc(4)
+    if ptr_is_null(items) or ptr_is_null(status):
+        free(items)
+        free(status)
+        return 127
+    store_ptr(items, 0, cstr("/bin/sh"))
+    store_ptr(items, 8, cstr("-c"))
+    store_ptr(items, 16, command)
+    store_ptr(items, 24, null())
+    store_i32(status, 0, 0)
+
+    child_env = platform_env_snapshot()
+    if ptr_is_null(child_env):
+        free(items)
+        free(status)
+        return 127
+    pid = platform_spawnp(items, child_env, capture_output)
+    platform_env_snapshot_free(child_env)
+    free(items)
+    if pid <= 0:
+        free(status)
+        return 127
+    waited = platform_waitpid(pid, status, 0)
+    if waited != pid:
+        free(status)
+        return 127
+    result = py_process_normalize_wait_status(load_i32(status, 0))
+    free(status)
+    return result
+
+
 @c_abi_export("py_subprocess_check_output")
 def py_subprocess_check_output(argv):
     cmd = _build_shell_command(argv)
@@ -223,21 +272,7 @@ def py_subprocess_run(argv, capture_output: int) -> int:
     cmd = _build_shell_command(argv)
     if ptr_is_null(cmd):
         return 127
-    if capture_output != 0:
-        st = _buf_new()
-        if ptr_is_null(st):
-            free(cmd)
-            return 127
-        if _buf_append(st, cmd, strlen(cmd)) != 0:
-            free(cmd)
-            _buf_free(st)
-            return 127
-        free(cmd)
-        if _buf_append(st, cstr(" >/dev/null 2>&1"), 16) != 0:
-            _buf_free(st)
-            return 127
-        cmd = _buf_detach(st)
-    rc: int = system(cmd)
+    rc: int = _run_shell_command(cmd, capture_output)
     free(cmd)
     return rc
 
@@ -249,7 +284,7 @@ def py_os_getpid():
 
 @c_abi_export("py_sys_executable_str")
 def py_sys_executable_str():
-    arg0 = py_program_argv(0)
+    arg0 = py_program_executable()
     if ptr_is_null(arg0):
         return _empty_str()
     return py_str_new(arg0, strlen(arg0))
@@ -680,7 +715,7 @@ def py_tempdir_cleanup(path) -> None:
         if _buf_append(st, cstr("rm -rf "), 7) == 0:
             if _append_shell_quoted(st, raw) == 0:
                 cmd = _buf_detach(st)
-                system(cmd)
+                _run_shell_command(cmd, 0)
                 free(cmd)
                 py_decref(path_str)
                 return

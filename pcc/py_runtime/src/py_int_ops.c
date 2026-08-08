@@ -160,11 +160,10 @@ PyObject *py_int_truediv(PyObject *a, PyObject *b) {
     else bv = py_bigint_to_double((const PyIntObject *)b);
 
     double q = av / bv;
-    PyFloatObject *f = (PyFloatObject *)malloc(sizeof(PyFloatObject));
+    PyFloatObject *f = (PyFloatObject *)pcc_gc_alloc(
+        (int64_t)sizeof(PyFloatObject), PY_TYPE_FLOAT, 0
+    );
     if (f == NULL) return NULL;
-    f->h.refcount = 1;
-    f->h.type_tag = PY_TYPE_FLOAT;
-    f->h.flags    = 0;
     f->value      = q;
     return (PyObject *)f;
 }
@@ -180,11 +179,10 @@ PyObject *py_int_pow(PyObject *a, PyObject *b) {
             if (PY_IS_TAGGED_INT(a)) av = (double)py_untag_int(a);
             else av = py_bigint_to_double((const PyIntObject *)a);
             double r = pow(av, (double)ev);
-            PyFloatObject *f = (PyFloatObject *)malloc(sizeof(PyFloatObject));
+            PyFloatObject *f = (PyFloatObject *)pcc_gc_alloc(
+                (int64_t)sizeof(PyFloatObject), PY_TYPE_FLOAT, 0
+            );
             if (f == NULL) return NULL;
-            f->h.refcount = 1;
-            f->h.type_tag = PY_TYPE_FLOAT;
-            f->h.flags    = 0;
             f->value      = r;
             return (PyObject *)f;
         }

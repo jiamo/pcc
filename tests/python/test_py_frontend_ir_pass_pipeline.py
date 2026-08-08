@@ -9,7 +9,27 @@ import pytest
 
 from pcc.ir_passes.parity import normalize_ir
 from pcc.passes.llvm_text_pipeline import find_opt_binary, run_pipeline
-from pcc.py_frontend import ir_pass_pipeline, pipeline
+from pcc.py_frontend import ir_pass_pipeline, pipeline, pipeline_pass_config
+
+
+def test_default_python_ir_pass_manifest_is_versioned_and_bounded():
+    assert (
+        pipeline_pass_config.PYTHON_IR_PASS_DEFAULT_TIER_SCHEMA
+        == "pcc.python-ir-default-tier.v1"
+    )
+    assert pipeline_pass_config.PYTHON_IR_PASS_DEFAULT_TIER == (
+        "mem2reg",
+        "sroa",
+    )
+    assert (
+        len(pipeline_pass_config.PYTHON_IR_PASS_DEFAULT_TIER)
+        <= pipeline_pass_config.PYTHON_IR_PASS_DEFAULT_TIER_MAX_PASSES
+        <= 6
+    )
+    assert pipeline._PYTHON_IR_PASS_DEFAULT_TIER == (
+        "mem2reg",
+        "sroa",
+    )
 
 
 def test_python_frontend_jobs_defaults_to_auto(monkeypatch):
@@ -220,25 +240,25 @@ def test_python_frontend_single_native_worker_still_isolates_each_module(tmp_pat
     )
 
 
-def test_python_frontend_single_source_worker_keeps_one_chunk():
+def test_python_frontend_single_source_worker_bounds_retained_state():
     assert (
         pipeline._python_frontend_codegen_chunk_count(
             111,
             1,
             ["python", "-m", "pcc"],
         )
-        == 1
+        == 4
     )
 
 
-def test_python_frontend_source_workers_keep_one_chunk_per_worker():
+def test_python_frontend_source_workers_use_short_bounded_chunks():
     assert (
         pipeline._python_frontend_codegen_chunk_count(
             111,
             10,
             ["python", "-m", "pcc"],
         )
-        == 10
+        == 40
     )
 
 
@@ -450,13 +470,36 @@ def test_python_ir_pass_names_stay_list_for_bootstrap_joining():
 
 def test_host_python_prefers_repo_venv(tmp_path, monkeypatch):
     monkeypatch.delenv("PCC_HOST_PYTHON", raising=False)
-    venv_bin = tmp_path / ".venv" / "bin"
-    venv_bin.mkdir(parents=True)
-    host_py = venv_bin / "python3"
+    source_root = tmp_path / "pcc-source"
+    caller_root = tmp_path / "application"
+    source_venv_bin = source_root / ".venv" / "bin"
+    caller_venv_bin = caller_root / ".venv" / "bin"
+    source_venv_bin.mkdir(parents=True)
+    caller_venv_bin.mkdir(parents=True)
+    host_py = source_venv_bin / "python3"
     host_py.write_text("#!/bin/sh\n", encoding="utf-8")
-    monkeypatch.chdir(tmp_path)
+    (caller_venv_bin / "python3").write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.setattr(
+        pipeline,
+        "_pcc_source_root_for_host_subprocess",
+        lambda: str(source_root),
+    )
+    monkeypatch.chdir(caller_root)
 
     assert pipeline._host_python_command() == str(host_py)
+
+
+def test_runtime_make_resolves_path_command_without_using_repo_relative_path(
+    monkeypatch,
+):
+    monkeypatch.setattr(pipeline, "_host_python_command", lambda: "python3")
+    monkeypatch.setattr(
+        pipeline.shutil,
+        "which",
+        lambda command: "/usr/bin/python3" if command == "python3" else None,
+    )
+
+    assert pipeline._runtime_host_python_for_make() == "/usr/bin/python3"
 
 
 def test_module_name_from_package_main(tmp_path):
@@ -1253,6 +1296,100 @@ def test_compile_python_emit_llvm_applies_python_ir_pass_pipeline(
     assert "; pass marker" in out.read_text(encoding="utf-8")
 
 
+def test_compile_python_link_args_reach_only_the_final_native_link(
+    tmp_path,
+    monkeypatch,
+):
+    src = tmp_path / "main.py"
+    src.write_text("print(1)\n", encoding="utf-8")
+    runtime = tmp_path / "libpy_runtime.a"
+    runtime.write_bytes(b"")
+    executable = tmp_path / "main.out"
+    emitted_ir = tmp_path / "main.ll"
+    link_calls = []
+    requested = ("-Wl,-rpath,/tmp/pcc-link-arg", "/tmp/libhelper.a")
+
+    def fake_link_native(
+        ll_paths,
+        out_path,
+        runtime_archive,
+        verbose,
+        **kwargs,
+    ):
+        link_calls.append(tuple(kwargs.get("extra_link_args", ())))
+
+    monkeypatch.setattr(pipeline, "_link_native", fake_link_native)
+
+    pipeline.compile_python(
+        str(src),
+        str(executable),
+        runtime_archive=str(runtime),
+        link_args=requested,
+    )
+    pipeline.compile_python(
+        str(src),
+        str(emitted_ir),
+        emit_llvm_only=True,
+        link_args=requested,
+    )
+
+    assert link_calls == [requested]
+    assert emitted_ir.is_file()
+
+
+def test_compile_python_package_link_args_reach_the_multi_file_link(
+    tmp_path,
+    monkeypatch,
+):
+    package = tmp_path / "pkg"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "helper.py").write_text(
+        "def value() -> int:\n"
+        "    return 7\n",
+        encoding="utf-8",
+    )
+    entry = package / "__main__.py"
+    entry.write_text(
+        "from .helper import value\n"
+        "print(value())\n",
+        encoding="utf-8",
+    )
+    runtime = tmp_path / "libpy_runtime.a"
+    runtime.write_bytes(b"")
+    executable = tmp_path / "pkg.out"
+    emitted_ir = tmp_path / "pkg.ll"
+    link_calls = []
+    requested = ("-Wl,-rpath,/tmp/pcc-package-link-arg", "/tmp/libpkghelper.a")
+
+    def fake_link_native(
+        ll_paths,
+        out_path,
+        runtime_archive,
+        verbose,
+        **kwargs,
+    ):
+        link_calls.append(tuple(kwargs.get("extra_link_args", ())))
+
+    monkeypatch.setattr(pipeline, "_link_native", fake_link_native)
+
+    pipeline.compile_python(
+        str(entry),
+        str(executable),
+        runtime_archive=str(runtime),
+        link_args=requested,
+    )
+    pipeline.compile_python(
+        str(entry),
+        str(emitted_ir),
+        emit_llvm_only=True,
+        link_args=requested,
+    )
+
+    assert link_calls == [requested]
+    assert emitted_ir.is_file()
+
+
 def test_string_literals_emit_immortal_globals_not_py_str_new(tmp_path):
     src = tmp_path / "main.py"
     src.write_text('print("same")\nprint("same")\n', encoding="utf-8")
@@ -1578,7 +1715,7 @@ def test_parallel_frontend_codegen_uses_shared_export_context(tmp_path, monkeypa
     assert out.read_text(encoding="utf-8") == "linked"
 
 
-def test_self_backend_native_compile_defaults_python_ir_passes_off(
+def test_self_backend_native_compile_defaults_to_bounded_python_ir_pass_manifest(
     tmp_path,
     monkeypatch,
 ):
@@ -1621,7 +1758,7 @@ def test_self_backend_native_compile_defaults_python_ir_passes_off(
     monkeypatch.setattr(
         pipeline,
         "_link_with_self_backend_ir_texts",
-        lambda ir_texts, out_path, runtime_archive, verbose, *, needs_libpython=False, needs_native_extension_exports=False, profile=None: out.write_text(
+        lambda ir_texts, out_path, runtime_archive, verbose, **_kwargs: out.write_text(
             "linked", encoding="utf-8"
         ),
     )
@@ -1634,10 +1771,10 @@ def test_self_backend_native_compile_defaults_python_ir_passes_off(
         entry_module="pkg.entry",
     )
 
-    assert defaults == ["off"]
+    assert defaults == ["default"]
 
 
-def test_self_backend_emit_llvm_defaults_python_ir_passes_off(
+def test_self_backend_emit_llvm_defaults_to_bounded_python_ir_pass_manifest(
     tmp_path,
     monkeypatch,
 ):
@@ -1675,7 +1812,7 @@ def test_self_backend_emit_llvm_defaults_python_ir_passes_off(
         entry_module="pkg.entry",
     )
 
-    assert defaults == ["off"]
+    assert defaults == ["default"]
     assert out.exists()
 
 

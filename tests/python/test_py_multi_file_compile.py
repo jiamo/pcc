@@ -50,6 +50,47 @@ class MultiFileCompileTests(unittest.TestCase):
 
         shutil.rmtree(path, ignore_errors=True)
 
+    def test_from_import_computed_raw_int_uses_importer_owned_scalar_slot(self):
+        from pcc.py_frontend.pipeline import compile_python_multi
+
+        td = tempfile.mkdtemp(prefix="pcc_multi_imported_raw_int_")
+        self.addCleanup(self._rmtree, td)
+        provider = os.path.join(td, "provider.py")
+        consumer = os.path.join(td, "consumer.py")
+        with open(provider, "w", encoding="utf-8") as fh:
+            fh.write("FLAG = 1 << 1\n")
+        with open(consumer, "w", encoding="utf-8") as fh:
+            fh.write(
+                "from pcc.provider import FLAG\n"
+                "def read() -> int:\n"
+                "    return FLAG\n"
+            )
+
+        out_ll = os.path.join(td, "pair.ll")
+        compile_python_multi(
+            [consumer, provider],
+            out_ll,
+            module_names=["pcc.consumer", "pcc.provider"],
+            entry_module="pcc.consumer",
+            emit_llvm_only=True,
+            ir_scaffold_mode="on",
+            libpython_mode="off",
+            recursive_stdlib=False,
+        )
+        with open(out_ll, "r", encoding="utf-8") as fh:
+            ir_text = fh.read()
+
+        self.assertIn("@.modvar.pcc_provider.FLAG = global i64 0", ir_text)
+        self.assertIn("@.modvar.pcc_consumer.FLAG = global i64 0", ir_text)
+        consumer_fini = ir_text.index(
+            "define void @_pcc_py_module_fini_pcc_consumer"
+        )
+        consumer_fini_end = ir_text.index("\n}", consumer_fini)
+        self.assertNotIn(
+            "@.modvar.pcc_provider.FLAG",
+            ir_text[consumer_fini:consumer_fini_end],
+        )
+
     def test_entry_only_no_siblings(self):
         _, out, code = self._run_multi(
             {"entry.py": "print(1)\nprint(2)\n"},

@@ -8,7 +8,7 @@ def is_aarch64_darwin_triple(triple: str) -> bool:
     return (
         (triple.startswith("arm64-") or triple.startswith("aarch64-"))
         and "apple" in triple
-        and "darwin" in triple
+        and ("darwin" in triple or "macosx" in triple)
     )
 
 

@@ -20,7 +20,9 @@ def test_help_shows_jobs_default_8():
 
 
 def test_python_m_help_does_not_import_click():
-    repo_root = os.path.dirname(os.path.dirname(__file__))
+    repo_root = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
     code = (
         "import builtins, runpy, sys\n"
         "orig_import = builtins.__import__\n"
@@ -47,7 +49,9 @@ def test_python_m_help_does_not_import_click():
 
 
 def test_importing_pcc_wrapper_without_click_falls_back_to_plain_main():
-    repo_root = os.path.dirname(os.path.dirname(__file__))
+    repo_root = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
     code = (
         "import builtins, importlib\n"
         "orig_import = builtins.__import__\n"
@@ -128,7 +132,9 @@ def test_plain_cli_python_libpython_off_supports_native_subset(tmp_path):
 
 
 def test_plain_cli_python_libpython_default_is_off(tmp_path):
-    repo_root = os.path.dirname(os.path.dirname(__file__))
+    repo_root = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
     script_path = tmp_path / "needs_fallback.py"
     exe_path = tmp_path / "needs_fallback_bin"
     script_path.write_text(
@@ -176,7 +182,9 @@ def test_python_libpython_resolver_defaults_to_off():
 
 
 def test_python_libpython_off_reports_friendly_error_for_fallback_script(tmp_path):
-    repo_root = os.path.dirname(os.path.dirname(__file__))
+    repo_root = os.path.dirname(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+)
     script_path = tmp_path / "needs_fallback.py"
     exe_path = tmp_path / "needs_fallback_bin"
     script_path.write_text(

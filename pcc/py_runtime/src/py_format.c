@@ -1,3 +1,5 @@
+/* Host-C oracle; production libpy_runtime_pcc_py.a owns these ABIs in
+ * py/py_format_runtime.py. */
 #include "py_internal.h"
 #include <math.h>
 #include <stdint.h>
@@ -31,8 +33,9 @@ int py_format_try_cpy_object_into_fd(int fd, void *obj, int32_t tag) {
     if (py_format_cpy_object_hook == NULL) return 0;
     if (obj == NULL) return 0;
     /* pcc-native PyTypeTag values currently top out at
-     * PY_TYPE_VALUEBOX = 200; user-class tags start at PY_TYPE_USER
-     * = 100. Any tag below ~1024 is plausibly pcc-native; anything
+     * PY_TYPE_VALUEBOX = 200; allocated user-class tags start at
+     * PY_TYPE_USER_CLASS_START. Any tag below ~1024 is plausibly
+     * pcc-native; anything
      * above is almost certainly a CPython ob_type pointer
      * truncation (heap addresses are typically in the millions).
      * The guard avoids invoking PyObject_Str on a value pcc itself
@@ -42,21 +45,34 @@ int py_format_try_cpy_object_into_fd(int fd, void *obj, int32_t tag) {
 }
 
 static int ptr_can_have_header(void *ptr) {
-    uintptr_t bits = (uintptr_t)ptr;
-    if (ptr == NULL) return 0;
-    if ((bits & 1u) != 0u) return 0;
-    if (bits < 0x1000u) return 0;
-    if ((bits & 0x7u) != 0u) return 0;
-#if UINTPTR_MAX > 0xffffffffu
-    if ((bits >> 48) != 0u) return 0;
-#endif
-    return 1;
+    return pcc_gc_pointer_is_managed((PyObject *)ptr) != 0;
+}
+
+static PyObject *format_require_result(
+    PyObject *result,
+    const char *helper_name,
+    const char *message
+) {
+    if (result == NULL) {
+        py_runtime_error_if_unset(helper_name, message);
+    }
+    return result;
 }
 
 static PyObject *call_format_method(PyObject *method, PyObject *self,
                                     PyObject *spec) {
     if (method == NULL) return NULL;
-    if (spec == NULL) spec = py_str_new("", 0);
+    int made_spec = spec == NULL;
+    if (made_spec) {
+        spec = py_str_new("", 0);
+        if (spec == NULL) {
+            return format_require_result(
+                NULL,
+                "py_str_new",
+                "format callback could not allocate an empty format spec"
+            );
+        }
+    }
     if (ptr_can_have_header(method) && !PY_IS_TAGGED_INT(method)
         && py_type_of(method) == PY_TYPE_FUNC) {
         /* Bound PyFunc whose captures already hold ``self``. User-code
@@ -68,15 +84,35 @@ static PyObject *call_format_method(PyObject *method, PyObject *self,
          * shows up as ``TypeError: unsupported operand type(s) for +``
          * when the user body does ``"fmt:" + spec``. */
         PyObject *args = py_tuple_new(1);
-        if (args == NULL) return NULL;
+        if (args == NULL) {
+            if (made_spec) py_decref(spec);
+            return format_require_result(
+                NULL,
+                "py_tuple_new",
+                "format callback argument tuple allocation failed"
+            );
+        }
         py_tuple_set_item(args, 0, spec);
+        if (made_spec) py_decref(spec);
         PyObject *out = py_func_call(method, args);
+        format_require_result(
+            out,
+            "__format__",
+            "format callback returned NULL without setting an exception"
+        );
         py_decref(args);
         return out;
     }
     typedef PyObject *(*FormatMethod)(PyObject *, PyObject *);
     FormatMethod fn = (FormatMethod)(uintptr_t)method;
-    return fn(self, spec);
+    PyObject *out = fn(self, spec);
+    format_require_result(
+        out,
+        "__format__",
+        "format callback returned NULL without setting an exception"
+    );
+    if (made_spec) py_decref(spec);
+    return out;
 }
 
 static int spec_is(PyObject *spec, const char *text) {

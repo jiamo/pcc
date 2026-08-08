@@ -1,18 +1,9 @@
-"""Reference mirror for ``py_complex_pow`` — C-only, NOT a linked port module.
+"""Readable oracle for the production ``py_complex_pow`` implementation.
 
-Complex ``base ** exp`` is implemented once in C in
-``pcc/py_runtime/src/py_complex_pow.c`` and linked into BOTH runtime archives
-(the C-runtime ``libpy_runtime.a`` via ``SRCS`` and the default pcc-Python port
-archive ``libpy_runtime_pcc_py.a`` via ``OBJ_PY_CC_HELPERS`` in the Makefile),
-exactly like its sibling complex helpers in ``py_format.c``
-(``py_complex_sub`` / ``py_complex_mul`` / ``py_complex_div`` / ``py_complex_abs`` ...).
-
-It is intentionally C-only — it is **not** listed in ``PY_MODULES`` and this
-file is **not** compiled/linked. The general complex-power path needs
-transcendental math (``exp`` / ``log`` / ``cos`` / ``sin`` / ``atan2`` /
-``hypot``) that the pcc-Python runtime subset would only awkwardly reimplement,
-so per the "C-only OBJ_PY_CC_HELPERS helper (single C impl, no port)" pattern a
-single C implementation is the source of truth.
+The production pcc-Python archive owns the ABI in ``py_obj_stubs.py`` alongside
+the other complex arithmetic helpers.  ``src/py_complex_pow.c`` remains the
+host-C/pcc-C oracle implementation; this ordinary-Python transcription remains
+a directly readable algorithm oracle for both implementations.
 
 The pure-Python transcription below exists purely as a readable reference of
 the algorithm (which mirrors CPython ``Objects/complexobject.c::_Py_c_pow`` +

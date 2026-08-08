@@ -4,15 +4,10 @@ Upstream reference:
 - /tmp/llvm-src/llvm-20.1.8.src/lib/Transforms/Scalar/JumpThreading.cpp
 """
 
-import shutil
 import unittest
 
 from pcc.ir_passes.jump_threading import JumpThreadingPass, jump_thread_text
 from pcc.ir_passes.parity import run_pcc_ir_pass
-
-
-_OPT = shutil.which("opt")
-
 
 _PHI_THREADABLE = """
 define i32 @f(i1 %p) {

@@ -3,13 +3,9 @@ from __future__ import annotations
 """AArch64 Darwin register/immediate helpers for the self backend."""
 
 from . import BackendUnavailable
+from .aarch64_fp_immediates import direct_fp_immediate_literal
 from .self_backend_float_bits import bits_to_float64, float32_to_bits, float64_to_bits
 from .self_backend_ir import TypeDesc
-
-_DIRECT_FP_IMMEDIATES = {
-    1.0: "1.0",
-    2.0: "2.0",
-}
 
 
 def as_x_reg(reg: str) -> str:
@@ -74,14 +70,14 @@ def emit_fp_hex_constant(value_type: TypeDesc, reg: str, token: str) -> list[str
         )
     if value_type.width <= 32:
         as_double = bits_to_float64(bits)
-        immediate = _DIRECT_FP_IMMEDIATES.get(float(as_double))
+        immediate = direct_fp_immediate_literal(float(as_double))
         if immediate is not None:
             return [f"  fmov {reg}, #{immediate}"]
         fp_bits = float32_to_bits(float(as_double))
         lines = emit_const_to_reg(TypeDesc("int", 32), "w12", fp_bits)
         lines.append(f"  fmov {reg}, w12")
         return lines
-    immediate = _DIRECT_FP_IMMEDIATES.get(bits_to_float64(bits))
+    immediate = direct_fp_immediate_literal(bits_to_float64(bits))
     if immediate is not None:
         return [f"  fmov {reg}, #{immediate}"]
     lines = emit_const_to_reg(TypeDesc("int", 64), "x12", bits)
@@ -96,7 +92,7 @@ def emit_fp_constant(value_type: TypeDesc, reg: str, token: str) -> list[str]:
         raise BackendUnavailable(
             f"self backend fp constant helper expects fp type, got {value_type.describe()}"
         )
-    immediate = _DIRECT_FP_IMMEDIATES.get(float(token))
+    immediate = direct_fp_immediate_literal(float(token))
     if immediate is not None:
         return [f"  fmov {reg}, #{immediate}"]
     if value_type.width <= 32:

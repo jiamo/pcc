@@ -33,3 +33,38 @@ entry:
     out, report = postprocess_ir_text_with_report(ir)
     assert "va_arg ptr %ap, i64" in out
     assert report.to_json()["count"] == 1
+
+
+def test_varargs_rewrite_handles_typed_calls_and_quoted_ssa_names():
+    from pcc.codegen.c_varargs import postprocess_varargs_ir
+
+    ir = '''declare double @__pcc_va_arg_17(ptr %ap)
+define double @f(ptr %ap) {
+entry:
+  %"value with spaces" = call double (ptr) @__pcc_va_arg_17(ptr %"cursor with spaces")
+  ret double %"value with spaces"
+}
+'''
+    rewrites = []
+    out = postprocess_varargs_ir(ir, report=rewrites)
+    assert (
+        '%"value with spaces" = va_arg ptr %"cursor with spaces", double'
+        in out
+    )
+    assert len(rewrites) == 1
+    assert rewrites[0].helper == "__pcc_va_arg_17"
+    assert rewrites[0].arg_value == '%"cursor with spaces"'
+
+
+def test_varargs_rewrite_leaves_non_helper_ir_byte_identical():
+    from pcc.codegen.c_varargs import postprocess_varargs_ir
+
+    ir = "define i64 @plain(i64 %x) {\n  ret i64 %x\n}\n"
+    assert postprocess_varargs_ir(ir) == ir
+
+
+def test_varargs_rewrite_does_not_delete_similar_non_numeric_symbol():
+    from pcc.codegen.c_varargs import postprocess_varargs_ir
+
+    ir = "declare i64 @__pcc_va_arg_helper(ptr %x)\n"
+    assert postprocess_varargs_ir(ir) == ir

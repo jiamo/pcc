@@ -65,14 +65,18 @@ class AsyncWithLoweringMixin:
             self._emit_post_call_err_check()
             self._emit_native_context_body(stmt, ctx_val, enter_val)
             return
+        ctx_owned = self._cpy_value_is_owned(ctx_val)
+        self._guard_cpy_value_not_null(ctx_val)
 
         enter_ptr = self._ptr_to_cstr(
             self._cstr_global("__enter__", ".cpy.attr.__enter__")
         )
-        enter_fn = self.builder.call(
-            self.runtime["py_cpy_getattr"],
-            [ctx_val, enter_ptr],
-            name=self._fresh("with.enter.fn"),
+        enter_fn = self._mark_owned_cpy_value(
+            self.builder.call(
+                self.runtime["py_cpy_getattr"],
+                [ctx_val, enter_ptr],
+                name=self._fresh("with.enter.fn"),
+            )
         )
         enter_val = self.builder.call(
             self.runtime["py_cpy_call_noargs"],
@@ -80,10 +84,10 @@ class AsyncWithLoweringMixin:
             name=self._fresh("with.enter.val"),
         )
         self.builder.call(self.runtime["py_cpy_decref"], [enter_fn])
+        self._forget_owned_cpy_value(enter_fn)
+        self._guard_cpy_value_not_null(enter_val)
 
-        if not hasattr(self, "_cpy_values"):
-            self._cpy_values = set()
-        self._cpy_values.add(enter_val)
+        self._mark_owned_cpy_value(enter_val)
 
         if as_expr is not None:
             if not isinstance(as_expr, Name):
@@ -111,10 +115,12 @@ class AsyncWithLoweringMixin:
             exit_ptr = self._ptr_to_cstr(
                 self._cstr_global("__exit__", ".cpy.attr.__exit__")
             )
-            exit_fn = self.builder.call(
-                self.runtime["py_cpy_getattr"],
-                [ctx_val, exit_ptr],
-                name=self._fresh("with.exit.fn"),
+            exit_fn = self._mark_owned_cpy_value(
+                self.builder.call(
+                    self.runtime["py_cpy_getattr"],
+                    [ctx_val, exit_ptr],
+                    name=self._fresh("with.exit.fn"),
+                )
             )
             none_gv = declare_runtime_global(self.module, "py_None")
             none = self.builder.load(none_gv, name=self._fresh("none"))
@@ -123,14 +129,21 @@ class AsyncWithLoweringMixin:
                 [none],
                 name=self._fresh("cpy.none"),
             )
-            self.builder.call(
+            exit_val = self.builder.call(
                 self.runtime["py_cpy_call3"],
                 [exit_fn, cpy_none, cpy_none, cpy_none],
                 name=self._fresh("with.exit.val"),
             )
             self.builder.call(self.runtime["py_cpy_decref"], [cpy_none])
             self.builder.call(self.runtime["py_cpy_decref"], [exit_fn])
+            self._forget_owned_cpy_value(exit_fn)
+            self._guard_cpy_value_not_null(exit_val)
+            self.builder.call(self.runtime["py_cpy_decref"], [exit_val])
             self.builder.call(self.runtime["py_cpy_decref"], [enter_val])
+            self._forget_owned_cpy_value(enter_val)
+            if ctx_owned:
+                self.builder.call(self.runtime["py_cpy_decref"], [ctx_val])
+                self._forget_owned_cpy_value(ctx_val)
 
     def _class_name_for_context_expr(self, expr: Expr) -> Optional[str]:
         if (

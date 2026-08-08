@@ -4,6 +4,32 @@ import json
 import textwrap
 
 
+def test_pipeline_facade_reexports_ast_wire_codec() -> None:
+    from pcc.py_frontend import pipeline, pipeline_ast_wire
+
+    assert pipeline._py_ast_field_names is pipeline_ast_wire._py_ast_field_names
+    assert pipeline._py_ast_to_wire is pipeline_ast_wire._py_ast_to_wire
+    assert pipeline._py_ast_from_wire is pipeline_ast_wire._py_ast_from_wire
+    assert pipeline._write_py_ast_wire is pipeline_ast_wire._write_py_ast_wire
+    assert pipeline._read_py_ast_wire is pipeline_ast_wire._read_py_ast_wire
+
+
+def test_ast_wire_field_names_use_the_stable_table_and_ignore_primitive_leaves() -> None:
+    from pcc.py_frontend import pipeline_ast_wire, py_ast
+
+    node = py_ast.Name(
+        span=py_ast.SourceSpan("probe.py", 1, 0, 1, 1),
+        ty=py_ast.IntType("int"),
+        ident="value",
+    )
+    assert pipeline_ast_wire._py_ast_field_names(node) == (
+        "span",
+        "ty",
+        "ident",
+    )
+    assert pipeline_ast_wire._py_ast_field_names("leaf") == ()
+
+
 def test_py_ast_wire_roundtrip_preserves_full_lifted_ast() -> None:
     from pcc.parse.py_lift import parse_and_lift
     from pcc.py_frontend.pipeline import _py_ast_from_wire, _py_ast_to_wire
@@ -109,3 +135,21 @@ def test_py_ast_wire_roundtrips_first_class_set_type() -> None:
     set_ty = SetType(name="set", elem=DynType(name="dyn"))
 
     assert _py_ast_from_wire(_py_ast_to_wire(set_ty)) == set_ty
+
+
+def test_stdlib_ast_lifter_preserves_interleaved_call_operand_order() -> None:
+    from pcc.py_frontend.parser import parse
+    from pcc.py_frontend.py_ast import Call, ExprStmt
+
+    module = parse(
+        "target(named=value, *items, **mapping)\n",
+        "operand_order_probe.py",
+    )
+    stmt = module.body[0]
+    assert isinstance(stmt, ExprStmt)
+    assert isinstance(stmt.expr, Call)
+    assert stmt.expr.operand_order == (
+        ("kw", 0),
+        ("arg", 0),
+        ("kw", 1),
+    )

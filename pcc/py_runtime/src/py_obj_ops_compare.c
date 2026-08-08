@@ -242,7 +242,7 @@ PyObject *py_obj_abs(PyObject *o) {
     if (pcc_capi_is_cext_type_tag(tag)) {
         return pcc_capi_cext_absolute(o);
     }
-    if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER) {
+    if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER_CLASS_START) {
         /* abs(obj) on a user instance dispatches __abs__. NULL+no-exception
          * means no __abs__ -> fall through to the TypeError below. */
         PyObject *r = py_user_abs_dispatch(o);
@@ -406,6 +406,7 @@ static int64_t py_valuebox_hash(PyValueBoxObject *box) {
     for (int32_t i = 0; i < n_fields; i++) {
         PyObject *v = pcc_gc_load_ptr((PyObject *)box, &box->fields[i]);
         int64_t field_hash = (v == NULL) ? 0 : py_obj_hash(v);
+        if (py_err_occurred()) return -1;
         h = (h * 31 + (field_hash % 1000003)) % 1000000007;
     }
     return (h == -1) ? -2 : h;
@@ -490,6 +491,18 @@ int64_t py_obj_hash(PyObject *o) {
             PyBytesObject *b = (PyBytesObject *)o;
             return fnv1a((const unsigned char *)b->data, (size_t)b->byte_len);
         }
+        case PY_TYPE_LIST:
+            py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "unhashable type: 'list'"));
+            return -1;
+        case PY_TYPE_DICT:
+            py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "unhashable type: 'dict'"));
+            return -1;
+        case PY_TYPE_SET:
+            py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "unhashable type: 'set'"));
+            return -1;
+        case PY_TYPE_BYTEARRAY:
+            py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "unhashable type: 'bytearray'"));
+            return -1;
         case PY_TYPE_TUPLE: {
             PyTupleObject *t = (PyTupleObject *)o;
             uint64_t h = 3527539u;
@@ -499,6 +512,7 @@ int64_t py_obj_hash(PyObject *o) {
                 int64_t item_hash = 0;
                 if (!py_obj_hash_leaf_fast(item, &item_hash)) {
                     item_hash = py_obj_hash(item);
+                    if (py_err_occurred()) return -1;
                 }
                 h = (h ^ (uint64_t)item_hash) * mult;
                 h += 82520u + (uint64_t)i + (uint64_t)i;
@@ -509,7 +523,7 @@ int64_t py_obj_hash(PyObject *o) {
             return (out == -1) ? -2 : out;
         }
         default:
-            if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER) {
+            if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER_CLASS_START) {
                 int64_t handled = 0;
                 int64_t user_hash = py_user_hash_dispatch(o, &handled);
                 if (handled) {
@@ -745,7 +759,7 @@ int64_t py_obj_contains(PyObject *container, PyObject *item) {
         }
         case PY_TYPE_STR:   return py_str_contains(container, item);
         default:
-            if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER) {
+            if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER_CLASS_START) {
                 int64_t handled = 0;
                 int64_t result = py_user_contains_dispatch(container, item, &handled);
                 if (handled) return result;

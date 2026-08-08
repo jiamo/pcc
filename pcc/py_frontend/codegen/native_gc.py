@@ -137,6 +137,12 @@ class NativeGcLoweringMixin:
         if kind == "gc.unfreeze" and not args:
             self.builder.call(self.runtime["py_gc_unfreeze"], [])
             return self._emit_none_literal()
+        if kind == "gc.immortalize" and len(args) == 1:
+            self.builder.call(
+                self.runtime["pcc_gc_immortalize"],
+                [self._emit_as_object(args[0])],
+            )
+            return self._emit_none_literal()
         if kind == "gc.get_freeze_count" and not args:
             count = self.builder.call(
                 self.runtime["py_gc_get_freeze_count"],

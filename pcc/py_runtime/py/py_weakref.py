@@ -1,4 +1,8 @@
 """Minimal pcc-Python port of weakref.ref runtime support."""
+from pcc.py_runtime.py.py_abi_constants import (
+    PY_TYPE_VALUEBOX,
+    PY_TYPE_WEAKREF,
+)
 
 from pcc.extern import extern, c_abi_export, c_ptr, c_int32, c_int64, c_void
 from pcc.unsafe import (
@@ -92,7 +96,7 @@ def py_weakref_new(target, callback):
     # analogue (weakref.ref(3) -> TypeError). 200 == PY_TYPE_VALUEBOX,
     # 3 == PY_EXC_TYPEERROR. The compile-time diagnostic catches the
     # static form; this covers Dyn-path boxes.
-    if load_i32(target, 8) == 200:
+    if load_i32(target, 8) == PY_TYPE_VALUEBOX:
         py_raise(
             py_exc_new(
                 3,
@@ -104,11 +108,11 @@ def py_weakref_new(target, callback):
         callback = null()
     target = pcc_gc_note_relocation_read(target)
 
-    wr = pcc_gc_alloc(48, 21, 0)
+    wr = pcc_gc_alloc(48, PY_TYPE_WEAKREF, 0)
     if ptr_is_null(wr) != 0:
         return null()
     store_i64(wr, 0, 1)
-    store_i32(wr, 8, 21)        # PY_TYPE_WEAKREF
+    store_i32(wr, 8, PY_TYPE_WEAKREF)        # PY_TYPE_WEAKREF
     store_ptr(wr, 16, target)
     store_ptr(wr, 24, null())
     store_ptr(wr, 32, null())
@@ -131,7 +135,7 @@ def py_weakref_call(ref):
         return null()
     if is_tagged_int(ref) != 0:
         return null()
-    if load_i32(ref, 8) != 21:
+    if load_i32(ref, 8) != PY_TYPE_WEAKREF:
         return null()
     target = load_ptr(ref, 16)
     if ptr_is_null(target) != 0:
@@ -321,7 +325,13 @@ def py_weakref_invalidate(target) -> None:
                 if ptr_is_null(args) == 0:
                     pcc_runtime_log_event_code(4, 3, 0, 0, wr)
                     py_tuple_set_item(args, 0, wr)
-                    py_obj_call(callback, args, _py_none())
+                    # Weakref callbacks are an unraisable boundary.  The
+                    # callback result is owned even though its value is
+                    # ignored; py_obj_call first classifies silent NULL, then
+                    # this boundary deliberately clears that exception.
+                    result = py_obj_call(callback, args, _py_none())
+                    if ptr_is_null(result) == 0:
+                        py_decref(result)
                     py_decref(args)
                 py_clear_exception()
         elif ptr_eq(resolved, wr_target) == 0:

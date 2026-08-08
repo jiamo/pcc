@@ -140,6 +140,14 @@ class NativeFilesLoweringMixin:
             # Raises ValueError on a closed file.
             self._emit_post_call_err_check(getattr(expr, "span", None))
             return result
+        if attr.name == "fileno" and not expr.args:
+            result = self.builder.call(
+                self.runtime["py_file_fileno"],
+                [recv],
+                name=self._fresh("file.fileno"),
+            )
+            self._emit_post_call_err_check(getattr(expr, "span", None))
+            return result
         if attr.name == "close" and not expr.args:
             self.builder.call(self.runtime["py_file_close"], [recv])
             return self._emit_none_literal()
@@ -240,7 +248,7 @@ class NativeFilesLoweringMixin:
             # is rebound.  Pin the newly opened file while releasing the old
             # binding so a collector step in that release cannot move it
             # before it reaches the rooted slot.
-            self.builder.call(self.runtime["pcc_gc_pin"], [file_val])
+            self._gc_pin(file_val)
             self._release_existing_owned_local(as_expr.ident)
         self.builder.store(file_val, slot[0])
         # Re-add compile-time rooted-name bookkeeping after replacement;
@@ -252,7 +260,7 @@ class NativeFilesLoweringMixin:
             [ir.Constant(_CSTR, None), file_val],
         )
         if replacing_owned:
-            self.builder.call(self.runtime["pcc_gc_unpin"], [file_val])
+            self._gc_unpin(file_val)
         self._owned_local_names.add(as_expr.ident)
         self._owned_local_has_value.add(as_expr.ident)
         owned_flag = self._ensure_owned_local_flag(as_expr.ident, slot[0])

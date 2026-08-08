@@ -35,6 +35,7 @@ def test_scalar_layout_ir_and_ssa_facts_match():
         (ir.IntType(16), ["short"]),
         (ir.IntType(32), ["int"]),
         (ir.IntType(64), ["long"]),
+        (ir.HalfType(), ["_Float16"]),
         (ir.FloatType(), ["float"]),
         (ir.DoubleType(), ["double"]),
     )

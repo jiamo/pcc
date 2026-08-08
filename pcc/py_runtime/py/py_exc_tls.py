@@ -3,9 +3,10 @@
 Reimplements the four TLS-facing exception entries:
     py_raise, py_err_occurred, py_current_exception, py_clear_exception
 
-Plus the raw-slot accessors py_tls_exc_get / py_tls_exc_set stay in
-their cc-compiled .o (they manage the actual _Thread_local slot); the
-Python port uses them via extern.
+The raw-slot accessors py_tls_exc_get / py_tls_exc_set are owned by the
+pcc-Python substrate.  That module defines the native-TLS slot and its
+per-thread GC-root handle; this semantic layer calls the accessors via extern
+so exception ownership stays separate from the freestanding storage ABI.
 
 PyExceptionObject layout (from py_internal.h):
     offset  0   PyObjectHeader  (i64 refcount, i32 tag, i32 flags — 16 bytes total)
@@ -18,9 +19,15 @@ PyExceptionObject layout (from py_internal.h):
 Tagged-int encoding: low bit of pointer == 1 means tagged int. Non-
 tagged pointers come from malloc (8-byte aligned) so low bit is 0.
 
-PY_TYPE_EXC == 12 (py_internal.h).
-PY_EXC_RUNTIMEERROR == 7 (py_internal.h).
+Public object type tags come from the generated ``py_abi_constants`` module.
+The runtime-error exception-table code remains owned by the exception ABI.
 """
+from pcc.py_runtime.py.py_abi_constants import (
+    PY_TYPE_EXC,
+    PY_TYPE_INSTANCE,
+    PY_TYPE_INT,
+    PY_TYPE_USER_CLASS_START,
+)
 from pcc.extern import extern, c_abi_export, c_int32, c_ptr, c_int64, c_void
 from pcc.unsafe import (
     cstr,
@@ -60,7 +67,7 @@ def _type_of(obj) -> int:
     # Offsets / tag literals inlined to avoid module-level globals
     # (which would require a main() for init). See py_obj_stubs.py.
     if is_tagged_int(obj):
-        return 2       # PY_TYPE_INT
+        return PY_TYPE_INT       # PY_TYPE_INT
     return load_i32(obj, 8)   # PyObjectHeader.type_tag
 
 
@@ -70,9 +77,9 @@ def _instance_like(obj) -> int:
     if is_tagged_int(obj):
         return 0
     tag: int = _type_of(obj)
-    if tag == 11:             # PY_TYPE_INSTANCE
+    if tag == PY_TYPE_INSTANCE:             # PY_TYPE_INSTANCE
         return 1
-    if tag >= 100:            # PY_TYPE_USER
+    if tag >= PY_TYPE_USER_CLASS_START:
         return 1
     return 0
 
@@ -86,7 +93,7 @@ def _normalize_raised(exc):
             7,  # PY_EXC_RUNTIMEERROR
             cstr("no active exception to reraise"),
         )
-    if _type_of(exc) == 12:              # PY_TYPE_EXC
+    if _type_of(exc) == PY_TYPE_EXC:              # PY_TYPE_EXC
         py_incref(exc)
         return exc
 
@@ -172,7 +179,7 @@ def py_raise(exc) -> None:
     if not cur_is_null and not exc_is_null:
         if ptr_eq(cur, exc) == 0:
             tag: int = _type_of(exc)
-            if tag == 12:                     # PY_TYPE_EXC
+            if tag == PY_TYPE_EXC:                     # PY_TYPE_EXC
                 existing_ctx = pcc_gc_load_ptr(
                     exc,
                     ptr_add(exc, 40),

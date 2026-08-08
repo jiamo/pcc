@@ -1,6 +1,7 @@
-"""``sysconfig.get_config_var`` native lowering."""
+"""``sysconfig`` routes through the pcc-owned recursive stdlib provider."""
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 import textwrap
@@ -23,6 +24,8 @@ def _compile_to_ll(source: str, name: str, *, mode: str) -> str:
         str(out),
         emit_llvm_only=True,
         ir_scaffold_mode=mode,
+        libpython_mode="off",
+        recursive_stdlib=True,
     )
     return out.read_text(encoding="utf-8")
 
@@ -38,7 +41,7 @@ def _function_body(ir_text: str, fn_name_suffix: str) -> str | None:
     return m.group(1) if m else None
 
 
-def test_sysconfig_get_config_var_dispatches_to_native_helper():
+def test_sysconfig_get_config_var_dispatches_to_compiled_stdlib_provider():
     program = textwrap.dedent(
         """
         import sysconfig
@@ -52,12 +55,13 @@ def test_sysconfig_get_config_var_dispatches_to_native_helper():
     body = _function_body(ir_text, "f")
 
     assert body is not None
-    assert "@py_sysconfig_get_config_var" in body, body
+    assert "@user_sysconfig_get_config_var" in body, body
+    assert "@py_sysconfig_get_config_var" not in body, body
     assert "cpy.import.sysconfig" not in body, body
     assert "cpy.fn.get_config_var" not in body, body
 
 
-def test_native_sysconfig_runtime_returns_version(tmp_path):
+def test_native_sysconfig_runtime_returns_version_without_host_python(tmp_path):
     from pcc.py_frontend.pipeline import compile_python
 
     src = tmp_path / "prog.py"
@@ -77,12 +81,22 @@ def test_native_sysconfig_runtime_returns_version(tmp_path):
         ).lstrip(),
         encoding="utf-8",
     )
-    compile_python(str(src), str(exe), ir_scaffold_mode="on")
+    compile_python(
+        str(src),
+        str(exe),
+        ir_scaffold_mode="on",
+        libpython_mode="off",
+        recursive_stdlib=True,
+    )
+    run_env = os.environ.copy()
+    run_env["PCC_HOST_PYTHON"] = "/usr/bin/false"
+    run_env["PATH"] = str(tmp_path / "no-host-python")
     run = subprocess.run(
         [str(exe)],
         capture_output=True,
         text=True,
         timeout=20,
+        env=run_env,
     )
     assert run.returncode == 0, run.stderr
     assert run.stdout == "True\n"

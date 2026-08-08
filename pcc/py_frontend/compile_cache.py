@@ -20,6 +20,62 @@ _OBJECT_CACHE_ENV = "PCC_SELF_BACKEND_OBJECT_CACHE"
 _OBJECT_CACHE_DIR_ENV = "PCC_SELF_BACKEND_OBJECT_CACHE_DIR"
 _OBJECT_CACHE_IDENTITY_ENV = "PCC_SELF_BACKEND_OBJECT_CACHE_IDENTITY"
 
+
+_RETENTION_HELPER_CODE = r"""
+import os
+import sys
+
+try:
+    source_root = sys.argv[1]
+    if source_root and source_root not in sys.path:
+        sys.path.insert(0, source_root)
+    from pcc.tools.compiler_cache_retention import (
+        acquire_entry_lease,
+        maintain_cache,
+        record_successful_access,
+        release_entry_lease,
+    )
+
+    mode = sys.argv[2]
+    if mode == "lease-acquire":
+        lease = acquire_entry_lease(sys.argv[3], owner_pid=os.getppid())
+        print(lease)
+    elif mode == "lease-release":
+        release_entry_lease(sys.argv[3])
+        print("1")
+    elif mode == "touch":
+        print("1" if record_successful_access(sys.argv[3]) else "0")
+    elif mode == "auto":
+        root = sys.argv[3]
+        protected = sys.argv[4:]
+        report = maintain_cache(root, automatic=True, protected_paths=protected)
+        reclaimed = int(report.get("reclaimed_bytes", 0) or 0)
+        failures = int(report.get("quarantine_failures", 0) or 0)
+        pending = int(report.get("quarantine_pending", 0) or 0)
+        if reclaimed or failures or pending:
+            sys.stderr.write(
+                "pcc compiler cache retention: reclaimed="
+                + str(reclaimed)
+                + " failures="
+                + str(failures)
+                + " pending="
+                + str(pending)
+                + "\n"
+            )
+        print("1")
+    else:
+        raise ValueError("unknown compiler cache retention helper mode")
+except BaseException as exc:
+    message = str(exc).replace("\n", " ")[:200]
+    sys.stderr.write(
+        "pcc compiler cache retention skipped: "
+        + type(exc).__name__
+        + (": " + message if message else "")
+        + "\n"
+    )
+    raise SystemExit(2)
+"""
+
 # Settings that can change frontend-generated IR. Execution-only settings such
 # as GC backend, runtime archive, worker count, profiling, IR passes, and native
 # object-emitter policy intentionally remain outside this pre-pass key.
@@ -197,7 +253,51 @@ if mode == "plan":
         encoded = json.dumps(material, sort_keys=True, separators=(",", ":")).encode("utf-8")
         key = hashlib.sha256(encoded).hexdigest()
         parent, entry, lock = cache_paths(root, key)
-        print(key + "\t" + parent + "\t" + entry + "\t" + lock)
+        graph_material = {
+            "entry_module": material["entry_module"],
+            "module_paths": [
+                (source["module"], source["path"])
+                for source in material["sources"]
+            ],
+            "schema": SCHEMA,
+        }
+        graph_key = hashlib.sha256(
+            json.dumps(
+                graph_material,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        option_material = {
+            "codegen_environment": material["codegen_environment"],
+            "entry_module": material["entry_module"],
+            "ir_scaffold_mode": material["ir_scaffold_mode"],
+            "libpython_mode": material["libpython_mode"],
+            "sibling_inits": material["sibling_inits"],
+        }
+        options_digest = hashlib.sha256(
+            json.dumps(
+                option_material,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        runtime_abi_digest = hashlib.sha256(
+            material["identity"].encode("utf-8")
+        ).hexdigest()
+        action_root = os.path.join(root, "module-actions", graph_key)
+        fields = (
+            key,
+            parent,
+            entry,
+            lock,
+            material["compiler_sha256"],
+            runtime_abi_digest,
+            material["platform"] + ":" + material["machine"],
+            options_digest,
+            action_root,
+        )
+        print("\t".join(fields))
     finally:
         try: os.unlink(input_path)
         except OSError: pass
@@ -217,21 +317,63 @@ elif mode == "wait":
     else:
         print("MISS")
 elif mode == "acquire":
-    parent, lock = sys.argv[2:4]
+    parent, lock, entry = sys.argv[2:5]
+    eviction = entry + ".pcc-evict"
     os.makedirs(parent, exist_ok=True)
-    try:
-        os.mkdir(lock)
-        print("1")
-    except FileExistsError:
+    acquired = False
+    if not os.path.exists(eviction):
         try:
-            if time.time() - os.path.getmtime(lock) > 900.0:
-                shutil.rmtree(lock)
-                os.mkdir(lock)
-                print("1")
-            else:
-                print("0")
+            os.mkdir(lock)
+            acquired = True
+        except FileExistsError:
+            try:
+                owner_pid = 0
+                try:
+                    owner_path = os.path.join(lock, "owner.json")
+                    with open(owner_path, "r", encoding="utf-8") as stream:
+                        owner_pid = int(json.load(stream).get("pid", 0))
+                except Exception:
+                    owner_pid = 0
+                owner_alive = False
+                if owner_pid > 0:
+                    try:
+                        os.kill(owner_pid, 0)
+                        owner_alive = True
+                    except PermissionError:
+                        owner_alive = True
+                    except OSError:
+                        owner_alive = False
+                if owner_pid > 0:
+                    stale = not owner_alive
+                else:
+                    stale = time.time() - os.path.getmtime(lock) > 900.0
+                if stale:
+                    shutil.rmtree(lock)
+                    os.mkdir(lock)
+                    acquired = True
+            except OSError:
+                acquired = False
         except OSError:
-            print("0")
+            acquired = False
+    if acquired:
+        try:
+            with open(os.path.join(lock, "owner.json"), "w", encoding="utf-8") as stream:
+                json.dump(
+                    {"pid": os.getppid(), "created_ns": time.time_ns()},
+                    stream,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+                stream.write("\n")
+        except OSError:
+            shutil.rmtree(lock, ignore_errors=True)
+            acquired = False
+    if acquired and os.path.exists(eviction):
+        try:
+            shutil.rmtree(lock)
+        finally:
+            acquired = False
+    print("1" if acquired else "0")
 elif mode == "publish":
     input_path, bundle_path, parent, entry = sys.argv[2:6]
     temporary = entry + ".tmp." + str(os.getpid()) + "." + str(time.time_ns())
@@ -320,6 +462,17 @@ def python_frontend_ir_cache_dir() -> str:
     return os.path.join(base, "frontend-ir")
 
 
+def python_compiler_cache_root() -> str:
+    """Return the shared lifecycle root for frontend and object entries."""
+
+    frontend = python_frontend_ir_cache_dir()
+    if os.path.basename(frontend) == "frontend-ir":
+        return os.path.dirname(frontend)
+    # An explicitly configured standalone frontend cache remains a valid
+    # lifecycle root even when no object cache shares its parent.
+    return frontend
+
+
 def _machine_name() -> str:
     try:
         return str(os.uname().machine)
@@ -348,6 +501,52 @@ def _helper_output(host_python: str, mode: str, args) -> str:
     return str(subprocess.check_output(command, text=True)).strip()
 
 
+def _default_source_root() -> str:
+    configured = str(
+        os.environ.get("PCC_SOURCE_ROOT", "")
+        or os.environ.get("PCC_REPO_ROOT", "")
+        or ""
+    ).strip()
+    if configured:
+        return os.path.abspath(configured)
+    return os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    )
+
+
+def _retention_helper_output(plan, mode: str, args) -> str:
+    command = [
+        str(plan["host_python"]),
+        "-c",
+        _RETENTION_HELPER_CODE,
+        str(plan.get("source_root") or _default_source_root()),
+        mode,
+    ]
+    for arg in args:
+        command.append(str(arg))
+    return str(subprocess.check_output(command, text=True)).strip()
+
+
+def _retention_touch(plan) -> None:
+    try:
+        _retention_helper_output(plan, "touch", (plan["entry"],))
+    except Exception:
+        pass
+
+
+def _retention_auto(plan) -> None:
+    try:
+        _retention_helper_output(
+            plan,
+            "auto",
+            (plan["cache_root"], plan["entry"]),
+        )
+    except Exception:
+        # Cache lifecycle failures never turn successful compilation into an
+        # error.  The next lookup safely behaves like a normal cache miss.
+        pass
+
+
 def plan_python_frontend_ir_cache(
     src_paths,
     module_names,
@@ -358,6 +557,7 @@ def plan_python_frontend_ir_cache(
     sibling_inits,
     libpython_mode: str,
     ir_scaffold_mode: str,
+    source_root: str = "",
 ):
     """Return a cache plan, or ``None`` when a safe key is unavailable."""
     if not python_frontend_ir_cache_enabled():
@@ -397,7 +597,7 @@ def plan_python_frontend_ir_cache(
             (input_path, python_frontend_ir_cache_dir()),
         )
         parts = output.split("\t")
-        if len(parts) != 4:
+        if len(parts) != 9:
             return None
         return {
             "schema": _CACHE_SCHEMA,
@@ -405,7 +605,14 @@ def plan_python_frontend_ir_cache(
             "parent": parts[1],
             "entry": parts[2],
             "lock": parts[3],
+            "compiler_digest": parts[4],
+            "runtime_abi_digest": parts[5],
+            "target": parts[6],
+            "options_digest": parts[7],
+            "action_root": parts[8],
             "host_python": str(host_python),
+            "cache_root": python_compiler_cache_root(),
+            "source_root": str(source_root or _default_source_root()),
         }
     except Exception:
         return None
@@ -466,15 +673,36 @@ def _parse_loaded_result(output: str, plan, expected_module_names):
 def load_python_frontend_ir_cache(plan, expected_module_names):
     if plan is None:
         return None
+    lease_path = ""
     try:
+        lease_path = _retention_helper_output(
+            plan,
+            "lease-acquire",
+            (plan["entry"],),
+        )
+        if not lease_path:
+            return None
         output = _helper_output(
             str(plan["host_python"]),
             "load",
             (plan["entry"], plan["key"]),
         )
-        return _parse_loaded_result(output, plan, expected_module_names)
+        result = _parse_loaded_result(output, plan, expected_module_names)
+        if result is not None:
+            _retention_touch(plan)
+        return result
     except Exception:
         return None
+    finally:
+        if lease_path:
+            try:
+                _retention_helper_output(
+                    plan,
+                    "lease-release",
+                    (lease_path,),
+                )
+            except Exception:
+                pass
 
 
 def acquire_python_frontend_ir_cache(plan) -> bool:
@@ -485,7 +713,7 @@ def acquire_python_frontend_ir_cache(plan) -> bool:
             _helper_output(
                 str(plan["host_python"]),
                 "acquire",
-                (plan["parent"], plan["lock"]),
+                (plan["parent"], plan["lock"], plan["entry"]),
             )
             == "1"
         )
@@ -510,7 +738,12 @@ def wait_python_frontend_ir_cache(
                 str(timeout_seconds),
             ),
         )
-        return _parse_loaded_result(output, plan, expected_module_names)
+        if not output.startswith("HIT\n"):
+            return None
+        # Re-load under an explicit reader lease.  The readiness helper may
+        # race with a pruner after it returns; the leased load either validates
+        # the complete entry again or degrades to a normal miss.
+        return load_python_frontend_ir_cache(plan, expected_module_names)
     except Exception:
         return None
 
@@ -543,7 +776,7 @@ def publish_python_frontend_ir_cache(plan, result) -> bool:
                 stream.write(
                     _safe_field(module_name) + "\t" + str(len(str(ir_text))) + "\n"
                 )
-        return (
+        published = (
             _helper_output(
                 str(plan["host_python"]),
                 "publish",
@@ -556,6 +789,10 @@ def publish_python_frontend_ir_cache(plan, result) -> bool:
             )
             == "1"
         )
+        if published:
+            _retention_touch(plan)
+            _retention_auto(plan)
+        return published
     except Exception:
         return False
 

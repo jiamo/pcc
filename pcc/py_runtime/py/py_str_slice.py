@@ -6,6 +6,16 @@ slicing implementation into executables that only index strings.
 """
 
 from pcc.extern import c_abi_export, c_int32, c_int64, c_ptr, extern
+from pcc.py_runtime.py.py_abi_constants import (
+    PYOBJECTHEADER_TYPE_TAG_OFFSET,
+    PYSTROBJECT_BYTE_LEN_OFFSET,
+    PYSTROBJECT_CP_LEN_OFFSET,
+    PYSTROBJECT_DATA_OFFSET,
+    PYSTROBJECT_HASH_OFFSET,
+    PYSTROBJECT_SIZE,
+    PY_TYPE_INT,
+    PY_TYPE_STR,
+)
 from pcc.unsafe import (
     free,
     global_load_ptr,
@@ -34,13 +44,13 @@ def _str_alloc(byte_len: int):
         return null()
     if byte_len > 9223372036854775807 - 41:
         return null()
-    s = pcc_gc_alloc(40 + byte_len + 1, 4, 0)
+    s = pcc_gc_alloc(PYSTROBJECT_SIZE + byte_len + 1, PY_TYPE_STR, 0)
     if ptr_is_null(s) != 0:
         return null()
-    store_i64(s, 16, byte_len)
-    store_i64(s, 24, -1)
-    store_i64(s, 32, -1)
-    store_i8(s, 40 + byte_len, 0)
+    store_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET, byte_len)
+    store_i64(s, PYSTROBJECT_CP_LEN_OFFSET, -1)
+    store_i64(s, PYSTROBJECT_HASH_OFFSET, -1)
+    store_i8(s, PYSTROBJECT_DATA_OFFSET + byte_len, 0)
     return s
 
 
@@ -56,23 +66,23 @@ def _utf8_codepoint_count(data, byte_len: int) -> int:
 
 
 def _str_cp_len(s) -> int:
-    cp: int = load_i64(s, 24)
+    cp: int = load_i64(s, PYSTROBJECT_CP_LEN_OFFSET)
     if cp < 0:
-        cp = _utf8_codepoint_count(ptr_add(s, 40), load_i64(s, 16))
-        store_i64(s, 24, cp)
+        cp = _utf8_codepoint_count(ptr_add(s, PYSTROBJECT_DATA_OFFSET), load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET))
+        store_i64(s, PYSTROBJECT_CP_LEN_OFFSET, cp)
     return cp
 
 
 def _utf8_byte_offset_for_codepoint(s, cp_idx: int) -> int:
     if cp_idx <= 0:
         return 0
-    byte_len: int = load_i64(s, 16)
-    cached_cp_len: int = load_i64(s, 24)
+    byte_len: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
+    cached_cp_len: int = load_i64(s, PYSTROBJECT_CP_LEN_OFFSET)
     if cached_cp_len == byte_len:
         if cp_idx >= byte_len:
             return byte_len
         return cp_idx
-    data = ptr_add(s, 40)
+    data = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
     seen: int = 0
     i: int = 0
     while i < byte_len:
@@ -86,12 +96,12 @@ def _utf8_byte_offset_for_codepoint(s, cp_idx: int) -> int:
 
 
 def _utf8_codepoint_byte_len(s, byte_off: int) -> int:
-    byte_len: int = load_i64(s, 16)
+    byte_len: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
     if byte_off < 0:
         return 0
     if byte_off >= byte_len:
         return 0
-    b: int = load_i8(ptr_add(s, 40), byte_off) & 255
+    b: int = load_i8(ptr_add(s, PYSTROBJECT_DATA_OFFSET), byte_off) & 255
     if (b & 128) == 0:
         return 1
     if (b & 224) == 192:
@@ -126,14 +136,14 @@ def _str_from_range(data, n: int):
     if ptr_is_null(out) != 0:
         return null()
     if n > 0:
-        memmove(ptr_add(out, 40), data, n)
+        memmove(ptr_add(out, PYSTROBJECT_DATA_OFFSET), data, n)
     return out
 
 
 def _type_of(obj) -> int:
     if is_tagged_int(obj) != 0:
-        return 2
-    return load_i32(obj, 8)
+        return PY_TYPE_INT
+    return load_i32(obj, PYOBJECTHEADER_TYPE_TAG_OFFSET)
 
 
 def _int_or_default(obj, default_value: int) -> int:
@@ -141,7 +151,7 @@ def _int_or_default(obj, default_value: int) -> int:
         return default_value
     if ptr_eq(obj, global_load_ptr("py_None")) != 0:
         return default_value
-    if _type_of(obj) == 2:
+    if _type_of(obj) == PY_TYPE_INT:
         return py_int_value_i64(obj)
     return default_value
 
@@ -172,7 +182,7 @@ def py_str_slice(s, lo, hi, step):
         if step_v == 1:
             bo_lo: int = _utf8_byte_offset_for_codepoint(s, lo_v)
             bo_hi: int = _utf8_byte_offset_for_codepoint(s, hi_v)
-            return _str_from_range(ptr_add(ptr_add(s, 40), bo_lo), bo_hi - bo_lo)
+            return _str_from_range(ptr_add(ptr_add(s, PYSTROBJECT_DATA_OFFSET), bo_lo), bo_hi - bo_lo)
 
         bo_lo2: int = _utf8_byte_offset_for_codepoint(s, lo_v)
         bo_hi2: int = _utf8_byte_offset_for_codepoint(s, hi_v)
@@ -180,8 +190,8 @@ def py_str_slice(s, lo, hi, step):
         out = _str_alloc(cap)
         if ptr_is_null(out) != 0:
             return null()
-        src = ptr_add(s, 40)
-        dst = ptr_add(out, 40)
+        src = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
+        dst = ptr_add(out, PYSTROBJECT_DATA_OFFSET)
         out_bytes: int = 0
         out_cps: int = 0
         cp_index: int = lo_v
@@ -196,9 +206,9 @@ def py_str_slice(s, lo, hi, step):
                 next_target = next_target + step_v
             bpos = bpos + w
             cp_index = cp_index + 1
-        store_i64(out, 16, out_bytes)
+        store_i64(out, PYSTROBJECT_BYTE_LEN_OFFSET, out_bytes)
         store_i8(dst, out_bytes, 0)
-        store_i64(out, 24, out_cps)
+        store_i64(out, PYSTROBJECT_CP_LEN_OFFSET, out_cps)
         return out
 
     default_lo: int = cp_len - 1
@@ -235,8 +245,8 @@ def py_str_slice(s, lo, hi, step):
     if ptr_is_null(cp_off) != 0:
         return null()
 
-    src2 = ptr_add(s, 40)
-    byte_len: int = load_i64(s, 16)
+    src2 = ptr_add(s, PYSTROBJECT_DATA_OFFSET)
+    byte_len: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
     cp: int = 0
     i: int = 0
     while i < byte_len:
@@ -251,7 +261,7 @@ def py_str_slice(s, lo, hi, step):
     if ptr_is_null(out2) != 0:
         free(cp_off)
         return null()
-    dst2 = ptr_add(out2, 40)
+    dst2 = ptr_add(out2, PYSTROBJECT_DATA_OFFSET)
     out_bytes2: int = 0
     k: int = 0
     while k < out_n:
@@ -262,8 +272,8 @@ def py_str_slice(s, lo, hi, step):
         memmove(ptr_add(dst2, out_bytes2), ptr_add(src2, start), width)
         out_bytes2 = out_bytes2 + width
         k = k + 1
-    store_i64(out2, 16, out_bytes2)
+    store_i64(out2, PYSTROBJECT_BYTE_LEN_OFFSET, out_bytes2)
     store_i8(dst2, out_bytes2, 0)
-    store_i64(out2, 24, out_n)
+    store_i64(out2, PYSTROBJECT_CP_LEN_OFFSET, out_n)
     free(cp_off)
     return out2

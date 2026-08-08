@@ -2,6 +2,8 @@
 
 第 10 章讲完了五个收集器共用的骨架:一套选择 ABI、一套槽位契约、一套根集、一对读写屏障、一条生产平等规则。本章逐个打开五个后端,看五种算法如何在同一副骨架上行走。每个后端用同一套问题展开:参照系是谁、核心算法是什么、移植到 pcc 时做了哪些关键决定、有哪些只属于它的不变式、今天的诚实状态如何——以及至少一个真实的案例研究。所有性能数字只作相对量级使用,并标注测量日期与含义;自举(bootstrap)负载下的秒数衡量的是"收集器对编译器型负载收的税",不是暂停画像。
 
+> **2026 年 8 月状态说明。** 五个生产 collector 的 policy 现已由严格 freestanding pcc-Python 编写并进入生产归档,C collector 不再拥有生产符号;证据边界见 [freestanding five-GC production closure](../../docs/goal/evidence/2026-08-03-freestanding-gc-done-strong.md)。本章保留的 C→pcc-Python 对照和失败故事是迁移过程的差分证据,不是“今天仍有两套生产实现”的陈述。算法等价性、长期暂停/RSS/碎片和完整固定点仍须按各自 gate 单独声明。
+
 ## 本章导读:五个后端概览
 
 第 10 章回答的是"五个后端共用什么信息";本章回答的是"每个后端拿同一份信息做什么事"。先不要背算法名,先用下面这张表建立直觉:
@@ -182,7 +184,7 @@ void pcc_gc_step(int64_t work_limit) {
 
 **专属不变式。** 构造函数必须保全 young/minor 头 flags(`gc-backend3-pcc-py-constructor-header-flags.md`);类元数据的借用槽(`methods[i].func`、`del_method`)必须参与晋升,但不得为此把它们塞进 #4 的通用追踪面(借用槽对追踪意味着重复计数);挂起的生成器帧槽(`PyGenObject.frame` 指向的堆帧列表)同样参与记忆集与改写(`gc-backend3-suspended-generator-frame-slot-rewrite.md`)。
 
-**已知状态。** README:production-facing focused gates green,C 与 pcc-Python 双轨,含线程本地 arena;开放项是跨域记忆集共享与更广的端口线程化对象索引同步。选择矩阵列它为中期吞吐候选;2026-05-07 审计的分配翻腾探针里它是唯一真正动了分代遥测的非默认后端(`minor_collections=18`)。
+**已知状态。** 2026 年 8 月的生产所有权由 freestanding pcc-Python 单轨承担,C 路径保留为差分 oracle;线程本地 arena 的有限所有权闸门已绿。开放项仍包括跨域记忆集共享、更广的线程化对象索引同步和长期性能证明。选择矩阵列它为中期吞吐候选;2026-05-07 审计的分配翻腾探针里它是唯一真正动了分代遥测的非默认后端(`minor_collections=18`)。
 
 **案例研究:四个字节的字符串,两个不变式(`gc-backend-selection-matrix.md` 闭合段,闸门日期 2026-05-17)。** 选择矩阵收尾时,#3 的 pcc1 矩阵格子崩在 `IRBuilder.call` 里:`_opname_of()` 每次调用都新切一个 `"call"` 短字符串,这个 16 字节级的对象正好落进 minor arena,却被存进长生命周期的 IR 元数据——一条教科书式的老→新边,在当时的记忆集覆盖之外。记录的修复是让 `_opname_of()` 返回稳定的操作码字面量:编译器侧消灭这条边,而不是当场为它扩展运行时覆盖。同一轮闭合还抓到第二个缺口:类元数据晋升漏掉了借用的 `methods[i].func` 与 `del_method` 槽——C 与端口随后同步补上(`gc-backend3-class-metadata-slot-rewrite.md`)。两个 bug 同一形状:**分代正确性的边界恰好是"谁可能持有新生引用"这张清单**,清单漏一行,就有一类对象在晋升后悬挂。
 

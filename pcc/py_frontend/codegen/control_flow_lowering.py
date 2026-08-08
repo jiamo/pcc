@@ -153,12 +153,20 @@ class ControlFlowLoweringMixin:
             selected_val = self._emit_expr(selected)
             coerced = self._coerce(selected_val, selected.ty, expr.ty)
             if selected_val in getattr(self, "_cpy_values", ()):
+                if self._cpy_value_is_owned(selected_val):
+                    return self._mark_owned_cpy_value(coerced)
                 return self._mark_cpy_value(coerced)
             return coerced
 
         result_ty = expr.ty
         cond_val = self._emit_condition_value(expr.cond)
+        cond_is_cpy = cond_val in getattr(self, "_cpy_values", ())
+        if cond_is_cpy:
+            self._guard_cpy_value_not_null(cond_val)
         cond_b = self._truthy(cond_val, expr.cond.ty)
+        if cond_is_cpy and self._cpy_value_is_owned(cond_val):
+            self.builder.call(self.runtime["py_cpy_decref"], [cond_val])
+            self._forget_owned_cpy_value(cond_val)
 
         fn = self.current_function
         then_bb = fn.append_basic_block(name=self._fresh("ternary_true"))
@@ -183,20 +191,41 @@ class ControlFlowLoweringMixin:
             else_is_cpy = else_val in getattr(self, "_cpy_values", ())
             if then_is_cpy or else_is_cpy:
                 cpy_result = True
+                self.builder.position_at_end(then_exit)
                 if not then_is_cpy:
-                    self.builder.position_at_end(then_exit)
-                    then_val, _ = self._marshal_to_cpython(
+                    then_val, then_owned = (
+                        self._marshal_to_cpython_consuming_source(
                         then_val,
                         expr.then_e.ty,
+                        expr.then_e,
+                        )
                     )
-                    then_exit = self.builder._block
+                else:
+                    then_owned = self._cpy_value_is_owned(then_val)
+                self._guard_cpy_value_not_null(then_val)
+                if then_owned:
+                    self._forget_owned_cpy_value(then_val)
+                else:
+                    self.builder.call(self.runtime["py_cpy_incref"], [then_val])
+                then_exit = self.builder._block
+
+                self.builder.position_at_end(else_exit)
                 if not else_is_cpy:
-                    self.builder.position_at_end(else_exit)
-                    else_val, _ = self._marshal_to_cpython(
+                    else_val, else_owned = (
+                        self._marshal_to_cpython_consuming_source(
                         else_val,
                         expr.else_e.ty,
+                        expr.else_e,
+                        )
                     )
-                    else_exit = self.builder._block
+                else:
+                    else_owned = self._cpy_value_is_owned(else_val)
+                self._guard_cpy_value_not_null(else_val)
+                if else_owned:
+                    self._forget_owned_cpy_value(else_val)
+                else:
+                    self.builder.call(self.runtime["py_cpy_incref"], [else_val])
+                else_exit = self.builder._block
             if not isinstance(then_val.type, ir.PointerType):
                 self.builder.position_at_end(then_exit)
                 then_val = marshal.marshal_to_object(
@@ -228,7 +257,7 @@ class ControlFlowLoweringMixin:
         phi.add_incoming(then_val, then_exit)
         phi.add_incoming(else_val, else_exit)
         if cpy_result:
-            return self._mark_cpy_value(phi)
+            return self._mark_owned_cpy_value(phi)
         return phi
 
     def _emit_if_expr_as_pcc_object(self, expr: IfExpr) -> ir.Value:
@@ -249,10 +278,32 @@ class ControlFlowLoweringMixin:
 
         self.builder.position_at_end(then_bb)
         then_val = self._emit_expr_as_pcc_object(expr.then_e)
+        if (
+            isinstance(expr.then_e, Name)
+            and getattr(self, "_exact_int_env_flags", {}).get(
+                expr.then_e.ident,
+                False,
+            )
+        ):
+            then_val = self._gc_retain(
+                then_val,
+                name=self._fresh("ternary.obj.then.retain"),
+            )
         then_exit = self.builder._block
 
         self.builder.position_at_end(else_bb)
         else_val = self._emit_expr_as_pcc_object(expr.else_e)
+        if (
+            isinstance(expr.else_e, Name)
+            and getattr(self, "_exact_int_env_flags", {}).get(
+                expr.else_e.ident,
+                False,
+            )
+        ):
+            else_val = self._gc_retain(
+                else_val,
+                name=self._fresh("ternary.obj.else.retain"),
+            )
         else_exit = self.builder._block
 
         self.builder.position_at_end(then_exit)

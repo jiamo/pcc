@@ -341,7 +341,7 @@ class DominatorTree:
 class DominatorTreeResult(AnalysisResult):
     """Analysis-cache wrapper around :class:`DominatorTree`."""
 
-    KEY = AnalysisKey("dominator-tree")
+    KEY = AnalysisKey("dominator-tree", scope="function")
 
     def __init__(self, tree: DominatorTree) -> None:
         self.tree = tree
@@ -353,7 +353,7 @@ class DominatorTreeResult(AnalysisResult):
 
 
 class PostDominatorTreeResult(AnalysisResult):
-    KEY = AnalysisKey("post-dominator-tree")
+    KEY = AnalysisKey("post-dominator-tree", scope="function")
 
     def __init__(self, tree: DominatorTree) -> None:
         self.tree = tree

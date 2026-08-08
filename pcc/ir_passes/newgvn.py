@@ -31,6 +31,7 @@ import re
 import llvmlite.binding as llvm
 
 from .dce import dce_module_text
+from .dominator_tree import DominatorTreeResult, register_dominator_analyses
 from .gvn import gvn_text
 from .instsimplify import simplify_module_text
 from .manager import AnalysisManager, ModulePass, PreservedAnalyses
@@ -132,23 +133,30 @@ def newgvn_text(
 
 class NewGVNPass(ModulePass):
     name = "pcc-newgvn"
+    required_analyses = (DominatorTreeResult.KEY,)
+    mutation_class = "instructions"
 
     def __init__(self) -> None:
         self.rewritten_ir: str | None = None
+
+    def register_analyses(self, am: AnalysisManager) -> None:
+        register_dominator_analyses(am)
 
     def run(
         self,
         module: llvm.ModuleRef,
         am: AnalysisManager,
     ) -> PreservedAnalyses:
-        from .dominator_tree import compute_dominator_tree
         self.rewritten_ir = None
         ir_text = str(module)
         fn_doms: dict[str, dict[str, list[str]]] = {}
         for fn in module.functions:
             if fn.is_declaration:
                 continue
-            dom = compute_dominator_tree(fn)
+            result = am.get(DominatorTreeResult.KEY, fn)
+            if not isinstance(result, DominatorTreeResult):
+                raise TypeError("dominator-tree analysis returned wrong result")
+            dom = result.tree
             fn_doms[fn.name] = {
                 block: dom.dominators(block) for block in dom.all_blocks()
             }
@@ -160,4 +168,4 @@ class NewGVNPass(ModulePass):
         except RuntimeError:
             return PreservedAnalyses.all()
         self.rewritten_ir = new_text
-        return PreservedAnalyses.none()
+        return PreservedAnalyses({DominatorTreeResult.KEY})

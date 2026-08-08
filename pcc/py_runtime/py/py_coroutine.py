@@ -13,6 +13,18 @@ Coroutine object layout:
 """
 
 from pcc.extern import extern, c_abi_export, c_int32, c_int64, c_ptr, c_void
+from pcc.py_runtime.py.py_abi_constants import (
+    PYOBJECTHEADER_FLAGS_OFFSET,
+    PYOBJECTHEADER_TYPE_TAG_OFFSET,
+    PY_FLAG_IMMORTAL,
+    PY_TYPE_CONTINUATION,
+    PY_TYPE_INT,
+    PY_TYPE_TASK,
+)
+from pcc.py_runtime.py.py_abi_constants import (
+    PY_TYPE_COROUTINE,
+    PY_TYPE_GEN,
+)
 from pcc.unsafe import (
     call_ptr2,
     calloc,
@@ -44,6 +56,9 @@ py_incref = extern("py_incref", (c_ptr,), c_void)
 py_decref = extern("py_decref", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+py_runtime_error_if_unset = extern(
+    "py_runtime_error_if_unset", (c_ptr, c_ptr), c_ptr
+)
 py_obj_next = extern("py_obj_next", (c_ptr,), c_ptr)
 py_current_exception = extern("py_current_exception", (), c_ptr)
 py_exc_builtin_class = extern("py_exc_builtin_class", (c_int64,), c_ptr)
@@ -86,8 +101,8 @@ define_global_ptr_null("py_continuation_class_cache")
 
 def _type_of(obj) -> int:
     if is_tagged_int(obj):
-        return 2
-    return load_i32(obj, 8)
+        return PY_TYPE_INT
+    return load_i32(obj, PYOBJECTHEADER_TYPE_TAG_OFFSET)
 
 
 def _raise_typeerror(message) -> None:
@@ -100,6 +115,12 @@ def _raise_runtimeerror(message) -> None:
     py_raise(exc)
 
 
+def _coroutine_require_result(result, helper_name, message):
+    if ptr_is_null(result):
+        py_runtime_error_if_unset(helper_name, message)
+    return result
+
+
 @c_abi_export("py_coroutine_class")
 def py_coroutine_class():
     cls = global_load_ptr("py_coroutine_class_cache")
@@ -107,8 +128,12 @@ def py_coroutine_class():
         return cls
     cls = py_class_new(cstr("coroutine"), null(), 0, null(), 0)
     if not ptr_is_null(cls):
-        flags: int = load_i32(cls, 12)
-        store_i32(cls, 12, flags | 1)  # PY_FLAG_IMMORTAL
+        flags: int = load_i32(cls, PYOBJECTHEADER_FLAGS_OFFSET)
+        store_i32(
+            cls,
+            PYOBJECTHEADER_FLAGS_OFFSET,
+            flags | PY_FLAG_IMMORTAL,
+        )
         global_store_ptr("py_coroutine_class_cache", cls)
     return cls
 
@@ -120,9 +145,13 @@ def py_coroutine_new(name):
 
 @c_abi_export("py_coroutine_new_native")
 def py_coroutine_new_native(name, entry, captures_tuple, args_tuple):
-    coro = pcc_gc_alloc(64, 20, 0)
+    coro = pcc_gc_alloc(64, PY_TYPE_COROUTINE, 0)
     if ptr_is_null(coro):
-        return null()
+        return _coroutine_require_result(
+            null(),
+            cstr("pcc_gc_alloc"),
+            cstr("coroutine construction could not allocate coroutine state"),
+        )
     store_ptr(coro, 16, name)
     store_ptr(coro, 24, entry)
     made_captures: int = 0
@@ -130,6 +159,11 @@ def py_coroutine_new_native(name, entry, captures_tuple, args_tuple):
         captures_tuple = py_tuple_new(0)
         made_captures = 1
         if ptr_is_null(captures_tuple):
+            _coroutine_require_result(
+                null(),
+                cstr("py_tuple_new"),
+                cstr("coroutine construction could not allocate captures tuple"),
+            )
             py_decref(coro)
             return null()
     made_args: int = 0
@@ -137,6 +171,11 @@ def py_coroutine_new_native(name, entry, captures_tuple, args_tuple):
         args_tuple = py_tuple_new(0)
         made_args = 1
         if ptr_is_null(args_tuple):
+            _coroutine_require_result(
+                null(),
+                cstr("py_tuple_new"),
+                cstr("coroutine construction could not allocate arguments tuple"),
+            )
             if made_captures != 0:
                 py_decref(captures_tuple)
             py_decref(coro)
@@ -163,7 +202,7 @@ def _checked_coroutine(coro):
     if is_tagged_int(coro):
         _raise_typeerror(cstr("object is not a coroutine"))
         return null()
-    if _type_of(coro) != 20:  # PY_TYPE_COROUTINE
+    if _type_of(coro) != PY_TYPE_COROUTINE:  # PY_TYPE_COROUTINE
         _raise_typeerror(cstr("object is not a coroutine"))
         return null()
     return coro
@@ -187,7 +226,14 @@ def py_coroutine_run(coro):
         args = pcc_gc_load_ptr(coro, ptr_add(coro, 40))
         result = call_ptr2(entry, captures, args)
         if ptr_is_null(result):
-            return null()
+            entry_name = load_ptr(coro, 16)
+            if ptr_is_null(entry_name):
+                entry_name = cstr("coroutine entry")
+            return _coroutine_require_result(
+                null(),
+                entry_name,
+                cstr("coroutine entry returned NULL without setting an exception"),
+            )
     else:
         py_incref(result)
     pcc_gc_store_ptr(coro, ptr_add(coro, 48), result)
@@ -223,14 +269,18 @@ def py_coroutine_close(coro):
         return global_load_ptr("py_None")
     if is_tagged_int(coro):
         return global_load_ptr("py_None")
-    if _type_of(coro) == 20:
+    if _type_of(coro) == PY_TYPE_COROUTINE:
         store_i32(coro, 56, 1)
     return global_load_ptr("py_None")
 
 
 def _await_iterator(it):
     if ptr_is_null(it):
-        return null()
+        return _coroutine_require_result(
+            null(),
+            cstr("await_iterator"),
+            cstr("await iterator received NULL iterator"),
+        )
     while True:
         item = py_obj_next(it)
         if not ptr_is_null(item):
@@ -251,18 +301,36 @@ def _await_iterator(it):
 @c_abi_export("py_await")
 def py_await(awaitable):
     if ptr_is_null(awaitable):
-        return null()
+        return _coroutine_require_result(
+            null(),
+            cstr("py_await"),
+            cstr("py_await received NULL awaitable"),
+        )
     if is_tagged_int(awaitable) == 0:
         tag: int = _type_of(awaitable)
-        if tag == 20:  # PY_TYPE_COROUTINE
+        if tag == PY_TYPE_COROUTINE:  # PY_TYPE_COROUTINE
             return py_coroutine_run(awaitable)
-        if tag == 15:  # PY_TYPE_GEN
+        if tag == PY_TYPE_GEN:  # PY_TYPE_GEN
             return _await_iterator(awaitable)
     method = py_obj_getattr(awaitable, cstr("__await__"))
     if not ptr_is_null(method):
         args = py_tuple_new(0)
+        if ptr_is_null(args):
+            _coroutine_require_result(
+                null(),
+                cstr("py_tuple_new"),
+                cstr("__await__ could not allocate its argument tuple"),
+            )
+            py_decref(method)
+            return null()
         iterator = py_obj_call(method, args, global_load_ptr("py_None"))
+        _coroutine_require_result(
+            iterator,
+            cstr("__await__"),
+            cstr("__await__ returned NULL without setting an exception"),
+        )
         py_decref(args)
+        py_decref(method)
         if ptr_is_null(iterator):
             return null()
         result = _await_iterator(iterator)
@@ -320,7 +388,7 @@ def _checked_continuation(cont):
         _raise_typeerror(cstr("object is not a continuation"))
         return null()
     cont = pcc_gc_note_relocation_read(cont)
-    if _type_of(cont) != 29:  # PY_TYPE_CONTINUATION
+    if _type_of(cont) != PY_TYPE_CONTINUATION:
         _raise_typeerror(cstr("object is not a continuation"))
         return null()
     return cont
@@ -333,8 +401,12 @@ def py_continuation_class():
         return cls
     cls = py_class_new(cstr("continuation"), null(), 0, null(), 0)
     if not ptr_is_null(cls):
-        flags: int = load_i32(cls, 12)
-        store_i32(cls, 12, flags | 1)  # PY_FLAG_IMMORTAL
+        flags: int = load_i32(cls, PYOBJECTHEADER_FLAGS_OFFSET)
+        store_i32(
+            cls,
+            PYOBJECTHEADER_FLAGS_OFFSET,
+            flags | PY_FLAG_IMMORTAL,
+        )
         global_store_ptr("py_continuation_class_cache", cls)
     return cls
 
@@ -359,7 +431,7 @@ def _py_continuation_new_with_abi(frame_map, slots, resume_pc, resume_abi: int):
             return null()
         store_ptr(chunk, 16, chunk_slots)
 
-    cont = pcc_gc_alloc(48, 29, 0)
+    cont = pcc_gc_alloc(48, PY_TYPE_CONTINUATION, 0)
     if ptr_is_null(cont):
         if not ptr_is_null(chunk_slots):
             free(chunk_slots)
@@ -528,11 +600,11 @@ def _checked_task(task):
         _raise_typeerror(cstr("object is not a task"))
         return null()
     task = pcc_gc_note_relocation_read(task)
-    if _type_of(task) != 28:  # PY_TYPE_TASK
+    if _type_of(task) != PY_TYPE_TASK:
         _raise_typeerror(cstr("object is not a task"))
         return null()
     if ptr_eq(task, original) == 0:
-        if _type_of(original) == 28:
+        if _type_of(original) == PY_TYPE_TASK:
             pcc_gc_store_ptr(original, ptr_add(original, 16), null())
             pcc_gc_store_ptr(original, ptr_add(original, 24), null())
             pcc_gc_store_ptr(original, ptr_add(original, 32), null())
@@ -541,7 +613,7 @@ def _checked_task(task):
 
 @c_abi_export("py_task_new")
 def py_task_new(coro):
-    task = pcc_gc_alloc(48, 28, 0)
+    task = pcc_gc_alloc(48, PY_TYPE_TASK, 0)
     if ptr_is_null(task):
         return null()
     store_ptr(task, 16, null())  # coro

@@ -27,6 +27,7 @@ transformations.
 from __future__ import annotations
 
 from .manager import (
+    AnalysisCounters,
     AnalysisKey,
     AnalysisManager,
     FunctionPass,
@@ -137,6 +138,7 @@ from .vectorize_passes import (
 
 __all__ = [
     # Core framework
+    "AnalysisCounters",
     "AnalysisKey",
     "AnalysisManager",
     "FunctionPass",

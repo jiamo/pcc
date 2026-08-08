@@ -20,13 +20,12 @@ from ..py_ast import (
     StrType,
 )
 from . import marshal
+from .freestanding_abi_constants import PY_TYPE_BYTEARRAY, PY_TYPE_BYTES
 
 _I1 = ir.IntType(1)
 _I32 = ir.IntType(32)
 _I64 = ir.IntType(64)
 _CSTR = ir.IntType(8).as_pointer()
-_PY_TYPE_BYTES = 17
-_PY_TYPE_BYTEARRAY = 18
 
 _STR_METHOD_NATIVE = frozenset(
     {
@@ -110,7 +109,7 @@ def _str_i32_to_i1(host, v: ir.Value, nm: str) -> ir.Value:
 # CPython uses PY_SSIZE_T_MAX as the default ``end`` for
 # str.find/rfind/index/rindex; the runtime *_range helpers clamp any
 # end > cp_len down to cp_len, so this sentinel reproduces "no end given".
-_STR_FIND_END_DEFAULT = 0x7FFFFFFFFFFFFFFF
+_STR_FIND_END_DEFAULT = ((0x7FFFFFFF << 32) | 0xFFFFFFFF)
 
 
 def _str_find_range_bounds(host, expr: Call):
@@ -137,16 +136,16 @@ class StringMethodLoweringMixin:
         owned argument is released.
         """
         items = _str_method_arg(self, arg_expr)
-        self.builder.call(self.runtime["pcc_gc_pin"], [items])
+        self._gc_pin(items)
         result = self.builder.call(
             self.runtime["py_str_join"],
             [recv, items],
             name=self._fresh(prefix + ".join"),
         )
-        self.builder.call(self.runtime["pcc_gc_pin"], [result])
-        self.builder.call(self.runtime["pcc_gc_unpin"], [items])
+        self._gc_pin(result)
+        self._gc_unpin(items)
         self._gc_release_if_owned(items, arg_expr)
-        self.builder.call(self.runtime["pcc_gc_unpin"], [result])
+        self._gc_unpin(result)
         return result
 
     def _extract_splitlines_keepends(self, expr: Call):
@@ -636,13 +635,13 @@ class StringMethodLoweringMixin:
             is_bytes = self.builder.icmp_signed(
                 "==",
                 tag,
-                ir.Constant(_I64, _PY_TYPE_BYTES),
+                ir.Constant(_I64, PY_TYPE_BYTES),
                 name=self._fresh("dyn.bytes.decode.is_bytes"),
             )
             is_bytearray = self.builder.icmp_signed(
                 "==",
                 tag,
-                ir.Constant(_I64, _PY_TYPE_BYTEARRAY),
+                ir.Constant(_I64, PY_TYPE_BYTEARRAY),
                 name=self._fresh("dyn.bytes.decode.is_bytearray"),
             )
             is_bytes_like = self.builder.or_(

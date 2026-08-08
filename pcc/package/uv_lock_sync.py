@@ -20,6 +20,10 @@ import urllib.request
 
 from pcc.package.acquire import requires_python_allows
 from pcc.package.install import _artifact_compatibility_reason_from_name
+from pcc.package.runtime_profile import (
+    CapabilityArtifactError,
+    read_capability_artifacts,
+)
 from pcc.package_environment import resolve_package_environment
 
 UV_LOCK_ADAPTER_SCHEMA = "pcc.uv-lock-adapter.v1"
@@ -853,6 +857,18 @@ def sync_uv_lock(
                     artifact, cache_root
                 )
                 downloads += int(downloaded)
+            try:
+                capability_rows = (
+                    read_capability_artifacts(artifact_path)
+                    if artifact_path.is_dir()
+                    else []
+                )
+            except CapabilityArtifactError as exc:
+                raise UvLockSyncError(
+                    "PCC-PKG-UVLOCK-CAPABILITY-INVALID",
+                    f"invalid capability manifest for {package['name']}: {exc}",
+                    capability_code=exc.code,
+                ) from exc
             install_report = _install_with_pcc1(
                 native_pcc1,
                 artifact_path,
@@ -881,6 +897,7 @@ def sync_uv_lock(
                     "artifact_path": artifact["path"],
                     "artifact_url": artifact["url"],
                     "build_key": _build_key(package, environment),
+                    "capability_artifacts": capability_rows,
                     "dependencies": package["dependencies"],
                     "downloaded": downloaded,
                     "install_ok": True,

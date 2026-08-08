@@ -1,13 +1,13 @@
 # 第 7 章 对象模型
 
-运行时的一切都从"一个 Python 值在内存里长什么样"开始。pcc 的对象模型回答三件事:每个堆对象共享什么样的对象头(object header);类与实例如何布局、属性如何查找;以及最特殊的一条——同一套布局为什么要用 C 和 pcc-Python 各写一遍,并且必须逐字节一致。本章只讲对象的静态结构与属性协议:引用计数与所有权契约见第 9 章,异常协议见第 8 章,五个 GC 后端如何遍历和移动这些对象见第 10、11 章。读完本章,应当能对照 [pcc/py_runtime/src/py_internal.h](../../pcc/py_runtime/src/py_internal.h) 画出 `PyClassObject` 的 120 字节,并解释为什么"对象明明有这个属性却报 AttributeError"的排查顺序是布局、屏障、错误检查——而不是先怀疑前端。
+运行时的一切都从"一个 Python 值在内存里长什么样"开始。pcc 的对象模型回答三件事:每个堆对象共享什么样的对象头(object header);类与实例如何布局、属性如何查找;以及最特殊的一条——生产运行时里的 pcc-Python 实现为什么仍须与 C ABI 布局和差分 oracle 逐字节一致。本章只讲对象的静态结构与属性协议:引用计数与所有权契约见第 9 章,异常协议见第 8 章,五个 GC 后端如何遍历和移动这些对象见第 10、11 章。读完本章,应当能对照 [pcc/py_runtime/src/py_internal.h](../../pcc/py_runtime/src/py_internal.h) 画出 `PyClassObject` 的 120 字节,并解释为什么"对象明明有这个属性却报 AttributeError"的排查顺序是布局、屏障、错误检查——而不是先怀疑前端。
 
 ## 本章导读:从对象头开始
 
-这一章细节很多,但入口很简单:所有堆对象先有同一类对象头,再由类型标签和具体布局决定后面的身体是什么。只要对象头、类型标签、slot 访问和 C/pcc-Python 镜像一致,后面的属性、方法和 GC 才有共同地基。
+这一章细节很多,但入口很简单:所有堆对象先有同一类对象头,再由类型标签和具体布局决定后面的身体是什么。只要对象头、类型标签、slot 访问以及 pcc-Python 与 C ABI oracle 的布局一致,后面的属性、方法和 GC 才有共同地基。
 
 - 遇到对象 bug,先问指针指向的到底是哪种 type tag。
-- 遇到类/实例 bug,先核对 C 布局和 pcc-Python 镜像是否逐字段一致。
+- 遇到类/实例 bug,先核对 pcc-Python 生产实现和 C ABI/oracle 布局是否逐字段一致。
 - 遇到 backend #3/#4 专属 bug,先看读写对象槽有没有走 GC barrier。
 
 ## 7.1 问题与设计空间
@@ -136,7 +136,7 @@ offset size 字段              语义
 
 **`methods` 与方法值的双重形态。** `PyClassMethod` 是 `{const char *name; PyObject *func}`,`func` 上的注释毫不掩饰:"borrowed — points at a user_* LLVM function"。方法表里存的多数不是堆上的函数对象,而是代码生成发射的裸函数指针 cast 成 `PyObject *`。调用辅助函数(`py_class.c` 的 `class_call_binary_method()` 等)先做头嗅探——指针能承载对象头且标签是 `PY_TYPE_FUNC` 才按 `PyFuncObject` 走 `py_func_call()`,否则直接 cast 回函数指针调用。这换来了零分配的静态方法表(模块 init 只做 realloc 追加),代价是运行时必须能可靠区分"堆对象"与"代码地址"——前述防御性指针判定在此不是诊断手段而是正确性依赖。`py_class_lookup()` 沿 MRO 线性扫每个类的方法表,字符串比较前先做指针相等短路(字段名/方法名通常是同一份 rodata 字面量);`__name__` 与 `__mro__` 在这里特判合成。
 
-**`del_method`。** 终结器查找在 dealloc 热路径上,所以缓存到固定偏移:`py_class_new()` 结尾预填 `py_class_lookup(c, "__del__")`(继承的也能拿到);`py_class_add_method()` 看到 `"__del__"` 时同步更新;`py_dunder.c` 的 `py_user_del_dispatch()` 发现槽为空时懒补一次。值得注意的是 pcc-Python 端口的 `py_class_new` 没有这步预填(memset 留 NULL),两个实现靠懒补收敛到同一可观察行为——这是"布局必须逐字节相同,行为允许不同步调、但必须收敛"的一个干净例子(练习 3)。
+**`del_method`。** 终结器查找在 dealloc 热路径上,所以缓存到固定偏移。历史 C oracle 的 `py_class_new()` 在结尾预填 `py_class_lookup(c, "__del__")`(继承的也能拿到),`py_class_add_method()` 看到 `"__del__"` 时同步更新,而 `py_dunder.c` 的 `py_user_del_dispatch()` 发现槽为空时懒补一次。当前 pcc-Python 生产所有者的 `py_class_new` 不做预填(memset 留 NULL),而是依赖懒补得到同一可观察行为。这是"布局必须逐字节相同,oracle 与生产实现的行为允许不同步调、但必须收敛"的一个干净例子(练习 3)。
 
 **`attrs`:类级变量字典。** 这是布局里最年轻的槽,它的来历是一段三幕剧(7.7 节)。今天的形态:`attrs` 是类**拥有**的字典,存放 `class C: x = 1` 这类类变量以及 `type()` 三参形式的命名空间;[pcc/py_runtime/src/py_class_attrs.c](../../pcc/py_runtime/src/py_class_attrs.c) 顶部注释言明,旧的指针键侧表(`PccClassAttrsNode` 链)已退化为索引,不再拥有字典——把边放进对象本体,移动型收集器才能直接追踪与改写它。类属性读取 `py_class_getattr()` 的顺序是:`__dict__` 特判 → 元类的数据描述符 → 沿 MRO 查每个类的 `attrs` 字典(命中 classmethod 则绑定、命中描述符则调 `__get__`)→ 退到 `py_class_lookup()` 方法表。写入 `py_class_setattr()` 先问元类数据描述符的 `__set__`,否则进本类 `attrs`。
 
@@ -191,9 +191,9 @@ py_instance_getattr(inst, name)                    py_class.c
 
 `py_instance_dealloc()`(`py_class.c`)的开头两行决定了 Python 终结语义的对象模型部分:先 `py_weakref_invalidate()` 清弱引用,再 `py_user_del_dispatch()` 派发 `__del__`;随后检查 `refcount > 0`——终结器可能把 `self` 存到别处使对象**复活**,此时重新 `py_gc_track()` 并返回,不释放。因为 `py_user_del_dispatch()` 在派发时已置 `PY_FLAG_FINALIZED`,复活对象的下一次死亡不会再进终结器。终结器抛出的异常被 `py_clear_exception()` 吞掉(CPython 的 unraisable 语义,告警通道是后续诊断任务)。引用计数为何在这一刻可信、跨后端如何保证,见第 9、10 章。
 
-## 7.5 一套布局,两份实现:C 与 pcc-Python 的镜像纪律
+## 7.5 一套布局,一个生产所有者:pcc-Python 与 C oracle 的镜像纪律
 
-pcc 的运行时分层(第 1、14 章)要求 Python 语义逐步从手写 C 迁进 pcc-Python:[pcc/py_runtime/src/py_class.c](../../pcc/py_runtime/src/py_class.c) 有一个孪生兄弟 [pcc/py_runtime/py/py_class.py](../../pcc/py_runtime/py/py_class.py),以 `@c_abi_export("py_class_lookup")` 等修饰导出**同名同 ABI** 的符号,默认构建(`PY_MODULES`)链接的是端口而不是 C 源。于是同一个 `PyClassObject` 有两个生产者、两个消费者,布局成为两份实现之间的**公共财产**。
+pcc 的运行时分层(第 1、14 章)已经把这段生产所有权迁进 pcc-Python:[pcc/py_runtime/py/py_class.py](../../pcc/py_runtime/py/py_class.py) 以 `@c_abi_export("py_class_lookup")` 等修饰导出**同名同 ABI** 的符号,当前生产归档链接 pcc-Python 对象,不把 [pcc/py_runtime/src/py_class.c](../../pcc/py_runtime/src/py_class.c) 当作第二份生产实现。C 结构声明和历史实现仍有两项职责:定义外部 ABI 布局,以及充当迁移期差分 oracle。于是 `PyClassObject` 仍是双方的**公共契约**,但生产所有者只有 pcc-Python。
 
 端口没有结构体可用,它用原始访存重述布局:
 
@@ -213,13 +213,13 @@ store_ptr(cls, 112, metaclass)    # metaclass
 
 1. **改布局 = 一次双边提交。** C 结构体与端口 docstring/字面量在同一变更里走;`py_class.py` 文档头那张偏移表是事实规范,先改表再改码。
 2. **默认模式测试,而非 `PCC_RUNTIME_CC=cc`。** 修在 C 文件里的 bug,若该文件属于 `PY_MODULES`(默认链接端口),默认模式根本不会执行你的 C 修复——仓库记录过四个切片在 cc 模式下给出假信心的教训(第 14 章)。
-3. **行为允许收敛式差异,布局不允许任何差异。** `del_method` 预填(C)对懒补(端口)是合法差异,因为可观察 ABI 行为相同;偏移 96 对偏移 88 不是差异,是腐坏。
+3. **行为允许收敛式差异,布局不允许任何差异。** `del_method` 预填(C oracle)对懒补(pcc-Python 生产实现)是合法差异,因为可观察 ABI 行为相同;偏移 96 对偏移 88 不是差异,是腐坏。
 
 ## 7.6 "明明定义了 X 却说没有":三因检查顺序
 
 把 7.2–7.5 节的机制叠起来,就能解释 [AGENTS.md](../../AGENTS.md) 里那条排查口诀。症状:真实程序报 `AttributeError: object has no attribute X`,而类源码明明定义了 `X`。由 7.4 节可知,这个消息只在 `py_obj_missing_attr()` 处产生,意味着七层查找**全部**走空。按命中概率与验证成本排序的三因:
 
-1. **布局漂移(C `PyClassObject` vs `py_class.py`)。** 若两份实现对 `n_fields@72`、`field_names@80`、`methods@64` 中任何一个的理解不同,`lookup_field_index()` 会在垃圾上扫描,`_class_lookup_in_mro()` 会读错方法表——查找不崩溃,只是永远落空。验证:对照 `py_internal.h` 与 `py_class.py` docstring 的偏移表逐行核;看最近的 diff 是否单边动过布局。
+1. **布局漂移(C ABI `PyClassObject` vs `py_class.py`)。** 若 ABI 声明与生产实现对 `n_fields@72`、`field_names@80`、`methods@64` 中任何一个的理解不同,`lookup_field_index()` 会在垃圾上扫描,`_class_lookup_in_mro()` 会读错方法表——查找不崩溃,只是永远落空。验证:对照 `py_internal.h` 与 `py_class.py` docstring 的偏移表逐行核;看最近的 diff 是否单边动过布局。
 2. **缺失 `pcc_gc_load_ptr()` 屏障(后端 #3/#4)。** 指针槽必须经 `pcc_gc_load_ptr()` 读、`pcc_gc_store_ptr()` 写;裸读 `obj->slot` 在默认后端 #0 上完全正常,在分代 #3 / 重定位 #4 上可能拿到搬迁前的旧地址——旧地址上的"类"读出来的方法表是噪声。验证:`PCC_GC_BACKEND=0` 复跑,若症状消失,几乎可以锁定某条新加的裸槽访问;然后在涉事路径上找没走屏障的读写。(屏障语义本身见第 10 章。)
 3. **缺失 `py_err_occurred()` 检查。** pcc 的异常是"存 TLS、正常返回"(第 8 章):一个更早的调用失败后,若生成代码或运行时漏检 `py_err_occurred()`,NULL 会被当成"没找到"继续传播,最终在不相干的属性上报错——或者反过来,挂起的旧异常让 `py_obj_missing_attr()` 放弃报错,症状漂移到更远处。验证:在症状点回溯最近一次可抛调用,检查每个调用点之后是否有 err-check 分支。
 
@@ -265,7 +265,7 @@ store_ptr(cls, 112, metaclass)    # metaclass
 
 ## 7.8 小结
 
-pcc 的对象模型由四个相互咬合的决定构成。16 字节对象头(`refcount@0`、`type_tag@8`、`flags@12`)用整数标签而非类型指针,换来无解引用的分派、可防御的指针验证、五 GC 共用的头格式与可镜像性。标记小整数通道征用指针 bit 0,让 `int` 的值投影零分配,代价是全运行时的"先问 tagged"纪律。`PyClassObject` 的 120 字节把 MRO、线性方法表、静态字段名表、`del_method`/`attrs`/`metaclass` 三个尾槽压进一个 C 结构体,实例则是"类指针 + 静态槽 + 一个隐藏字典槽",属性协议按描述符优先级分七层,`AttributeError` 只有一个出生地。最后,这一切存在两份——C 与 pcc-Python——逐字节一致是用纪律而非工具保证的契约,于是排查属性丢失的顺序永远是:布局、屏障、错误检查,然后才轮到前端。
+pcc 的对象模型由四个相互咬合的决定构成。16 字节对象头(`refcount@0`、`type_tag@8`、`flags@12`)用整数标签而非类型指针,换来无解引用的分派、可防御的指针验证、五 GC 共用的头格式与可镜像性。标记小整数通道征用指针 bit 0,让 `int` 的值投影零分配,代价是全运行时的"先问 tagged"纪律。`PyClassObject` 的 120 字节把 MRO、线性方法表、静态字段名表、`del_method`/`attrs`/`metaclass` 三个尾槽压进一个 ABI 布局,实例则是"类指针 + 静态槽 + 一个隐藏字典槽",属性协议按描述符优先级分七层,`AttributeError` 只有一个出生地。最后,当前生产实现归 pcc-Python 所有,C 保留为 ABI 声明与差分 oracle;逐字节一致仍是用纪律保证的契约。于是排查属性丢失的顺序永远是:布局、屏障、错误检查,然后才轮到前端。
 
 对象怎么死、引用怎么算,翻到第 9 章;这些槽位如何被五个收集器遍历、改写、搬迁,翻到第 10、11 章。
 
@@ -273,6 +273,6 @@ pcc 的对象模型由四个相互咬合的决定构成。16 字节对象头(`re
 
 1. **(读源码)** 对照 [pcc/py_runtime/src/py_internal.h](../../pcc/py_runtime/src/py_internal.h) 手算 `PyClassObject` 全部 15 个字段的偏移,标出四处 4 字节填充的位置,验证 120 字节与 `del_method@96/attrs@104/metaclass@112`;再对照 [pcc/py_runtime/py/py_class.py](../../pcc/py_runtime/py/py_class.py) 的 docstring 与代码中的字面量,找出端口读写每个槽的所有位置。
 2. **(审计)** `PY_TYPE_VALUEBOX = 200` 落在用户类标签空间内,而 `py_class.c` 的 `g_next_user_tag` 从 104 起单调递增且无避让。第 97 个领到标签的用户类会与之相撞。读 `py_obj_ops_compare.c`、`py_weakref.c`、`py_format.c` 中所有消费 `PY_TYPE_VALUEBOX` 的判断,描述相撞后的可观察症状;给出两种修复(分配器跳号 / 迁移 VALUEBOX 标签)并论证各自对镜像与已发射代码的代价。
-3. **(行为收敛证明)** C 的 `py_class_new()` 预填 `del_method`,端口的不预填。借助 `py_user_del_dispatch()` 的懒补逻辑,论证两者对任何用户程序不可区分;再构造一个(只能用运行时内部探针观察到的)差异点,说明为什么"可观察 ABI 等价"是比"逐语句等价"更合理的镜像标准。
+3. **(行为收敛证明)** C oracle 的 `py_class_new()` 预填 `del_method`,pcc-Python 生产实现不预填。借助 `py_user_del_dispatch()` 的懒补逻辑,论证两者对任何用户程序不可区分;再构造一个(只能用运行时内部探针观察到的)差异点,说明为什么"可观察 ABI 等价"是比"逐语句等价"更合理的差分标准。
 4. **(设计权衡)** `PY_CLASS_FLAG_SLOTS_ONLY` 复用了 `PY_FLAG_GC_TRACKED` 的 bit 0x2,安全前提是类对象从不进入 `py_gc_track()`。假设未来要让类对象参与循环收集(例如支持运行期类的卸载),列出这个 bit 复用会以什么症状暴露,并提出迁移方案(提示:`py_internal.h` 的 flags 空间还剩哪些位?端口里有多少处 `flags & 2` 需要同步?)。
 5. **(测量设计)** `py_class_lookup()` 是线性扫描,注释承诺"future phase can swap to a hashmap"。设计一个实验回答换哈希是否值得:应测量哪些真实负载(提示:自举 stage2 编译、[tests/python/](../../tests/python) 下的类密集用例)、统计什么分布(每类方法数、查找命中深度)、以及在什么阈值下结论成立。说明为什么微基准在这里会误导。

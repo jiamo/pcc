@@ -61,9 +61,13 @@ static int pcc_dealloc_should_defer(int32_t type_tag) {
         case PY_TYPE_CONTINUATION:
         case PY_TYPE_TASK:
         case PY_TYPE_VIRTUAL_THREAD:
+        case PY_TYPE_VTHREAD_CHANNEL:
+        case PY_TYPE_PROPERTY:
+        case PY_TYPE_CLASSMETHOD:
+        case PY_TYPE_STATICMETHOD:
             return 1;
         default:
-            return type_tag >= PY_TYPE_USER;
+            return type_tag >= PY_TYPE_USER_CLASS_START;
     }
 }
 
@@ -95,9 +99,13 @@ static void pcc_dealloc_dispatch(PyObject *o, int32_t type_tag) {
         case PY_TYPE_THREAD: py_dealloc_thread_thread(o); break;
         case PY_TYPE_TASK: py_dealloc_task(o); break;
         case PY_TYPE_VIRTUAL_THREAD: py_dealloc_virtual_thread(o); break;
+        case PY_TYPE_VTHREAD_CHANNEL: py_dealloc_vthread_channel(o); break;
+        case PY_TYPE_PROPERTY:
+        case PY_TYPE_CLASSMETHOD:
+        case PY_TYPE_STATICMETHOD: py_descriptor_dealloc(o); break;
         default:
             if (pcc_capi_dealloc_cext_object(o, (int64_t)type_tag) != 0) break;
-            if (type_tag >= PY_TYPE_USER) py_instance_dealloc(o);
+            if (type_tag >= PY_TYPE_USER_CLASS_START) py_instance_dealloc(o);
             else py_dealloc_generic(o);
             break;
     }
@@ -149,9 +157,16 @@ static void pcc_dealloc_trash_drain(void) {
 
 void pcc_dealloc_with_trash(PyObject *o, int64_t type_tag) {
     int32_t tag = (int32_t)type_tag;
-    /* zpage-resident objects must dealloc IMMEDIATELY (see py_obj.c
-     * py_decref: deferred dealloc can read fields after a same-cascade
-     * page recycle memsets the span). */
+    /* INTENTIONAL DIVERGENCE from the pcc-Python production port: the
+     * port defers zpage-resident objects too (excluding them recursed
+     * the whole cascade and overflowed the stack on backend 4) and
+     * closes the recycle UAF by deferring backend-4 page recycles while
+     * pcc_dealloc_cascade_active(), completed by
+     * pcc_gc_backend4_sweep_deferred_recycles after the drain. This C
+     * oracle has no zpage allocator, so PY_FLAG_GC_ZPAGE_ALLOC is never
+     * set in a pure-C link and the exclusion below is unreachable; it is
+     * kept fail-safe for hybrid links that mix the C dealloc with a
+     * zpage-capable allocator without the deferred-recycle machinery. */
     if (
         pcc_dealloc_depth > 0
         && pcc_dealloc_should_defer(tag)

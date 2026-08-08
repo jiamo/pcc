@@ -1,13 +1,15 @@
 """Real-transform tests for LoopRotatePass (subset)."""
 
-import shutil
+import pytest
 import unittest
 
 from pcc.ir_passes.loop_rotate import LoopRotatePass, loop_rotate_module
 from pcc.ir_passes.parity import assert_ir_parity, run_pcc_ir_pass
 
 
-_OPT = shutil.which("opt")
+from pcc.passes.llvm_text_pipeline import find_opt_binary
+
+_OPT = find_opt_binary()
 
 
 class LoopRotateTests(unittest.TestCase):
@@ -98,7 +100,7 @@ exit:
         self.assertIn("%i.lcssa = phi i32 [ %i, %header ]", out)
 
 
-@unittest.skipUnless(_OPT, "requires LLVM opt")
+@pytest.mark.pcc_gate(unavailable=None if _OPT else "matching LLVM opt not installed")
 class UpstreamParityTests(unittest.TestCase):
     def test_single_step_counting_loop_matches_upstream(self):
         report = assert_ir_parity("""

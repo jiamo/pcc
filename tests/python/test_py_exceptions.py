@@ -92,10 +92,17 @@ class PyExceptionTests(unittest.TestCase):
         src = self._write(
             "traceback_frames.py",
             """
-            def boom() -> None:
+            def inner() -> None:
+                marker = 42
                 raise TypeError("boom")
 
-            boom()
+            def middle() -> None:
+                inner()
+
+            def outer() -> None:
+                middle()
+
+            outer()
             """,
         )
         exe = os.path.join(self.td, "traceback_frames.out")
@@ -114,9 +121,55 @@ class PyExceptionTests(unittest.TestCase):
         )
         self.assertEqual(run.returncode, 1)
         self.assertIn("Traceback (most recent call last):\n", run.stderr)
-        self.assertIn('File "' + src + '", line 2, in boom', run.stderr)
-        self.assertIn('File "' + src + '", line 4, in <module>', run.stderr)
+        module_frame = 'File "' + src + '", line 11, in <module>'
+        outer_frame = 'File "' + src + '", line 9, in outer'
+        middle_frame = 'File "' + src + '", line 6, in middle'
+        inner_frame = 'File "' + src + '", line 3, in inner'
+        for frame in (module_frame, outer_frame, middle_frame, inner_frame):
+            self.assertIn(frame, run.stderr)
+        self.assertLess(run.stderr.index(module_frame), run.stderr.index(outer_frame))
+        self.assertLess(run.stderr.index(outer_frame), run.stderr.index(middle_frame))
+        self.assertLess(run.stderr.index(middle_frame), run.stderr.index(inner_frame))
+        self.assertIn("    outer()\n", run.stderr)
+        self.assertIn("    middle()\n", run.stderr)
+        self.assertIn("    inner()\n", run.stderr)
+        self.assertIn('    raise TypeError("boom")\n', run.stderr)
         self.assertIn("TypeError: boom\n", run.stderr)
+
+    def test_not_callable_failure_keeps_runtime_dispatch_reason(self):
+        from pcc.py_frontend.pipeline import compile_python
+
+        src = self._write(
+            "not_callable_reason.py",
+            """
+            def invoke_number() -> None:
+                value = 42
+                value()
+
+            invoke_number()
+            """,
+        )
+        exe = os.path.join(self.td, "not_callable_reason.out")
+        compile_python(
+            src,
+            exe,
+            libpython_mode="off",
+            ir_scaffold_mode="on",
+            backend="self",
+        )
+        run = subprocess.run(
+            [exe],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        self.assertEqual(run.returncode, 1)
+        self.assertIn("TypeError: 'int' object is not callable\n", run.stderr)
+        self.assertNotIn("TypeError: object is not callable", run.stderr)
+        self.assertNotIn(
+            "py_obj_call returned NULL without setting an exception",
+            run.stderr,
+        )
 
     def test_nested_function_except_as_name_is_local_binding(self):
         from pcc.py_frontend.pipeline import compile_python

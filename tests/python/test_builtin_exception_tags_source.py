@@ -76,7 +76,7 @@ def test_memory_error_runtime_tables_match_c_and_pcc_python():
     c_header = _read("pcc/py_runtime/include/py_runtime.h")
     c_substrate = _read("pcc/py_runtime/src/py_substrate.c")
     py_substrate = _read("pcc/py_runtime/py/py_substrate.py")
-    py_gc = _read("pcc/py_runtime/py/py_gc_backend.py")
+    py_gc = _read("pcc/py_runtime/py/freestanding_gc_mapped_roots.py")
 
     assert "PY_EXC_MEMORYERROR       = 19" in c_header
     assert "PY_EXC_IMPORTERROR       = 20" in c_header
@@ -87,5 +87,5 @@ def test_memory_error_runtime_tables_match_c_and_pcc_python():
     assert 'define_global_cstr("PY_EXC_NAME_19", "MemoryError")' in py_substrate
     assert 'define_global_null_ptr_array("py_exc_classes", 22)' in py_substrate
     assert "def py_subs_exc_n_builtin() -> int:\n    return 22" in py_substrate
-    assert "def _py_visit_builtin_exception_cache_slots" in py_gc
-    assert "_py_visit_mapped_root_slots(\n        22," in py_gc
+    assert "def pcc_gc_visit_builtin_exception_cache_slots" in py_gc
+    assert "pcc_gc_visit_mapped_root_slots(\n        22," in py_gc

@@ -4,6 +4,45 @@ import subprocess
 import textwrap
 
 
+def test_annotated_builtin_buffers_keep_semantic_types_for_isinstance():
+    from pcc.parse.py_lift import parse_and_lift
+    from pcc.py_frontend.codegen.layer1 import L1CodeGen
+    from pcc.py_frontend.py_ast import (
+        ByteArrayType,
+        BytesType,
+        MemoryViewType,
+        SetType,
+    )
+    from pcc.py_frontend.type_infer import infer_module
+
+    source = textwrap.dedent("""
+        def check_bytes(value: bytes) -> bool:
+            return isinstance(value, bytes)
+
+        def check_bytearray(value: bytearray) -> bool:
+            return isinstance(value, bytearray)
+
+        def check_memoryview(value: memoryview) -> bool:
+            return isinstance(value, memoryview)
+
+        def check_set(value: set[int]) -> bool:
+            return isinstance(value, set)
+    """)
+    typed = infer_module(parse_and_lift(source, "annotated.py", "annotated"))
+
+    annotations = tuple(fn.args[0].annotation for fn in typed.body)
+    assert isinstance(annotations[0], BytesType)
+    assert isinstance(annotations[1], ByteArrayType)
+    assert isinstance(annotations[2], MemoryViewType)
+    assert isinstance(annotations[3], SetType)
+
+    ir_text = str(L1CodeGen(typed, ir_scaffold_mode="on").generate(typed))
+    bytes_body = ir_text.split("define external i1 @user_annotated_check_bytes", 1)[1]
+    bytes_body = bytes_body.split("\n}", 1)[0]
+    assert "zext i1 0 to i32" not in bytes_body
+    assert "zext i1 1 to i32" in bytes_body
+
+
 def test_dynamic_isinstance_second_arg_dispatches_to_runtime(tmp_path):
     from pcc.py_frontend.pipeline import compile_python
 
@@ -146,6 +185,48 @@ def test_dyn_builtin_isinstance_uses_runtime_type_tag(tmp_path):
     )
     assert run.returncode == 0, run.stderr
     assert run.stdout == "True\nFalse\n"
+
+
+def test_dyn_bytes_bytearray_and_set_isinstance_use_runtime_type_tags(tmp_path):
+    from pcc.py_frontend.pipeline import compile_python
+
+    src = tmp_path / "builtin_buffer_isinstance.py"
+    src.write_text(
+        textwrap.dedent("""
+        def classify(obj):
+            return (
+                isinstance(obj, (bytes, bytearray)),
+                isinstance(obj, set),
+            )
+
+        print(classify(b"x"))
+        print(classify(bytearray(b"x")))
+        print(classify({1}))
+        print(classify("x"))
+        """),
+        encoding="utf-8",
+    )
+    exe = tmp_path / "builtin_buffer_isinstance.out"
+    compile_python(
+        str(src),
+        str(exe),
+        ir_scaffold_mode="on",
+        libpython_mode="off",
+        backend="self",
+    )
+    run = subprocess.run(
+        [str(exe)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert run.returncode == 0, run.stderr
+    assert run.stdout == (
+        "(True, False)\n"
+        "(True, False)\n"
+        "(False, True)\n"
+        "(False, False)\n"
+    )
 
 
 def test_isinstance_tuple_accepts_type_none(tmp_path):

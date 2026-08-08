@@ -193,7 +193,7 @@ PyObject *py_builtin_callable(PyObject *o) {
     if (tag == PY_TYPE_FUNC || tag == PY_TYPE_CLASS || tag == PY_TYPE_WEAKREF) {
         return py_bool_from_bit(1);
     }
-    if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER) {
+    if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER_CLASS_START) {
         PyInstanceObject *inst = (PyInstanceObject *)o;
         PyClassObject *cls = (PyClassObject *)pcc_gc_load_ptr(
             o,
@@ -261,21 +261,13 @@ PyObject *py_int_format_decimal(
 }
 
 static int pcc_dunder_pointer_can_have_header(void *ptr) {
-    uintptr_t bits = (uintptr_t)ptr;
-    if (ptr == NULL) return 0;
-    if ((bits & 1u) != 0u) return 0;
-    if (bits < 0x1000u) return 0;
-    if ((bits & 0x7u) != 0u) return 0;
-#if UINTPTR_MAX > 0xffffffffu
-    if ((bits >> 48) != 0u) return 0;
-#endif
-    return 1;
+    return pcc_gc_pointer_is_managed((PyObject *)ptr) != 0;
 }
 
 static int pcc_dunder_is_user_instance(PyObject *o) {
     if (o == NULL || PY_IS_TAGGED_INT(o)) return 0;
     int32_t tag = py_header(o)->type_tag;
-    if (tag != PY_TYPE_INSTANCE && tag < PY_TYPE_USER) return 0;
+    if (tag != PY_TYPE_INSTANCE && tag < PY_TYPE_USER_CLASS_START) return 0;
     return 1;
 }
 
@@ -289,21 +281,48 @@ static PyObject *pcc_user_dunder_lookup(PyObject *o, const char *name) {
     return py_class_lookup(cls, name);
 }
 
+static PyObject *dunder_require_result(
+    PyObject *result,
+    const char *helper_name,
+    const char *message
+) {
+    if (result == NULL) {
+        py_runtime_error_if_unset(helper_name, message);
+    }
+    return result;
+}
+
 static PyObject *pcc_call_user_unary_method(PyObject *func, PyObject *self) {
+    /* ``func == NULL`` is the deliberate "dunder not defined" sentinel. */
     if (func == NULL) return NULL;
     if (pcc_dunder_pointer_can_have_header(func)
         && !PY_IS_TAGGED_INT(func)
         && py_type_of(func) == PY_TYPE_FUNC) {
         PyObject *args = py_tuple_new(1);
-        if (args == NULL) return NULL;
+        if (args == NULL) {
+            return dunder_require_result(
+                NULL,
+                "py_tuple_new",
+                "user dunder argument tuple allocation failed"
+            );
+        }
         py_tuple_set_item(args, 0, self);
         PyObject *out = py_func_call(func, args);
+        dunder_require_result(
+            out,
+            "user dunder call",
+            "user dunder callback returned NULL without an exception"
+        );
         py_decref(args);
         return out;
     }
     typedef PyObject *(*UnaryMethod)(PyObject *);
     UnaryMethod meth = (UnaryMethod)(uintptr_t)func;
-    return meth(self);
+    return dunder_require_result(
+        meth(self),
+        "user dunder call",
+        "user dunder callback returned NULL without an exception"
+    );
 }
 
 static void pcc_call_user_unary_method_void(PyObject *func, PyObject *self) {
@@ -369,7 +388,7 @@ void py_user_del_dispatch(PyObject *o) {
     if (o == NULL || PY_IS_TAGGED_INT(o)) return;
     PyObjectHeader *h = py_header(o);
     int32_t tag = h->type_tag;
-    if (tag != PY_TYPE_INSTANCE && tag < PY_TYPE_USER) return;
+    if (tag != PY_TYPE_INSTANCE && tag < PY_TYPE_USER_CLASS_START) return;
     if (pcc_capi_is_cext_type_tag((int64_t)tag) != 0) return;
     if ((h->flags & PY_FLAG_FINALIZED) != 0) {
         pcc_runtime_log_event("finalizer", "skipped", tag, 1, o);

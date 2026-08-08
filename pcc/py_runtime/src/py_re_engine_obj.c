@@ -3,8 +3,8 @@
  *
  * The core (py_re_engine.c) stays pure C / standalone so the differential
  * test can build it as a dylib; this file owns the runtime-facing wrapper
- * used by py_re.c and the pcc-Python port py_re.py (extern, C-only helper —
- * no port mirror of the engine itself).
+ * used by the host-C oracle runtime. Production pcc-Python ownership lives in
+ * py/py_re_engine_runtime.py; this source must not enter its archive.
  */
 
 #include <stdint.h>

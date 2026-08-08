@@ -1,0 +1,166 @@
+"""Raw storage for the five production GC backends.
+
+This definition-only module keeps collector state in the strict freestanding
+kernel.  Managed GC APIs and telemetry formatting live in their existing
+pcc-Python modules and reference these symbols through ``pcc.unsafe``.
+"""
+
+from pcc import i64
+from pcc.unsafe import define_global_i32, define_global_i64, define_global_ptr_null
+
+__pcc_freestanding__ = True
+
+
+# Backend-0 cycle collector and public gc-module policy.
+define_global_i32("py_gc_enabled", 1)
+define_global_i32("py_gc_threshold0", 700)
+define_global_i32("py_gc_threshold1", 10)
+define_global_i32("py_gc_threshold2", 10)
+define_global_i32("py_gc_freeze_count", 0)
+define_global_ptr_null("py_gc_head")
+define_global_ptr_null("pcc_gc_deferred_node_free_head")
+define_global_i64("pcc_gc_table_lock_owner_token", 0)
+define_global_ptr_null("pcc_gc_backend4_parked_head")
+define_global_i32("pcc_gc_forwarding_population", 0)
+define_global_i32("py_gc_tracked_count", 0)
+define_global_i32("py_gc_collecting", 0)
+define_global_ptr_null("py_gc_callbacks")
+define_global_i32("py_gc_callbacks_firing", 0)
+
+# Shared selector, accounting, pacing, and configuration state.
+define_global_i32("pcc_gc_backend_selected", 0)
+define_global_i32("pcc_gc_metric_alloc", 0)
+define_global_i32("pcc_gc_metric_store", 0)
+define_global_i32("pcc_gc_metric_load", 0)
+define_global_i32("pcc_gc_metric_safepoint", 0)
+define_global_i32("pcc_gc_metric_pin", 0)
+define_global_i32("pcc_gc_metric_step", 0)
+define_global_i32("pcc_gc_metric_max_pause_us", 0)
+define_global_i32("pcc_gc_metric_pause_count", 0)
+define_global_i32("pcc_gc_metric_pause_sum_us", 0)
+define_global_i32("pcc_gc_metric_pause_hist0", 0)
+define_global_i32("pcc_gc_metric_pause_hist1", 0)
+define_global_i32("pcc_gc_metric_pause_hist2", 0)
+define_global_i32("pcc_gc_metric_pause_hist3", 0)
+define_global_i32("pcc_gc_debt_bytes", 0)
+define_global_i32("pcc_gc_last_alloc_bytes", 0)
+define_global_i32("pcc_gc_live_bytes", 0)
+define_global_i32("pcc_gc_pause", 1000)
+define_global_i32("pcc_gc_stepmul", 10000)
+define_global_i32("pcc_gc_debt_threshold_override", 0)
+define_global_i32("pcc_gc_config_initialized", 0)
+define_global_i32("pcc_gc_read_barrier_enabled", 1)
+define_global_i32("pcc_gc_backend0_frame_roots_enabled", 0)
+define_global_i32("pcc_gc_in_auto_step", 0)
+define_global_i32("pcc_gc_explicit_collect_active", 0)
+define_global_i32("pcc_gc_gray_count", 0)
+
+# Backend-2 concurrent and backend-3 generational state.
+define_global_i32("pcc_gc_minor_heap_size", 1048576)
+define_global_i32("pcc_gc_minor_alloc_max", 256)
+define_global_i32("pcc_gc_minor_allocations", 0)
+define_global_i32("pcc_gc_minor_collections", 0)
+define_global_i32("pcc_gc_minor_bytes", 0)
+define_global_i32("pcc_gc_cms_worker_started", 0)
+define_global_i32("pcc_gc_cms_worker_stop_requested", 0)
+define_global_ptr_null("pcc_gc_cms_worker_handle")
+define_global_i32("pcc_gc_cms_worker_starts", 0)
+define_global_i32("pcc_gc_cms_queue_pushes", 0)
+define_global_i32("pcc_gc_cms_worker_drains", 0)
+define_global_i32("pcc_gc_cms_mutator_assists", 0)
+define_global_i32("pcc_gc_cms_worker_traces", 0)
+define_global_i32("pcc_gc_minor_arena_refills", 0)
+define_global_i32("pcc_gc_minor_arena_bumps", 0)
+define_global_i32("pcc_gc_minor_arena_fallbacks", 0)
+define_global_i32("pcc_gc_cms_worker_stops", 0)
+define_global_i32("pcc_gc_cms_wb_flushes", 0)
+define_global_ptr_null("pcc_gc_minor_blocks")
+define_global_ptr_null("pcc_gc_minor_current")
+define_global_ptr_null("pcc_gc_pending_minor_block")
+
+# Backend-4 relocation, page, store-buffer, and remembered-set metrics.
+define_global_i32("pcc_gc_relocation_forwards", 0)
+define_global_i32("pcc_gc_relocation_barrier_forwards", 0)
+define_global_i32("pcc_gc_relocation_pin_rejects", 0)
+define_global_i32("pcc_gc_backend4_genzgc_store_barriers", 0)
+define_global_i32("pcc_gc_backend4_store_buffer_entries_count", 0)
+define_global_i32("pcc_gc_backend4_young_promotions", 0)
+define_global_i32("pcc_gc_backend4_evacuation_candidates", 0)
+define_global_i32("pcc_gc_backend4_evacuated_bytes_count", 0)
+define_global_i32("pcc_gc_backend4_large_object_defers", 0)
+define_global_i32("pcc_gc_backend4_large_object_deferred_bytes_count", 0)
+define_global_i32("pcc_gc_backend4_large_object_reconsiderations_count", 0)
+define_global_i32("pcc_gc_backend4_small_page_candidates", 0)
+define_global_i32("pcc_gc_backend4_medium_page_candidates", 0)
+define_global_i32("pcc_gc_backend4_evacuation_candidate_bytes_count", 0)
+define_global_i32("pcc_gc_backend4_small_page_candidate_bytes_count", 0)
+define_global_i32("pcc_gc_backend4_medium_page_candidate_bytes_count", 0)
+define_global_i32("pcc_gc_backend4_evacuation_candidate_zpage_bytes_count", 0)
+define_global_i32("pcc_gc_backend4_small_page_candidate_zpage_bytes_count", 0)
+define_global_i32("pcc_gc_backend4_medium_page_candidate_zpage_bytes_count", 0)
+define_global_i32("pcc_gc_backend4_store_buffer_drain_batches_count", 0)
+define_global_i32("pcc_gc_backend4_store_buffer_drained_entries_count", 0)
+define_global_i32("pcc_gc_backend4_store_buffer_duplicate_skips_count", 0)
+define_global_i32("pcc_gc_backend4_store_buffer_high_water_count", 0)
+define_global_i32(
+    "pcc_gc_backend4_store_buffer_owner_fanout_high_water_count", 0
+)
+define_global_i32(
+    "pcc_gc_backend4_store_buffer_owner_count_high_water_count", 0
+)
+define_global_i32("pcc_gc_backend4_store_buffer_incomplete_drains_count", 0)
+define_global_i32("pcc_gc_backend4_evacuation_incomplete_batches_count", 0)
+define_global_i32("pcc_gc_backend4_store_buffer_max_batch_size_count", 0)
+define_global_i32("pcc_gc_backend4_store_buffer_full_batches_count", 0)
+define_global_i32("pcc_gc_backend4_store_buffer_medium_count", 0)
+define_global_i32("pcc_gc_backend4_store_buffer_medium_flushes_count", 0)
+define_global_i32(
+    "pcc_gc_backend4_store_buffer_medium_flushed_entries_count", 0
+)
+define_global_i32(
+    "pcc_gc_backend4_store_buffer_medium_full_flushes_count", 0
+)
+define_global_i32("pcc_gc_backend4_remembered_set_entries_count", 0)
+define_global_i32("pcc_gc_backend4_remembered_set_duplicate_skips_count", 0)
+define_global_i32("pcc_gc_backend4_remembered_set_high_water_count", 0)
+define_global_i32("pcc_gc_backend3_remembered_overflow", 0)
+define_global_i32("pcc_gc_next_object_id", 1)
+
+# Raw linked structures and root registries shared by all five backends.
+define_global_ptr_null("pcc_gc_last_alloc")
+define_global_ptr_null("pcc_gc_forwarding_head")
+define_global_ptr_null("pcc_gc_identity_head")
+define_global_ptr_null("pcc_gc_relocation_set_head")
+define_global_ptr_null("pcc_gc_backend3_remembered_owner_head")
+define_global_ptr_null("pcc_gc_backend4_store_buffer_head")
+define_global_ptr_null("pcc_gc_backend4_store_buffer_medium_head")
+define_global_ptr_null("pcc_gc_backend4_zpage_head")
+define_global_ptr_null("pcc_gc_backend4_zpage_payload_span_head")
+define_global_ptr_null("pcc_gc_backend4_page_head")
+# Count of pages whose recycle was deferred (flag at page+104) while a
+# dealloc trash cascade was active; lets the post-drain sweep no-op in O(1)
+# when nothing deferred instead of walking the live page list per cascade.
+define_global_i64("pcc_gc_backend4_deferred_recycle_pages", 0)
+define_global_ptr_null("pcc_gc_backend4_free_page_head")
+define_global_ptr_null("pcc_gc_backend4_retained_page_head")
+define_global_ptr_null("pcc_gc_backend4_evacuation_page_head")
+define_global_ptr_null("pcc_gc_backend4_active_small_young_page")
+define_global_ptr_null("pcc_gc_backend4_active_small_old_page")
+define_global_ptr_null("pcc_gc_backend4_active_medium_young_page")
+define_global_ptr_null("pcc_gc_backend4_active_medium_old_page")
+define_global_ptr_null("pcc_gc_backend4_remembered_slots_head")
+define_global_ptr_null("pcc_gc_object_node_free_head")
+define_global_i32("pcc_gc_object_node_free_count", 0)
+define_global_ptr_null("pcc_gc_backend4_zpage_node_free_head")
+define_global_i32("pcc_gc_backend4_zpage_node_free_count", 0)
+define_global_i32("pcc_gc_mark_active", 0)
+define_global_i32("pcc_gc_cycle_requested", 0)
+define_global_i32("pcc_gc_root_count", 0)
+define_global_ptr_null("pcc_gc_root_slots")
+define_global_ptr_null("pcc_gc_frame_head")
+define_global_ptr_null("pcc_gc_continuation_root_head")
+define_global_ptr_null("pcc_gc_scheduler_root_head")
+define_global_ptr_null("pcc_gc_object_head")
+define_global_ptr_null("pcc_gc_trace_cursor")
+define_global_ptr_null("pcc_gc_backend3_young_head")
+define_global_ptr_null("pcc_gc_relocate_slot_pairs_ctx")

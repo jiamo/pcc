@@ -14,15 +14,7 @@
 #include <string.h>
 
 static int dispatch_ptr_can_have_header(void *ptr) {
-    uintptr_t bits = (uintptr_t)ptr;
-    if (ptr == NULL) return 0;
-    if ((bits & 1u) != 0u) return 0;
-    if (bits < 0x1000u) return 0;
-    if ((bits & 0x7u) != 0u) return 0;
-#if UINTPTR_MAX > 0xffffffffu
-    if ((bits >> 48) != 0u) return 0;
-#endif
-    return 1;
+    return pcc_gc_pointer_is_managed((PyObject *)ptr) != 0;
 }
 
 static int dispatch_is_heap_obj(PyObject *o) {
@@ -35,14 +27,24 @@ static PyObject *dispatch_call_method_with_args(
     PyObject *args,
     PyObject *kwargs
 ) {
-    if (method == NULL) return NULL;
+    if (method == NULL) {
+        return py_runtime_error_if_unset(
+            "dispatch_call_method_with_args",
+            "dispatch_call_method_with_args received NULL method"
+        );
+    }
     int64_t n = args == NULL ? 0 : py_tuple_len(args);
     if (
         dispatch_is_heap_obj(method)
         && py_type_of(method) == PY_TYPE_FUNC
     ) {
         PyObject *full_args = py_tuple_new(n + 1);
-        if (full_args == NULL) return NULL;
+        if (full_args == NULL) {
+            return py_runtime_error_if_unset(
+                "py_tuple_new",
+                "bound method call could not allocate its argument tuple"
+            );
+        }
         py_tuple_set_item(full_args, 0, self);
         for (int64_t i = 0; i < n; i++) {
             PyObject *item = py_tuple_get(args, i);
@@ -50,17 +52,36 @@ static PyObject *dispatch_call_method_with_args(
             py_decref(item);
         }
         PyObject *out = py_func_call_kwargs(method, full_args, kwargs);
+        if (out == NULL) {
+            py_runtime_error_if_unset(
+                "py_func_call_kwargs",
+                "bound function call returned NULL without setting an exception"
+            );
+        }
         py_decref(full_args);
         return out;
     }
     if (n == 0) {
         typedef PyObject *(*M0)(PyObject *);
-        return ((M0)(uintptr_t)method)(self);
+        PyObject *out = ((M0)(uintptr_t)method)(self);
+        if (out == NULL) {
+            py_runtime_error_if_unset(
+                "bound native method",
+                "bound native method returned NULL without setting an exception"
+            );
+        }
+        return out;
     }
     if (n == 1) {
         PyObject *a0 = py_tuple_get(args, 0);
         typedef PyObject *(*M1)(PyObject *, PyObject *);
         PyObject *out = ((M1)(uintptr_t)method)(self, a0);
+        if (out == NULL) {
+            py_runtime_error_if_unset(
+                "bound native method",
+                "bound native method returned NULL without setting an exception"
+            );
+        }
         py_decref(a0);
         return out;
     }
@@ -69,6 +90,12 @@ static PyObject *dispatch_call_method_with_args(
         PyObject *a1 = py_tuple_get(args, 1);
         typedef PyObject *(*M2)(PyObject *, PyObject *, PyObject *);
         PyObject *out = ((M2)(uintptr_t)method)(self, a0, a1);
+        if (out == NULL) {
+            py_runtime_error_if_unset(
+                "bound native method",
+                "bound native method returned NULL without setting an exception"
+            );
+        }
         py_decref(a0);
         py_decref(a1);
         return out;
@@ -79,6 +106,12 @@ static PyObject *dispatch_call_method_with_args(
         PyObject *a2 = py_tuple_get(args, 2);
         typedef PyObject *(*M3)(PyObject *, PyObject *, PyObject *, PyObject *);
         PyObject *out = ((M3)(uintptr_t)method)(self, a0, a1, a2);
+        if (out == NULL) {
+            py_runtime_error_if_unset(
+                "bound native method",
+                "bound native method returned NULL without setting an exception"
+            );
+        }
         py_decref(a0);
         py_decref(a1);
         py_decref(a2);
@@ -112,7 +145,7 @@ int64_t py_obj_truthy(PyObject *o) {
         case PY_TYPE_DICT:  return ((PyDictObject *)o)->size != 0;
         case PY_TYPE_SET:   return ((PySetObject *)o)->size != 0;
         default:
-            if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER) {
+            if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER_CLASS_START) {
                 int64_t handled = 0;
                 int64_t user_bool = py_user_bool_dispatch(o, &handled);
                 if (handled) return user_bool ? 1 : 0;
@@ -169,8 +202,8 @@ PyObject *py_obj_add(PyObject *a, PyObject *b) {
     if (at == PY_TYPE_TUPLE && bt == PY_TYPE_TUPLE) {
         return py_tuple_concat(a, b);
     }
-    if (at == PY_TYPE_INSTANCE || at >= PY_TYPE_USER
-        || bt == PY_TYPE_INSTANCE || bt >= PY_TYPE_USER) {
+    if (at == PY_TYPE_INSTANCE || at >= PY_TYPE_USER_CLASS_START
+        || bt == PY_TYPE_INSTANCE || bt >= PY_TYPE_USER_CLASS_START) {
         return py_user_binop_dispatch(
             a, b, "__add__", "__radd__",
             "unsupported operand type(s) for +");
@@ -199,8 +232,8 @@ PyObject *py_obj_sub(PyObject *a, PyObject *b) {
     if (pcc_capi_is_cext_type_tag(at) || pcc_capi_is_cext_type_tag(bt)) {
         return pcc_capi_cext_subtract(a, b);
     }
-    if (at == PY_TYPE_INSTANCE || at >= PY_TYPE_USER
-        || bt == PY_TYPE_INSTANCE || bt >= PY_TYPE_USER) {
+    if (at == PY_TYPE_INSTANCE || at >= PY_TYPE_USER_CLASS_START
+        || bt == PY_TYPE_INSTANCE || bt >= PY_TYPE_USER_CLASS_START) {
         return py_user_binop_dispatch(
             a, b, "__sub__", "__rsub__",
             "unsupported operand type(s) for -");
@@ -247,8 +280,8 @@ PyObject *py_obj_mul(PyObject *a, PyObject *b) {
     if (pcc_capi_is_cext_type_tag(at) || pcc_capi_is_cext_type_tag(bt)) {
         return pcc_capi_cext_binary_number(a, b, 2);
     }
-    if (at == PY_TYPE_INSTANCE || at >= PY_TYPE_USER
-        || bt == PY_TYPE_INSTANCE || bt >= PY_TYPE_USER) {
+    if (at == PY_TYPE_INSTANCE || at >= PY_TYPE_USER_CLASS_START
+        || bt == PY_TYPE_INSTANCE || bt >= PY_TYPE_USER_CLASS_START) {
         return py_user_binop_dispatch(
             a, b, "__mul__", "__rmul__",
             "unsupported operand type(s) for *");
@@ -276,8 +309,8 @@ PyObject *py_obj_mod(PyObject *a, PyObject *b) {
     ) {
         return py_int_mod(a, b);
     }
-    if (at == PY_TYPE_INSTANCE || at >= PY_TYPE_USER
-        || bt == PY_TYPE_INSTANCE || bt >= PY_TYPE_USER) {
+    if (at == PY_TYPE_INSTANCE || at >= PY_TYPE_USER_CLASS_START
+        || bt == PY_TYPE_INSTANCE || bt >= PY_TYPE_USER_CLASS_START) {
         return py_user_binop_dispatch(
             a, b, "__mod__", "__rmod__",
             "unsupported operand type(s) for %");
@@ -348,6 +381,7 @@ PyObject *py_obj_type_name(PyObject *o) {
         case PY_TYPE_COROUTINE: name = "coroutine"; break;
         case PY_TYPE_CONTINUATION: name = "continuation"; break;
         case PY_TYPE_VIRTUAL_THREAD: name = "virtual_thread"; break;
+        case PY_TYPE_VTHREAD_CHANNEL: name = "vthread_channel"; break;
         case PY_TYPE_EXC: {
             PyExceptionObject *exc = (PyExceptionObject *)o;
             PyClassObject *cls = (PyClassObject *)pcc_gc_load_ptr(
@@ -360,7 +394,7 @@ PyObject *py_obj_type_name(PyObject *o) {
             break;
         }
         default:
-            if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER) {
+            if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER_CLASS_START) {
                 PyInstanceObject *inst = (PyInstanceObject *)o;
                 PyClassObject *cls = (PyClassObject *)pcc_gc_load_ptr(
                     o,
@@ -427,7 +461,8 @@ PyObject *py_slice_new(PyObject *start, PyObject *stop, PyObject *step) {
 int64_t py_obj_is_slice(PyObject *o) {
     if (o == NULL || pcc_slice_cls == NULL) return 0;
     /* py_isinstance handles the tagged-int/header/instance-tag checks and the
-     * MRO walk; an instance may carry a per-class tag >= PY_TYPE_USER, so do
+     * MRO walk; an instance may carry a per-class tag at or above
+     * PY_TYPE_USER_CLASS_START, so do
      * NOT pre-filter on PY_TYPE_INSTANCE here. */
     return py_isinstance(o, pcc_slice_cls) ? 1 : 0;
 }
@@ -519,7 +554,7 @@ PyObject *py_type_builtin(PyObject *o) {
             return (PyObject *)cls;
         }
     }
-    if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER) {
+    if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER_CLASS_START) {
         PyInstanceObject *inst = (PyInstanceObject *)o;
         PyClassObject *cls = (PyClassObject *)pcc_gc_load_ptr(
             o,
@@ -547,7 +582,14 @@ int64_t py_obj_len(PyObject *o) {
         case PY_TYPE_DICT:  return py_dict_len(o);
         case PY_TYPE_SET:   return py_set_len(o);
         default:
-            if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER) {
+            /* Symmetric with py_obj_getitem below: a C-extension object's
+             * length lives in its mp_length/sq_length slot, not in a Python
+             * __len__. Without this, len(np.array(...)) returned 0. */
+            if (pcc_capi_is_cext_type_tag(tag)) {
+                int64_t cext_len = pcc_capi_cext_object_length(o);
+                if (cext_len >= 0) return cext_len;
+            }
+            if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER_CLASS_START) {
                 int64_t handled = 0;
                 int64_t user_len = py_user_len_dispatch(o, &handled);
                 if (handled) return user_len;
@@ -583,7 +625,7 @@ PyObject *py_obj_getitem(PyObject *o, PyObject *k) {
         case PY_TYPE_MEMORYVIEW:
             return py_bytes_getitem(o, k);
         default:
-            if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER) {
+            if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER_CLASS_START) {
                 return py_user_getitem_dispatch(o, k);
             }
             return NULL;
@@ -626,7 +668,7 @@ PyObject *py_obj_getitem_i64(PyObject *o, int64_t idx) {
             return out;
         }
         default:
-            if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER) {
+            if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER_CLASS_START) {
                 PyObject *key = py_int_from_i64(idx);
                 PyObject *out = py_user_getitem_dispatch(o, key);
                 py_decref(key);
@@ -652,7 +694,7 @@ PyObject *py_obj_slice(PyObject *o, PyObject *lo, PyObject *hi, PyObject *step) 
         case PY_TYPE_MEMORYVIEW:
             return py_bytes_slice(o, lo, hi, step);
         default:
-            if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER) {
+            if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER_CLASS_START) {
                 /* obj[lo:hi:step] on a user class dispatches
                  * __getitem__(slice(lo, hi, step)), like CPython. */
                 PyObject *sl = py_slice_new(lo, hi, step);
@@ -669,6 +711,13 @@ int64_t py_obj_set_slice(PyObject *o, PyObject *lo, PyObject *hi,
                          PyObject *step, PyObject *replacement) {
     if (o == NULL) return -1;
     int32_t tag = py_type_of(o);
+    if (pcc_capi_is_cext_type_tag(tag)) {
+        PyObject *slice = py_slice_new(lo, hi, step);
+        if (slice == NULL) return -1;
+        int64_t rc = pcc_capi_cext_object_setitem(o, slice, replacement);
+        py_decref(slice);
+        return rc;
+    }
     switch (tag) {
         case PY_TYPE_LIST:
             return py_list_set_slice(o, lo, hi, step, replacement);
@@ -695,6 +744,9 @@ int64_t py_obj_setitem(PyObject *o, PyObject *k, PyObject *v) {
     if (o == NULL || k == NULL) return -1;
     int32_t tag = py_type_of(o);
     pcc_runtime_log_event_code(7, 3, tag, py_type_of(k), o);
+    if (pcc_capi_is_cext_type_tag(tag)) {
+        return pcc_capi_cext_object_setitem(o, k, v);
+    }
     switch (tag) {
         case PY_TYPE_LIST: {
             int64_t idx = py_obj_index_i64(k);
@@ -709,7 +761,7 @@ int64_t py_obj_setitem(PyObject *o, PyObject *k, PyObject *v) {
         case PY_TYPE_BYTEARRAY:
             return py_bytearray_setitem(o, k, v);
         default:
-            if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER) {
+            if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER_CLASS_START) {
                 int64_t handled = 0;
                 int64_t rc = py_user_setitem_dispatch(o, k, v, &handled);
                 if (handled) return rc;
@@ -722,6 +774,13 @@ int64_t py_obj_setitem_i64(PyObject *o, int64_t idx, PyObject *v) {
     if (o == NULL) return -1;
     int32_t tag = py_type_of(o);
     pcc_runtime_log_event_code(7, 3, tag, PY_TYPE_INT, o);
+    if (pcc_capi_is_cext_type_tag(tag)) {
+        PyObject *key = py_int_from_i64(idx);
+        if (key == NULL) return -1;
+        int64_t rc = pcc_capi_cext_object_setitem(o, key, v);
+        py_decref(key);
+        return rc;
+    }
     switch (tag) {
         case PY_TYPE_LIST:
             /* User-visible store: out-of-range raises catchable IndexError. */
@@ -739,7 +798,7 @@ int64_t py_obj_setitem_i64(PyObject *o, int64_t idx, PyObject *v) {
             return rc;
         }
         default:
-            if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER) {
+            if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER_CLASS_START) {
                 int64_t handled = 0;
                 PyObject *key = py_int_from_i64(idx);
                 int64_t rc = py_user_setitem_dispatch(o, key, v, &handled);
@@ -764,7 +823,7 @@ int64_t py_obj_delitem(PyObject *o, PyObject *k) {
         case PY_TYPE_DICT:
             return py_dict_del(o, k);
         default:
-            if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER) {
+            if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER_CLASS_START) {
                 int64_t handled = 0;
                 int64_t rc = py_user_delitem_dispatch(o, k, &handled);
                 if (handled) return rc;
@@ -774,7 +833,7 @@ int64_t py_obj_delitem(PyObject *o, PyObject *k) {
 }
 
 static int is_instance_tag_d(int32_t tag) {
-    return tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER;
+    return tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER_CLASS_START;
 }
 
 static PyObject *py_obj_missing_attr(const char *name) {
@@ -1257,14 +1316,66 @@ int64_t py_obj_delattr(PyObject *o, const char *name) {
     return -1;
 }
 
+static PyObject *dispatch_require_call_result(
+    PyObject *result,
+    const char *callee,
+    const char *message
+) {
+    if (result == NULL && !py_err_occurred()) {
+        py_runtime_error_if_unset(callee, message);
+    }
+    return result;
+}
+
+static const char *dispatch_not_callable_message(int32_t tag) {
+    if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER_CLASS_START) {
+        return "instance has no __call__ method";
+    }
+    switch (tag) {
+        case PY_TYPE_NONE: return "'NoneType' object is not callable";
+        case PY_TYPE_BOOL: return "'bool' object is not callable";
+        case PY_TYPE_INT: return "'int' object is not callable";
+        case PY_TYPE_FLOAT: return "'float' object is not callable";
+        case PY_TYPE_STR: return "'str' object is not callable";
+        case PY_TYPE_LIST: return "'list' object is not callable";
+        case PY_TYPE_DICT: return "'dict' object is not callable";
+        case PY_TYPE_TUPLE: return "'tuple' object is not callable";
+        case PY_TYPE_SET: return "'set' object is not callable";
+        case PY_TYPE_BYTES: return "'bytes' object is not callable";
+        case PY_TYPE_BYTEARRAY: return "'bytearray' object is not callable";
+        case PY_TYPE_MEMORYVIEW: return "'memoryview' object is not callable";
+        default: return "object type has no callable protocol";
+    }
+}
+
+static PyObject *dispatch_raise_not_callable(PyObject *callable, int32_t tag) {
+    pcc_runtime_log_event_code(7, 10, tag, 0, callable);
+    py_raise_owned(py_exc_new(
+        PY_EXC_TYPEERROR,
+        dispatch_not_callable_message(tag)
+    ));
+    return NULL;
+}
+
 PyObject *py_obj_call(PyObject *callable, PyObject *args, PyObject *kwargs) {
-    if (!callable) return NULL;
-    if (PY_IS_TAGGED_INT(callable)) return NULL;
+    if (!callable) {
+        return py_runtime_error_if_unset(
+            "py_obj_call",
+            "py_obj_call received NULL callable"
+        );
+    }
+    if (PY_IS_TAGGED_INT(callable)) {
+        return dispatch_raise_not_callable(callable, PY_TYPE_INT);
+    }
     int32_t tag = py_header(callable)->type_tag;
     pcc_runtime_log_event_code(7, 8, tag, 0, callable);
 
     if (pcc_capi_type_object_is_callable(callable)) {
-        return pcc_capi_call_type_object(callable, args, kwargs);
+        return dispatch_require_call_result(
+            pcc_capi_call_type_object(callable, args, kwargs),
+            "pcc_capi_call_type_object",
+            "pcc_capi_call_type_object returned NULL without setting an exception"
+        );
     }
 
     if (tag == PY_TYPE_CLASS) {
@@ -1351,11 +1462,22 @@ PyObject *py_obj_call(PyObject *callable, PyObject *args, PyObject *kwargs) {
                     }
                 }
             }
+            dispatch_require_call_result(
+                out,
+                "native builtin constructor",
+                "native builtin constructor returned NULL without setting an exception"
+            );
             if (arg != NULL) py_decref(arg);
             return out;
         }
         PyObject *inst = py_instance_new(cls);
-        if (inst == NULL) return NULL;
+        if (inst == NULL) {
+            return dispatch_require_call_result(
+                NULL,
+                "py_instance_new",
+                "py_instance_new returned NULL without setting an exception"
+            );
+        }
         PyObject *init_method = py_class_lookup(cls, "__init__");
         if (init_method != NULL) {
             PyObject *result = dispatch_call_method_with_args(
@@ -1364,24 +1486,41 @@ PyObject *py_obj_call(PyObject *callable, PyObject *args, PyObject *kwargs) {
                 args,
                 kwargs
             );
-            if (result == NULL && py_err_occurred()) {
+            if (result == NULL) {
+                dispatch_require_call_result(
+                    NULL,
+                    "class __init__",
+                    "class __init__ returned NULL without setting an exception"
+                );
                 py_decref(inst);
                 return NULL;
             }
-            if (result != NULL) py_decref(result);
+            py_decref(result);
         }
         return inst;
     }
     if (tag == PY_TYPE_FUNC) {
-        return py_func_call_kwargs(callable, args, kwargs);
+        return dispatch_require_call_result(
+            py_func_call_kwargs(callable, args, kwargs),
+            "py_func_call_kwargs",
+            "py_func_call_kwargs returned NULL without setting an exception"
+        );
     }
     if (tag == PY_TYPE_WEAKREF) {
         (void)args;
         (void)kwargs;
-        return py_weakref_call(callable);
+        return dispatch_require_call_result(
+            py_weakref_call(callable),
+            "py_weakref_call",
+            "py_weakref_call returned NULL without setting an exception"
+        );
     }
     if (pcc_capi_is_cext_type_tag((int64_t)tag) != 0) {
-        return pcc_capi_call_cext_object(callable, args, kwargs);
+        return dispatch_require_call_result(
+            pcc_capi_call_cext_object(callable, args, kwargs),
+            "pcc_capi_call_cext_object",
+            "pcc_capi_call_cext_object returned NULL without setting an exception"
+        );
     }
     if (is_instance_tag_d(tag)) {
         PyInstanceObject *inst = (PyInstanceObject *)callable;
@@ -1391,21 +1530,62 @@ PyObject *py_obj_call(PyObject *callable, PyObject *args, PyObject *kwargs) {
         );
         PyObject *method = py_class_lookup(cls, "__call__");
         if (method != NULL) {
-            return dispatch_call_method_with_args(method, callable, args, kwargs);
+            return dispatch_require_call_result(
+                dispatch_call_method_with_args(method, callable, args, kwargs),
+                "instance __call__",
+                "instance __call__ returned NULL without setting an exception"
+            );
         }
     }
-    return NULL;
+    return dispatch_raise_not_callable(callable, tag);
 }
 
 PyObject *py_obj_call_method1(PyObject *o, const char *name, PyObject *arg) {
-    if (!o || !name) return NULL;
+    if (o == NULL) {
+        return py_runtime_error_if_unset(
+            "py_obj_call_method1",
+            "py_obj_call_method1 received NULL object"
+        );
+    }
+    if (name == NULL) {
+        return py_runtime_error_if_unset(
+            "py_obj_call_method1",
+            "py_obj_call_method1 received NULL method name"
+        );
+    }
+    if (arg == NULL) {
+        return py_runtime_error_if_unset(
+            "py_obj_call_method1",
+            "py_obj_call_method1 received NULL argument"
+        );
+    }
     PyObject *method = py_obj_getattr(o, name);
-    if (method == NULL) return NULL;
+    if (method == NULL) {
+        return dispatch_require_call_result(
+            NULL,
+            "py_obj_getattr",
+            "py_obj_getattr returned NULL without setting an exception"
+        );
+    }
     PyObject *args = py_tuple_new(2);
-    if (args == NULL) return NULL;
+    if (args == NULL) {
+        dispatch_require_call_result(
+            NULL,
+            "py_tuple_new",
+            "py_obj_call_method1 could not allocate its argument tuple"
+        );
+        py_decref(method);
+        return NULL;
+    }
     py_tuple_set_item(args, 0, o);
     py_tuple_set_item(args, 1, arg);
     PyObject *out = py_obj_call(method, args, py_None);
+    dispatch_require_call_result(
+        out,
+        "py_obj_call",
+        "py_obj_call_method1 callee returned NULL without setting an exception"
+    );
+    py_decref(method);
     py_decref(args);
     return out;
 }

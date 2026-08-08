@@ -33,18 +33,33 @@ typedef struct {
 } PyGcCoroutineObject;
 
 static PyGcNode *py_gc_head = NULL;
+static PyGcNode *py_gc_deferred_node_free_head = NULL;
 static int64_t py_gc_tracked_count = 0;
 static int32_t py_gc_collecting = 0;
 static unsigned char py_gc_table_lock_word = 0;
+static uintptr_t py_gc_table_lock_owner_token = 0;
 
 static void py_gc_table_lock(void) {
     while (__atomic_test_and_set(&py_gc_table_lock_word, __ATOMIC_ACQUIRE)) {
         pcc_thread_safepoint();
     }
+    __atomic_store_n(
+        &py_gc_table_lock_owner_token,
+        (uintptr_t)pcc_current_native_thread_token(),
+        __ATOMIC_RELEASE
+    );
 }
 
 static void py_gc_table_unlock(void) {
+    __atomic_store_n(&py_gc_table_lock_owner_token, 0, __ATOMIC_RELEASE);
     __atomic_clear(&py_gc_table_lock_word, __ATOMIC_RELEASE);
+}
+
+static int py_gc_current_thread_owns_table_lock(void) {
+    uintptr_t owner = __atomic_load_n(
+        &py_gc_table_lock_owner_token, __ATOMIC_ACQUIRE);
+    return owner != 0 &&
+        owner == (uintptr_t)pcc_current_native_thread_token();
 }
 
 static PyGcNode *py_gc_find_node(PyObject *o) {
@@ -59,6 +74,24 @@ static void py_gc_unlink_node(PyGcNode *n) {
     n->prev = NULL;
     n->next = NULL;
     py_gc_tracked_count--;
+}
+
+static void py_gc_defer_node_free(PyGcNode *n) {
+    if (n == NULL) return;
+    n->obj = NULL;
+    n->prev = NULL;
+    n->next = py_gc_deferred_node_free_head;
+    py_gc_deferred_node_free_head = n;
+}
+
+static void py_gc_drain_deferred_node_frees(void) {
+    PyGcNode *n = py_gc_deferred_node_free_head;
+    py_gc_deferred_node_free_head = NULL;
+    while (n != NULL) {
+        PyGcNode *next = n->next;
+        free(n);
+        n = next;
+    }
 }
 
 static int py_gc_is_unreachable(PyObject *o) {
@@ -198,17 +231,21 @@ static int py_gc_maybe_finalize_unreachable(PyGcNode **unreachable,
                                             int64_t n_unreachable) {
     int finalized = 0;
     for (int64_t i = 0; i < n_unreachable; i++) {
-        PyObject *obj = unreachable[i]->obj;
+        PyGcNode *n = unreachable[i];
+        if (n == NULL) continue;
+        PyObject *obj = n->obj;
         if (obj == NULL || PY_IS_TAGGED_INT(obj)) continue;
         PyObjectHeader *h = py_header(obj);
         int32_t tag = h->type_tag;
-        if (tag != PY_TYPE_INSTANCE && tag < PY_TYPE_USER) continue;
+        if (tag != PY_TYPE_INSTANCE && tag < PY_TYPE_USER_CLASS_START) continue;
         if (pcc_capi_is_cext_type_tag((int64_t)tag) != 0) continue;
         int32_t flags_before = h->flags;
         py_user_del_dispatch(obj);
-        if ((flags_before & PY_FLAG_FINALIZED) == 0 &&
-            (py_header(obj)->flags & PY_FLAG_FINALIZED) != 0) {
-            finalized = 1;
+        if ((flags_before & PY_FLAG_FINALIZED) == 0) {
+            if (n->obj == NULL ||
+                (py_header(n->obj)->flags & PY_FLAG_FINALIZED) != 0) {
+                finalized = 1;
+            }
         }
     }
     return finalized;
@@ -290,11 +327,15 @@ static void py_gc_dealloc_unreachable(PyObject *o) {
         case PY_TYPE_CONTINUATION: py_dealloc_continuation(o); break;
         case PY_TYPE_TASK:      py_dealloc_task(o);      break;
         case PY_TYPE_VIRTUAL_THREAD: py_dealloc_virtual_thread(o); break;
+        case PY_TYPE_VTHREAD_CHANNEL: py_dealloc_vthread_channel(o); break;
         case PY_TYPE_MEMORYVIEW: py_dealloc_memoryview(o); break;
         case PY_TYPE_WEAKREF:   py_dealloc_weakref(o);   break;
+        case PY_TYPE_PROPERTY:
+        case PY_TYPE_CLASSMETHOD:
+        case PY_TYPE_STATICMETHOD: py_descriptor_dealloc(o); break;
         default:
             if (pcc_capi_dealloc_cext_object(o, (int64_t)h->type_tag) != 0) break;
-            if (h->type_tag >= PY_TYPE_USER) py_instance_dealloc(o);
+            if (h->type_tag >= PY_TYPE_USER_CLASS_START) py_instance_dealloc(o);
             else py_dealloc_generic(o);
             break;
     }
@@ -357,12 +398,14 @@ int64_t py_gc_collect(void) {
     }
     for (int64_t i = 0; i < n_unreachable; i++) {
         PyGcNode *n = unreachable[i];
+        if (n == NULL || n->obj == NULL) continue;
         if (n->reachable != 0) continue;
         py_weakref_invalidate(n->obj);
         py_gc_clear_referents(n->obj);
     }
     for (int64_t i = 0; i < n_unreachable; i++) {
         PyGcNode *n = unreachable[i];
+        if (n == NULL || n->obj == NULL) continue;
         if (n->reachable != 0) continue;
         PyObject *obj = n->obj;
         PyGcNode *index_n = py_gc_index_remove(obj);
@@ -378,6 +421,7 @@ int64_t py_gc_collect(void) {
 
 done:
     if (unreachable != NULL) free(unreachable);
+    py_gc_drain_deferred_node_frees();
     py_gc_collecting = 0;
     py_gc_table_unlock();
     (void)pcc_resume_world();
@@ -392,28 +436,29 @@ void py_gc_track(PyObject *o) {
     ) {
         return;
     }
-    py_gc_table_lock();
+    int collector_owns_lock = py_gc_current_thread_owns_table_lock();
+    if (!collector_owns_lock) py_gc_table_lock();
     PyObjectHeader *h = py_header(o);
     if ((py_header_flags_load(h) & PY_FLAG_GC_TRACKED) != 0) {
         py_header_flags_or(py_header(o), PY_FLAG_GC_TRACKED);
-        py_gc_table_unlock();
+        if (!collector_owns_lock) py_gc_table_unlock();
         return;
     }
     PyGcNode *n = (PyGcNode *)calloc(1, sizeof(PyGcNode));
     if (n == NULL) {
-        py_gc_table_unlock();
+        if (!collector_owns_lock) py_gc_table_unlock();
         return;
     }
     int status = (int)py_gc_index_insert(o, n);
     if (status == 0) {
         py_header_flags_or(h, PY_FLAG_GC_TRACKED);
         free(n);
-        py_gc_table_unlock();
+        if (!collector_owns_lock) py_gc_table_unlock();
         return;
     }
     if (status != 1) {
         free(n);
-        py_gc_table_unlock();
+        if (!collector_owns_lock) py_gc_table_unlock();
         return;
     }
     n->obj = o;
@@ -422,7 +467,7 @@ void py_gc_track(PyObject *o) {
     py_gc_head = n;
     py_gc_tracked_count++;
     py_header_flags_or(h, PY_FLAG_GC_TRACKED);
-    py_gc_table_unlock();
+    if (!collector_owns_lock) py_gc_table_unlock();
 }
 
 void py_gc_untrack(PyObject *o) {
@@ -433,19 +478,21 @@ void py_gc_untrack(PyObject *o) {
     ) {
         return;
     }
-    py_gc_table_lock();
+    int collector_owns_lock = py_gc_current_thread_owns_table_lock();
+    if (!collector_owns_lock) py_gc_table_lock();
     PyObjectHeader *h = py_header(o);
     if ((py_header_flags_load(h) & PY_FLAG_GC_TRACKED) == 0) {
-        py_gc_table_unlock();
+        if (!collector_owns_lock) py_gc_table_unlock();
         return;
     }
     PyGcNode *n = py_gc_index_remove(o);
     if (n != NULL) {
         py_gc_unlink_node(n);
-        free(n);
+        if (collector_owns_lock) py_gc_defer_node_free(n);
+        else free(n);
     }
     py_header_flags_and(h, ~PY_FLAG_GC_TRACKED);
-    py_gc_table_unlock();
+    if (!collector_owns_lock) py_gc_table_unlock();
 }
 
 void py_gc_enable(void) {

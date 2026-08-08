@@ -1,5 +1,10 @@
 """pcc-Python replacement for py_runtime/src/py_int_mul.c."""
 from pcc.extern import extern, c_abi_export, c_int64, c_ptr
+from pcc.py_runtime.py.py_abi_constants import (
+    PYINTOBJECT_DIGITS_OFFSET,
+    PYINTOBJECT_NDIGITS_OFFSET,
+    PYINTOBJECT_SIGN_OFFSET,
+)
 from pcc.unsafe import load_i32, ptr_is_null, store_i32
 
 
@@ -17,14 +22,14 @@ def _store_u32(obj, offset: int, value: int) -> None:
 
 
 def _normalize(b) -> None:
-    ndigits: int = load_i32(b, 20)
-    while ndigits > 0 and _load_u32(b, 24 + (ndigits - 1) * 4) == 0:
+    ndigits: int = load_i32(b, PYINTOBJECT_NDIGITS_OFFSET)
+    while ndigits > 0 and _load_u32(b, PYINTOBJECT_DIGITS_OFFSET + (ndigits - 1) * 4) == 0:
         ndigits = ndigits - 1
-    store_i32(b, 20, ndigits)
+    store_i32(b, PYINTOBJECT_NDIGITS_OFFSET, ndigits)
     if ndigits == 0:
-        store_i32(b, 16, 0)
-    elif load_i32(b, 16) == 0:
-        store_i32(b, 16, 1)
+        store_i32(b, PYINTOBJECT_SIGN_OFFSET, 0)
+    elif load_i32(b, PYINTOBJECT_SIGN_OFFSET) == 0:
+        store_i32(b, PYINTOBJECT_SIGN_OFFSET, 1)
 
 
 def _mul_u32_low(a: int, b: int) -> int:
@@ -49,11 +54,11 @@ def _mul_u32_high(a: int, b: int) -> int:
 
 @c_abi_export("py_bigint_mul")
 def py_bigint_mul(a, b):
-    if load_i32(a, 16) == 0 or load_i32(b, 16) == 0:
+    if load_i32(a, PYINTOBJECT_SIGN_OFFSET) == 0 or load_i32(b, PYINTOBJECT_SIGN_OFFSET) == 0:
         return py_bigint_alloc(0)
 
-    la: int = load_i32(a, 20)
-    lb: int = load_i32(b, 20)
+    la: int = load_i32(a, PYINTOBJECT_NDIGITS_OFFSET)
+    lb: int = load_i32(b, PYINTOBJECT_NDIGITS_OFFSET)
     r = py_bigint_alloc(la + lb)
     if ptr_is_null(r):
         return r
@@ -61,23 +66,23 @@ def py_bigint_mul(a, b):
     i: int = 0
     while i < la:
         carry: int = 0
-        av: int = _load_u32(a, 24 + i * 4)
+        av: int = _load_u32(a, PYINTOBJECT_DIGITS_OFFSET + i * 4)
         j: int = 0
         while j < lb:
-            bv: int = _load_u32(b, 24 + j * 4)
+            bv: int = _load_u32(b, PYINTOBJECT_DIGITS_OFFSET + j * 4)
             low: int = _mul_u32_low(av, bv)
             high: int = _mul_u32_high(av, bv)
-            off: int = 24 + (i + j) * 4
+            off: int = PYINTOBJECT_DIGITS_OFFSET + (i + j) * 4
             total: int = _load_u32(r, off) + low + carry
             _store_u32(r, off, total & 4294967295)
             carry = high + (total >> 32)
             j = j + 1
-        _store_u32(r, 24 + (i + lb) * 4, carry & 4294967295)
+        _store_u32(r, PYINTOBJECT_DIGITS_OFFSET + (i + lb) * 4, carry & 4294967295)
         i = i + 1
 
-    if load_i32(a, 16) == load_i32(b, 16):
-        store_i32(r, 16, 1)
+    if load_i32(a, PYINTOBJECT_SIGN_OFFSET) == load_i32(b, PYINTOBJECT_SIGN_OFFSET):
+        store_i32(r, PYINTOBJECT_SIGN_OFFSET, 1)
     else:
-        store_i32(r, 16, -1)
+        store_i32(r, PYINTOBJECT_SIGN_OFFSET, -1)
     _normalize(r)
     return r

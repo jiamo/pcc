@@ -6,8 +6,62 @@ from . import BackendUnavailable
 from .self_backend_ir import TypeDesc, _align_to
 
 
+def _append_hfa_members(
+    value_type: TypeDesc,
+    members: list[tuple[TypeDesc, int]],
+) -> bool:
+    if value_type.is_fp:
+        member_size = 4 if value_type.width <= 32 else 8
+        members.append((value_type, len(members) * member_size))
+        return len(members) <= 4
+    if value_type.is_array:
+        if value_type.elem is None or value_type.count <= 0:
+            return False
+        index = 0
+        while index < value_type.count:
+            if not _append_hfa_members(value_type.elem, members):
+                return False
+            index += 1
+        return True
+    if value_type.is_struct:
+        index = 0
+        while index < len(value_type.fields):
+            if not _append_hfa_members(value_type.fields[index], members):
+                return False
+            index += 1
+        return True
+    return False
+
+
+def aggregate_hfa_members(value_type: TypeDesc) -> tuple[tuple[TypeDesc, int], ...]:
+    """Return flattened homogeneous FP members and byte offsets, or ``()``.
+
+    Darwin follows AAPCS64's homogeneous floating-point aggregate rule: one
+    through four recursively nested, same-width FP members use consecutive
+    SIMD/FP registers instead of the ordinary aggregate GPR classes.
+    """
+    if not (value_type.is_array or value_type.is_struct):
+        return ()
+    members: list[tuple[TypeDesc, int]] = []
+    if not _append_hfa_members(value_type, members):
+        return ()
+    if not members or len(members) > 4:
+        return ()
+    width = members[0][0].width
+    index = 1
+    while index < len(members):
+        if members[index][0].width != width:
+            return ()
+        index += 1
+    return tuple(members)
+
+
 def reg_name(value_type: TypeDesc, index: int) -> str:
     if value_type.is_array or value_type.is_struct:
+        hfa = aggregate_hfa_members(value_type)
+        if len(hfa) == 1:
+            prefix = "s" if hfa[0][0].width <= 32 else "d"
+            return f"{prefix}{index}"
         chunks = aggregate_reg_chunks(value_type)
         if len(chunks) != 1:
             raise BackendUnavailable(
@@ -62,6 +116,10 @@ def abi_value_reg_names(value_type: TypeDesc, start_index: int) -> tuple[str, ..
     if value_type.is_void:
         return ()
     if value_type.is_array or value_type.is_struct:
+        hfa = aggregate_hfa_members(value_type)
+        if hfa:
+            prefix = "s" if hfa[0][0].width <= 32 else "d"
+            return tuple(f"{prefix}{start_index + index}" for index in range(len(hfa)))
         names: list[str] = []
         for index, chunk_size in enumerate(aggregate_reg_chunks(value_type)):
             prefix = "x" if chunk_size > 4 else "w"
@@ -73,6 +131,8 @@ def abi_value_reg_names(value_type: TypeDesc, start_index: int) -> tuple[str, ..
 def aggregate_fits_reg_abi(value_type: TypeDesc) -> bool:
     if not (value_type.is_array or value_type.is_struct):
         return True
+    if aggregate_hfa_members(value_type):
+        return True
     try:
         aggregate_reg_chunks(value_type)
     except BackendUnavailable:
@@ -81,7 +141,9 @@ def aggregate_fits_reg_abi(value_type: TypeDesc) -> bool:
 
 
 def aggregate_passed_indirect(value_type: TypeDesc) -> bool:
-    return (value_type.is_array or value_type.is_struct) and not aggregate_fits_reg_abi(value_type)
+    return (value_type.is_array or value_type.is_struct) and not aggregate_fits_reg_abi(
+        value_type
+    )
 
 
 def aggregate_returned_indirect(value_type: TypeDesc) -> bool:
@@ -113,6 +175,16 @@ def assign_abi_arg_regs(arg_types: list[TypeDesc]) -> list[tuple[str, ...]]:
         if arg_type.is_fp:
             regs = abi_value_reg_names(arg_type, fpr_index)
             if fpr_index + len(regs) > 8:
+                assignments.append(())
+            else:
+                fpr_index += len(regs)
+                assignments.append(regs)
+            continue
+        hfa = aggregate_hfa_members(arg_type)
+        if hfa:
+            regs = abi_value_reg_names(arg_type, fpr_index)
+            if fpr_index + len(regs) > 8:
+                fpr_index = 8
                 assignments.append(())
             else:
                 fpr_index += len(regs)

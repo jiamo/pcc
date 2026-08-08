@@ -193,6 +193,8 @@ class BuiltinTypeAttrLoweringMixin:
         Inert in no-libpython mode (``_cpy_values`` is empty)."""
         obj_val = self._emit_as_object(expr.args[0])
         if obj_val in getattr(self, "_cpy_values", ()):
+            self._guard_cpy_value_not_null(obj_val)
+            obj_owned = self._cpy_value_is_owned(obj_val)
             cpy_name = self._ptr_to_cstr(
                 self._cstr_global("__class__", ".cpy.attr.__class__")
             )
@@ -201,9 +203,11 @@ class BuiltinTypeAttrLoweringMixin:
                 [obj_val, cpy_name],
                 name=self._fresh("cpy.type"),
             )
-            if not hasattr(self, "_cpy_values"):
-                self._cpy_values = set()
-            self._cpy_values.add(cls)
+            if obj_owned:
+                self.builder.call(self.runtime["py_cpy_decref"], [obj_val])
+                self._forget_owned_cpy_value(obj_val)
+            self._mark_owned_cpy_value(cls)
+            self._guard_cpy_value_not_null(cls)
             return cls
         name_ptr = self._attr_name_ptr("__class__")
         return self.builder.call(
@@ -230,11 +234,16 @@ class BuiltinTypeAttrLoweringMixin:
         obj = self._emit_expr(arg)
         # CPython-backed value: dispatch through py_cpy_len (PyObject_Length).
         if obj in getattr(self, "_cpy_values", ()):
-            return self.builder.call(
+            self._guard_cpy_value_not_null(obj)
+            result = self.builder.call(
                 self.runtime["py_cpy_len"],
                 [obj],
                 name=self._fresh("cpy.len"),
             )
+            if self._cpy_value_is_owned(obj):
+                self.builder.call(self.runtime["py_cpy_decref"], [obj])
+                self._forget_owned_cpy_value(obj)
+            return result
         if weak_dict_kind == "value":
             return self.builder.call(
                 self.runtime["py_weak_value_dict_len"],
@@ -295,22 +304,36 @@ class BuiltinTypeAttrLoweringMixin:
         if isinstance(arg.ty, StrType):
             v = self._emit_expr(arg)
             if v in getattr(self, "_cpy_values", ()):
-                return self.builder.call(
+                self._guard_cpy_value_not_null(v)
+                result = self.builder.call(
                     self.runtime["py_cpy_to_pcc_str"],
                     [v],
                     name=self._fresh("cpy.to_pcc_str"),
                 )
+                if self._cpy_value_is_owned(v):
+                    self.builder.call(self.runtime["py_cpy_decref"], [v])
+                    self._forget_owned_cpy_value(v)
+                self._guard_cpy_value_not_null(result)
+                self._emit_post_call_err_check(getattr(arg, "span", None))
+                return result
             if self._expr_returns_owned_object(arg):
                 return v
             return self._gc_retain(v, name=self._fresh("str.retain"))
         if self._expr_looks_cpython(arg):
             v = self._emit_expr(arg)
             if v in getattr(self, "_cpy_values", ()):
-                return self.builder.call(
+                self._guard_cpy_value_not_null(v)
+                result = self.builder.call(
                     self.runtime["py_cpy_to_pcc_str"],
                     [v],
                     name=self._fresh("cpy.to_pcc_str"),
                 )
+                if self._cpy_value_is_owned(v):
+                    self.builder.call(self.runtime["py_cpy_decref"], [v])
+                    self._forget_owned_cpy_value(v)
+                self._guard_cpy_value_not_null(result)
+                self._emit_post_call_err_check(getattr(arg, "span", None))
+                return result
         boxed = self._emit_expr_as_pcc_object(arg)
         result = self.builder.call(
             self.runtime["py_obj_str"], [boxed], name=self._fresh("obj.str")

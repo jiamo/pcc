@@ -53,6 +53,18 @@ entry:
 """
 
 
+REGALLOC_INT_IR = """
+define i32 @main() {
+entry:
+  %a = add i32 7, 5
+  %b = mul i32 %a, 3
+  %c = xor i32 %b, 10
+  %d = sub i32 %c, 4
+  ret i32 %d
+}
+"""
+
+
 def _host_triple() -> str:
     return llvm.Target.from_default_triple().triple
 
@@ -153,4 +165,13 @@ def test_llvm_self_ptr_vector_lane_matches(tmp_path):
     self_result = _run_self_from_ir(PTR_VECTOR_IR, tmp_path, triple)
     assert_result_triplet_matches(
         "llvm-self-ptr-vector", "llvm", llvm_result, "self", self_result
+    )
+
+
+def test_llvm_self_block_local_regalloc_result_matches(tmp_path):
+    triple = _host_self_supported()
+    llvm_result = _run_llvm_from_ir(REGALLOC_INT_IR, tmp_path, triple)
+    self_result = _run_self_from_ir(REGALLOC_INT_IR, tmp_path, triple)
+    assert_result_triplet_matches(
+        "llvm-self-block-local-regalloc", "llvm", llvm_result, "self", self_result
     )

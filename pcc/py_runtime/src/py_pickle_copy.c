@@ -1,4 +1,6 @@
-/* Native copy/pickle subset for no-libpython compiled Python.
+/* Host-C oracle for py/py_pickle_copy_runtime.py.
+ *
+ * Native copy/pickle subset for no-libpython compiled Python.
  *
  * This is intentionally a small runtime helper, not a CPython-compatible
  * pickle implementation.  It covers the data-model hooks that the compiler's
@@ -28,15 +30,7 @@ static PccPickleEntry *pcc_pickle_entries = NULL;
 static int64_t pcc_pickle_next_id = 1;
 
 static int copy_ptr_can_have_header(void *ptr) {
-    uintptr_t bits = (uintptr_t)ptr;
-    if (ptr == NULL) return 0;
-    if ((bits & 1u) != 0u) return 0;
-    if (bits < 0x1000u) return 0;
-    if ((bits & 0x7u) != 0u) return 0;
-#if UINTPTR_MAX > 0xffffffffu
-    if ((bits >> 48) != 0u) return 0;
-#endif
-    return 1;
+    return pcc_gc_pointer_is_managed((PyObject *)ptr) != 0;
 }
 
 static int copy_is_heap_obj(PyObject *o) {
@@ -46,7 +40,7 @@ static int copy_is_heap_obj(PyObject *o) {
 static int copy_is_instance(PyObject *o) {
     if (!copy_is_heap_obj(o)) return 0;
     int32_t tag = py_type_of(o);
-    return tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER;
+    return tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER_CLASS_START;
 }
 
 static PyClassObject *copy_instance_class(PyObject *o) {
@@ -73,6 +67,17 @@ static PyObject *copy_lookup_method(PyObject *o, const char *name) {
     return py_class_lookup(cls, name);
 }
 
+static PyObject *copy_require_result(
+    PyObject *result,
+    const char *helper_name,
+    const char *message
+) {
+    if (result == NULL) {
+        py_runtime_error_if_unset(helper_name, message);
+    }
+    return result;
+}
+
 static PyObject *copy_call_method_with_args(
     PyObject *method,
     PyObject *self,
@@ -85,41 +90,125 @@ static PyObject *copy_call_method_with_args(
         && py_type_of(method) == PY_TYPE_FUNC
     ) {
         PyObject *full_args = py_tuple_new(n + 1);
-        if (full_args == NULL) return NULL;
+        if (full_args == NULL) {
+            return copy_require_result(
+                NULL,
+                "py_tuple_new",
+                "copy callback argument tuple allocation failed"
+            );
+        }
         py_tuple_set_item(full_args, 0, self);
         for (int64_t i = 0; i < n; i++) {
             PyObject *item = py_tuple_get(args, i);
+            if (item == NULL) {
+                copy_require_result(
+                    NULL,
+                    "py_tuple_get",
+                    "copy callback argument lookup failed"
+                );
+                py_decref(full_args);
+                return NULL;
+            }
             py_tuple_set_item(full_args, i + 1, item);
             py_decref(item);
         }
         PyObject *out = py_func_call(method, full_args);
+        copy_require_result(
+            out,
+            "copy_call_method_with_args",
+            "copy callback returned NULL without setting an exception"
+        );
         py_decref(full_args);
         return out;
     }
     if (n == 0) {
         typedef PyObject *(*M0)(PyObject *);
-        return ((M0)(uintptr_t)method)(self);
+        PyObject *out = ((M0)(uintptr_t)method)(self);
+        return copy_require_result(
+            out,
+            "copy_call_method_with_args",
+            "copy callback returned NULL without setting an exception"
+        );
     }
     if (n == 1) {
         PyObject *a0 = py_tuple_get(args, 0);
+        if (a0 == NULL) {
+            return copy_require_result(
+                NULL,
+                "py_tuple_get",
+                "copy callback argument lookup failed"
+            );
+        }
         typedef PyObject *(*M1)(PyObject *, PyObject *);
         PyObject *out = ((M1)(uintptr_t)method)(self, a0);
+        copy_require_result(
+            out,
+            "copy_call_method_with_args",
+            "copy callback returned NULL without setting an exception"
+        );
         py_decref(a0);
         return out;
     }
     if (n == 2) {
         PyObject *a0 = py_tuple_get(args, 0);
+        if (a0 == NULL) {
+            return copy_require_result(
+                NULL,
+                "py_tuple_get",
+                "copy callback argument lookup failed"
+            );
+        }
         PyObject *a1 = py_tuple_get(args, 1);
+        if (a1 == NULL) {
+            copy_require_result(
+                NULL,
+                "py_tuple_get",
+                "copy callback argument lookup failed"
+            );
+            py_decref(a0);
+            return NULL;
+        }
         typedef PyObject *(*M2)(PyObject *, PyObject *, PyObject *);
         PyObject *out = ((M2)(uintptr_t)method)(self, a0, a1);
+        copy_require_result(
+            out,
+            "copy_call_method_with_args",
+            "copy callback returned NULL without setting an exception"
+        );
         py_decref(a0);
         py_decref(a1);
         return out;
     }
     if (n == 3) {
         PyObject *a0 = py_tuple_get(args, 0);
+        if (a0 == NULL) {
+            return copy_require_result(
+                NULL,
+                "py_tuple_get",
+                "copy callback argument lookup failed"
+            );
+        }
         PyObject *a1 = py_tuple_get(args, 1);
+        if (a1 == NULL) {
+            copy_require_result(
+                NULL,
+                "py_tuple_get",
+                "copy callback argument lookup failed"
+            );
+            py_decref(a0);
+            return NULL;
+        }
         PyObject *a2 = py_tuple_get(args, 2);
+        if (a2 == NULL) {
+            copy_require_result(
+                NULL,
+                "py_tuple_get",
+                "copy callback argument lookup failed"
+            );
+            py_decref(a0);
+            py_decref(a1);
+            return NULL;
+        }
         typedef PyObject *(*M3)(
             PyObject *,
             PyObject *,
@@ -127,6 +216,11 @@ static PyObject *copy_call_method_with_args(
             PyObject *
         );
         PyObject *out = ((M3)(uintptr_t)method)(self, a0, a1, a2);
+        copy_require_result(
+            out,
+            "copy_call_method_with_args",
+            "copy callback returned NULL without setting an exception"
+        );
         py_decref(a0);
         py_decref(a1);
         py_decref(a2);
@@ -142,7 +236,13 @@ static PyObject *copy_call_unary(PyObject *method, PyObject *self) {
 
 static PyObject *copy_call_binary(PyObject *method, PyObject *self, PyObject *arg) {
     PyObject *args = py_tuple_new(1);
-    if (args == NULL) return NULL;
+    if (args == NULL) {
+        return copy_require_result(
+            NULL,
+            "py_tuple_new",
+            "copy callback argument tuple allocation failed"
+        );
+    }
     py_tuple_set_item(args, 0, arg);
     PyObject *out = copy_call_method_with_args(method, self, args);
     py_decref(args);

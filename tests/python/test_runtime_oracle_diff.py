@@ -35,13 +35,12 @@ RUNTIME_DIR = REPO_ROOT / "pcc" / "py_runtime"
 
 # Each corpus case compiles a small program through pcc with a 120s per-compile
 # timeout (kept tight on purpose: an un-stamped archive rebuild must not happen
-# once per corpus program). Under the default `-n auto` that timeout
-# is also contention-sensitive — running this file concurrently with the other
-# heavy subprocess-spawning suites (GC backend matrix, runtime emit) starved a
-# normally-fast per-program compile past 120s. Pin the file to its own
-# xdist_group so `--dist=loadgroup` runs its cases on a single worker, isolated
-# from that cross-suite contention, without relaxing the rebuild guard.
-pytestmark = pytest.mark.xdist_group(name="pcc_runtime_oracle")
+# once per corpus program). Under the default xdist run that timeout is also
+# contention-sensitive. Share the reduced self-GC heavy lane instead of
+# creating another independently runnable group; this keeps the archive/cache
+# fixture on one worker while bounding nested compiler/pytest workloads at two
+# lanes without relaxing the rebuild guard.
+pytestmark = pytest.mark.xdist_group(name="pcc_heavy_self")
 
 
 _KNOWN_PCC_C_DIVERGENCES: dict[str, str] = {}

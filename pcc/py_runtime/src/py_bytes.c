@@ -814,6 +814,173 @@ int64_t py_bytes_len(PyObject *o) {
     return n;
 }
 
+/* ---- Compiler-owned readonly signed-i64 buffer ----------------------- */
+
+#define PCC_I64_BUFFER_LAYOUT_VERSION 1
+#define PCC_GUARDED_LOOP_COUNTER_COUNT 6
+
+static int64_t guarded_loop_counters[PCC_GUARDED_LOOP_COUNTER_COUNT];
+
+int64_t py_guarded_loop_counter_add(int64_t counter, int64_t delta) {
+    if (counter < 0 || counter >= PCC_GUARDED_LOOP_COUNTER_COUNT) return -1;
+    return __atomic_add_fetch(
+        &guarded_loop_counters[counter], delta, __ATOMIC_RELAXED);
+}
+
+int64_t py_guarded_loop_counter_get(int64_t counter) {
+    if (counter < 0 || counter >= PCC_GUARDED_LOOP_COUNTER_COUNT) return -1;
+    return __atomic_load_n(&guarded_loop_counters[counter], __ATOMIC_RELAXED);
+}
+
+static int i64_buffer_shape(PyObject *buffer, const char **data,
+                            int64_t *element_count, int exact_bytes) {
+    int64_t byte_len = 0;
+    const char *raw = NULL;
+    if (buffer != NULL && (!exact_bytes || py_type_of(buffer) == PY_TYPE_BYTES)) {
+        raw = bytes_data(buffer, &byte_len);
+    }
+    if (raw == NULL) {
+        py_raise(py_exc_new(PY_EXC_TYPEERROR,
+                            "signed-i64 buffer must be bytes-like"));
+        return -1;
+    }
+    if ((byte_len & 7) != 0) {
+        py_raise(py_exc_new(PY_EXC_VALUEERROR,
+                            "signed-i64 buffer byte length must be divisible by 8"));
+        return -1;
+    }
+    *data = raw;
+    *element_count = byte_len / 8;
+    return 0;
+}
+
+PyObject *py_i64_buffer_new(int64_t element_count) {
+    if (element_count < 1 || element_count > 1048576) {
+        py_raise(py_exc_new(PY_EXC_VALUEERROR,
+                            "pcc.i64_buffer length must be between 1 and 1048576"));
+        return NULL;
+    }
+    int64_t byte_len = element_count * 8;
+    PyObject *out = py_bytes_new(NULL, byte_len);
+    if (out == NULL) {
+        py_raise(py_exc_new(PY_EXC_MEMORYERROR,
+                            "unable to allocate pcc.i64_buffer"));
+        return NULL;
+    }
+    memset(((PyBytesObject *)out)->data, 0, (size_t)byte_len);
+    return out;
+}
+
+int64_t py_i64_buffer_set_item(PyObject *buffer, int64_t index,
+                               PyObject *value) {
+    const char *raw = NULL;
+    int64_t count = 0;
+    if (i64_buffer_shape(buffer, &raw, &count, 1) != 0) return -1;
+    if (index < 0 || index >= count) {
+        py_raise(py_exc_new(PY_EXC_INDEXERROR,
+                            "pcc.i64_buffer assignment index out of range"));
+        return -1;
+    }
+    int overflow = 0;
+    int64_t integer = py_int_to_i64(value, &overflow);
+    if (overflow) {
+        py_raise(py_exc_new(PY_EXC_OVERFLOWERROR,
+                            "pcc.i64_buffer element does not fit signed i64"));
+        return -1;
+    }
+    unsigned char *dst = (unsigned char *)(uintptr_t)raw + index * 8;
+    uint64_t bits = 0;
+    memcpy(&bits, &integer, sizeof(bits));
+    for (int shift = 0; shift < 8; shift++) {
+        dst[shift] = (unsigned char)(bits >> (shift * 8));
+    }
+    return 0;
+}
+
+PyObject *py_i64_buffer_get_item(PyObject *buffer, int64_t index) {
+    const char *raw = NULL;
+    int64_t count = 0;
+    if (i64_buffer_shape(buffer, &raw, &count, 0) != 0) return NULL;
+    if (index < 0 || index >= count) {
+        py_raise(py_exc_new(PY_EXC_INDEXERROR,
+                            "pcc.i64_buffer index out of range"));
+        return NULL;
+    }
+    const unsigned char *src = (const unsigned char *)raw + index * 8;
+    uint64_t bits = 0;
+    for (int shift = 0; shift < 8; shift++) {
+        bits |= ((uint64_t)src[shift]) << (shift * 8);
+    }
+    int64_t integer = 0;
+    memcpy(&integer, &bits, sizeof(integer));
+    return py_int_from_i64(integer);
+}
+
+const char *py_i64_buffer_data(PyObject *buffer) {
+    if (buffer == NULL || py_type_of(buffer) != PY_TYPE_BYTES) return NULL;
+    PyBytesObject *bytes = (PyBytesObject *)buffer;
+    if ((bytes->byte_len & 7) != 0) return NULL;
+    return bytes->data;
+}
+
+int64_t py_i64_buffer_layout_version(PyObject *buffer) {
+    return py_i64_buffer_data(buffer) != NULL
+               ? PCC_I64_BUFFER_LAYOUT_VERSION
+               : 0;
+}
+
+int64_t py_i64_buffer_version(PyObject *buffer) {
+    /* Exact bytes are immutable, so version 1 remains valid for their entire
+     * lifetime.  Mutable bytearray/memoryview values deliberately miss. */
+    return py_i64_buffer_data(buffer) != NULL ? 1 : 0;
+}
+
+PyObject *py_i64_buffer_dot_scalar(PyObject *left, PyObject *right,
+                                   int64_t expected_count) {
+    const char *left_data = NULL;
+    const char *right_data = NULL;
+    int64_t left_count = 0;
+    int64_t right_count = 0;
+    if (i64_buffer_shape(left, &left_data, &left_count, 0) != 0) return NULL;
+    if (i64_buffer_shape(right, &right_data, &right_count, 0) != 0) return NULL;
+    if (left_count != expected_count || right_count != expected_count) {
+        py_raise(py_exc_new(PY_EXC_VALUEERROR,
+                            "guarded_i64_dot buffers must match the declared length"));
+        return NULL;
+    }
+
+    PyObject *accumulator = py_int_from_i64(0);
+    if (accumulator == NULL) return NULL;
+    for (int64_t index = 0; index < expected_count; index++) {
+        /* Preserve the scalar oracle's observable order: left load, right
+         * load, multiply, accumulate, then advance the index. */
+        PyObject *left_value = py_i64_buffer_get_item(left, index);
+        if (left_value == NULL) {
+            py_decref(accumulator);
+            return NULL;
+        }
+        PyObject *right_value = py_i64_buffer_get_item(right, index);
+        if (right_value == NULL) {
+            py_decref(left_value);
+            py_decref(accumulator);
+            return NULL;
+        }
+        PyObject *product = py_int_mul(left_value, right_value);
+        py_decref(left_value);
+        py_decref(right_value);
+        if (product == NULL) {
+            py_decref(accumulator);
+            return NULL;
+        }
+        PyObject *updated = py_int_add(accumulator, product);
+        py_decref(product);
+        py_decref(accumulator);
+        if (updated == NULL) return NULL;
+        accumulator = updated;
+    }
+    return accumulator;
+}
+
 int64_t py_bytes_find(PyObject *src, PyObject *needle) {
     int64_t n = 0;
     const char *data = bytes_data(src, &n);

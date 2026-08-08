@@ -59,6 +59,20 @@ appear verbatim throughout.
 | mode-labeled | Annotated with host-pcc vs pcc1, libpython vs no-libpython, LLVM vs self backend, stage1 vs fixed point. |
 | investigation | A written, evidence-chained record under [docs/investigations/](../../docs/investigations), one bug per file, ending in a CONFIRMED/DENIED verdict. |
 | case study | The raw material of each chapter's History and Lessons section. |
-| no-libpython | Not depending on the CPython runtime — which does not mean zero C in the binary. |
-| C kernel | The minimized bottom layer of the four-layer runtime model: platform/ABI, allocation, atomics, threads, dlopen, safepoints, GC primitives. |
-| C-API shim | The ABI surface extensions see; specified and generated, not CPython's libpython. |
+| no-libpython | Not depending on the CPython runtime; it does not by itself imply zero-libc. |
+| zero-libc | A Linux mode claim: no production C/libc object, dynamic interpreter/dependency, or undefined symbol. The label is inapplicable to Darwin's named-libSystem boundary. |
+| compiler intrinsic | A raw-memory, atomic, syscall, or host-ABI machine operation. It must not become a hiding place for Python semantic policy. |
+| freestanding pcc-Python | The strict, managed-runtime-independent subset used to implement allocation, threads, safepoints, GC, and the libc-like substrate. |
+| C-API shim | The ABI surface extensions see; production ownership is migrating into `py_capi_*_runtime.py`, distinct from CPython's libpython. |
+
+## GUI
+
+| Term | Meaning in pcc |
+|---|---|
+| declarative UI | Components derive descriptors from props and state instead of mutating the committed tree every frame. |
+| keyed reconciliation | Reuse, move, replacement, and removal decided by parent, key, and compatible node type. |
+| atomic commit | Only a complete work-in-progress result may mutate the committed kernel tree. |
+| scheduling lane | Discrete, animation, default, or background priority with aging and replay semantics. |
+| effect phase | Before-mutation, mutation/layout cleanup, layout creation, passive cleanup, or passive creation. |
+| managed state | Application state in the command owner with explicit slot kind and ownership, not an arbitrary Python object. |
+| native bridge | The named CoreGraphics/Metal/AppKit ABI boundary; render/present reachability does not imply pixel correctness. |

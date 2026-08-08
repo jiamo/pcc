@@ -165,40 +165,55 @@ class CoreHelperMixin:
         entry = getattr(self, "_current_entry_block", None)
         if entry is None:
             entry = fn.blocks[0]
-        saved_block = getattr(self.builder, "_block", None)
-        # Position at the end of entry, but before the first non-alloca
-        # instruction if entry already has body content.
-        insert_before = None
-        cached_fn = getattr(self, "_entry_alloca_insert_before_function", None)
-        cached_instr = getattr(self, "_entry_alloca_insert_before_instr", None)
-        if cached_fn is fn and cached_instr is not None:
-            insert_before = cached_instr
-        elif (
-            len(entry._instrs) > 0
-            and self._instruction_opname_text(entry._instrs[len(entry._instrs) - 1])
-            != "alloca"
-        ):
-            for instr in entry._instrs:
-                if self._instruction_opname_text(instr) != "alloca":
-                    insert_before = instr
-                    break
+        # O(1) insertion cursor: a per-function numeric index, bumped per
+        # insert. The earlier shape cached the first non-alloca INSTRUCTION
+        # and repositioned with ``position_before(instr)``, which rescans
+        # the entry block's instruction list on every call (one identity
+        # compare per record). A function with N rooted calls grows an
+        # N-alloca entry prefix, so codegen went O(N^2) per function —
+        # invisible at host list speed, but the pcc1-executed stage2
+        # regressed 282s -> 5245s (and the pcc1 self-host getattr-default
+        # bug made the instr cache never hit there; see marshal
+        # ``_stash_overflow_slot``'s NOTE, same discipline used here:
+        # direct attribute reads, attrs initialised in layer1_init).
+        # Ordering among entry allocas is irrelevant — each executes once.
+        if self._entry_alloca_insert_before_function is not fn:
+            insert_index = 0
+            n_entry = len(entry._instrs)
+            while insert_index < n_entry and (
+                self._instruction_opname_text(entry._instrs[insert_index])
+                == "alloca"
+            ):
+                insert_index = insert_index + 1
             self._entry_alloca_insert_before_function = fn
-            self._entry_alloca_insert_before_instr = insert_before
-        else:
-            self._entry_alloca_insert_before_function = fn
-            self._entry_alloca_insert_before_instr = None
-        if insert_before is not None:
-            self.builder.position_before(insert_before)
-        else:
-            self.builder.position_at_end(entry)
+            self._entry_alloca_insert_index = insert_index
+        insert_index = self._entry_alloca_insert_index
+        saved_block = self.builder._block
+        saved_pos = self.builder._pos
+        end_marker = self.builder._END
+        self.builder._block = entry
+        self.builder._pos = insert_index
         alloca = self.builder.alloca(ir_ty, name=name)
+        emitted = 1
         if init_null and isinstance(ir_ty, ir.PointerType):
             if self._ir_type_matches(ir_ty, _CSTR):
                 self.builder.store(
                     ir.Constant(ir_ty, None),
                     alloca,
                 )
-        # Restore the main builder's insertion point.
+                emitted = 2
+        self._entry_alloca_insert_index = insert_index + emitted
+        # Restore the caller's insertion point; if the caller was emitting
+        # into the entry block itself at/after the insertion cursor, the
+        # inserted records shifted its position.
         if saved_block is not None:
-            self.builder.position_at_end(saved_block)
+            self.builder._block = saved_block
+            if (
+                saved_block is entry
+                and saved_pos != end_marker
+                and saved_pos >= insert_index
+            ):
+                self.builder._pos = saved_pos + emitted
+            else:
+                self.builder._pos = saved_pos
         return alloca

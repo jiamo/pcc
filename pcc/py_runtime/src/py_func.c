@@ -68,6 +68,12 @@ static PyObject *py_func_type_error(const char *message) {
     return NULL;
 }
 
+static PyObject *py_func_runtime_error_if_unset(const char *helper_name,
+                                                const char *message) {
+    if (py_err_occurred()) return NULL;
+    return py_runtime_error_if_unset(helper_name, message);
+}
+
 static int py_func_kwargs_empty(PyObject *kwargs) {
     if (kwargs == NULL || kwargs == py_None) return 1;
     if (PY_IS_TAGGED_INT(kwargs)) return 0;
@@ -110,6 +116,10 @@ static PyObject *py_func_signature_from_captures(
     PyObject *inner = py_tuple_get(captures, 0);
     if (inner == NULL) {
         py_decref(candidate);
+        py_func_runtime_error_if_unset(
+            "py_func_signature_from_captures",
+            "native function signature has no captures tuple"
+        );
         return NULL;
     }
     *actual_captures = inner;
@@ -699,17 +709,37 @@ PyObject *py_func_call_kwargs(
     PyObject *args_tuple,
     PyObject *kwargs
 ) {
-    if (callable == NULL) return NULL;
-    if (PY_IS_TAGGED_INT(callable)) return NULL;
+    if (callable == NULL) {
+        return py_func_type_error("native function call received NULL callable");
+    }
+    if (PY_IS_TAGGED_INT(callable)) {
+        return py_func_type_error("native function call requires a function object");
+    }
     PyObjectHeader *h = py_header(callable);
-    if (h->type_tag != PY_TYPE_FUNC) return NULL;
+    if (h->type_tag != PY_TYPE_FUNC) {
+        return py_func_type_error("native function call requires a function object");
+    }
     PyFuncObject *f = (PyFuncObject *)callable;
-    if (f->entry == NULL) return NULL;
+    if (f->entry == NULL) {
+        return py_func_runtime_error_if_unset(
+            "py_func_call_kwargs",
+            "native function object has no entry point"
+        );
+    }
     PyObject *args = args_tuple == NULL ? py_tuple_new(0) : args_tuple;
-    if (args == NULL) return NULL;
+    if (args == NULL) {
+        return py_func_runtime_error_if_unset(
+            "py_tuple_new",
+            "native function could not create its argument tuple"
+        );
+    }
     PyObject *captures = pcc_gc_load_ptr(callable, &f->captures);
     PyObject *actual_captures = captures;
     PyObject *sig = py_func_signature_from_captures(captures, &actual_captures);
+    if (sig == NULL && py_err_occurred()) {
+        if (args_tuple == NULL) py_decref(args);
+        return NULL;
+    }
     if (sig == NULL && !py_func_kwargs_empty(kwargs)) {
         if (args_tuple == NULL) py_decref(args);
         return py_func_type_error("native function does not accept keywords");
@@ -720,6 +750,14 @@ PyObject *py_func_call_kwargs(
     if (sig != NULL) {
         call_args = py_func_bind_signature(sig, args, kwargs);
         if (call_args == NULL) {
+            /* Enforce the callee contract before releasing temporary
+             * signature state.  Cleanup can run deallocators; it must not be
+             * allowed to turn a silent binder failure into an unrelated
+             * exception (or leave it silent). */
+            py_func_runtime_error_if_unset(
+                "py_func_bind_signature",
+                "native function argument binding returned NULL without exception"
+            );
             py_decref(sig);
             py_decref(actual_captures);
             if (args_tuple == NULL) py_decref(args);
@@ -729,6 +767,16 @@ PyObject *py_func_call_kwargs(
     }
 
     PyObject *result = f->entry(actual_captures, call_args);
+    /* Inspect the entry result at the immediate call boundary.  In
+     * particular, do this before decrefing call_args/signature captures so a
+     * cleanup side effect cannot supply the exception that the compiled
+     * entry itself failed to set. */
+    if (result == NULL) {
+        py_func_runtime_error_if_unset(
+            f->name != NULL ? f->name : "<compiled native function>",
+            "compiled native function returned NULL without exception"
+        );
+    }
     if (bound_args) py_decref(call_args);
     if (sig != NULL) {
         py_decref(sig);

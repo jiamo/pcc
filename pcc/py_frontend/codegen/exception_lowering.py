@@ -35,6 +35,7 @@ from .builtin_exceptions import (
 
 _I8 = ir.IntType(8)
 _I1 = ir.IntType(1)
+_I32 = ir.IntType(32)
 _I64 = ir.IntType(64)
 _CSTR = _I8.as_pointer()
 _OPTIONAL_IMPORT_MISSING_NONE = "pcc.optional_import_missing.None"
@@ -70,6 +71,122 @@ class ExceptionLoweringMixin:
 
     def _current_try_err_block(self):
         return self._try_err_block
+
+    def _emit_generator_exceptional_finally(
+        self,
+        stmt: Try,
+        current_exc: ir.Value,
+        outer_err_block,
+    ) -> bool:
+        """Run a generator ``finally`` with its unwinding exception rooted.
+
+        Resume points receive thrown-in cancellation through TLS.  Leaving that
+        old exception pending while emitting cleanup makes every ordinary
+        post-call check mistake it for a new cleanup failure.  Move it into the
+        generator's managed frame slot, clear TLS for cleanup, then restore it
+        unless cleanup raised a replacement exception.
+
+        The slot is part of the heap frame rather than a C stack temporary, so
+        even a forbidden cleanup yield cannot leave an updateable GC root
+        pointing into a returned carrier stack. ``py_gen_close`` will reject
+        that yield and the terminal task-failure path releases the frame.
+        """
+        if not stmt.finally_body or not self._generator_ctx_stack:
+            return False
+        ctx = self._generator_ctx_stack[-1]
+        hidden = self._generator_finally_exception_name(stmt)
+        frame_entry = ctx["frame_slots"].get(hidden)
+        if frame_entry is None:
+            return False
+        root_ptr = self._as_gc_ptr(
+            frame_entry[1],
+            name=self._fresh("finally.exception.root"),
+        )
+        self.builder.call(
+            self.runtime["pcc_gc_store_root"],
+            [root_ptr, current_exc],
+        )
+        self.builder.call(self.runtime["py_clear_exception"], [])
+
+        cleanup_error_bb = self.current_function.append_basic_block(
+            name=self._fresh("finally.cleanup.error")
+        )
+        saved_err_block = self._push_try_err_block(cleanup_error_bb)
+        active_roots = ctx["active_exception_unwind_roots"]
+        active_roots.append(root_ptr)
+        try:
+            self._emit_stmts(stmt.finally_body)
+        finally:
+            active_roots.pop()
+            self._restore_try_err_block(saved_err_block)
+
+        if not self._builder_block_is_terminated():
+            saved_exc = self.builder.call(
+                self.runtime["pcc_gc_load_ptr"],
+                [ir.Constant(_CSTR, None), root_ptr],
+                name=self._fresh("finally.exception.restore"),
+            )
+            self.builder.call(self.runtime["py_raise"], [saved_exc])
+            self.builder.call(
+                self.runtime["pcc_gc_store_root"],
+                [root_ptr, ir.Constant(_CSTR, None)],
+            )
+            self.builder.branch(outer_err_block)
+
+        self.builder.position_at_end(cleanup_error_bb)
+        cleanup_exc = self.builder.call(
+            self.runtime["py_current_exception"],
+            [],
+            name=self._fresh("finally.cleanup.exception"),
+        )
+        saved_exc = self.builder.call(
+            self.runtime["pcc_gc_load_ptr"],
+            [ir.Constant(_CSTR, None), root_ptr],
+            name=self._fresh("finally.original.exception"),
+        )
+        cleanup_nonnull = self.builder.icmp_unsigned(
+            "!=",
+            cleanup_exc,
+            ir.Constant(_CSTR, None),
+            name=self._fresh("finally.cleanup.nonnull"),
+        )
+        saved_nonnull = self.builder.icmp_unsigned(
+            "!=",
+            saved_exc,
+            ir.Constant(_CSTR, None),
+            name=self._fresh("finally.original.nonnull"),
+        )
+        distinct = self.builder.icmp_unsigned(
+            "!=",
+            cleanup_exc,
+            saved_exc,
+            name=self._fresh("finally.exception.distinct"),
+        )
+        set_context = self.builder.and_(
+            self.builder.and_(cleanup_nonnull, saved_nonnull),
+            distinct,
+            name=self._fresh("finally.exception.set_context"),
+        )
+        context_bb = self.current_function.append_basic_block(
+            name=self._fresh("finally.exception.context")
+        )
+        release_bb = self.current_function.append_basic_block(
+            name=self._fresh("finally.exception.release")
+        )
+        self.builder.cbranch(set_context, context_bb, release_bb)
+        self.builder.position_at_end(context_bb)
+        self.builder.call(
+            self.runtime["py_exc_set_context"],
+            [cleanup_exc, saved_exc],
+        )
+        self.builder.branch(release_bb)
+        self.builder.position_at_end(release_bb)
+        self.builder.call(
+            self.runtime["pcc_gc_store_root"],
+            [root_ptr, ir.Constant(_CSTR, None)],
+        )
+        self.builder.branch(outer_err_block)
+        return True
 
     def _maybe_emit_optional_missing_import_try(self, stmt: Try) -> bool:
         if stmt.else_body or stmt.finally_body:
@@ -115,7 +232,6 @@ class ExceptionLoweringMixin:
                 "tempfile",
                 "shutil",
                 "shlex",
-                "sysconfig",
                 "math",
                 "json",
                 "re",
@@ -126,7 +242,6 @@ class ExceptionLoweringMixin:
                 "threading",
                 "pcc.virtual_thread",
                 "pcc",
-                "importlib",
                 "inspect",
                 "contextlib",
                 "warnings",
@@ -333,10 +448,16 @@ class ExceptionLoweringMixin:
         )
 
         if not stmt.handlers:
-            if stmt.finally_body:
-                self._emit_stmts(stmt.finally_body)
+            outer = prev_err_block or self._ensure_fn_err_exit()
+            emitted_rooted_finally = self._emit_generator_exceptional_finally(
+                stmt,
+                current_exc,
+                outer,
+            )
+            if not emitted_rooted_finally:
+                if stmt.finally_body:
+                    self._emit_stmts(stmt.finally_body)
             if not self._builder_block_is_terminated():
-                outer = prev_err_block or self._ensure_fn_err_exit()
                 self.builder.branch(outer)
             self.builder.position_at_end(done_bb)
             try_log("dispatch end no handlers")
@@ -448,10 +569,18 @@ class ExceptionLoweringMixin:
                 # guarantees finally always executes). Mirrors the no-handlers
                 # path above; without this the finally was silently skipped on
                 # the unmatched-exception path.
-                if stmt.finally_body:
-                    self._emit_stmts(stmt.finally_body)
+                outer = prev_err_block or self._ensure_fn_err_exit()
+                emitted_rooted_finally = (
+                    self._emit_generator_exceptional_finally(
+                        stmt,
+                        current_exc,
+                        outer,
+                    )
+                )
+                if not emitted_rooted_finally:
+                    if stmt.finally_body:
+                        self._emit_stmts(stmt.finally_body)
                 if not self._builder_block_is_terminated():
-                    outer = prev_err_block or self._ensure_fn_err_exit()
                     self.builder.branch(outer)
 
             self.builder.position_at_end(body_bb)
@@ -873,12 +1002,37 @@ class ExceptionLoweringMixin:
         func_ptr = self._pooled_cstr_ptr(func_name, ".tb.func")
         file_name = span.file or "<unknown>"
         file_ptr = self._pooled_cstr_ptr(file_name, ".tb.file")
-        self.builder.call4_i32(
-            self.runtime["py_exc_append_frame"],
-            exc,
-            func_ptr,
-            file_ptr,
-            int(span.line),
+        source_line = ""
+        if file_name and not file_name.startswith("<") and int(span.line) > 0:
+            # Read and split each source file once.  Every traceback frame
+            # needs one line of it, but re-reading and re-splitting the whole
+            # module per frame allocated a fresh list of every source line
+            # thousands of times per compile; `splitlines` alone was ~2% of a
+            # self-hosted pcc1 run.  An unreadable file caches as empty, which
+            # leaves `source_line` empty exactly as the OSError path did.
+            source_lines = self._source_file_lines_cache.get(file_name)
+            if source_lines is None:
+                try:
+                    with open(
+                        file_name, "r", encoding="utf-8"
+                    ) as source_stream:
+                        source_lines = source_stream.read().splitlines()
+                except OSError:
+                    source_lines = []
+                self._source_file_lines_cache[file_name] = source_lines
+            source_index = int(span.line) - 1
+            if source_index >= 0 and source_index < len(source_lines):
+                source_line = source_lines[source_index].strip()
+        source_ptr = self._pooled_cstr_ptr(source_line, ".tb.source")
+        self.builder.call(
+            self.runtime["py_exc_append_frame_source"],
+            [
+                exc,
+                func_ptr,
+                file_ptr,
+                source_ptr,
+                ir.Constant(_I32, int(span.line)),
+            ],
         )
 
     def _emit_post_call_err_check(
@@ -886,6 +1040,12 @@ class ExceptionLoweringMixin:
         span: Optional[SourceSpan] = None,
         *,
         release_on_error: tuple[ir.Value, ...] = (),
+        cpy_release_on_error: tuple[ir.Value, ...] = (),
+        rooted_release_on_error: tuple[
+            tuple[ir.Value, ir.Value], ...
+        ] = (),
+        pinned_release_on_error: tuple[tuple[ir.Value, bool], ...] = (),
+        lifo_owned_root_slots_on_error: tuple[ir.Value, ...] = (),
     ) -> None:
         """After any call that could raise a Python exception, emit
         `if (py_err_occurred()) goto err_target` where err_target is
@@ -930,12 +1090,46 @@ class ExceptionLoweringMixin:
         error_dest = err_target
         if span is not None:
             error_dest = self._ensure_post_call_frame_block(err_target, span)
-        if release_on_error:
+        if (
+            release_on_error
+            or cpy_release_on_error
+            or rooted_release_on_error
+            or pinned_release_on_error
+            or lifo_owned_root_slots_on_error
+        ):
             cleanup = parent_fn.append_basic_block(
                 name=self._fresh("call.err.cleanup")
             )
             self.builder.cbranch(cmp, cleanup, cont)
             self.builder.position_at_end(cleanup)
+            for value in cpy_release_on_error:
+                self.builder.call(self.runtime["py_cpy_decref"], [value])
+            for value, root_slot in rooted_release_on_error:
+                self._leave_container_temp_root(root_slot)
+                self.builder.call(self.runtime["pcc_gc_release"], [value])
+            for root_slot in lifo_owned_root_slots_on_error:
+                root_ptr = self._as_gc_ptr(
+                    root_slot,
+                    name=self._fresh("call.err.root.ptr"),
+                )
+                current = self.builder.call(
+                    self.runtime["pcc_gc_load_ptr"],
+                    [ir.Constant(_CSTR, None), root_ptr],
+                    name=self._fresh("call.err.root.current"),
+                )
+                self.builder.call(
+                    self.runtime["pcc_gc_store_root"],
+                    [root_ptr, ir.Constant(_CSTR, None)],
+                )
+                self._emit_gc_frame_leave_lifo_for_slot(root_slot)
+                # The slot owned one temporary retain in addition to the
+                # callee's returned owned reference. Clearing the slot drops
+                # the former; this drops the latter on the exceptional edge.
+                self.builder.call(self.runtime["pcc_gc_release"], [current])
+            for value, release_owned in pinned_release_on_error:
+                self._gc_unpin(value)
+                if release_owned:
+                    self.builder.call(self.runtime["pcc_gc_release"], [value])
             for value in release_on_error:
                 self.builder.call(self.runtime["pcc_gc_release"], [value])
             self.builder.branch(error_dest)
@@ -949,25 +1143,36 @@ class ExceptionLoweringMixin:
         span: SourceSpan,
     ) -> ir.Block:
         parent_fn = self.current_function
-        func_name = "<module>"
-        if self.current_func_def is not None:
-            func_name = self.current_func_def.name
-        file_name = span.file or "<unknown>"
-        key = (
-            parent_fn.name,
-            err_target.name,
-            func_name,
-            file_name,
-            int(span.line),
-        )
-        existing = self._post_call_frame_blocks.get(key)
+        line = int(span.line)
+        # Nested cheap-key dicts, not one five-element tuple key.  This runs
+        # after every call that may raise and dominated a self-hosted pcc1
+        # compile (31% inclusive): the tuple key allocated a GC object per
+        # lookup (registration, object-graph lock, managed-pointer probe) and
+        # boxed `span.line`, then hashed five elements through per-element
+        # dispatch.  The outer key is `id(parent_fn)` rather than
+        # `parent_fn.name` because the mangled LLVM name is ~80 characters and
+        # nothing caches a string's hash here, so keying on it re-hashes those
+        # bytes on every call — measurably worse than the tuple it replaced.
+        # An address below 2**62 is a tagged int, so this allocates nothing.
+        # `func_name` and `file_name` drop out of the key: one LLVM function is
+        # emitted from one Python def in one source file, so `parent_fn`
+        # already determines both.
+        by_target = self._post_call_frame_blocks.get(id(parent_fn))
+        if by_target is None:
+            by_target = {}
+            self._post_call_frame_blocks[id(parent_fn)] = by_target
+        by_line = by_target.get(err_target.name)
+        if by_line is None:
+            by_line = {}
+            by_target[err_target.name] = by_line
+        existing = by_line.get(line)
         if existing is not None:
             return existing
 
         frame_bb = parent_fn.append_basic_block(
             name=self._fresh("err.frame"),
         )
-        self._post_call_frame_blocks[key] = frame_bb
+        by_line[line] = frame_bb
         save_block = self.builder._block
         self.builder.position_at_end(frame_bb)
         exc = self.builder.call(
@@ -995,6 +1200,57 @@ class ExceptionLoweringMixin:
         # Position a small builder at err_bb to emit the sentinel return.
         save_block = self.builder._block
         self.builder.position_at_end(err_bb)
+        # Function-level exact-int representation planning registers every
+        # such local and its owned flag before body emission.  Release the
+        # currently-owned object on the shared error epilogue before the root
+        # frame is left; otherwise an exception in a later exact operation
+        # leaks the initializer/previous branch value.  Keep this finite and
+        # representation-specific rather than changing the historical cleanup
+        # policy for unrelated locals in this slice.
+        exact_flags = getattr(self, "_exact_int_env_flags", {})
+        for_target_names = getattr(self, "_for_target_owned_names", set())
+        for local_name in sorted(getattr(self, "_owned_local_names", set())):
+            if (
+                not exact_flags.get(local_name, False)
+                and local_name not in for_target_names
+            ):
+                continue
+            slot = self.env.get(local_name)
+            if slot is None:
+                continue
+            local_alloca, local_ir_ty, _local_decl_ty = slot
+            if not isinstance(local_ir_ty, ir.PointerType):
+                continue
+            owned_flag = self._ensure_owned_local_flag(
+                local_name,
+                local_alloca,
+            )
+            is_owned = self.builder.load(
+                owned_flag,
+                name=self._fresh(local_name + ".err.owned"),
+            )
+            current = self.builder.call(
+                self.runtime["pcc_gc_load_ptr"],
+                [
+                    ir.Constant(_CSTR, None),
+                    self._as_gc_ptr(
+                        local_alloca,
+                        name=self._fresh(local_name + ".err.gc.slot"),
+                    ),
+                ],
+                name=self._fresh(local_name + ".err.current"),
+            )
+            release_value = self.builder.select(
+                is_owned,
+                current,
+                ir.Constant(_CSTR, None),
+                name=self._fresh(local_name + ".err.release.value"),
+            )
+            self._gc_release(
+                release_value,
+                self._release_context_label("local:" + local_name),
+            )
+            self.builder.store(ir.Constant(_I1, 0), owned_flag)
         ret_ty = fn.function_type.return_type
         if isinstance(ret_ty, ir.VoidType):
             self.builder.ret_void()

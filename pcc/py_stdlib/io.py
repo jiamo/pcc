@@ -26,7 +26,7 @@ class StringIO:
 
     def read(self, n: int = -1) -> str:
         v = self.getvalue()
-        if n < 0:
+        if n is None or n < 0:
             r = v[self._pos:]
             self._pos = len(v)
             return r
@@ -34,10 +34,13 @@ class StringIO:
         self._pos += len(r)
         return r
 
-    def readline(self) -> str:
+    def readline(self, size: int = -1) -> str:
         v = self.getvalue()
         i = self._pos
-        while i < len(v):
+        stop = len(v)
+        if size is not None and size >= 0 and self._pos + size < stop:
+            stop = self._pos + size
+        while i < stop:
             i += 1
             if v[i - 1] == "\n":
                 break
@@ -81,7 +84,7 @@ class BytesIO:
         return bytes(self._buf)
 
     def read(self, n: int = -1) -> bytes:
-        if n < 0:
+        if n is None or n < 0:
             r = bytes(self._buf[self._pos:])
             self._pos = len(self._buf)
             return r
@@ -101,9 +104,12 @@ class BytesIO:
         # bytes-arg constructor.
         self._buf = bytearray(b"")
 
-    def readline(self) -> bytes:
+    def readline(self, size: int = -1) -> bytes:
         i = self._pos
-        while i < len(self._buf):
+        stop = len(self._buf)
+        if size is not None and size >= 0 and self._pos + size < stop:
+            stop = self._pos + size
+        while i < stop:
             i += 1
             if self._buf[i - 1] == 10:
                 break

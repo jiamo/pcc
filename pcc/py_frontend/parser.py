@@ -619,12 +619,41 @@ class _Lifter:
             for kw in node.keywords
             if kw.arg is None
         )
+        # ``ast.Call`` stores positional/starred operands separately from
+        # keyword/``**`` operands even when the source interleaves them (for
+        # example ``f(named=v, *items)``).  Preserve the original source stream
+        # explicitly so CPython-fallback lowering never reorders side effects.
+        # ``kwargs + splats`` below groups the two keyword forms, so retain the
+        # corresponding grouped index while sorting by each syntax node's
+        # location.
+        ordered_operands: list[tuple[int, int, str, int]] = []
+        for index, arg in enumerate(node.args):
+            ordered_operands.append(
+                (arg.lineno, arg.col_offset, "arg", index)
+            )
+        explicit_index = 0
+        splat_index = len(kwargs)
+        for kw in node.keywords:
+            if kw.arg is None:
+                grouped_index = splat_index
+                splat_index += 1
+            else:
+                grouped_index = explicit_index
+                explicit_index += 1
+            ordered_operands.append(
+                (kw.value.lineno, kw.value.col_offset, "kw", grouped_index)
+            )
+        ordered_operands.sort(key=lambda item: (item[0], item[1]))
         return pa.Call(
             span=self._span(node),
             ty=_DYN,
             func=func,
             args=args,
             kwargs=kwargs + splats,
+            operand_order=tuple(
+                (kind, index)
+                for _line, _column, kind, index in ordered_operands
+            ),
         )
 
     def _expr_Attribute(self, node: _py_ast.Attribute) -> pa.Attr:
@@ -1061,6 +1090,17 @@ class _Lifter:
             else:
                 elems = (self._lift_annotation(slice_node),)
             return pa.TupleType(name="tuple", elems=elems)
+        if normalized == "i64_buffer":
+            if not (
+                isinstance(slice_node, _py_ast.Constant)
+                and isinstance(slice_node.value, int)
+                and not isinstance(slice_node.value, bool)
+            ):
+                return pa.DynType(name="dyn")
+            length = int(slice_node.value)
+            if length < 1 or length > 1_048_576:
+                return pa.DynType(name="dyn")
+            return pa.BytesType(name="pcc.i64_buffer[" + str(length) + "]")
         if normalized == "callable":
             if (
                 isinstance(slice_node, _py_ast.Tuple)

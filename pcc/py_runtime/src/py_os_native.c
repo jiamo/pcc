@@ -18,6 +18,7 @@
 #include <sys/utsname.h>
 #include <unistd.h>
 
+#ifndef PCC_USE_FREESTANDING_PLATFORM_SYSTEM
 /* `os.uname()` — five strings in CPython's sequence order. The compiler also
  * recognizes direct `.sysname` / `.machine` access on the result. Keeping the
  * syscall in this non-replaced C-kernel module gives the cc and pcc-Python
@@ -60,6 +61,7 @@ PyObject *py_os_cpu_count(void) {
     if (n <= 0) return py_int_from_i64(0);
     return py_int_from_i64((int64_t)n);
 }
+#endif
 
 static PyObject *py_os_native_coerce_path_str(
     PyObject *o, PyObject **owned
@@ -228,7 +230,7 @@ PyObject *py_os_path_expandvars(PyObject *path) {
                     if (name == NULL) { oom = 1; break; }
                     memcpy(name, &d[i + 2], (size_t)name_len);
                     name[name_len] = '\0';
-                    const char *val = getenv(name);
+                    const char *val = pcc_runtime_getenv(name);
                     free(name);
                     if (val != NULL) {
                         seg = val;
@@ -257,7 +259,7 @@ PyObject *py_os_path_expandvars(PyObject *path) {
                 if (name == NULL) { oom = 1; break; }
                 memcpy(name, &d[i + 1], (size_t)name_len);
                 name[name_len] = '\0';
-                const char *val = getenv(name);
+                const char *val = pcc_runtime_getenv(name);
                 free(name);
                 if (val != NULL) {
                     seg = val;

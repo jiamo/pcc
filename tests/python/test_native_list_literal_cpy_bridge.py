@@ -91,12 +91,15 @@ def test_splat_cpy_iterable_still_falls_back():
 
         def f() -> list:
             cpy_iter = os.environ.keys()
-            return [*cpy_iter, "tail"]
+            return [*cpy_iter]
         """
     )
     ir = _compile_to_ll(program, "list_splat_cpy", mode="off")
     body = _function_body(ir, "f")
     assert body is not None
+    # A terminal splat can safely use the CPython-list path. A CPython splat
+    # followed by another operand is rejected by the focused ownership suite
+    # until iteration can happen at the splat's exact source position.
     # Either cpython_list_ops fires, or codegen retains py_cpy_call_list.
     # The bridge MUST NOT have been used on the splat iterable.
     assert "@py_cpy_to_pcc_obj" not in body or "cpy.list" in body, body

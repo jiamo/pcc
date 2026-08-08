@@ -1,5 +1,10 @@
 """pcc-Python replacement for py_runtime/src/py_int_bigint_pow.c."""
 from pcc.extern import extern, c_abi_export, c_int64, c_ptr
+from pcc.py_runtime.py.py_abi_constants import (
+    PYINTOBJECT_DIGITS_OFFSET,
+    PYINTOBJECT_NDIGITS_OFFSET,
+    PYINTOBJECT_SIGN_OFFSET,
+)
 from pcc.unsafe import free, load_i32, null, ptr_is_null, store_i32
 
 
@@ -16,27 +21,27 @@ def _load_u32(obj, offset: int) -> int:
 
 
 def _bigint_copy(a):
-    ndigits: int = load_i32(a, 20)
+    ndigits: int = load_i32(a, PYINTOBJECT_NDIGITS_OFFSET)
     r = py_bigint_alloc(ndigits)
     if ptr_is_null(r):
         return r
-    store_i32(r, 16, load_i32(a, 16))
+    store_i32(r, PYINTOBJECT_SIGN_OFFSET, load_i32(a, PYINTOBJECT_SIGN_OFFSET))
     i: int = 0
     while i < ndigits:
-        store_i32(r, 24 + i * 4, load_i32(a, 24 + i * 4))
+        store_i32(r, PYINTOBJECT_DIGITS_OFFSET + i * 4, load_i32(a, PYINTOBJECT_DIGITS_OFFSET + i * 4))
         i = i + 1
     return r
 
 
 @c_abi_export("py_bigint_pow")
 def py_bigint_pow(base, exp):
-    if load_i32(exp, 16) < 0:
+    if load_i32(exp, PYINTOBJECT_SIGN_OFFSET) < 0:
         return null()
-    if load_i32(exp, 16) == 0:
+    if load_i32(exp, PYINTOBJECT_SIGN_OFFSET) == 0:
         return py_bigint_from_i64(1)
 
-    top_digit: int = load_i32(exp, 20) - 1
-    top: int = _load_u32(exp, 24 + top_digit * 4)
+    top_digit: int = load_i32(exp, PYINTOBJECT_NDIGITS_OFFSET) - 1
+    top: int = _load_u32(exp, PYINTOBJECT_DIGITS_OFFSET + top_digit * 4)
     top_bit: int = 31
     while top_bit >= 0 and (top & (1 << top_bit)) == 0:
         top_bit = top_bit - 1
@@ -48,7 +53,7 @@ def py_bigint_pow(base, exp):
     di: int = top_digit
     bit: int = top_bit - 1
     while di >= 0:
-        digit: int = _load_u32(exp, 24 + di * 4)
+        digit: int = _load_u32(exp, PYINTOBJECT_DIGITS_OFFSET + di * 4)
         while bit >= 0:
             sq = py_bigint_mul(result, result)
             free(result)

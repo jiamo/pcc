@@ -93,6 +93,18 @@ static int pcc_run_compiled_module_init(const char *name) {
     return 0;
 }
 
+static int pcc_compiled_module_has_init(const char *name) {
+    if (name == NULL || name[0] == '\0') return 0;
+    for (
+        PccCompiledModuleInitNode *n = pcc_compiled_module_inits;
+        n != NULL;
+        n = n->next
+    ) {
+        if (strcmp(n->name, name) == 0) return 1;
+    }
+    return 0;
+}
+
 /* Importing a.b.c initializes a, then a.b, before a.b.c itself.  In-progress
  * parents return early, preserving partial-module behavior through cycles. */
 int py_compiled_module_ensure_parent_packages(const char *module_name) {
@@ -121,6 +133,7 @@ static int pcc_run_compiled_module_init_with_parents(const char *name) {
 }
 
 PyObject *py_compiled_module_import_by_name(const char *name) {
+    if (name == NULL || name[0] == '\0') return NULL;
     for (
         PccCompiledModuleNode *n = pcc_compiled_modules;
         n != NULL;
@@ -131,6 +144,12 @@ PyObject *py_compiled_module_import_by_name(const char *name) {
             return n->module;
         }
     }
+
+    /* The module attributes side table is intentionally create-on-write.
+     * Do not let that implementation detail turn an unknown import into a
+     * successful empty module: only linked modules with a registered guarded
+     * initializer belong to this registry. */
+    if (!pcc_compiled_module_has_init(name)) return NULL;
 
     if (pcc_run_compiled_module_init_with_parents(name) != 0) return NULL;
 

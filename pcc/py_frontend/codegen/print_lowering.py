@@ -46,22 +46,46 @@ class PrintLoweringMixin:
             out.append((k, vexpr))
         return out
 
-    def _emit_print_many_arg(self, tup, idx, arg) -> None:
+    def _load_print_many_tuple(self, tup, frame_slot):
+        if frame_slot is None:
+            return tup
+        return self.builder.call(
+            self.runtime["pcc_gc_load_ptr"],
+            [
+                ir.Constant(_CSTR, None),
+                self._as_gc_ptr(
+                    frame_slot,
+                    name=self._fresh("pr.args.frame.ptr"),
+                ),
+            ],
+            name=self._fresh("pr.args.frame.value"),
+        )
+
+    def _emit_print_many_arg(self, tup, idx, arg, frame_slot=None) -> None:
         if isinstance(arg.ty, IntType):
             exact_obj = self._maybe_emit_exact_int_object(arg)
             if exact_obj is not None:
+                current_tup = self._load_print_many_tuple(tup, frame_slot)
                 self.builder.call(
-                    self.runtime["py_tuple_set_item"], [tup, idx, exact_obj]
+                    self.runtime["py_tuple_set_item"],
+                    [current_tup, idx, exact_obj],
                 )
                 return
         v = self._emit_expr(arg)
         if v in self._cpy_values:
+            v_owned = self._cpy_value_is_owned(v)
             pcc_str = self.builder.call(
                 self.runtime["py_cpy_to_pcc_str"],
                 [v],
                 name=self._fresh("cpy.str"),
             )
-            self.builder.call(self.runtime["py_cpy_decref"], [v])
+            self._guard_cpy_value_not_null(
+                pcc_str,
+                (v,) if v_owned else (),
+            )
+            if v_owned:
+                self.builder.call(self.runtime["py_cpy_decref"], [v])
+                self._forget_owned_cpy_value(v)
             v_obj = pcc_str
         else:
             boxed_valueclass = self._emit_valueclass_payload_to_object(v, arg.ty)
@@ -71,7 +95,11 @@ class PrintLoweringMixin:
                 v_obj = marshal.marshal_to_object(
                     self.builder, self.module, self.runtime, v, arg.ty
                 )
-        self.builder.call(self.runtime["py_tuple_set_item"], [tup, idx, v_obj])
+        current_tup = self._load_print_many_tuple(tup, frame_slot)
+        self.builder.call(
+            self.runtime["py_tuple_set_item"],
+            [current_tup, idx, v_obj],
+        )
 
     def _emit_print_call(self, call: Call) -> None:
         # print(*items) / print(a, *rest): a positional *splat. The per-arg
@@ -92,17 +120,24 @@ class PrintLoweringMixin:
             if self._try_emit_native_file_stream_print(call):
                 return
             fn_val = self._load_cpython_builtin("print")
-            self._finish_cpy_call_kw(
+            result = self._finish_cpy_call_kw(
                 fn_val,
                 "print",
                 call.args,
                 call.kwargs,
+                call.operand_order,
             )
+            self._guard_cpy_value_not_null(result)
+            self.builder.call(self.runtime["py_cpy_decref"], [result])
+            self._forget_owned_cpy_value(result)
             return
 
         if len(call.args) == 0:
-            nl_gv = self._cstr_global("\n", ".fmt_nl")
-            self.builder.call(self._printf, [self._ptr_to_cstr(nl_gv)])
+            null_obj = ir.Constant(_CSTR, None)
+            self.builder.call(
+                self.runtime["py_print_many"],
+                [null_obj, null_obj, null_obj],
+            )
             return
 
         if len(call.args) > 1:
@@ -121,32 +156,39 @@ class PrintLoweringMixin:
         value = self._emit_expr(arg)
 
         if value in self._cpy_values:
+            value_owned = self._cpy_value_is_owned(value)
             pcc_str = self.builder.call(
                 self.runtime["py_cpy_to_pcc_str"],
                 [value],
                 name=self._fresh("cpy.str"),
             )
+            self._guard_cpy_value_not_null(
+                pcc_str,
+                (value,) if value_owned else (),
+            )
             self.builder.call(self.runtime["py_print"], [pcc_str])
-            self.builder.call(self.runtime["py_cpy_decref"], [value])
+            if value_owned:
+                self.builder.call(self.runtime["py_cpy_decref"], [value])
+                self._forget_owned_cpy_value(value)
             return
 
         if isinstance(arg_ty, IntType):
             if isinstance(value.type, ir.PointerType):
                 self.builder.call(self.runtime["py_print"], [value])
                 return
-            fmt = self._ptr_to_cstr(self._get_fmt_int())
-            self.builder.call(self._printf, [fmt, value])
+            obj = marshal.marshal_to_object(
+                self.builder, self.module, self.runtime, value, arg_ty
+            )
+            self.builder.call(self.runtime["py_print"], [obj])
             return
         if isinstance(arg_ty, FloatType):
             self._emit_print_float_value(value)
             return
         if isinstance(arg_ty, BoolType):
-            true_fmt = self._ptr_to_cstr(self._get_fmt_bool_true())
-            false_fmt = self._ptr_to_cstr(self._get_fmt_bool_false())
-            chosen = self.builder.select(
-                value, true_fmt, false_fmt, name=self._fresh("bool_fmt")
+            obj = marshal.marshal_to_object(
+                self.builder, self.module, self.runtime, value, arg_ty
             )
-            self.builder.call(self._printf, [chosen])
+            self.builder.call(self.runtime["py_print"], [obj])
             return
 
         boxed_valueclass = self._emit_valueclass_payload_to_object(value, arg_ty)
@@ -177,30 +219,118 @@ class PrintLoweringMixin:
         tup = self.builder.call(
             self.runtime["py_tuple_new"], [n_val], name=self._fresh("pr.args")
         )
-        tup_root = self._alloca_in_entry(_CSTR, name=self._fresh("pr.args.root"))
-        self.builder.store(tup, tup_root)
-        self._emit_current_gc_frame_enter_lifo(self._gc_one_slot_frame_map(), tup_root)
-        for i, arg in enumerate(call.args):
-            idx = ir.Constant(_I64, i)
-            self._emit_print_many_arg(tup, idx, arg)
-
-        sep_obj: Optional[ir.Value] = None
-        end_obj: Optional[ir.Value] = None
-        for k, vexpr in self._print_kwargs_without_flush(call.kwargs):
-            v = self._emit_expr(vexpr)
-            boxed = marshal.marshal_to_object(
-                self.builder, self.module, self.runtime, v, vexpr.ty
+        self._emit_post_call_err_check(getattr(call, "span", None))
+        tup_root = None
+        tup_frame_slot = None
+        tup_reload_slot = None
+        if len(getattr(self, "_generator_ctx_stack", ())) > 0:
+            ctx = self._generator_ctx_stack[-1]
+            hidden = self._generator_print_args_name(call)
+            frame_entry = ctx["frame_slots"].get(hidden)
+            if frame_entry is None:
+                raise RuntimeError("generator print missing persisted args slot")
+            tup_frame_slot = frame_entry[1]
+            self.builder.call(
+                self.runtime["pcc_gc_store_root"],
+                [
+                    self._as_gc_ptr(
+                        tup_frame_slot,
+                        name=self._fresh("pr.args.frame.root"),
+                    ),
+                    tup,
+                ],
             )
-            if k == "sep":
-                sep_obj = boxed
-            elif k == "end":
-                end_obj = boxed
+            # The traced frame slot now owns the tuple.  Consume py_tuple_new's
+            # direct owner so a park/resume transfers exactly one local owner.
+            self._gc_release(tup)
+            tup_reload_slot = tup_frame_slot
+        else:
+            # The tuple remains owned by this lowering until py_print_many
+            # returns.  Use the ordinary temporary-container protocol so it
+            # is pinned/rooted across later operand calls and so both pcc and
+            # CPython exceptional edges can run the exact same cleanup.
+            tup_root = self._enter_container_temp_root(
+                tup,
+                "pr.args",
+            )
+            tup_reload_slot = tup_root
+
+        previous_cpy_cleanup = None
+        previous_pcc_target = None
+        if tup_frame_slot is None:
+            previous_cpy_cleanup = getattr(
+                self,
+                "_cpy_operand_cleanup_block",
+                None,
+            )
+            previous_pcc_target = self._current_try_err_block()
+            pcc_target = previous_pcc_target
+            if pcc_target is None:
+                pcc_target = self._ensure_fn_err_exit()
+            rooted_tuple = ((tup, tup_root),)
+            pcc_cleanup = self._make_cpy_operand_cleanup_block(
+                (),
+                rooted_tuple,
+                pcc_target,
+                "print.args.pcc.cleanup",
+            )
+            cpy_target = previous_cpy_cleanup
+            if cpy_target is None:
+                cpy_target = self._ensure_fn_err_exit()
+            if cpy_target is pcc_target:
+                cpy_cleanup = pcc_cleanup
+            else:
+                cpy_cleanup = self._make_cpy_operand_cleanup_block(
+                    (),
+                    rooted_tuple,
+                    cpy_target,
+                    "print.args.cpy.cleanup",
+                )
+            self._try_err_block = pcc_cleanup
+            self._cpy_operand_cleanup_block = cpy_cleanup
+
+        try:
+            for i, arg in enumerate(call.args):
+                idx = ir.Constant(_I64, i)
+                self._emit_print_many_arg(tup, idx, arg, tup_reload_slot)
+
+            sep_obj: Optional[ir.Value] = None
+            end_obj: Optional[ir.Value] = None
+            for k, vexpr in self._print_kwargs_without_flush(call.kwargs):
+                v = self._emit_expr(vexpr)
+                boxed = marshal.marshal_to_object(
+                    self.builder, self.module, self.runtime, v, vexpr.ty
+                )
+                if k == "sep":
+                    sep_obj = boxed
+                elif k == "end":
+                    end_obj = boxed
+        finally:
+            if tup_frame_slot is None:
+                self._try_err_block = previous_pcc_target
+                self._cpy_operand_cleanup_block = previous_cpy_cleanup
+
         if sep_obj is None:
             sep_obj = self._emit_literal_str(" ")
         if end_obj is None:
             end_obj = self._emit_literal_str("\n")
-        self.builder.call(self.runtime["py_print_many"], [tup, sep_obj, end_obj])
-        self._emit_gc_frame_leave_lifo_for_slot(tup_root)
+        current_tup = self._load_print_many_tuple(tup, tup_reload_slot)
+        self.builder.call(
+            self.runtime["py_print_many"],
+            [current_tup, sep_obj, end_obj],
+        )
+        if tup_frame_slot is None:
+            self._emit_post_call_err_check(
+                getattr(call, "span", None),
+                rooted_release_on_error=((tup, tup_root),),
+            )
+            self._leave_container_temp_root(tup_root)
+            self._gc_release(tup)
+        else:
+            self.builder.call(
+                self.runtime["pcc_gc_store_root"],
+                [tup_frame_slot, self._emit_none_literal()],
+            )
 
     def _emit_print_many_splat(self, call: Call) -> None:
         """``print(*items)`` / ``print(a, *rest, b)``: build the positional
@@ -210,29 +340,85 @@ class PrintLoweringMixin:
         that tuple to ``py_print_many`` like the fixed-arity path. Only sep/end
         kwargs and a bool-literal flush= reach here (gated by the caller); the
         flush= no-op is dropped before the sep/end loop."""
-        lst = self._emit_pcc_args_list(call.args, "print.splat")
+        list_roots = []
+        lst = self._emit_pcc_args_list(
+            call.args,
+            "print.splat",
+            cpy_live_owned=[],
+            cpy_temp_root_out=list_roots,
+        )
+        lst_root = list_roots[0]
         tup = self.builder.call(
             self.runtime["py_call_merge_posargs"],
             [ir.Constant(_CSTR, None), lst],
             name=self._fresh("pr.splat.args"),
         )
-        tup_root = self._alloca_in_entry(_CSTR, name=self._fresh("pr.splat.root"))
-        self.builder.store(tup, tup_root)
-        self._emit_current_gc_frame_enter_lifo(self._gc_one_slot_frame_map(), tup_root)
-        sep_obj: Optional[ir.Value] = None
-        end_obj: Optional[ir.Value] = None
-        for k, vexpr in self._print_kwargs_without_flush(call.kwargs):
-            v = self._emit_expr(vexpr)
-            boxed = marshal.marshal_to_object(
-                self.builder, self.module, self.runtime, v, vexpr.ty
+        self._emit_post_call_err_check(
+            getattr(call, "span", None),
+            rooted_release_on_error=((lst, lst_root),),
+        )
+        self._leave_container_temp_root(lst_root)
+        self._gc_release(lst)
+
+        tup_root = self._enter_container_temp_root(tup, "pr.splat")
+        previous_cpy_cleanup = getattr(
+            self,
+            "_cpy_operand_cleanup_block",
+            None,
+        )
+        previous_pcc_target = self._current_try_err_block()
+        pcc_target = previous_pcc_target
+        if pcc_target is None:
+            pcc_target = self._ensure_fn_err_exit()
+        rooted_tuple = ((tup, tup_root),)
+        pcc_cleanup = self._make_cpy_operand_cleanup_block(
+            (),
+            rooted_tuple,
+            pcc_target,
+            "print.splat.pcc.cleanup",
+        )
+        cpy_target = previous_cpy_cleanup
+        if cpy_target is None:
+            cpy_target = self._ensure_fn_err_exit()
+        if cpy_target is pcc_target:
+            cpy_cleanup = pcc_cleanup
+        else:
+            cpy_cleanup = self._make_cpy_operand_cleanup_block(
+                (),
+                rooted_tuple,
+                cpy_target,
+                "print.splat.cpy.cleanup",
             )
-            if k == "sep":
-                sep_obj = boxed
-            elif k == "end":
-                end_obj = boxed
+        self._try_err_block = pcc_cleanup
+        self._cpy_operand_cleanup_block = cpy_cleanup
+        try:
+            sep_obj: Optional[ir.Value] = None
+            end_obj: Optional[ir.Value] = None
+            for k, vexpr in self._print_kwargs_without_flush(call.kwargs):
+                v = self._emit_expr(vexpr)
+                boxed = marshal.marshal_to_object(
+                    self.builder, self.module, self.runtime, v, vexpr.ty
+                )
+                if k == "sep":
+                    sep_obj = boxed
+                elif k == "end":
+                    end_obj = boxed
+        finally:
+            self._try_err_block = previous_pcc_target
+            self._cpy_operand_cleanup_block = previous_cpy_cleanup
+
         if sep_obj is None:
             sep_obj = self._emit_literal_str(" ")
         if end_obj is None:
             end_obj = self._emit_literal_str("\n")
-        self.builder.call(self.runtime["py_print_many"], [tup, sep_obj, end_obj])
-        self._emit_gc_frame_leave_lifo_for_slot(tup_root)
+        current_tup = self._load_print_many_tuple(tup, tup_root)
+        self.builder.call(
+            self.runtime["py_print_many"],
+            [current_tup, sep_obj, end_obj],
+        )
+        self._emit_post_call_err_check(
+            getattr(call, "span", None),
+            rooted_release_on_error=((tup, tup_root),),
+        )
+        self._leave_container_temp_root(tup_root)
+        self._gc_release(tup)

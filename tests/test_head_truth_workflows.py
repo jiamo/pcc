@@ -65,6 +65,16 @@ def test_heavy_registry_prebuilds_runtime_archive_before_consumers() -> None:
         spec for spec in specs if spec.gate_id == "self-five-gc-bootstrap"
     )
     assert self_five_gc.timeout_seconds == 1800
+    assert self_five_gc.command[:6] == (
+        "uv",
+        "run",
+        "pytest",
+        "-q",
+        "-m",
+        "integration",
+    )
+    assert "-rA" in self_five_gc.command
+    assert "-n0" not in self_five_gc.command
 
     numpy_core = next(spec for spec in specs if spec.gate_id == "numpy-core-head")
     assert numpy_core.suite == "heavy"

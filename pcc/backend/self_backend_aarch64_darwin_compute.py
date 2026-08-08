@@ -21,6 +21,7 @@ from .self_backend_aarch64_darwin_ops import (
     sign_extend_int_reg,
 )
 from .self_backend_aarch64_darwin_regs import emit_add_offset, emit_const_to_reg
+from .self_backend_aarch64_darwin_regalloc import commit_allocated_scalar_result
 from .self_backend_aarch64_darwin_slots import (
     copy_address_to_address,
     copy_address_to_slot,
@@ -32,7 +33,7 @@ from .self_backend_aarch64_darwin_slots import (
     zero_address,
     zero_slot,
 )
-from .self_backend_ir import I1, ParsedFunction
+from .self_backend_ir import I1, ParsedFunction, TypeDesc
 from .self_backend_module_symbols import PreparedModuleSymbols
 from .self_backend_parse import (
     aggregate_literal_to_bytes,
@@ -42,6 +43,24 @@ from .self_backend_parse import (
     split_top_level,
     strip_typed_initializer,
 )
+from .self_backend_target_passes import (
+    aarch64_madd_fusion_for_product,
+    aarch64_madd_fusion_for_result,
+)
+
+
+def _commit_or_spill_scalar_result(
+    func: ParsedFunction,
+    dest: str,
+    value_type: TypeDesc,
+    source_reg: str,
+) -> list[str]:
+    allocated_lines = commit_allocated_scalar_result(
+        func, dest, value_type, source_reg
+    )
+    if allocated_lines is not None:
+        return allocated_lines
+    return store_reg_to_slot(source_reg, func.value_slots[dest])
 
 
 def _vector_lane_stride(vector_type: TypeDesc) -> tuple[TypeDesc, int]:
@@ -807,8 +826,38 @@ def emit_compute_instruction(
 ) -> list[str] | None:
     if kind == "binop":
         op, dest, value_type, lhs, rhs = data
+        if (
+            op == "mul"
+            and value_type.is_int
+            and value_type.width == 64
+            and aarch64_madd_fusion_for_product(func, dest) is not None
+        ):
+            # The single consumer emits the multiply and add/sub together.
+            return []
         if dest not in func.value_slots:
             return []
+        fusion = None
+        if value_type.is_int and value_type.width == 64:
+            fusion = aarch64_madd_fusion_for_result(func, dest)
+        if fusion is not None:
+            lines = materialize_value(
+                func, fusion.mul_lhs, value_type, 9, module_symbols
+            )
+            lines.extend(
+                materialize_value(
+                    func, fusion.mul_rhs, value_type, 10, module_symbols
+                )
+            )
+            lines.extend(
+                materialize_value(
+                    func, fusion.accumulator, value_type, 12, module_symbols
+                )
+            )
+            lines.append(f"  {fusion.mnemonic} x11, x9, x10, x12")
+            lines.extend(
+                _commit_or_spill_scalar_result(func, dest, value_type, "x11")
+            )
+            return lines
         if (
             value_type.is_array
             and value_type.elem is not None
@@ -838,7 +887,9 @@ def emit_compute_instruction(
             lines.extend(sign_extend_int_reg(value_type, reg_name(value_type, 10)))
         lines.extend(emit_binop(op, value_type))
         lines.extend(
-            store_reg_to_slot(reg_name(value_type, 11), func.value_slots[dest])
+            _commit_or_spill_scalar_result(
+                func, dest, value_type, reg_name(value_type, 11)
+            )
         )
         return lines
 
@@ -884,7 +935,7 @@ def emit_compute_instruction(
             lines.extend(sign_extend_int_reg(value_type, reg_name(value_type, 10)))
         lines.append(f"  cmp {reg_name(value_type, 9)}, {reg_name(value_type, 10)}")
         lines.append(f"  cset w11, {aarch64_cc(cond)}")
-        lines.extend(store_reg_to_slot("w11", func.value_slots[dest]))
+        lines.extend(_commit_or_spill_scalar_result(func, dest, I1, "w11"))
         return lines
 
     if kind == "fcmp":
@@ -923,7 +974,11 @@ def emit_compute_instruction(
             )
         lines = materialize_value(func, value, src_type, 9, module_symbols)
         lines.extend(emit_cast(op, src_type, dst_type))
-        lines.extend(store_reg_to_slot(reg_name(dst_type, 10), func.value_slots[dest]))
+        lines.extend(
+            _commit_or_spill_scalar_result(
+                func, dest, dst_type, reg_name(dst_type, 10)
+            )
+        )
         return lines
 
     if kind == "select":
@@ -959,7 +1014,9 @@ def emit_compute_instruction(
                 f"  csel {reg_name(value_type, 12)}, {reg_name(value_type, 10)}, {reg_name(value_type, 11)}, ne"
             )
         lines.extend(
-            store_reg_to_slot(reg_name(value_type, 12), func.value_slots[dest])
+            _commit_or_spill_scalar_result(
+                func, dest, value_type, reg_name(value_type, 12)
+            )
         )
         return lines
 
@@ -974,7 +1031,9 @@ def emit_compute_instruction(
             )
         lines = materialize_value(func, value, value_type, 10, module_symbols)
         lines.extend(
-            store_reg_to_slot(reg_name(value_type, 10), func.value_slots[dest])
+            _commit_or_spill_scalar_result(
+                func, dest, value_type, reg_name(value_type, 10)
+            )
         )
         return lines
 
@@ -1066,13 +1125,24 @@ def emit_compute_instruction(
             return []
         lines = materialize_pointer(func, ptr_value, 9, module_symbols)
         lines.extend(emit_gep_offset(func, base_type, indices, module_symbols))
-        lines.extend(store_reg_to_slot("x11", func.value_slots[dest]))
+        lines.extend(
+            _commit_or_spill_scalar_result(
+                func, dest, func.value_slots[dest].type, "x11"
+            )
+        )
         return lines
 
     if kind == "call":
-        dest, ret_type, callee, is_indirect, args, fixed_arg_count, is_vararg_call = (
-            data
-        )
+        (
+            dest,
+            ret_type,
+            callee,
+            is_indirect,
+            args,
+            fixed_arg_count,
+            is_vararg_call,
+            arg_alignments,
+        ) = data
         return emit_call_instruction(
             func,
             dest,
@@ -1082,6 +1152,7 @@ def emit_compute_instruction(
             args,
             fixed_arg_count,
             is_vararg_call,
+            arg_alignments,
             module_symbols,
         )
 

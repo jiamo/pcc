@@ -107,3 +107,91 @@ def test_validate_requires_the_single_canonical_protocol() -> None:
         "version 2 board source_protocol must be docs/goal/goal-prompt.md"
         in errors
     )
+
+
+def test_validate_rejects_oversized_boundaries_and_unbounded_performance_rows() -> None:
+    task = _task("PERF-M1-TASK", milestone="M1", rank=1)
+    task["track"] = "performance/runtime"
+    task["open_boundary"] = "x" * (goal_state.MAX_OPEN_BOUNDARY_CHARS + 1)
+
+    errors = goal_state.validate(_board([task]))
+
+    assert (
+        "PERF-M1-TASK: open_boundary exceeds "
+        + str(goal_state.MAX_OPEN_BOUNDARY_CHARS)
+        + " characters"
+    ) in errors
+    assert "PERF-M1-TASK: unfinished performance task missing scope_limit" in errors
+    for field in goal_state.REQUIRED_OPEN_PERFORMANCE_FIELDS - {"scope_limit"}:
+        assert (
+            "PERF-M1-TASK: execution-ready performance task missing " + field
+        ) in errors
+
+    task["open_boundary"] = "One bounded optimization shape."
+    task["scope_limit"] = "One lowering pattern on AArch64."
+    task["baseline_metric"] = "Instruction count on one pinned fixture."
+    task["success_threshold"] = "At least 10% fewer instructions."
+    task["failure_disposition"] = "Record rejection evidence and remove the experiment."
+    task["baseline_evidence"] = "docs/goal/task-board.yaml"
+    assert goal_state.validate(_board([task])) == []
+
+
+def test_validate_allows_performance_design_rows_without_invented_baselines() -> None:
+    task = _task(
+        "PERF-M1-DESIGN",
+        milestone="M1",
+        rank=1,
+        status="TODO_NEEDS_DESIGN",
+    )
+    task["track"] = "performance/runtime"
+    task["scope_limit"] = "One finite runtime shape."
+
+    assert goal_state.validate(_board([task])) == []
+
+    del task["scope_limit"]
+    assert (
+        "PERF-M1-DESIGN: unfinished performance task missing scope_limit"
+        in goal_state.validate(_board([task]))
+    )
+
+
+def test_validate_requires_traceable_baseline_evidence_for_ready_performance_rows() -> None:
+    task = _task("PERF-M1-READY", milestone="M1", rank=1)
+    task["track"] = "performance/runtime"
+    task["scope_limit"] = "One finite runtime shape."
+    task["baseline_metric"] = "Recorded wall time and peak RSS."
+    task["success_threshold"] = "Beat the recorded baseline without higher RSS."
+    task["failure_disposition"] = "Remove the experiment and record rejection evidence."
+
+    errors = goal_state.validate(_board([task]))
+    assert (
+        "PERF-M1-READY: execution-ready performance task missing baseline_evidence"
+        in errors
+    )
+
+    task["baseline_evidence"] = "docs/goal/does-not-exist.md"
+    errors = goal_state.validate(_board([task]))
+    assert (
+        "PERF-M1-READY: baseline_evidence missing: "
+        "docs/goal/does-not-exist.md"
+        in errors
+    )
+
+    task["baseline_evidence"] = "docs/goal/task-board.yaml"
+    assert goal_state.validate(_board([task])) == []
+
+
+def test_validate_requires_a_finite_budget_for_task_producing_audits() -> None:
+    task = _task("AUDIT-M1-TASK", milestone="M1", rank=1)
+    task["produces_tasks"] = True
+
+    errors = goal_state.validate(_board([task]))
+
+    assert (
+        "AUDIT-M1-TASK: produces_tasks requires a positive "
+        "task_expansion_limit no greater than 6"
+        in errors
+    )
+
+    task["task_expansion_limit"] = 6
+    assert goal_state.validate(_board([task])) == []

@@ -47,6 +47,14 @@ include = [
     "pcc/py_runtime/include/**",
     "pcc/py_runtime/py/**",
     "pcc/py_runtime/Makefile",
+    # The TLS provider is a source-build boundary.  Include only its reviewed
+    # inputs so a developer's native/build/*.so or *.dylib can never leak into
+    # an unrelated platform wheel through a recursive wildcard.
+    "pcc/gateway/include/pcc_tls_provider_v1.h",
+    "pcc/gateway/native/Makefile",
+    "pcc/gateway/native/README.md",
+    "pcc/gateway/native/openssl_provider.c",
+    "pcc/gateway/native/provider-manifest.json",
 ]
 
 # Wheel-build hook in hatch_build.py:

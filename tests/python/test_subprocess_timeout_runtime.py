@@ -87,6 +87,54 @@ def test_native_subprocess_timeout_kills_child_process_group(tmp_path: Path):
     assert not leaked_marker.exists(), "timed-out subprocess group survived"
 
 
+def test_native_subprocess_timeout_passes_owned_environment_to_child(tmp_path: Path):
+    source = tmp_path / "owned_child_env_probe.py"
+    executable = tmp_path / "owned_child_env_probe"
+    source.write_text(
+        "import os\n"
+        "import subprocess\n"
+        "os.environ['PCC_OWNED_CHILD_VALUE'] = 'from-owned-table'\n"
+        "subprocess.run([\"/bin/sh\", \"-c\", "
+        "\"test \\\"$PCC_OWNED_CHILD_VALUE\\\" = from-owned-table\"], "
+        "check=True, timeout=2)\n",
+        encoding="utf-8",
+    )
+
+    env = os.environ.copy()
+    env.pop("LC_ALL", None)
+    env.pop("PCC_OWNED_CHILD_VALUE", None)
+    build = subprocess.run(
+        [
+            "uv",
+            "run",
+            "pcc",
+            "--backend",
+            "self",
+            "--python-libpython=off",
+            "--ir-scaffold=on",
+            str(source),
+            "-o",
+            str(executable),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=120,
+        env=env,
+    )
+    assert build.returncode == 0, build.stderr
+
+    run = subprocess.run(
+        [str(executable)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        env=env,
+    )
+    assert run.returncode == 0, run.stdout + run.stderr
+
+
 def test_pcc1_bootstrap_wrapper_enforces_timeout(tmp_path: Path):
     pcc1 = find_current_pcc1(REPO_ROOT)
     if pcc1 is None:

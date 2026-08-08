@@ -7,6 +7,58 @@ from pathlib import Path
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 _GC_BACKEND_PY = _REPO_ROOT / "pcc" / "py_runtime" / "py" / "py_gc_backend.py"
+_GC_PUBLIC_COLLECTION_PY = (
+    _REPO_ROOT
+    / "pcc"
+    / "py_runtime"
+    / "py"
+    / "freestanding_gc_public_collection.py"
+)
+_GC_FRAME_REGISTRY_PY = (
+    _REPO_ROOT / "pcc" / "py_runtime" / "py" / "freestanding_gc_frame_registry.py"
+)
+_GC_INCREMENTAL_CONCURRENT_SCHEDULER_PY = (
+    _REPO_ROOT
+    / "pcc"
+    / "py_runtime"
+    / "py"
+    / "freestanding_gc_incremental_concurrent_scheduler.py"
+)
+_GC_BARRIER_DISPATCHER_PY = (
+    _REPO_ROOT
+    / "pcc"
+    / "py_runtime"
+    / "py"
+    / "freestanding_gc_barrier_dispatcher.py"
+)
+_GC_GENERATIONAL_PROMOTION_PY = (
+    _REPO_ROOT
+    / "pcc"
+    / "py_runtime"
+    / "py"
+    / "freestanding_gc_generational_promotion.py"
+)
+_GC_RELOCATION_DRAIN_PY = (
+    _REPO_ROOT
+    / "pcc"
+    / "py_runtime"
+    / "py"
+    / "freestanding_gc_relocation_drain.py"
+)
+_GC_RELOCATION_SELECTOR_PY = (
+    _REPO_ROOT
+    / "pcc"
+    / "py_runtime"
+    / "py"
+    / "freestanding_gc_relocation_selector.py"
+)
+_GC_ZPAGE_ALLOCATION_PY = (
+    _REPO_ROOT
+    / "pcc"
+    / "py_runtime"
+    / "py"
+    / "freestanding_gc_zpage_allocation.py"
+)
 _PY_OBJ_PY = _REPO_ROOT / "pcc" / "py_runtime" / "py" / "py_obj.py"
 _PY_CLASS_PY = _REPO_ROOT / "pcc" / "py_runtime" / "py" / "py_class.py"
 
@@ -27,43 +79,100 @@ def _function_source(name: str, path: Path = _GC_BACKEND_PY) -> str:
 
 
 def test_init_config_returns_cached_backend_for_hot_dispatch() -> None:
-    init_config = _function_source("_init_config")
+    init_config = _function_source("pcc_gc_config_ensure", _GC_PUBLIC_COLLECTION_PY)
     backend = _function_source("pcc_gc_backend")
+    managed = _source_text()
     c_src = (_REPO_ROOT / "pcc" / "py_runtime" / "src" / "py_gc_backend.c").read_text(
         encoding="utf-8"
     )
     c_backend = c_src.split("int64_t pcc_gc_backend(void)", 1)[1].split("\n}", 1)[0]
 
-    assert "def _init_config() -> int:" in init_config
+    assert "def pcc_gc_config_ensure() -> i64:" in init_config
     assert 'return load_i32(global_addr("pcc_gc_backend_selected"), 0)' in init_config
     assert "return backend" in init_config
+    assert '_init_config = extern("pcc_gc_config_ensure", (), c_int64)' in managed
     assert "return _init_config()" in backend
     assert "if (pcc_gc_config_initialized) return pcc_gc_selected_backend;" in c_backend
     assert c_backend.index("pcc_gc_config_initialized") < c_backend.index("pcc_gc_init_config()")
 
 
-def test_hot_gc_paths_reuse_init_config_backend_value() -> None:
-    hot_functions = (
-        "pcc_gc_try_minor_alloc",
-        "pcc_gc_backend4_try_zpage_alloc",
-        "_promote_young_if_known",
-        "pcc_gc_step",
-        "pcc_gc_note_alloc",
-        "pcc_gc_note_object_allocated_sized",
-        "pcc_gc_select_relocation_set",
-        "pcc_gc_backend4_evacuation_page_drain",
-        "pcc_gc_note_slot_write_barrier",
-        "pcc_gc_note_frame_leave",
+def test_gc_backend_environment_is_exact_and_fails_closed() -> None:
+    py_parser = _function_source(
+        "_pcc_gc_config_parse_backend", _GC_PUBLIC_COLLECTION_PY
     )
+    py_abort = _function_source(
+        "_pcc_gc_config_abort_bad_backend", _GC_PUBLIC_COLLECTION_PY
+    )
+    c_src = (_REPO_ROOT / "pcc" / "py_runtime" / "src" / "py_gc_backend.c").read_text(
+        encoding="utf-8"
+    )
+    c_parser = c_src.split(
+        "static int64_t pcc_gc_parse_backend_env(void)", 1
+    )[1].split("\n}", 1)[0]
 
-    for name in hot_functions:
-        body = _function_source(name)
-        marker = "backend: int = _init_config()"
+    assert "first >= 48 and first <= 52" in py_parser
+    assert "load_i8(raw, 1) == 0" in py_parser
+    assert "_pcc_gc_config_abort_bad_backend()" in py_parser
+    assert "pcc_platform_write(2, message, length)" in py_abort
+    assert "pcc_platform_abort()" in py_abort
+
+    assert "raw[0] >= '0' && raw[0] <= '4'" in c_parser
+    assert "raw[1] == '\\0'" in c_parser
+    assert "write(2, message" in c_parser
+    assert "abort();" in c_parser
+    assert "pcc_gc_parse_env_i64(\n        \"PCC_GC_BACKEND\"" not in c_src
+
+
+def test_hot_gc_paths_reuse_init_config_backend_value() -> None:
+    hot_functions = {
+        "pcc_gc_try_minor_alloc": ("pcc_gc_try_minor_alloc", _GC_BACKEND_PY),
+        "pcc_gc_backend4_try_zpage_alloc": (
+            "pcc_gc_backend4_try_zpage_alloc",
+            _GC_ZPAGE_ALLOCATION_PY,
+        ),
+        "pcc_gc_generational_promote_young_if_known": (
+            "pcc_gc_generational_promote_young_if_known",
+            _GC_GENERATIONAL_PROMOTION_PY,
+        ),
+        "pcc_gc_step": ("pcc_gc_step", _GC_BARRIER_DISPATCHER_PY),
+        "pcc_gc_note_object_allocated_sized": (
+            "pcc_gc_note_object_allocated_sized",
+            _GC_BACKEND_PY,
+        ),
+        "pcc_gc_select_relocation_set": (
+            "pcc_gc_select_relocation_set",
+            _GC_RELOCATION_SELECTOR_PY,
+        ),
+        "pcc_gc_backend4_evacuation_page_drain": (
+            "pcc_gc_backend4_evacuation_page_drain",
+            _GC_RELOCATION_DRAIN_PY,
+        ),
+        "pcc_gc_note_slot_write_barrier": (
+            "pcc_gc_note_slot_write_barrier",
+            _GC_BARRIER_DISPATCHER_PY,
+        ),
+    }
+
+    for name, (function_name, source_path) in hot_functions.items():
+        if name == "pcc_gc_step" or name == "pcc_gc_note_slot_write_barrier":
+            body = _function_source(function_name, source_path)
+            marker = "backend: i64 = _selected_backend()"
+            assert marker in body, name
+            assert "pcc_gc_backend()" not in body.split(marker, 1)[1], name
+            continue
+        body = _function_source(function_name, source_path)
+        marker = "backend: i64 = _init_config()"
         if marker in body:
+            suffix = body.split(marker, 1)[1]
+        elif "backend: i64 = pcc_gc_config_ensure()" in body:
+            marker = "backend: i64 = pcc_gc_config_ensure()"
             suffix = body.split(marker, 1)[1]
         else:
             assert 'load_i32(global_addr("pcc_gc_config_initialized"), 0) == 0' in body, name
-            assert "backend = _init_config()" in body, name
+            init_assign = "backend = _init_config()"
+            if init_assign not in body:
+                init_assign = "backend = pcc_gc_config_ensure()"
+            assert init_assign in body, name
             assert 'backend = load_i32(global_addr("pcc_gc_backend_selected"), 0)' in body, name
             suffix = body.split(
                 'backend = load_i32(global_addr("pcc_gc_backend_selected"), 0)',
@@ -71,9 +180,24 @@ def test_hot_gc_paths_reuse_init_config_backend_value() -> None:
             )[1]
         assert "pcc_gc_backend()" not in suffix, name
 
+    note_alloc = _function_source(
+        "pcc_gc_note_alloc", _GC_INCREMENTAL_CONCURRENT_SCHEDULER_PY
+    )
+    marker = "backend: i64 = pcc_gc_config_ensure()"
+    assert marker in note_alloc
+    assert "pcc_gc_config_ensure()" not in note_alloc.split(marker, 1)[1]
+
+    frame_leave = _function_source("pcc_gc_note_frame_leave", _GC_FRAME_REGISTRY_PY)
+    marker = "backend: i64 = gc_backend_current()"
+    assert marker in frame_leave
+    assert "gc_backend_current()" not in frame_leave.split(marker, 1)[1]
+
 
 def test_gc1_auto_step_uses_selected_backend_without_exported_query() -> None:
-    body = _function_source("_maybe_auto_step")
+    body = _function_source(
+        "pcc_gc_incremental_maybe_auto_step",
+        _GC_INCREMENTAL_CONCURRENT_SCHEDULER_PY,
+    )
 
     assert 'load_i32(global_addr("pcc_gc_backend_selected"), 0) != 1' in body
     assert "pcc_gc_backend()" not in body
@@ -135,9 +259,16 @@ def test_pcc_gc_release_skips_backend_query_for_null_and_tagged_ints() -> None:
 
 def test_py_gc_track_checks_threads_before_backend_query() -> None:
     for name in ("py_gc_track", "py_gc_untrack"):
-        body = _function_source(name, _REPO_ROOT / "pcc" / "py_runtime" / "py" / "py_obj_gc.py")
-        assert "if pcc_threads_enabled() != 0 and pcc_gc_backend() == 4:" in body, name
-        assert "if pcc_gc_backend() == 4 and pcc_threads_enabled() != 0:" not in body, name
+        body = _function_source(
+            name,
+            _REPO_ROOT
+            / "pcc"
+            / "py_runtime"
+            / "py"
+            / "freestanding_gc_tracking.py",
+        )
+        assert "if pcc_threads_enabled() != 0 and gc_backend_current() == 4:" in body, name
+        assert "if gc_backend_current() == 4 and pcc_threads_enabled() != 0:" not in body, name
 
     c_src = (_REPO_ROOT / "pcc" / "py_runtime" / "src" / "py_obj_gc.c").read_text(
         encoding="utf-8"

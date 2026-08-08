@@ -14,6 +14,31 @@ def _is_extern_decl(node) -> bool:
     )
 
 
+def _writes_a_tag_body(node) -> bool:
+    """True when this declaration is where a struct/union/enum tag is defined.
+
+    ``extern const struct T { double a; } g;`` both declares ``g`` and defines
+    ``struct T``. Dropping it as an unused extern takes the tag body with it,
+    so every later ``struct T`` resolves to an opaque identified type and the
+    object it types is unsized (BUG-P1-CC-EMBEDDED-TAG-IN-EXTERN-DECL-UNSIZED).
+    musl's ``exp_data.h`` / ``pow_data.h`` are written exactly this way.
+    """
+    current = getattr(node, "type", None)
+    while current is not None:
+        if isinstance(current, (c_ast.Struct, c_ast.Union)):
+            return current.decls is not None
+        if isinstance(current, c_ast.Enum):
+            return current.values is not None
+        if isinstance(
+            current,
+            (c_ast.TypeDecl, c_ast.PtrDecl, c_ast.ArrayDecl, c_ast.FuncDecl),
+        ):
+            current = current.type
+            continue
+        return False
+    return False
+
+
 class DeadArgElimAnalysisPass(ASTPass):
     """Record unused function parameters without rewriting ABI signatures."""
 
@@ -66,7 +91,7 @@ class ElimAvailExternPass(ASTPass):
         new_ext = []
         for ext in ast.ext:
             if _is_extern_decl(ext) and ext.init is None and ext.name:
-                if ext.name not in referenced:
+                if ext.name not in referenced and not _writes_a_tag_body(ext):
                     removed += 1
                     ctx.record(self.name, "remove_extern_decl", ext.name)
                     continue

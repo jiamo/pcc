@@ -77,6 +77,66 @@ class NativeSystemLoweringMixin:
         # unsupported kwarg above already returned None to bail to CPython.
         return True if seen_text else False
 
+    def _emit_native_called_process_error(
+        self,
+        module_alias: str,
+        rc: ir.Value,
+        argv_obj: ir.Value,
+        span,
+    ) -> ir.Value:
+        """Instantiate the pcc-Python ``subprocess.CalledProcessError``.
+
+        ``subprocess`` is compiled from ``pcc/py_stdlib/subprocess.py`` in the
+        recursive native-stdlib closure. Reuse that exported class and its
+        ``__init__`` instead of growing a second subprocess exception model in
+        the C runtime.
+        """
+        module_name = self._native_builtin_module_for_name(module_alias)
+        native_exports = self._native_module_exports or {}
+        export_info = native_exports.get(module_name or "", {}).get(
+            "CalledProcessError"
+        )
+        if not isinstance(export_info, dict) or export_info.get("kind") != "class":
+            raise NotImplementedError(
+                "native subprocess check=True requires the "
+                "pcc-Python CalledProcessError export"
+            )
+        class_info = self._declare_native_module_extern_class(
+            owning_module=export_info.get("owning_module", module_name),
+            class_name=export_info["class_name"],
+            field_names=export_info.get("field_names", ()),
+            methods=export_info.get("methods", ()),
+            local_name="CalledProcessError",
+            base_names=export_info.get("base_names", ()),
+            field_types=export_info.get("field_types", ()),
+        )
+        if class_info.init_fn is None:
+            raise NotImplementedError(
+                "native subprocess check=True requires " "CalledProcessError.__init__"
+            )
+
+        cls_obj = self.builder.load(
+            class_info.global_var,
+            name=self._fresh("subprocess.CalledProcessError.class"),
+        )
+        exc = self.builder.call(
+            self.runtime["py_instance_new"],
+            [cls_obj],
+            name=self._fresh("subprocess.CalledProcessError"),
+        )
+        self._gc_pin(exc)
+        none_obj = self._emit_none_literal()
+        self.builder.call(
+            class_info.init_fn,
+            [exc, rc, argv_obj, none_obj, none_obj],
+        )
+        self._gc_unpin(exc)
+        self._emit_post_call_err_check(
+            span,
+            release_on_error=(exc,),
+        )
+        return exc
+
     def _emit_native_subprocess_call(self, expr: Call) -> Optional[ir.Value]:
         attr = expr.func
         assert isinstance(attr, Attr)
@@ -135,20 +195,14 @@ class NativeSystemLoweringMixin:
         ok_bb = fn.append_basic_block(name=self._fresh("subprocess.check_call.ok"))
         self.builder.cbranch(failed, fail_bb, ok_bb)
         self.builder.position_at_end(fail_bb)
-        exc = self.builder.call(
-            self.runtime["py_exc_new"],
-            [
-                ir.Constant(_I64, 14),
-                self._ptr_to_cstr(
-                    self._cstr_global(
-                        "subprocess.check_call failed",
-                        self._fresh(".err.subprocess.check_call"),
-                    )
-                ),
-            ],
-            name=self._fresh("subprocess.check_call.exc"),
+        exc = self._emit_native_called_process_error(
+            attr.obj.ident,
+            rc,
+            argv_obj,
+            expr.span,
         )
         self.builder.call(self.runtime["py_raise"], [exc])
+        self._gc_release(exc)
         err_target = getattr(self, "_try_err_block", None)
         if err_target is None:
             err_target = self._ensure_fn_err_exit()
@@ -246,9 +300,7 @@ class NativeSystemLoweringMixin:
             timeout_bb = fn.append_basic_block(
                 name=self._fresh("subprocess.run.timeout")
             )
-            status_bb = fn.append_basic_block(
-                name=self._fresh("subprocess.run.status")
-            )
+            status_bb = fn.append_basic_block(name=self._fresh("subprocess.run.status"))
             timed_out = self.builder.icmp_signed(
                 "==",
                 rc,
@@ -280,20 +332,14 @@ class NativeSystemLoweringMixin:
             self.builder.position_at_end(status_bb)
             self.builder.cbranch(failed, fail_bb, ok_bb)
         self.builder.position_at_end(fail_bb)
-        exc = self.builder.call(
-            self.runtime["py_exc_new"],
-            [
-                ir.Constant(_I64, 7),
-                self._ptr_to_cstr(
-                    self._cstr_global(
-                        "subprocess.run failed",
-                        self._fresh(".err.subprocess.run"),
-                    )
-                ),
-            ],
-            name=self._fresh("subprocess.run.exc"),
+        exc = self._emit_native_called_process_error(
+            attr.obj.ident,
+            rc,
+            argv_obj,
+            expr.span,
         )
         self.builder.call(self.runtime["py_raise"], [exc])
+        self._gc_release(exc)
         err_target = getattr(self, "_try_err_block", None)
         if err_target is None:
             err_target = self._ensure_fn_err_exit()

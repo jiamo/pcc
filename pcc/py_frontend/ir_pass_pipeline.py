@@ -104,6 +104,11 @@ _PYTHON_FRONTEND_PASS_ENV_DEFAULTS = {
     # bootstrap bounded while still running LICM on normal modules.
     "PCC_LICM_LOOP_BUDGET": "8",
 }
+_PCC_ONLY_IR_PASSES = {
+    "pcc-rc-elision": (
+        "pcc.ir_passes.refcount_pair_elision:RefcountPairElisionPass"
+    ),
+}
 
 
 def _truthy_env(name: str) -> bool:
@@ -339,6 +344,18 @@ def _canonical_memory_pass_name(pass_name: str) -> str:
 
 
 def _load_python_ir_pass(pass_name: str):
+    pcc_class = _PCC_ONLY_IR_PASSES.get(str(pass_name).strip().lower())
+    if pcc_class is not None:
+        module_name, _, class_name = pcc_class.partition(":")
+        try:
+            module = __import__(module_name, fromlist=[class_name])
+            pass_cls = getattr(module, class_name)
+            return pass_cls()
+        except Exception as e:
+            raise PythonIRPassError(
+                "failed to construct pcc-only IR pass "
+                f"{pass_name!r} from {pcc_class!r}: {e}"
+            ) from e
     from pcc.passes.llvm_python_registry import llvm_python_translation
 
     entry = llvm_python_translation(pass_name)
@@ -502,6 +519,18 @@ def run_python_ir_pass_pipeline(
             }
         )
         return current
+    if transport == _TRANSPORT_MEMORY and any(
+        str(pass_name).strip().lower() in _PCC_ONLY_IR_PASSES
+        for pass_name in active_passes
+    ):
+        raise PythonIRPassError(
+            "pcc-only IR passes require text transport: "
+            + ",".join(
+                str(pass_name)
+                for pass_name in active_passes
+                if str(pass_name).strip().lower() in _PCC_ONLY_IR_PASSES
+            )
+        )
     if transport == _TRANSPORT_MEMORY:
         return _run_python_ir_memory_pipeline(
             current,
@@ -659,19 +688,21 @@ def _run_python_ir_text_pipeline(
     pipeline_start: float,
 ) -> str:
     import llvmlite.binding as llvm
-    from pcc.ir_passes.manager import IRPassManager
+    from pcc.ir_passes.manager import AnalysisManager, IRPassManager
 
     module = llvm.parse_assembly(current)
     module.verify()
+    analysis_manager = AnalysisManager()
     for pass_name in active_passes:
         pass_obj = _load_python_ir_pass(pass_name)
         pass_start = time.perf_counter()
         before_bytes = len(current)
         try:
-            IRPassManager().add(pass_obj).run(module)
+            IRPassManager().add(pass_obj).run(module, analysis_manager)
             rewritten = getattr(pass_obj, "rewritten_ir", None)
             if rewritten is not None:
                 current = str(rewritten)
+                analysis_manager.erase_module_tree(module)
                 module = llvm.parse_assembly(current)
             module.verify()
         except Exception as e:
@@ -683,6 +714,7 @@ def _run_python_ir_text_pipeline(
                     "module": module_name,
                     "pass": pass_name,
                     "status": "error",
+                    "analysis_counters": analysis_manager.telemetry(),
                 }
             )
             raise PythonIRPassError(
@@ -698,6 +730,7 @@ def _run_python_ir_text_pipeline(
                 "module": module_name,
                 "pass": pass_name,
                 "status": "run",
+                "analysis_counters": analysis_manager.telemetry(),
             }
         )
     _emit_telemetry(

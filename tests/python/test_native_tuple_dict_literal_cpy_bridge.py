@@ -5,9 +5,11 @@ CPython-backed value can be converted into a pcc object and inserted into
 a pcc-native tuple/dict without forcing the whole literal onto the legacy
 CPython construction path.
 
-Safety bounds stay narrow: a splat of a CPython iterable still falls back,
-and CPython-backed dict keys keep the CPython dict path so key identity and
-hash semantics are not silently changed by recursive marshalling.
+Safety bounds stay narrow: a terminal splat of a CPython iterable still falls
+back, and a single CPython-backed dict key keeps the CPython dict path so key
+identity and hash semantics are not silently changed by recursive marshalling.
+Multi-pair CPython-key displays fail closed until each insertion can happen
+before evaluation of the following pair.
 """
 from __future__ import annotations
 
@@ -76,7 +78,7 @@ def test_tuple_splat_cpy_iterable_still_falls_back():
 
         def f() -> tuple:
             cpy_iter = os.environ.keys()
-            return (*cpy_iter, "tail")
+            return (*cpy_iter,)
         """
     )
     ir = _compile_to_ll(program, "tuple_splat_cpy", mode="off")

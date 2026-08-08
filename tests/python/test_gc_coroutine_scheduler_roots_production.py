@@ -751,6 +751,15 @@ def test_coroutine_root_public_symbols_are_wired():
     header = (RUNTIME_DIR / "include" / "py_runtime.h").read_text(encoding="utf-8")
     c_src = (RUNTIME_DIR / "src" / "py_gc_backend.c").read_text(encoding="utf-8")
     py_src = (RUNTIME_DIR / "py" / "py_gc_backend.py").read_text(encoding="utf-8")
+    registry_src = (
+        RUNTIME_DIR / "py" / "freestanding_gc_root_registry.py"
+    ).read_text(encoding="utf-8")
+    introspection_src = (
+        RUNTIME_DIR / "py" / "freestanding_gc_root_introspection.py"
+    ).read_text(encoding="utf-8")
+    mapped_src = (
+        RUNTIME_DIR / "py" / "freestanding_gc_mapped_roots.py"
+    ).read_text(encoding="utf-8")
     abi = (REPO_ROOT / "pcc" / "py_frontend" / "codegen" / "runtime_abi.py").read_text(
         encoding="utf-8"
     )
@@ -794,12 +803,18 @@ def test_coroutine_root_public_symbols_are_wired():
     ).read_text(encoding="utf-8")
     assert "pcc_gc_frame_root_slot_count" in c_src
     assert "pcc_gc_continuation_root_slot_count" in c_src
-    assert '@c_abi_export("pcc_gc_scheduler_root_count")' in py_src
-    assert '@c_abi_export("pcc_gc_scheduler_root_register_handle")' in py_src
-    assert '@c_abi_export("pcc_gc_scheduler_root_unregister_handle")' in py_src
+    assert '@c_abi_export("pcc_gc_scheduler_root_count")' in introspection_src
+    assert (
+        '@c_abi_export("pcc_gc_continuation_root_slot_count")'
+        in introspection_src
+    )
+    assert '@c_abi_export("pcc_gc_scheduler_root_register_handle")' in registry_src
+    assert '@c_abi_export("pcc_gc_scheduler_root_unregister_handle")' in registry_src
     assert "PCC_GC_SCHEDULER_QUEUE_ENTRY_POOL_LIMIT" in py_src
     assert "_scheduler_queue_entry_recycle" in py_src
-    assert '@c_abi_export("pcc_gc_register_continuation_root")' in py_src
+    assert '@c_abi_export("pcc_gc_register_continuation_root")' in registry_src
+    assert '@c_abi_export("pcc_gc_trace_continuation_roots")' in mapped_src
+    assert '@c_abi_export("pcc_gc_rewrite_continuation_roots")' in mapped_src
     assert '@c_abi_export("py_continuation_new")' in (
         RUNTIME_DIR / "py" / "py_coroutine.py"
     ).read_text(encoding="utf-8")

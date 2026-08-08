@@ -139,3 +139,21 @@ def test_lvn_does_not_reuse_integer_constant_across_different_types():
     assert isinstance(second_decl, c_ast.Decl)
     assert isinstance(second_decl.init, c_ast.Constant)
     assert second_decl.init.value == "1"
+
+
+def test_lvn_does_not_reuse_string_literal_as_an_array_initializer():
+    func = _transformed_function(
+        r'''
+        int f(void) {
+            char first[20] = "abcdefgh";
+            char second[20] = "abcdefgh";
+            return first[0] + second[0];
+        }
+        '''
+    )
+
+    second_decl = func.body.block_items[1]
+    assert isinstance(second_decl, c_ast.Decl)
+    assert isinstance(second_decl.init, c_ast.Constant)
+    assert second_decl.init.type == "string"
+    assert second_decl.init.value == '"abcdefgh"'

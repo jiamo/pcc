@@ -148,8 +148,8 @@ class LambdaCallbackLoweringMixin:
         try:
             result = self._emit_expr(expr.body)
             self._gc_release_if_owned(result, expr.body)
-            for obj in param_objs:
-                self._gc_release(obj)
+            for param_obj in param_objs:
+                self._gc_release(param_obj)
             none_gv = declare_runtime_global(self.module, "py_None")
             self.builder.ret(self.builder.load(none_gv, name="none"))
         except NotImplementedError:

@@ -1,4 +1,15 @@
 """pcc-Python port of py_dunder.c."""
+from pcc.py_runtime.py.py_abi_constants import (
+    PYINSTANCEOBJECT_CLS_OFFSET,
+    PYOBJECTHEADER_FLAGS_OFFSET,
+    PY_TYPE_CLASS,
+    PY_TYPE_FUNC,
+    PY_TYPE_INSTANCE,
+    PY_TYPE_INT,
+    PY_TYPE_STR,
+    PY_TYPE_USER_CLASS_START,
+    PY_TYPE_WEAKREF,
+)
 
 from pcc.extern import extern, c_abi_export, c_int32, c_int64, c_ptr, c_void
 from pcc.unsafe import (
@@ -32,6 +43,9 @@ py_bool_from_bit = extern("py_bool_from_bit", (c_int32,), c_ptr)
 py_clear_exception = extern("py_clear_exception", (), c_void)
 py_current_exception = extern("py_current_exception", (), c_ptr)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
+py_runtime_error_if_unset = extern(
+    "py_runtime_error_if_unset", (c_ptr, c_ptr), c_ptr
+)
 py_int_to_i64 = extern("py_int_to_i64", (c_ptr, c_ptr), c_int64)
 py_incref = extern("py_incref", (c_ptr,), c_void)
 py_raise = extern("py_raise", (c_ptr,), c_void)
@@ -50,31 +64,52 @@ py_tls_exc_set = extern("py_tls_exc_set", (c_ptr,), c_void)
 
 def _type_of(obj) -> int:
     if is_tagged_int(obj):
-        return 2
+        return PY_TYPE_INT
     return load_i32(obj, 8)
 
 
 def _load_instance_cls(o):
     backend: int = pcc_gc_backend()
     if backend == 3 or backend == 4:
-        return pcc_gc_load_ptr(o, ptr_add(o, 16))
-    return load_ptr(o, 16)
+        return pcc_gc_load_ptr(o, ptr_add(o, PYINSTANCEOBJECT_CLS_OFFSET))
+    return load_ptr(o, PYINSTANCEOBJECT_CLS_OFFSET)
+
+
+def _dunder_require_result(result, helper_name, message):
+    if ptr_is_null(result):
+        py_runtime_error_if_unset(helper_name, message)
+    return result
 
 
 def _call_user_unary_method(func, self_obj):
+    # A NULL lookup is a deliberate "dunder not defined" sentinel.  Any NULL
+    # after selecting a method is an error result.
     if ptr_is_null(func):
         return null()
     if is_tagged_int(func):
         return call_ptr1(func, self_obj)
-    if load_i32(func, 8) == 9:  # PY_TYPE_FUNC
+    if load_i32(func, 8) == PY_TYPE_FUNC:  # PY_TYPE_FUNC
         args = py_tuple_new(1)
         if ptr_is_null(args):
-            return null()
+            return _dunder_require_result(
+                null(),
+                cstr("py_tuple_new"),
+                cstr("user dunder argument tuple allocation failed"),
+            )
         py_tuple_set_item(args, 0, self_obj)
         out = py_func_call(func, args)
+        _dunder_require_result(
+            out,
+            cstr("user dunder call"),
+            cstr("user dunder callback returned NULL without an exception"),
+        )
         py_decref(args)
         return out
-    return call_ptr1(func, self_obj)
+    return _dunder_require_result(
+        call_ptr1(func, self_obj),
+        cstr("user dunder call"),
+        cstr("user dunder callback returned NULL without an exception"),
+    )
 
 
 def _call_user_unary_method_void(func, self_obj) -> None:
@@ -83,7 +118,7 @@ def _call_user_unary_method_void(func, self_obj) -> None:
     if is_tagged_int(func):
         call_void_ptr1(func, self_obj)
         return
-    if load_i32(func, 8) == 9:  # PY_TYPE_FUNC
+    if load_i32(func, 8) == PY_TYPE_FUNC:  # PY_TYPE_FUNC
         result = _call_user_unary_method(func, self_obj)
         if ptr_is_null(result) == 0:
             py_decref(result)
@@ -113,11 +148,11 @@ def _tagged_int_to_str_obj(o):
             digits = digits + 1
 
     byte_len: int = digits + neg
-    out = pcc_gc_alloc(40 + byte_len + 1, 4, 0)
+    out = pcc_gc_alloc(40 + byte_len + 1, PY_TYPE_STR, 0)
     if ptr_is_null(out):
         return null()
     store_i64(out, 0, 1)             # refcount
-    store_i32(out, 8, 4)             # PY_TYPE_STR
+    store_i32(out, 8, PY_TYPE_STR)             # PY_TYPE_STR
     store_i64(out, 16, byte_len)     # byte_len
     store_i64(out, 24, -1)           # cp_len
     store_i64(out, 32, -1)           # hash
@@ -142,7 +177,7 @@ def py_int_to_str_obj(o):
         return null()
     if is_tagged_int(o):
         return _tagged_int_to_str_obj(o)
-    if _type_of(o) != 2:
+    if _type_of(o) != PY_TYPE_INT:
         return null()
     b = py_bigint_from_any(o)
     if ptr_is_null(b):
@@ -440,9 +475,9 @@ def py_builtin_callable(o):
     if is_tagged_int(o):
         return py_bool_from_bit(0)
     tag: int = load_i32(o, 8)
-    if tag == 9 or tag == 10 or tag == 21:
+    if tag == PY_TYPE_FUNC or tag == PY_TYPE_CLASS or tag == PY_TYPE_WEAKREF:
         return py_bool_from_bit(1)
-    if tag == 11 or tag >= 100:
+    if tag == PY_TYPE_INSTANCE or tag >= PY_TYPE_USER_CLASS_START:
         cls = _load_instance_cls(o)
         method = py_class_lookup(cls, cstr("__call__"))
         if ptr_is_null(method):
@@ -458,7 +493,7 @@ def py_user_str_dispatch(o):
     if is_tagged_int(o):
         return null()
     tag: int = load_i32(o, 8)
-    if tag != 11 and tag < 100:
+    if tag != PY_TYPE_INSTANCE and tag < PY_TYPE_USER_CLASS_START:
         return null()
     cls = _load_instance_cls(o)
     if ptr_is_null(cls):
@@ -476,7 +511,7 @@ def py_user_repr_dispatch(o):
     if is_tagged_int(o):
         return null()
     tag: int = load_i32(o, 8)
-    if tag != 11 and tag < 100:
+    if tag != PY_TYPE_INSTANCE and tag < PY_TYPE_USER_CLASS_START:
         return null()
     cls = _load_instance_cls(o)
     if ptr_is_null(cls):
@@ -496,7 +531,7 @@ def py_user_hash_dispatch(o, handled) -> int:
     if is_tagged_int(o):
         return 0
     tag: int = load_i32(o, 8)
-    if tag != 11 and tag < 100:
+    if tag != PY_TYPE_INSTANCE and tag < PY_TYPE_USER_CLASS_START:
         return 0
     cls = _load_instance_cls(o)
     if ptr_is_null(cls):
@@ -537,7 +572,7 @@ def py_user_iter_dispatch(o):
     if is_tagged_int(o):
         return null()
     tag: int = load_i32(o, 8)
-    if tag != 11 and tag < 100:
+    if tag != PY_TYPE_INSTANCE and tag < PY_TYPE_USER_CLASS_START:
         return null()
     cls = _load_instance_cls(o)
     if ptr_is_null(cls):
@@ -555,7 +590,7 @@ def py_user_next_dispatch(o):
     if is_tagged_int(o):
         return null()
     tag: int = load_i32(o, 8)
-    if tag != 11 and tag < 100:
+    if tag != PY_TYPE_INSTANCE and tag < PY_TYPE_USER_CLASS_START:
         return null()
     cls = _load_instance_cls(o)
     if ptr_is_null(cls):
@@ -573,11 +608,11 @@ def py_user_del_dispatch(o) -> None:
     if is_tagged_int(o):
         return
     tag: int = load_i32(o, 8)
-    if tag != 11 and tag < 100:
+    if tag != PY_TYPE_INSTANCE and tag < PY_TYPE_USER_CLASS_START:
         return
     if pcc_capi_is_cext_type_tag(tag) != 0:
         return
-    flags: int = load_i32(o, 12)
+    flags: int = load_i32(o, PYOBJECTHEADER_FLAGS_OFFSET)
     if (flags & 4) != 0:
         pcc_runtime_log_event_code(5, 4, tag, 1, o)
         return
@@ -587,7 +622,7 @@ def py_user_del_dispatch(o) -> None:
     func = py_class_lookup(cls, cstr("__del__"))
     if ptr_is_null(func):
         return
-    store_i32(o, 12, flags | 4)
+    store_i32(o, PYOBJECTHEADER_FLAGS_OFFSET, flags | 4)
     saved_exc = py_current_exception()
     if ptr_is_null(saved_exc) == 0:
         py_incref(saved_exc)

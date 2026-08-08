@@ -110,7 +110,7 @@ def test_bootstrap_cli_without_output_reuses_run_cache(monkeypatch, tmp_path):
     assert len(calls) == 1
 
 
-def test_cli_core_without_output_reuses_run_cache(monkeypatch, tmp_path):
+def test_cli_core_without_output_cache_separates_link_args(monkeypatch, tmp_path):
     import pcc.cli_core as cli
     import pcc.py_frontend.pipeline as pipeline
 
@@ -118,8 +118,8 @@ def test_cli_core_without_output_reuses_run_cache(monkeypatch, tmp_path):
     src.write_text("print('ok')\n", encoding="utf-8")
     calls = []
 
-    def fake_compile(_src, out, **_kwargs):
-        calls.append((_src, out))
+    def fake_compile(_src, out, **kwargs):
+        calls.append((_src, out, tuple(kwargs.get("link_args", ()))))
         out_path = Path(out)
         out_path.write_text("#!/bin/sh\nprintf 'cached\\n'\n", encoding="utf-8")
         out_path.chmod(out_path.stat().st_mode | stat.S_IXUSR)
@@ -130,6 +130,56 @@ def test_cli_core_without_output_reuses_run_cache(monkeypatch, tmp_path):
     assert cli.cli_main([str(src)]) == 0
     assert cli.cli_main([str(src)]) == 0
     assert len(calls) == 1
+    assert cli.cli_main(["--link-arg=-Wl,-dead_strip", str(src)]) == 0
+    assert len(calls) == 2
+    assert calls[-1][2] == ("-Wl,-dead_strip",)
+
+
+def test_cli_core_forwards_python_link_args_in_executable_and_emit_modes(
+    monkeypatch,
+    tmp_path,
+):
+    import pcc.cli_core as cli
+    import pcc.py_frontend.pipeline as pipeline
+
+    src = tmp_path / "prog.py"
+    src.write_text("print('ok')\n", encoding="utf-8")
+    executable = tmp_path / "prog.out"
+    emitted_ir = tmp_path / "prog.ll"
+    calls = []
+    requested = ["-Wl,-rpath,/tmp/pcc-cli-link-arg", "/tmp/libclihelper.a"]
+
+    def fake_compile(_src, _out, **kwargs):
+        calls.append(
+            (
+                bool(kwargs.get("emit_llvm_only")),
+                list(kwargs.get("link_args", ())),
+            )
+        )
+
+    monkeypatch.setattr(pipeline, "compile_python", fake_compile)
+
+    assert cli.cli_main(
+        [
+            "--link-arg=" + requested[0],
+            "--link-arg",
+            requested[1],
+            str(src),
+            "-o",
+            str(executable),
+        ]
+    ) == 0
+    assert cli.cli_main(
+        [
+            "--link-arg=" + requested[0],
+            "--link-arg",
+            requested[1],
+            "--emit-llvm=" + str(emitted_ir),
+            str(src),
+        ]
+    ) == 0
+
+    assert calls == [(False, requested), (True, requested)]
 
 
 def test_python_entry_infers_project_root_for_tests_dir(monkeypatch, tmp_path):

@@ -41,13 +41,11 @@ class CallObjectLoweringMixin:
 
         raw = self._emit_expr(arg)
         if raw in getattr(self, "_cpy_values", ()):
-            obj = self.builder.call(
-                self.runtime["py_cpy_to_pcc_obj"],
-                [raw],
-                name=self._fresh("call.arg.bridge"),
+            return self._emit_value_as_pcc_object_or_bridge(
+                raw,
+                arg.ty,
+                "call.arg.bridge",
             )
-            self.builder.call(self.runtime["py_cpy_decref"], [raw])
-            return obj
 
         boxed_valueclass = self._emit_valueclass_payload_to_object(raw, arg.ty)
         if boxed_valueclass is not None:

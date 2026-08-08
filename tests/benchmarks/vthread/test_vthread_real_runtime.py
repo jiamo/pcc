@@ -27,8 +27,12 @@ def test_gc3_malloc_ownership_is_explicit_after_minor_block_address_scan() -> No
     c_gc = (
         REPO_ROOT / "pcc" / "py_runtime" / "src" / "py_gc_backend.c"
     ).read_text(encoding="utf-8")
-    py_gc = (
-        REPO_ROOT / "pcc" / "py_runtime" / "py" / "py_gc_backend.py"
+    py_oldification = (
+        REPO_ROOT
+        / "pcc"
+        / "py_runtime"
+        / "py"
+        / "freestanding_gc_generational_oldification.py"
     ).read_text(encoding="utf-8")
 
     alloc = c_obj.split("PyObject *pcc_gc_alloc", 1)[1].split(
@@ -48,10 +52,11 @@ def test_gc3_malloc_ownership_is_explicit_after_minor_block_address_scan() -> No
     )
     assert "if ((flags & PY_FLAG_GC_MALLOC_ALLOC) == 0)" in free_path
 
-    py_oldify = py_gc.split("def _generational_oldify_copy", 1)[1].split(
-        "def _promote_young", 1
-    )[0]
-    assert "(new_flags & ~(128 | 4096 | 512 | 2048 | 262144)) | 256 | 262144" in py_oldify
+    assert '@c_abi_export("pcc_gc_generational_oldify_copy")' in py_oldification
+    assert (
+        "(new_flags & ~(128 | 4096 | 512 | 2048 | 262144)) | 256 | 262144"
+        in py_oldification
+    )
 
 
 def test_small_production_runtime_matrix_is_real_and_balanced() -> None:

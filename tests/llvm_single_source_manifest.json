@@ -1,0 +1,35 @@
+{
+  "schema": "pcc-llvm-test-suite-single-source.v1",
+  "upstream": {
+    "repository": "https://github.com/llvm/llvm-test-suite",
+    "commit": "824802c01e93a8d49a77384da4e68c76d1021953",
+    "license": "Apache-2.0 WITH LLVM-exception",
+    "license_path": "tests/corpus/llvm_single_source/LICENSE.TXT",
+    "license_sha256": "42a020428636b94c738e9a925cab45c4267bed899f7f28c681cc54f9d44edf4a"
+  },
+  "corpus_root": "tests/corpus/llvm_single_source",
+  "wall_time_budget_seconds": 60,
+  "case_timeout_seconds": 15,
+  "cases": [
+    {
+      "path": "SingleSource/UnitTests/2003-07-09-SignedArgs.c",
+      "sha256": "3a9dcfbaadd32b56ffdfa564ed6171a45e05b7a7aaab1d96968a10d57ea0626e",
+      "features": ["signedness", "varargs"]
+    },
+    {
+      "path": "SingleSource/Regression/C/2004-02-03-AggregateCopy.c",
+      "sha256": "6acc67b79a6d47b5aeb5ada12e8b07dc539588600c79afebc0b84191f179053f",
+      "features": ["aggregates"]
+    },
+    {
+      "path": "SingleSource/UnitTests/2003-05-14-AtExit.c",
+      "sha256": "65d2e49248ca19aaa22b287cd120e84b65fa84db5ec94fb42b4d66f2630c0d51",
+      "features": ["function_pointers"]
+    },
+    {
+      "path": "SingleSource/UnitTests/2003-05-07-VarArgs.c",
+      "sha256": "bf1f4f2390895be009fa0040a8721d49fdcbd6bde17512110295cae9ab827127",
+      "features": ["aggregates", "varargs"]
+    }
+  ]
+}

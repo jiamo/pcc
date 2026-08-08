@@ -76,10 +76,15 @@ non-negotiable differentiators are the three-stage fixed point, comparative
 five-GC runtime, opt-in identity-free value projection, self backend as an
 execution root, and long-running runtime efficiency.
 
-The low-level C kernel remains for allocation, headers, atomics, syscalls,
-threads, dynamic loading, safepoints, stack maps, GC primitives, and C-extension
-entrypoints. High-level Python semantics migrate toward pcc-Python; they must not
-be duplicated indefinitely in a second hand-maintained C semantic runtime.
+The production runtime, including allocation, headers, atomics, syscalls,
+threads, dynamic loading, safepoints, stack maps, all five GC implementations,
+and extension ABI entrypoints, migrates to freestanding pcc-Python compiled by
+pcc. Compiler-owned raw-memory/syscall/atomic intrinsics are the machine
+boundary. Existing C and vendored libc implementations are transition oracles,
+not the final production dependency; do not replace host libc with another
+permanent C libc. Darwin may retain named libSystem ABI entry calls and must not
+be labeled zero-libc; the Linux static target must prove zero C/libc runtime
+dependencies in the final artifact.
 
 ## 2. Work loop
 

@@ -1,8 +1,7 @@
-# pcc.dist — Local Oracle, Localhost Owners, and Gated Multi-host Admission
+# pcc.dist — Local Oracle, Process-isolated Owners, and Optional Remote Admission
 
-Status: local oracle, explicit localhost TCP-ring/collective owners, and an
-explicit authenticated-but-unencrypted remote admission path landed. No
-multi-Mac execution proof exists yet.
+Status: local oracle, explicit process-isolated localhost TCP-ring/collective
+owners, and an optional authenticated-but-unencrypted remote admission path.
 Source: converted from `docs/refs_docs/deep-research/deep-research-distribute.md` (TVM Disco
 `Session`/`DRef`/device-mesh boundaries; Apple-Silicon transport reality;
 vLLM paged-KV block management).
@@ -15,15 +14,15 @@ Goal rows: `D-P0-DIST-SESSION`, `D-P0-DIST-TRANSPORT`, `D-P0-DIST-COLLECTIVE`,
 > device placement, deterministic collective *semantics*, sharding *schedules*,
 > and KV-block *bookkeeping* in a **single process, on CPU, with no sockets**.
 > It does **NOT** implement — and its existence does **NOT** justify any claim
-> of — multi-Mac execution, QUIC/RDMA transport, secure cluster
+> of — multi-host execution, QUIC/RDMA transport, secure cluster
 > admission (TLS / mTLS), PyTorch or MLX training, pcc-native tensors, or vLLM
 > serving. Every networking capability is reported **UNAVAILABLE** through an
 > explicit `SKIPPED_WITH_REASON` result, never silently skipped. The separate
 > explicit `transport.select_owner("tcp-ring", ...)` path defaults to bounded
 > localhost multi-process point-to-point transport. Its non-loopback path is
-> separately opt-in and PSK-authenticated but unencrypted. Until the strict
-> two-Mac gate runs on two physical hosts, neither path proves multi-Mac
-> execution.
+> separately opt-in and PSK-authenticated but unencrypted. The strict owned
+> execution gate uses independent spawned rank processes and proves only
+> same-host process isolation; neither path is labeled multi-host execution.
 
 This is the honest-boundary discipline required by the project north star:
 the mode label ("local-only metadata oracle") is part of every claim.
@@ -81,7 +80,7 @@ oracle, so the network path cannot introduce a second reduction semantics.
 Cancellation is checked at bounded ring rounds, and a nonparticipating peer is
 terminated by the underlying I/O deadline.
 
-## Explicit multi-host admission (execution proof still open)
+## Optional multi-host admission (outside the completion claim)
 
 `TCPRingOwner(..., allow_remote=True, admission_key=<32+ bytes>)` is the only
 route that accepts non-loopback endpoints. Before rank traffic, the accepting
@@ -93,12 +92,13 @@ apply on failures.
 
 This is authenticated cluster admission, not encrypted transport:
 `selection.authenticated=True`, `selection.secure=False`. It is not TLS/mTLS,
-and no confidentiality claim is made. `pcc.dist.multi_host` loads an explicit
-two-node JSON config, per-process rank, shared 256-bit-or-longer key, and
-bounded timeouts. `tests/dist/test_multi_mac_transport.py` fails hard in
-`PCC_DIST_HARDWARE_STRICT=1` mode when those inputs are absent or malformed.
-The same strict test must be launched concurrently on both configured Macs; a
-local skip is not evidence and the task remains open until that run exists.
+and no confidentiality claim is made. `pcc.dist.multi_host` remains an optional
+loader for an explicit two-node JSON config, per-process rank, shared
+256-bit-or-longer key and bounded timeouts; it is not a completion gate or a
+multi-host proof. The historically named
+`tests/dist/test_multi_mac_transport.py` now runs two independent spawned rank
+processes over real loopback TCP, checks authenticated admission and all five
+collectives, and records the honest `localhost-multiprocess` scope.
 
 ### The `SKIPPED_WITH_REASON` result object
 

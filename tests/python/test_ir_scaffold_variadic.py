@@ -79,6 +79,23 @@ def test_call_three_args():
     assert body is not None and "py_cpy_" not in body
 
 
+def test_call_eight_args_has_runtime_provider():
+    """The largest owned C-ABI shim currently emits eight fixed args."""
+    program = textwrap.dedent(
+        """
+        def f(builder, fn, a, b, c, d, e, f_arg, g, h):
+            return builder.call(fn, [a, b, c, d, e, f_arg, g, h])
+        """
+    )
+    ir_text = _compile_to_ll(program, "v_call8", mode="on")
+    assert "@user_pcc_llvm_capi_ir_IRBuilder_call8" in ir_text
+    body = _function_body(ir_text, "f")
+    assert body is not None and "py_cpy_" not in body
+    assert "def IRBuilder_call8(" in (
+        _REPO_ROOT / "pcc" / "llvm_capi" / "ir.py"
+    ).read_text(encoding="utf-8")
+
+
 def test_call_with_name_kwarg_still_lowers():
     program = textwrap.dedent(
         """

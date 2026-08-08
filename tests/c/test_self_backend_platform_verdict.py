@@ -3,11 +3,20 @@ from __future__ import annotations
 import ast
 from pathlib import Path
 
+from pcc.backend import resolve_backend
 from pcc.backend.self_backend_targets import (
     STATUS_SELF_TARGET_SUPPORTED,
     STATUS_SELF_TARGET_UNSUPPORTED,
     classify_self_backend_target_triple,
 )
+
+
+def test_self_backend_registry_is_supported_without_legacy_override():
+    config = resolve_backend("self")
+    assert config.kind == "self"
+    assert config.supported is True
+    assert "emit-object" in config.capabilities
+    assert config.cache_signature().endswith(":support")
 
 
 def test_supported_platform_verdict_is_capability_only():

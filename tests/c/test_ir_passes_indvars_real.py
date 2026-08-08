@@ -1,6 +1,6 @@
 """Real-transform tests for IndVarSimplifyPass (subset)."""
 
-import shutil
+import pytest
 
 import llvmlite.binding as llvm
 
@@ -10,7 +10,9 @@ from pcc.ir_passes.indvars import IndVarSimplifyPass, indvars_text
 from pcc.ir_passes.parity import assert_ir_parity, run_pcc_ir_pass
 
 
-_OPT = shutil.which("opt")
+from pcc.passes.llvm_text_pipeline import find_opt_binary
+
+_OPT = find_opt_binary()
 
 
 class IndVarsTests(unittest.TestCase):
@@ -357,7 +359,7 @@ exit:
         self.assertIn("%cmp.lcssa = phi i1 [ %cmp, %header ]", out)
 
 
-@unittest.skipUnless(_OPT, "requires LLVM opt")
+@pytest.mark.pcc_gate(unavailable=None if _OPT else "matching LLVM opt not installed")
 class UpstreamParityTests(unittest.TestCase):
     def _parity(self, ir: str):
         report = assert_ir_parity(ir, IndVarSimplifyPass(), "indvars")

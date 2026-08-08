@@ -1,37 +1,9 @@
 """Phase 4c.14: pcc-Python port of py_class.c.
 
-PyClassObject layout (120 bytes):
-    offset  0   PyObjectHeader   (16)
-    offset 16   name             (const char *)
-    offset 24   n_bases          (i32)
-    offset 32   bases            (PyClassObject **)
-    offset 40   n_mro            (i32)
-    offset 48   mro              (PyClassObject **)
-    offset 56   n_methods        (i32)
-    offset 64   methods          (PyClassMethod *)
-    offset 72   n_fields         (i32)
-    offset 80   field_names      (const char **)
-    offset 88   instance_size    (i32)
-    offset 92   type_tag_alloc   (i32)
-    offset 96   del_method       (PyObject *)
-    offset 104  attrs            (PyObject *)
-    offset 112  metaclass        (PyClassObject *, borrowed)
-
-PyClassMethod (16 bytes):
-    offset  0   name             (const char *)
-    offset  8   func             (PyObject *)
-
-PyInstanceObject:
-    offset  0   PyObjectHeader   (16)
-    offset 16   cls              (PyClassObject *)
-    offset 24   fields[]         (PyObject* flexible array)
-               fields[n_fields]  hidden dynamic-attribute dict slot
-
-Constants (inlined):
-    PY_FLAG_IMMORTAL = 1
-    PY_TYPE_CLASS    = 10
-    PY_TYPE_INSTANCE = 11
-    PY_TYPE_USER     = 100
+Public ``PyClassObject``, ``PyClassMethod``, ``PyInstanceObject``, descriptor,
+header, flag, and type-tag ABI values come from the generated
+``py_abi_constants`` module. Numeric copies do not belong in this prose: the
+C headers and generator are the layout authority.
 
 Notes on int width: py_class_new / py_instance_get_field / py_instance_
 set_field / py_instance_setattr / py_isinstance use int32 in their C
@@ -43,9 +15,66 @@ handles its own int width.
 """
 
 from pcc.extern import extern, c_abi_export, c_ptr, c_int32, c_int64, c_void
+from pcc.py_runtime.py.py_abi_constants import (
+    C_POINTER_SIZE,
+    DICTENTRY_KEY_OFFSET,
+    DICTENTRY_SIZE,
+    DICTENTRY_VALUE_OFFSET,
+    PYCLASSMETHOD_FUNC_OFFSET,
+    PYCLASSMETHOD_NAME_OFFSET,
+    PYCLASSMETHOD_SIZE,
+    PYCLASSMETHODOBJECT_FUNC_OFFSET,
+    PYCLASSMETHODOBJECT_SIZE,
+    PYCLASSOBJECT_ATTRS_OFFSET,
+    PYCLASSOBJECT_BASES_OFFSET,
+    PYCLASSOBJECT_DEL_METHOD_OFFSET,
+    PYCLASSOBJECT_FIELD_NAMES_OFFSET,
+    PYCLASSOBJECT_INSTANCE_SIZE_OFFSET,
+    PYCLASSOBJECT_METACLASS_OFFSET,
+    PYCLASSOBJECT_METHODS_OFFSET,
+    PYCLASSOBJECT_MRO_OFFSET,
+    PYCLASSOBJECT_NAME_OFFSET,
+    PYCLASSOBJECT_N_BASES_OFFSET,
+    PYCLASSOBJECT_N_FIELDS_OFFSET,
+    PYCLASSOBJECT_N_METHODS_OFFSET,
+    PYCLASSOBJECT_N_MRO_OFFSET,
+    PYCLASSOBJECT_SIZE,
+    PYCLASSOBJECT_TYPE_TAG_ALLOC_OFFSET,
+    PYDICTOBJECT_ENTRIES_OFFSET,
+    PYDICTOBJECT_ENTRIES_USED_OFFSET,
+    PYINSTANCEOBJECT_CLS_OFFSET,
+    PYINSTANCEOBJECT_FIELDS_OFFSET,
+    PYINSTANCEOBJECT_SIZE,
+    PYOBJECTHEADER_FLAGS_OFFSET,
+    PYOBJECTHEADER_REFCOUNT_OFFSET,
+    PYOBJECTHEADER_TYPE_TAG_OFFSET,
+    PY_FLAG_GC_MALLOC_ALLOC,
+    PY_FLAG_IMMORTAL,
+    PYPROPERTYOBJECT_FDEL_OFFSET,
+    PYPROPERTYOBJECT_FGET_OFFSET,
+    PYPROPERTYOBJECT_FSET_OFFSET,
+    PYPROPERTYOBJECT_SIZE,
+    PYSTATICMETHODOBJECT_FUNC_OFFSET,
+    PY_TYPE_CLASS,
+    PY_TYPE_CLASSMETHOD,
+    PY_TYPE_DICT,
+    PY_TYPE_EXC,
+    PY_TYPE_FUNC,
+    PY_TYPE_INSTANCE,
+    PY_TYPE_LIST,
+    PY_TYPE_PROPERTY,
+    PY_TYPE_STATICMETHOD,
+    PY_TYPE_STR,
+    PY_TYPE_TUPLE,
+    PY_TYPE_USER_CLASS_START,
+    PY_TYPE_VALUEBOX,
+)
 from pcc.unsafe import (
     cstr,
+    call_ptr1,
     call_ptr2,
+    call_ptr3,
+    call_ptr4,
     free,
     global_addr,
     global_load_ptr,
@@ -61,6 +90,7 @@ from pcc.unsafe import (
     ptr_add,
     ptr_eq,
     ptr_is_null,
+    ptr_to_int,
     realloc,
     store_i32,
     store_i64,
@@ -73,12 +103,18 @@ py_incref = extern("py_incref", (c_ptr,), c_void)
 py_decref = extern("py_decref", (c_ptr,), c_void)
 py_str_utf8 = extern("py_str_utf8", (c_ptr,), c_ptr)
 py_str_new = extern("py_str_new", (c_ptr, c_int64), c_ptr)
+py_str_eq = extern("py_str_eq", (c_ptr, c_ptr), c_int64)
 py_tuple_new = extern("py_tuple_new", (c_int64,), c_ptr)
+py_tuple_get = extern("py_tuple_get", (c_ptr, c_int64), c_ptr)
+py_tuple_len = extern("py_tuple_len", (c_ptr,), c_int64)
 py_tuple_set_item = extern("py_tuple_set_item", (c_ptr, c_int64, c_ptr), c_void)
 py_obj_call = extern("py_obj_call", (c_ptr, c_ptr, c_ptr), c_ptr)
 py_dict_subclass_getattr = extern("py_dict_subclass_getattr", (c_ptr, c_ptr), c_ptr)
-py_instance_bind_method = extern(
-    "py_instance_bind_method", (c_ptr, c_ptr, c_ptr), c_ptr
+py_func_new_bound = extern(
+    "py_func_new_bound", (c_ptr, c_ptr, c_ptr, c_ptr), c_ptr
+)
+py_class_new_abi = extern(
+    "py_class_new", (c_ptr, c_ptr, c_int32, c_ptr, c_int32), c_ptr
 )
 py_dict_new = extern("py_dict_new", (), c_ptr)
 py_dict_set = extern("py_dict_set", (c_ptr, c_ptr, c_ptr), c_void)
@@ -93,6 +129,9 @@ py_user_del_dispatch = extern("py_user_del_dispatch", (c_ptr,), c_void)
 py_weakref_invalidate = extern("py_weakref_invalidate", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+py_runtime_error_if_unset = extern(
+    "py_runtime_error_if_unset", (c_ptr, c_ptr), c_ptr
+)
 py_err_occurred = extern("py_err_occurred", (), c_int64)
 py_current_exception = extern("py_current_exception", (), c_ptr)
 py_clear_exception = extern("py_clear_exception", (), c_void)
@@ -102,6 +141,9 @@ pcc_gc_store_ptr = extern("pcc_gc_store_ptr", (c_ptr, c_ptr, c_ptr), c_void)
 pcc_gc_load_ptr = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_ptr)
 pcc_gc_note_relocation_read = extern("pcc_gc_note_relocation_read", (c_ptr,), c_ptr)
 pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
+pcc_gc_pointer_register = extern(
+    "pcc_gc_pointer_register", (c_ptr,), c_int64
+)
 pcc_gc_free_object_memory = extern("pcc_gc_free_object_memory", (c_ptr,), c_void)
 pcc_gc_backend = extern("pcc_gc_backend", (), c_int64)
 pcc_gc_note_store = extern("pcc_gc_note_store", (), c_void)
@@ -130,14 +172,17 @@ pcc_gc_backend4_zpage_retarget_owner_payload_span = extern(
     (c_ptr, c_ptr, c_ptr, c_int64),
     c_int64,
 )
-py_class_attrs_dict = extern("py_class_attrs_dict", (c_ptr, c_int64), c_ptr)
-py_class_setattr = extern("py_class_setattr", (c_ptr, c_ptr, c_ptr), c_int64)
-py_class_setattr_raw = extern("py_class_setattr_raw", (c_ptr, c_ptr, c_ptr), c_int64)
 
 
 # Helpers below take only ptrs / cstrs (no int args). They can be
 # called from i32-param functions because pcc-Python doesn't need to
 # sext anything at the call boundary.
+
+
+def _class_require_result(result, helper_name, message):
+    if ptr_is_null(result) != 0:
+        py_runtime_error_if_unset(helper_name, message)
+    return result
 
 
 def _alloc_user_tag() -> int:
@@ -152,70 +197,77 @@ def _object_root():
     if ptr_is_null(root) == 0:
         return root
 
-    r = malloc(120)  # sizeof(PyClassObject)
-    if ptr_is_null(r) != 0:
-        return null()
-    memset(r, 0, 120)
-
-    store_i64(r, 0, 1)  # refcount
-    store_i32(r, 8, 10)  # PY_TYPE_CLASS
-    store_i32(r, 12, 1)  # PY_FLAG_IMMORTAL
-    store_ptr(r, 16, cstr("object"))
-    store_i32(r, 24, 0)  # n_bases
-    store_ptr(r, 32, null())  # bases
-    store_i32(r, 40, 1)  # n_mro
-
-    mro = malloc(8)
+    mro = malloc(C_POINTER_SIZE)
     if ptr_is_null(mro) != 0:
-        free(r)
         return null()
-    store_ptr(mro, 0, r)
-    store_ptr(r, 48, mro)
+    # This root is cached in a raw global pointer, not a relocation-updated
+    # root slot.  Give it stable storage and register exact provenance.
+    r = malloc(PYCLASSOBJECT_SIZE)
+    if ptr_is_null(r) != 0:
+        free(mro)
+        return null()
+    memset(r, 0, PYCLASSOBJECT_SIZE)
+    store_i64(r, PYOBJECTHEADER_REFCOUNT_OFFSET, 1)
+    store_i32(r, PYOBJECTHEADER_TYPE_TAG_OFFSET, PY_TYPE_CLASS)
+    store_i32(
+        r,
+        PYOBJECTHEADER_FLAGS_OFFSET,
+        PY_FLAG_IMMORTAL | PY_FLAG_GC_MALLOC_ALLOC,
+    )
+    if pcc_gc_pointer_register(r) < 0:
+        free(r)
+        free(mro)
+        return null()
+    store_ptr(r, PYCLASSOBJECT_NAME_OFFSET, cstr("object"))
+    store_i32(r, PYCLASSOBJECT_N_BASES_OFFSET, 0)
+    store_ptr(r, PYCLASSOBJECT_BASES_OFFSET, null())
+    store_i32(r, PYCLASSOBJECT_N_MRO_OFFSET, 1)
 
-    store_i32(r, 56, 0)  # n_methods
-    store_ptr(r, 64, null())  # methods
-    store_i32(r, 72, 0)  # n_fields
-    store_ptr(r, 80, null())  # field_names
-    store_i32(r, 88, 32)  # instance header + dyn dict slot
-    store_i32(r, 92, 11)  # PY_TYPE_INSTANCE
-    store_ptr(r, 96, null())  # del_method
-    store_ptr(r, 104, null())  # attrs
+    store_ptr(mro, 0, r)
+    store_ptr(r, PYCLASSOBJECT_MRO_OFFSET, mro)
+
+    store_i32(r, PYCLASSOBJECT_N_METHODS_OFFSET, 0)
+    store_ptr(r, PYCLASSOBJECT_METHODS_OFFSET, null())
+    store_i32(r, PYCLASSOBJECT_N_FIELDS_OFFSET, 0)
+    store_ptr(r, PYCLASSOBJECT_FIELD_NAMES_OFFSET, null())
+    store_i32(
+        r,
+        PYCLASSOBJECT_INSTANCE_SIZE_OFFSET,
+        PYINSTANCEOBJECT_SIZE + C_POINTER_SIZE,
+    )
+    store_i32(r, PYCLASSOBJECT_TYPE_TAG_ALLOC_OFFSET, PY_TYPE_INSTANCE)
+    store_ptr(r, PYCLASSOBJECT_DEL_METHOD_OFFSET, null())
+    store_ptr(r, PYCLASSOBJECT_ATTRS_OFFSET, null())
 
     global_store_ptr("py_object_root_cache", r)
     return r
 
 
+pcc_gc_pointer_is_managed = extern(
+    "pcc_gc_pointer_is_managed", (c_ptr,), c_int64
+)
+
+
 def _ptr_can_have_header(o) -> bool:
-    if ptr_is_null(o) != 0:
-        return False
-    if is_tagged_int(o) != 0:
-        return False
-    bits: int = untag_int(o)
-    if bits < 2048:
-        return False
-    if (bits & 3) != 0:
-        return False
-    if bits >= 140737488355328:
-        return False
-    return True
+    return pcc_gc_pointer_is_managed(o) != 0
 
 
 def _ptr_is_class(o) -> bool:
     o = pcc_gc_note_relocation_read(o)
     if not _ptr_can_have_header(o):
         return False
-    return load_i32(o, 8) == 10
+    return load_i32(o, PYOBJECTHEADER_TYPE_TAG_OFFSET) == PY_TYPE_CLASS
 
 
 def _ptr_is_instance(o) -> bool:
     o = pcc_gc_note_relocation_read(o)
     if not _ptr_can_have_header(o):
         return False
-    tag: int = load_i32(o, 8)
-    if tag != 11:
-        if tag < 100:
+    tag: int = load_i32(o, PYOBJECTHEADER_TYPE_TAG_OFFSET)
+    if tag != PY_TYPE_INSTANCE:
+        if tag < PY_TYPE_USER_CLASS_START:
             return False
-    cls = pcc_gc_load_ptr(o, ptr_add(o, 16))
+    cls = pcc_gc_load_ptr(o, ptr_add(o, PYINSTANCEOBJECT_CLS_OFFSET))
     if ptr_is_null(cls) != 0:
         return False
     return _ptr_is_class(cls)
@@ -353,20 +405,22 @@ def _cstr_is_dunder_dict(s) -> int:
 
 
 def _class_lookup_in_mro(cls, name):
-    n_mro_i32: int = load_i32(cls, 40)
-    mro = load_ptr(cls, 48)
+    n_mro_i32: int = load_i32(cls, PYCLASSOBJECT_N_MRO_OFFSET)
+    mro = load_ptr(cls, PYCLASSOBJECT_MRO_OFFSET)
     i: int = 0
     while i < n_mro_i32:
         m = pcc_gc_load_ptr(cls, ptr_add(mro, i * 8))
         if ptr_is_null(m) == 0:
-            n_methods_i32: int = load_i32(m, 56)
-            methods = load_ptr(m, 64)
+            n_methods_i32: int = load_i32(m, PYCLASSOBJECT_N_METHODS_OFFSET)
+            methods = load_ptr(m, PYCLASSOBJECT_METHODS_OFFSET)
             j: int = 0
             while j < n_methods_i32:
-                m_off: int = j * 16
-                m_name = load_ptr(methods, m_off)
+                m_off: int = j * PYCLASSMETHOD_SIZE
+                m_name = load_ptr(methods, m_off + PYCLASSMETHOD_NAME_OFFSET)
                 if _strs_eq(m_name, name) != 0:
-                    method_slot = ptr_add(methods, m_off + 8)
+                    method_slot = ptr_add(
+                        methods, m_off + PYCLASSMETHOD_FUNC_OFFSET
+                    )
                     func = pcc_gc_note_relocation_read(load_ptr(method_slot, 0))
                     store_ptr(method_slot, 0, func)
                     return func
@@ -380,13 +434,13 @@ def _lookup_field_index(cls, name):
         return -1
     if ptr_is_null(name) != 0:
         return -1
-    n_fields_i32: int = load_i32(cls, 72)
-    field_names = load_ptr(cls, 80)
+    n_fields_i32: int = load_i32(cls, PYCLASSOBJECT_N_FIELDS_OFFSET)
+    field_names = load_ptr(cls, PYCLASSOBJECT_FIELD_NAMES_OFFSET)
     if ptr_is_null(field_names) != 0:
         return -1
     i: int = 0
     while i < n_fields_i32:
-        fn = load_ptr(field_names, i * 8)
+        fn = load_ptr(field_names, i * C_POINTER_SIZE)
         # print("  field[" + str(i) + "]=" + str(fn))
         if _strs_eq(fn, name) != 0:
             return i
@@ -403,8 +457,414 @@ def _bump_class_attr_cache_epoch() -> None:
     store_i32(slot, 0, load_i32(slot, 0) + 1)
 
 
+@c_abi_export("py_class_attrs_dict")
+def py_class_attrs_dict(cls, create: int):
+    if not _ptr_is_class(cls):
+        return null()
+    cls = pcc_gc_note_relocation_read(cls)
+    attrs = pcc_gc_load_ptr(cls, ptr_add(cls, PYCLASSOBJECT_ATTRS_OFFSET))
+    if ptr_is_null(attrs) != 0 and create != 0:
+        created = py_dict_new()
+        if ptr_is_null(created) != 0:
+            return null()
+        pcc_gc_store_ptr(cls, ptr_add(cls, PYCLASSOBJECT_ATTRS_OFFSET), created)
+        py_decref(created)
+        attrs = pcc_gc_load_ptr(cls, ptr_add(cls, PYCLASSOBJECT_ATTRS_OFFSET))
+    return attrs
+
+
+@c_abi_export("py_classmethod_new")
+def py_classmethod_new(func):
+    if ptr_is_null(func) != 0:
+        return null()
+    descriptor = pcc_gc_alloc(PYCLASSMETHODOBJECT_SIZE, PY_TYPE_CLASSMETHOD, 0)
+    if ptr_is_null(descriptor) != 0:
+        return null()
+    store_ptr(descriptor, PYCLASSMETHODOBJECT_FUNC_OFFSET, null())
+    pcc_gc_store_ptr(
+        descriptor,
+        ptr_add(descriptor, PYCLASSMETHODOBJECT_FUNC_OFFSET),
+        func,
+    )
+    py_gc_track(descriptor)
+    return descriptor
+
+
+@c_abi_export("py_property_new")
+def py_property_new(fget, fset, fdel):
+    descriptor = pcc_gc_alloc(PYPROPERTYOBJECT_SIZE, PY_TYPE_PROPERTY, 0)
+    if ptr_is_null(descriptor) != 0:
+        return null()
+    store_ptr(descriptor, PYPROPERTYOBJECT_FGET_OFFSET, null())
+    store_ptr(descriptor, PYPROPERTYOBJECT_FSET_OFFSET, null())
+    store_ptr(descriptor, PYPROPERTYOBJECT_FDEL_OFFSET, null())
+    none_obj = global_load_ptr("py_None")
+    if ptr_is_null(fget) == 0 and ptr_eq(fget, none_obj) == 0:
+        pcc_gc_store_ptr(
+            descriptor, ptr_add(descriptor, PYPROPERTYOBJECT_FGET_OFFSET), fget
+        )
+    if ptr_is_null(fset) == 0 and ptr_eq(fset, none_obj) == 0:
+        pcc_gc_store_ptr(
+            descriptor, ptr_add(descriptor, PYPROPERTYOBJECT_FSET_OFFSET), fset
+        )
+    if ptr_is_null(fdel) == 0 and ptr_eq(fdel, none_obj) == 0:
+        pcc_gc_store_ptr(
+            descriptor, ptr_add(descriptor, PYPROPERTYOBJECT_FDEL_OFFSET), fdel
+        )
+    py_gc_track(descriptor)
+    return descriptor
+
+
+def _func_signature_valid(signature) -> bool:
+    if not _ptr_can_have_header(signature):
+        return False
+    if load_i32(signature, PYOBJECTHEADER_TYPE_TAG_OFFSET) != PY_TYPE_TUPLE:
+        return False
+    if py_tuple_len(signature) < 5:
+        return False
+    magic = py_tuple_get(signature, 0)
+    if ptr_is_null(magic) != 0:
+        return False
+    expected = py_str_new(cstr("__pcc_func_signature_v1__"), 25)
+    ok: int = 0
+    if ptr_is_null(expected) == 0:
+        ok = py_str_eq(magic, expected)
+        py_decref(expected)
+    py_decref(magic)
+    return ok != 0
+
+
+def _func_signature(func):
+    if not _ptr_can_have_header(func):
+        return null()
+    if load_i32(func, PYOBJECTHEADER_TYPE_TAG_OFFSET) != PY_TYPE_FUNC:
+        return null()
+    captures = pcc_gc_load_ptr(func, ptr_add(func, 64))
+    if not _ptr_can_have_header(captures):
+        return null()
+    if load_i32(captures, PYOBJECTHEADER_TYPE_TAG_OFFSET) != PY_TYPE_TUPLE or py_tuple_len(captures) != 2:
+        return null()
+    candidate = py_tuple_get(captures, 1)
+    if not _func_signature_valid(candidate):
+        if ptr_is_null(candidate) == 0:
+            py_decref(candidate)
+        return null()
+    return candidate
+
+
+def _bound_signature(func):
+    signature = _func_signature(func)
+    if ptr_is_null(signature) != 0:
+        return null()
+    names = py_tuple_get(signature, 1)
+    kinds = py_tuple_get(signature, 2)
+    has_defaults = py_tuple_get(signature, 3)
+    defaults = py_tuple_get(signature, 4)
+    if (
+        ptr_is_null(names) != 0
+        or ptr_is_null(kinds) != 0
+        or ptr_is_null(has_defaults) != 0
+        or ptr_is_null(defaults) != 0
+    ):
+        if ptr_is_null(names) == 0:
+            py_decref(names)
+        if ptr_is_null(kinds) == 0:
+            py_decref(kinds)
+        if ptr_is_null(has_defaults) == 0:
+            py_decref(has_defaults)
+        if ptr_is_null(defaults) == 0:
+            py_decref(defaults)
+        py_decref(signature)
+        return null()
+    n: int = py_tuple_len(names)
+    if (
+        n <= 0
+        or py_tuple_len(kinds) != n
+        or py_tuple_len(has_defaults) != n
+        or py_tuple_len(defaults) != n
+    ):
+        py_decref(names)
+        py_decref(kinds)
+        py_decref(has_defaults)
+        py_decref(defaults)
+        py_decref(signature)
+        return null()
+    out_names = py_tuple_new(n - 1)
+    out_kinds = py_tuple_new(n - 1)
+    out_has_defaults = py_tuple_new(n - 1)
+    out_defaults = py_tuple_new(n - 1)
+    out_signature = py_tuple_new(5)
+    if (
+        ptr_is_null(out_names) != 0
+        or ptr_is_null(out_kinds) != 0
+        or ptr_is_null(out_has_defaults) != 0
+        or ptr_is_null(out_defaults) != 0
+        or ptr_is_null(out_signature) != 0
+    ):
+        if ptr_is_null(out_names) == 0:
+            py_decref(out_names)
+        if ptr_is_null(out_kinds) == 0:
+            py_decref(out_kinds)
+        if ptr_is_null(out_has_defaults) == 0:
+            py_decref(out_has_defaults)
+        if ptr_is_null(out_defaults) == 0:
+            py_decref(out_defaults)
+        if ptr_is_null(out_signature) == 0:
+            py_decref(out_signature)
+        py_decref(names)
+        py_decref(kinds)
+        py_decref(has_defaults)
+        py_decref(defaults)
+        py_decref(signature)
+        return null()
+    i: int = 1
+    valid: int = 1
+    while i < n:
+        name = py_tuple_get(names, i)
+        kind = py_tuple_get(kinds, i)
+        has_default = py_tuple_get(has_defaults, i)
+        default_obj = py_tuple_get(defaults, i)
+        if (
+            ptr_is_null(name) != 0
+            or ptr_is_null(kind) != 0
+            or ptr_is_null(has_default) != 0
+            or ptr_is_null(default_obj) != 0
+        ):
+            valid = 0
+        if valid != 0:
+            py_tuple_set_item(out_names, i - 1, name)
+            py_tuple_set_item(out_kinds, i - 1, kind)
+            py_tuple_set_item(out_has_defaults, i - 1, has_default)
+            py_tuple_set_item(out_defaults, i - 1, default_obj)
+        if ptr_is_null(name) == 0:
+            py_decref(name)
+        if ptr_is_null(kind) == 0:
+            py_decref(kind)
+        if ptr_is_null(has_default) == 0:
+            py_decref(has_default)
+        if ptr_is_null(default_obj) == 0:
+            py_decref(default_obj)
+        if valid == 0:
+            i = n
+        i = i + 1
+    magic = null()
+    if valid != 0:
+        magic = py_tuple_get(signature, 0)
+        if ptr_is_null(magic) != 0:
+            valid = 0
+    if valid != 0:
+        py_tuple_set_item(out_signature, 0, magic)
+        py_tuple_set_item(out_signature, 1, out_names)
+        py_tuple_set_item(out_signature, 2, out_kinds)
+        py_tuple_set_item(out_signature, 3, out_has_defaults)
+        py_tuple_set_item(out_signature, 4, out_defaults)
+    if ptr_is_null(magic) == 0:
+        py_decref(magic)
+    py_decref(out_names)
+    py_decref(out_kinds)
+    py_decref(out_has_defaults)
+    py_decref(out_defaults)
+    py_decref(names)
+    py_decref(kinds)
+    py_decref(has_defaults)
+    py_decref(defaults)
+    py_decref(signature)
+    if valid == 0:
+        py_decref(out_signature)
+        return null()
+    return out_signature
+
+
+def _wrap_bound_captures(method, captures):
+    signature = _bound_signature(method)
+    if ptr_is_null(signature) != 0:
+        return captures
+    wrapped = py_tuple_new(2)
+    if ptr_is_null(wrapped) != 0:
+        py_decref(signature)
+        return captures
+    py_tuple_set_item(wrapped, 0, captures)
+    py_tuple_set_item(wrapped, 1, signature)
+    py_decref(signature)
+    return wrapped
+
+
+def _call_pyfunc_bound_args(func, bound_args):
+    if not _ptr_can_have_header(func):
+        return _class_require_result(
+            null(),
+            cstr("class callback"),
+            cstr("class callback received an invalid function object"),
+        )
+    if load_i32(func, PYOBJECTHEADER_TYPE_TAG_OFFSET) != PY_TYPE_FUNC:
+        return _class_require_result(
+            null(),
+            cstr("class callback"),
+            cstr("class callback received an invalid function object"),
+        )
+    entry = load_ptr(func, 56)
+    if ptr_is_null(entry) != 0:
+        return _class_require_result(
+            null(),
+            cstr("class callback"),
+            cstr("class callback function has no entry point"),
+        )
+    captures = pcc_gc_load_ptr(func, ptr_add(func, 64))
+    actual_captures = captures
+    owns_actual: int = 0
+    if _ptr_can_have_header(captures):
+        if load_i32(captures, PYOBJECTHEADER_TYPE_TAG_OFFSET) == PY_TYPE_TUPLE and py_tuple_len(captures) == 2:
+            candidate = py_tuple_get(captures, 1)
+            if _func_signature_valid(candidate):
+                inner = py_tuple_get(captures, 0)
+                if ptr_is_null(inner) == 0:
+                    actual_captures = inner
+                    owns_actual = 1
+            if ptr_is_null(candidate) == 0:
+                py_decref(candidate)
+    out = call_ptr2(entry, actual_captures, bound_args)
+    _class_require_result(
+        out,
+        cstr("class callback"),
+        cstr("class callback returned NULL without setting an exception"),
+    )
+    if owns_actual != 0:
+        py_decref(actual_captures)
+    return out
+
+
+def _instance_bound_method_entry(captures, args):
+    func = py_tuple_get(captures, 0)
+    self_obj = py_tuple_get(captures, 1)
+    if ptr_is_null(func) != 0 or ptr_is_null(self_obj) != 0:
+        if ptr_is_null(func) == 0:
+            py_decref(func)
+        if ptr_is_null(self_obj) == 0:
+            py_decref(self_obj)
+        return null()
+    n_args: int = py_tuple_len(args)
+    out = null()
+    if _ptr_can_have_header(func) and load_i32(func, PYOBJECTHEADER_TYPE_TAG_OFFSET) == PY_TYPE_FUNC:
+        full_args = py_tuple_new(n_args + 1)
+        if ptr_is_null(full_args) == 0:
+            py_tuple_set_item(full_args, 0, self_obj)
+            i: int = 0
+            valid: int = 1
+            while i < n_args:
+                arg = py_tuple_get(args, i)
+                if ptr_is_null(arg) != 0:
+                    valid = 0
+                    i = n_args
+                else:
+                    py_tuple_set_item(full_args, i + 1, arg)
+                    py_decref(arg)
+                i = i + 1
+            if valid != 0:
+                out = _call_pyfunc_bound_args(func, full_args)
+                _class_require_result(
+                    out,
+                    cstr("class callback"),
+                    cstr("class callback returned NULL without setting an exception"),
+                )
+            py_decref(full_args)
+        else:
+            _class_require_result(
+                null(),
+                cstr("py_tuple_new"),
+                cstr("class callback argument tuple allocation failed"),
+            )
+    elif n_args == 0:
+        out = call_ptr1(func, self_obj)
+        _class_require_result(
+            out,
+            cstr("class callback"),
+            cstr("class callback returned NULL without setting an exception"),
+        )
+    elif n_args == 1:
+        arg0 = py_tuple_get(args, 0)
+        if ptr_is_null(arg0) == 0:
+            out = call_ptr2(func, self_obj, arg0)
+            _class_require_result(
+                out,
+                cstr("class callback"),
+                cstr("class callback returned NULL without setting an exception"),
+            )
+            py_decref(arg0)
+    elif n_args == 2:
+        arg0 = py_tuple_get(args, 0)
+        arg1 = py_tuple_get(args, 1)
+        if ptr_is_null(arg0) == 0 and ptr_is_null(arg1) == 0:
+            out = call_ptr3(func, self_obj, arg0, arg1)
+            _class_require_result(
+                out,
+                cstr("class callback"),
+                cstr("class callback returned NULL without setting an exception"),
+            )
+        if ptr_is_null(arg0) == 0:
+            py_decref(arg0)
+        if ptr_is_null(arg1) == 0:
+            py_decref(arg1)
+    elif n_args == 3:
+        arg0 = py_tuple_get(args, 0)
+        arg1 = py_tuple_get(args, 1)
+        arg2 = py_tuple_get(args, 2)
+        if (
+            ptr_is_null(arg0) == 0
+            and ptr_is_null(arg1) == 0
+            and ptr_is_null(arg2) == 0
+        ):
+            out = call_ptr4(func, self_obj, arg0, arg1, arg2)
+            _class_require_result(
+                out,
+                cstr("class callback"),
+                cstr("class callback returned NULL without setting an exception"),
+            )
+        if ptr_is_null(arg0) == 0:
+            py_decref(arg0)
+        if ptr_is_null(arg1) == 0:
+            py_decref(arg1)
+        if ptr_is_null(arg2) == 0:
+            py_decref(arg2)
+    if ptr_is_null(out) != 0:
+        _class_require_result(
+            out,
+            cstr("class callback"),
+            cstr("class callback returned NULL without setting an exception"),
+        )
+    py_decref(func)
+    py_decref(self_obj)
+    return out
+
+
+@c_abi_export("py_instance_bind_method")
+def py_instance_bind_method(method, self_obj, name):
+    if ptr_is_null(method) != 0 or ptr_is_null(self_obj) != 0:
+        return null()
+    captures = py_tuple_new(2)
+    if ptr_is_null(captures) != 0:
+        return null()
+    py_tuple_set_item(captures, 0, method)
+    py_tuple_set_item(captures, 1, self_obj)
+    bound_name = name
+    if _ptr_can_have_header(method) and load_i32(method, PYOBJECTHEADER_TYPE_TAG_OFFSET) == PY_TYPE_FUNC:
+        method_name = load_ptr(method, 72)
+        if ptr_is_null(method_name) == 0:
+            bound_name = method_name
+    bound_captures = _wrap_bound_captures(method, captures)
+    bound = py_func_new_bound(
+        _instance_bound_method_entry,
+        bound_captures,
+        bound_name,
+        self_obj,
+    )
+    if ptr_eq(bound_captures, captures) == 0:
+        py_decref(bound_captures)
+    py_decref(captures)
+    return bound
+
+
 def _field_cache_slot(cls, name) -> int:
-    return ((untag_int(cls) >> 4) ^ (untag_int(name) >> 4)) & 3
+    return ((ptr_to_int(cls) >> 4) ^ (ptr_to_int(name) >> 4)) & 3
 
 
 def _field_cache_lookup(cls, name) -> int:
@@ -466,14 +926,16 @@ def _field_cache_store(cls, name, idx: int) -> None:
 def _dynamic_attr_slot(inst):
     if not _ptr_is_instance(inst):
         return null()
-    cls = pcc_gc_load_ptr(inst, ptr_add(inst, 16))
-    flags: int = load_i32(cls, 12)
+    cls = pcc_gc_load_ptr(inst, ptr_add(inst, PYINSTANCEOBJECT_CLS_OFFSET))
+    flags: int = load_i32(cls, PYOBJECTHEADER_FLAGS_OFFSET)
     if (flags & 2) != 0:
         return null()
-    n_fields: int = load_i32(cls, 72)
+    n_fields: int = load_i32(cls, PYCLASSOBJECT_N_FIELDS_OFFSET)
     if n_fields < 0:
         n_fields = 0
-    return ptr_add(inst, 24 + n_fields * 8)
+    return ptr_add(
+        inst, PYINSTANCEOBJECT_FIELDS_OFFSET + n_fields * C_POINTER_SIZE
+    )
 
 
 @c_abi_export("py_instance_vars")
@@ -481,25 +943,27 @@ def py_instance_vars(inst):
     if not _ptr_is_instance(inst):
         py_raise(py_exc_new(3, cstr("vars() argument has no __dict__")))
         return null()
-    cls = pcc_gc_load_ptr(inst, ptr_add(inst, 16))
+    cls = pcc_gc_load_ptr(inst, ptr_add(inst, PYINSTANCEOBJECT_CLS_OFFSET))
     if not _ptr_is_class(cls):
         py_raise(py_exc_new(3, cstr("vars() argument has no __dict__")))
         return null()
     out = py_dict_new()
     if ptr_is_null(out) != 0:
         return null()
-    n_fields: int = load_i32(cls, 72)
+    n_fields: int = load_i32(cls, PYCLASSOBJECT_N_FIELDS_OFFSET)
     if n_fields < 0:
         n_fields = 0
-    field_names = load_ptr(cls, 80)
-    fields = ptr_add(inst, 24)
+    field_names = load_ptr(cls, PYCLASSOBJECT_FIELD_NAMES_OFFSET)
+    fields = ptr_add(inst, PYINSTANCEOBJECT_FIELDS_OFFSET)
     i: int = 0
     while i < n_fields:
         field_name = null()
         if ptr_is_null(field_names) == 0:
-            field_name = load_ptr(field_names, i * 8)
+            field_name = load_ptr(field_names, i * C_POINTER_SIZE)
         if ptr_is_null(field_name) == 0:
-            value = pcc_gc_load_ptr(inst, ptr_add(fields, i * 8))
+            value = pcc_gc_load_ptr(
+                inst, ptr_add(fields, i * C_POINTER_SIZE)
+            )
             if ptr_is_null(value) == 0:
                 key = py_str_new(field_name, strlen(field_name))
                 if ptr_is_null(key) != 0:
@@ -544,8 +1008,8 @@ def _class_attr_lookup_in_mro(cls, name):
     key = py_str_new(name, strlen(name))
     if ptr_is_null(key) != 0:
         return null()
-    n_mro: int = load_i32(cls, 40)
-    mro = load_ptr(cls, 48)
+    n_mro: int = load_i32(cls, PYCLASSOBJECT_N_MRO_OFFSET)
+    mro = load_ptr(cls, PYCLASSOBJECT_MRO_OFFSET)
     i: int = 0
     while i < n_mro:
         m = pcc_gc_load_ptr(cls, ptr_add(mro, i * 8))
@@ -568,14 +1032,17 @@ def _descriptor_method(descriptor, name):
         return null()
     if not _ptr_is_instance(descriptor):
         return null()
-    desc_cls = pcc_gc_load_ptr(descriptor, ptr_add(descriptor, 16))
+    desc_cls = pcc_gc_load_ptr(
+        descriptor,
+        ptr_add(descriptor, PYINSTANCEOBJECT_CLS_OFFSET),
+    )
     return _class_lookup_in_mro(desc_cls, name)
 
 
 def _descriptor_is_data(descriptor) -> bool:
     if ptr_is_null(descriptor) == 0:
         if is_tagged_int(descriptor) == 0:
-            if load_i32(descriptor, 8) == 101:  # PY_TYPE_PROPERTY
+            if load_i32(descriptor, PYOBJECTHEADER_TYPE_TAG_OFFSET) == PY_TYPE_PROPERTY:
                 return True
     if ptr_is_null(_descriptor_method(descriptor, cstr("__set__"))) == 0:
         return True
@@ -587,8 +1054,11 @@ def _descriptor_is_data(descriptor) -> bool:
 def _descriptor_call_get(descriptor, obj, owner):
     if ptr_is_null(descriptor) == 0:
         if is_tagged_int(descriptor) == 0:
-            if load_i32(descriptor, 8) == 101:  # PY_TYPE_PROPERTY
-                fget = pcc_gc_load_ptr(descriptor, ptr_add(descriptor, 16))
+            if load_i32(descriptor, PYOBJECTHEADER_TYPE_TAG_OFFSET) == PY_TYPE_PROPERTY:
+                fget = pcc_gc_load_ptr(
+                    descriptor,
+                    ptr_add(descriptor, PYPROPERTYOBJECT_FGET_OFFSET),
+                )
                 if ptr_is_null(fget) != 0:
                     py_raise(py_exc_new(6, cstr("unreadable attribute")))
                     return null()
@@ -597,9 +1067,18 @@ def _descriptor_call_get(descriptor, obj, owner):
                     return descriptor
                 args = py_tuple_new(1)
                 if ptr_is_null(args) != 0:
-                    return null()
+                    return _class_require_result(
+                        null(),
+                        cstr("py_tuple_new"),
+                        cstr("class callback argument tuple allocation failed"),
+                    )
                 py_tuple_set_item(args, 0, obj)
                 out = py_obj_call(fget, args, global_load_ptr("py_None"))
+                _class_require_result(
+                    out,
+                    cstr("property __get__"),
+                    cstr("class callback returned NULL without setting an exception"),
+                )
                 py_decref(args)
                 return out
     method = _descriptor_method(descriptor, cstr("__get__"))
@@ -607,11 +1086,20 @@ def _descriptor_call_get(descriptor, obj, owner):
         return null()
     args = py_tuple_new(3)
     if ptr_is_null(args) != 0:
-        return null()
+        return _class_require_result(
+            null(),
+            cstr("py_tuple_new"),
+            cstr("class callback argument tuple allocation failed"),
+        )
     py_tuple_set_item(args, 0, descriptor)
     py_tuple_set_item(args, 1, obj)
     py_tuple_set_item(args, 2, owner)
     out = py_obj_call(method, args, global_load_ptr("py_None"))
+    _class_require_result(
+        out,
+        cstr("descriptor __get__"),
+        cstr("class callback returned NULL without setting an exception"),
+    )
     py_decref(args)
     return out
 
@@ -619,17 +1107,30 @@ def _descriptor_call_get(descriptor, obj, owner):
 def _descriptor_call_set(descriptor, obj, value) -> int:
     if ptr_is_null(descriptor) == 0:
         if is_tagged_int(descriptor) == 0:
-            if load_i32(descriptor, 8) == 101:  # PY_TYPE_PROPERTY
-                fset = pcc_gc_load_ptr(descriptor, ptr_add(descriptor, 24))
+            if load_i32(descriptor, PYOBJECTHEADER_TYPE_TAG_OFFSET) == PY_TYPE_PROPERTY:
+                fset = pcc_gc_load_ptr(
+                    descriptor,
+                    ptr_add(descriptor, PYPROPERTYOBJECT_FSET_OFFSET),
+                )
                 if ptr_is_null(fset) != 0:
                     py_raise(py_exc_new(6, cstr("can't set attribute")))
                     return -1
                 args = py_tuple_new(2)
                 if ptr_is_null(args) != 0:
+                    _class_require_result(
+                        null(),
+                        cstr("py_tuple_new"),
+                        cstr("class callback argument tuple allocation failed"),
+                    )
                     return -1
                 py_tuple_set_item(args, 0, obj)
                 py_tuple_set_item(args, 1, value)
                 out = py_obj_call(fset, args, global_load_ptr("py_None"))
+                _class_require_result(
+                    out,
+                    cstr("property __set__"),
+                    cstr("class callback returned NULL without setting an exception"),
+                )
                 py_decref(args)
                 if ptr_is_null(out) != 0:
                     return -1
@@ -640,11 +1141,21 @@ def _descriptor_call_set(descriptor, obj, value) -> int:
         return -1
     args = py_tuple_new(3)
     if ptr_is_null(args) != 0:
+        _class_require_result(
+            null(),
+            cstr("py_tuple_new"),
+            cstr("class callback argument tuple allocation failed"),
+        )
         return -1
     py_tuple_set_item(args, 0, descriptor)
     py_tuple_set_item(args, 1, obj)
     py_tuple_set_item(args, 2, value)
     out = py_obj_call(method, args, global_load_ptr("py_None"))
+    _class_require_result(
+        out,
+        cstr("descriptor __set__"),
+        cstr("class callback returned NULL without setting an exception"),
+    )
     py_decref(args)
     if ptr_is_null(out) != 0:
         return -1
@@ -655,16 +1166,29 @@ def _descriptor_call_set(descriptor, obj, value) -> int:
 def _descriptor_call_delete(descriptor, obj) -> int:
     if ptr_is_null(descriptor) == 0:
         if is_tagged_int(descriptor) == 0:
-            if load_i32(descriptor, 8) == 101:  # PY_TYPE_PROPERTY
-                fdel = pcc_gc_load_ptr(descriptor, ptr_add(descriptor, 32))
+            if load_i32(descriptor, PYOBJECTHEADER_TYPE_TAG_OFFSET) == PY_TYPE_PROPERTY:
+                fdel = pcc_gc_load_ptr(
+                    descriptor,
+                    ptr_add(descriptor, PYPROPERTYOBJECT_FDEL_OFFSET),
+                )
                 if ptr_is_null(fdel) != 0:
                     py_raise(py_exc_new(6, cstr("can't delete attribute")))
                     return -1
                 args = py_tuple_new(1)
                 if ptr_is_null(args) != 0:
+                    _class_require_result(
+                        null(),
+                        cstr("py_tuple_new"),
+                        cstr("class callback argument tuple allocation failed"),
+                    )
                     return -1
                 py_tuple_set_item(args, 0, obj)
                 out = py_obj_call(fdel, args, global_load_ptr("py_None"))
+                _class_require_result(
+                    out,
+                    cstr("property __delete__"),
+                    cstr("class callback returned NULL without setting an exception"),
+                )
                 py_decref(args)
                 if ptr_is_null(out) != 0:
                     return -1
@@ -675,14 +1199,190 @@ def _descriptor_call_delete(descriptor, obj) -> int:
         return -1
     args = py_tuple_new(2)
     if ptr_is_null(args) != 0:
+        _class_require_result(
+            null(),
+            cstr("py_tuple_new"),
+            cstr("class callback argument tuple allocation failed"),
+        )
         return -1
     py_tuple_set_item(args, 0, descriptor)
     py_tuple_set_item(args, 1, obj)
     out = py_obj_call(method, args, global_load_ptr("py_None"))
+    _class_require_result(
+        out,
+        cstr("descriptor __delete__"),
+        cstr("class callback returned NULL without setting an exception"),
+    )
     py_decref(args)
     if ptr_is_null(out) != 0:
         return -1
     py_decref(out)
+    return 0
+
+
+def _classmethod_bind(descriptor, cls):
+    if ptr_is_null(descriptor) != 0 or ptr_is_null(cls) != 0:
+        return null()
+    if (
+        is_tagged_int(descriptor) != 0
+        or load_i32(descriptor, PYOBJECTHEADER_TYPE_TAG_OFFSET)
+        != PY_TYPE_CLASSMETHOD
+    ):
+        return descriptor
+    func = pcc_gc_load_ptr(
+        descriptor,
+        ptr_add(descriptor, PYCLASSMETHODOBJECT_FUNC_OFFSET),
+    )
+    if ptr_is_null(func) != 0:
+        return null()
+    name = null()
+    if _ptr_can_have_header(func) and load_i32(func, PYOBJECTHEADER_TYPE_TAG_OFFSET) == PY_TYPE_FUNC:
+        name = load_ptr(func, 72)
+    return py_instance_bind_method(func, cls, name)
+
+
+def _metaclass(cls):
+    if not _ptr_is_class(cls):
+        return null()
+    metaclass = pcc_gc_load_ptr(cls, ptr_add(cls, PYCLASSOBJECT_METACLASS_OFFSET))
+    if not _ptr_is_class(metaclass):
+        return null()
+    return pcc_gc_note_relocation_read(metaclass)
+
+
+@c_abi_export("py_class_getattr")
+def py_class_getattr(cls, name):
+    if not _ptr_is_class(cls) or ptr_is_null(name) != 0:
+        return null()
+    cls = pcc_gc_note_relocation_read(cls)
+    if _cstr_is_dunder_dict(name) != 0:
+        attrs = py_class_attrs_dict(cls, 1)
+        if ptr_is_null(attrs) == 0:
+            py_incref(attrs)
+        return attrs
+    metaclass = _metaclass(cls)
+    meta_attr = null()
+    if ptr_is_null(metaclass) == 0:
+        meta_attr = _class_attr_lookup_in_mro(metaclass, name)
+        if ptr_is_null(meta_attr) == 0:
+            if _descriptor_is_data(meta_attr):
+                out = _descriptor_call_get(meta_attr, cls, metaclass)
+                py_decref(meta_attr)
+                if ptr_is_null(out) == 0 or py_err_occurred() != 0:
+                    return out
+            else:
+                py_decref(meta_attr)
+    value = _class_attr_lookup_in_mro(cls, name)
+    if ptr_is_null(value) == 0:
+        bound = _classmethod_bind(value, cls)
+        if ptr_eq(bound, value) == 0:
+            py_decref(value)
+            return bound
+        descriptor_value = _descriptor_call_get(value, global_load_ptr("py_None"), cls)
+        if ptr_is_null(descriptor_value) == 0 or py_err_occurred() != 0:
+            py_decref(value)
+            return descriptor_value
+        return bound
+    if ptr_is_null(metaclass) == 0:
+        meta_attr = _class_attr_lookup_in_mro(metaclass, name)
+        if ptr_is_null(meta_attr) == 0:
+            out = _descriptor_call_get(meta_attr, cls, metaclass)
+            if ptr_is_null(out) == 0 or py_err_occurred() != 0:
+                py_decref(meta_attr)
+                return out
+            return meta_attr
+    method = py_class_lookup(cls, name)
+    if ptr_is_null(method) == 0:
+        py_incref(method)
+    return method
+
+
+@c_abi_export("py_class_setattr_raw")
+def py_class_setattr_raw(cls, name, value) -> int:
+    if not _ptr_is_class(cls):
+        return -1
+    if ptr_is_null(name) != 0 or ptr_is_null(value) != 0:
+        return -1
+    cls = pcc_gc_note_relocation_read(cls)
+    attrs = py_class_attrs_dict(cls, 1)
+    if ptr_is_null(attrs) != 0:
+        return -1
+    key = py_str_new(name, strlen(name))
+    if ptr_is_null(key) != 0:
+        return -1
+    py_dict_set(attrs, key, value)
+    py_decref(key)
+    _bump_class_attr_cache_epoch()
+    return 0
+
+
+@c_abi_export("py_class_setattr")
+def py_class_setattr(cls, name, value) -> int:
+    if not _ptr_is_class(cls):
+        return -1
+    if ptr_is_null(name) != 0 or ptr_is_null(value) != 0:
+        return -1
+    cls = pcc_gc_note_relocation_read(cls)
+    metaclass = _metaclass(cls)
+    if ptr_is_null(metaclass) == 0:
+        meta_attr = _class_attr_lookup_in_mro(metaclass, name)
+        if ptr_is_null(meta_attr) == 0:
+            if _descriptor_is_data(meta_attr):
+                rc: int = _descriptor_call_set(meta_attr, cls, value)
+                py_decref(meta_attr)
+                return rc
+            py_decref(meta_attr)
+    return py_class_setattr_raw(cls, name, value)
+
+
+@c_abi_export("py_class_delattr")
+def py_class_delattr(cls, name) -> int:
+    if not _ptr_is_class(cls) or ptr_is_null(name) != 0:
+        return -1
+    cls = pcc_gc_note_relocation_read(cls)
+    metaclass = _metaclass(cls)
+    if ptr_is_null(metaclass) == 0:
+        meta_attr = _class_attr_lookup_in_mro(metaclass, name)
+        if ptr_is_null(meta_attr) == 0:
+            if _descriptor_is_data(meta_attr):
+                rc: int = _descriptor_call_delete(meta_attr, cls)
+                py_decref(meta_attr)
+                return rc
+            py_decref(meta_attr)
+    attrs = py_class_attrs_dict(cls, 0)
+    if ptr_is_null(attrs) != 0:
+        return -1
+    key = py_str_new(name, strlen(name))
+    if ptr_is_null(key) != 0:
+        return -1
+    rc: int = py_dict_del(attrs, key)
+    py_decref(key)
+    if rc == 0:
+        _bump_class_attr_cache_epoch()
+    return rc
+
+
+@c_abi_export("py_class_attrs_dispose")
+def py_class_attrs_dispose(cls) -> None:
+    if ptr_is_null(cls) != 0:
+        return
+    attrs = load_ptr(cls, PYCLASSOBJECT_ATTRS_OFFSET)
+    if ptr_is_null(attrs) == 0:
+        store_ptr(cls, PYCLASSOBJECT_ATTRS_OFFSET, null())
+        py_decref(attrs)
+
+
+@c_abi_export("py_class_attrs_retarget")
+def py_class_attrs_retarget(source, destination) -> int:
+    if not _ptr_is_class(source) or not _ptr_is_class(destination):
+        return -1
+    attrs = pcc_gc_load_ptr(source, ptr_add(source, PYCLASSOBJECT_ATTRS_OFFSET))
+    if ptr_is_null(attrs) != 0:
+        return 0
+    existing = pcc_gc_load_ptr(destination, ptr_add(destination, PYCLASSOBJECT_ATTRS_OFFSET))
+    if ptr_is_null(existing) == 0:
+        return -1
+    pcc_gc_store_ptr(destination, ptr_add(destination, PYCLASSOBJECT_ATTRS_OFFSET), attrs)
     return 0
 
 
@@ -694,13 +1394,13 @@ def py_class_lookup(cls, name):
         return null()
     cls = pcc_gc_note_relocation_read(cls)
     if _cstr_is_dunder_name(name) != 0:
-        cls_name = load_ptr(cls, 16)
+        cls_name = load_ptr(cls, PYCLASSOBJECT_NAME_OFFSET)
         if ptr_is_null(cls_name) != 0:
             return py_str_new(name, 0)
         return py_str_new(cls_name, strlen(cls_name))
     if _cstr_is_dunder_mro(name) != 0:
-        n_mro: int = load_i32(cls, 40)
-        mro = load_ptr(cls, 48)
+        n_mro: int = load_i32(cls, PYCLASSOBJECT_N_MRO_OFFSET)
+        mro = load_ptr(cls, PYCLASSOBJECT_MRO_OFFSET)
         t = py_tuple_new(n_mro)
         i: int = 0
         while i < n_mro:
@@ -709,8 +1409,8 @@ def py_class_lookup(cls, name):
             i = i + 1
         return t
     if _strs_eq(name, cstr("__base__")) != 0:
-        n_bases: int = load_i32(cls, 24)
-        bases = load_ptr(cls, 32)
+        n_bases: int = load_i32(cls, PYCLASSOBJECT_N_BASES_OFFSET)
+        bases = load_ptr(cls, PYCLASSOBJECT_BASES_OFFSET)
         if n_bases <= 0 or ptr_is_null(bases) != 0:
             return global_load_ptr("py_None")
         return pcc_gc_load_ptr(cls, bases)
@@ -724,17 +1424,17 @@ def py_class_add_method(cls, name, func) -> None:
     if ptr_is_null(name) != 0:
         return
     cls = pcc_gc_note_relocation_read(cls)
-    n_methods_i32: int = load_i32(cls, 56)
+    n_methods_i32: int = load_i32(cls, PYCLASSOBJECT_N_METHODS_OFFSET)
     new_n: int = n_methods_i32 + 1
-    methods = load_ptr(cls, 64)
-    new_methods = realloc(methods, new_n * 16)
+    methods = load_ptr(cls, PYCLASSOBJECT_METHODS_OFFSET)
+    new_methods = realloc(methods, new_n * PYCLASSMETHOD_SIZE)
     if ptr_is_null(new_methods) != 0:
         return
-    method_off: int = n_methods_i32 * 16
-    store_ptr(new_methods, method_off, name)
-    store_ptr(new_methods, method_off + 8, func)
-    store_ptr(cls, 64, new_methods)
-    store_i32(cls, 56, new_n)
+    method_off: int = n_methods_i32 * PYCLASSMETHOD_SIZE
+    store_ptr(new_methods, method_off + PYCLASSMETHOD_NAME_OFFSET, name)
+    store_ptr(new_methods, method_off + PYCLASSMETHOD_FUNC_OFFSET, func)
+    store_ptr(cls, PYCLASSOBJECT_METHODS_OFFSET, new_methods)
+    store_i32(cls, PYCLASSOBJECT_N_METHODS_OFFSET, new_n)
     payload_offset: int = -1
     if ptr_is_null(methods) == 0:
         if ptr_eq(methods, new_methods) == 0:
@@ -758,8 +1458,8 @@ def py_class_add_method(cls, name, func) -> None:
         # Borrowed update-only alias for GC forwarding.  py_user_del_dispatch
         # deliberately resolves through py_class_lookup rather than treating
         # this slot as a separate semantic cache.
-        store_ptr(cls, 96, func)
-        _class_note_borrowed_metadata_slot_store(cls, ptr_add(cls, 96), func)
+        store_ptr(cls, PYCLASSOBJECT_DEL_METHOD_OFFSET, func)
+        _class_note_borrowed_metadata_slot_store(cls, ptr_add(cls, PYCLASSOBJECT_DEL_METHOD_OFFSET), func)
 
 
 @c_abi_export("py_class_set_metaclass")
@@ -771,8 +1471,8 @@ def py_class_set_metaclass(cls, metaclass) -> None:
         if not _ptr_is_class(metaclass):
             return
         metaclass = pcc_gc_note_relocation_read(metaclass)
-    store_ptr(cls, 112, metaclass)
-    _class_note_borrowed_metadata_slot_store(cls, ptr_add(cls, 112), metaclass)
+    store_ptr(cls, PYCLASSOBJECT_METACLASS_OFFSET, metaclass)
+    _class_note_borrowed_metadata_slot_store(cls, ptr_add(cls, PYCLASSOBJECT_METACLASS_OFFSET), metaclass)
 
 
 @c_abi_export("py_instance_new")
@@ -780,19 +1480,27 @@ def py_instance_new(cls) -> c_ptr:
     if not _ptr_is_class(cls):
         return null()
     cls = pcc_gc_note_relocation_read(cls)
-    n_fields_i32: int = load_i32(cls, 72)
+    n_fields_i32: int = load_i32(cls, PYCLASSOBJECT_N_FIELDS_OFFSET)
     n_slots: int = n_fields_i32 + 1
     if n_slots < 0:
         n_slots = 1
-    size: int = 24 + n_slots * 8
-    inst = pcc_gc_alloc(size, load_i32(cls, 92), 0)
+    size: int = PYINSTANCEOBJECT_SIZE + n_slots * C_POINTER_SIZE
+    inst = pcc_gc_alloc(
+        size,
+        load_i32(cls, PYCLASSOBJECT_TYPE_TAG_ALLOC_OFFSET),
+        0,
+    )
     if ptr_is_null(inst) != 0:
         return null()
-    memset(ptr_add(inst, 16), 0, size - 16)
-    store_i64(inst, 0, 1)  # refcount
-    type_tag_alloc: int = load_i32(cls, 92)
-    store_i32(inst, 8, type_tag_alloc)
-    store_ptr(inst, 16, cls)
+    memset(
+        ptr_add(inst, PYINSTANCEOBJECT_CLS_OFFSET),
+        0,
+        size - PYINSTANCEOBJECT_CLS_OFFSET,
+    )
+    store_i64(inst, PYOBJECTHEADER_REFCOUNT_OFFSET, 1)
+    type_tag_alloc: int = load_i32(cls, PYCLASSOBJECT_TYPE_TAG_ALLOC_OFFSET)
+    store_i32(inst, PYOBJECTHEADER_TYPE_TAG_OFFSET, type_tag_alloc)
+    store_ptr(inst, PYINSTANCEOBJECT_CLS_OFFSET, cls)
     py_gc_track(inst)
     # The freshly allocated instance is already a new reference; keep this as
     # a raw pointer expression so return lowering does not retain it again.
@@ -805,12 +1513,12 @@ def py_instance_get_field(inst, idx: int):
         return null()
     if idx < 0:
         return null()
-    cls = pcc_gc_load_ptr(inst, ptr_add(inst, 16))
-    n_fields: int = load_i32(cls, 72)
+    cls = pcc_gc_load_ptr(inst, ptr_add(inst, PYINSTANCEOBJECT_CLS_OFFSET))
+    n_fields: int = load_i32(cls, PYCLASSOBJECT_N_FIELDS_OFFSET)
     if idx >= n_fields:
         return null()
-    fields_base = ptr_add(inst, 24)
-    v = pcc_gc_load_ptr(inst, ptr_add(fields_base, idx * 8))
+    fields_base = ptr_add(inst, PYINSTANCEOBJECT_FIELDS_OFFSET)
+    v = pcc_gc_load_ptr(inst, ptr_add(fields_base, idx * C_POINTER_SIZE))
     if ptr_is_null(v) == 0:
         py_incref(v)
     return v
@@ -822,12 +1530,12 @@ def py_instance_set_field(inst, idx: int, value) -> None:
         return
     if idx < 0:
         return
-    cls = pcc_gc_load_ptr(inst, ptr_add(inst, 16))
-    n_fields: int = load_i32(cls, 72)
+    cls = pcc_gc_load_ptr(inst, ptr_add(inst, PYINSTANCEOBJECT_CLS_OFFSET))
+    n_fields: int = load_i32(cls, PYCLASSOBJECT_N_FIELDS_OFFSET)
     if idx >= n_fields:
         return
-    fields_base = ptr_add(inst, 24)
-    pcc_gc_store_ptr(inst, ptr_add(fields_base, idx * 8), value)
+    fields_base = ptr_add(inst, PYINSTANCEOBJECT_FIELDS_OFFSET)
+    pcc_gc_store_ptr(inst, ptr_add(fields_base, idx * C_POINTER_SIZE), value)
 
 
 @c_abi_export("py_valuebox_new")
@@ -835,7 +1543,7 @@ def py_valuebox_new(cls) -> c_ptr:
     box = py_instance_new(cls)
     if ptr_is_null(box) != 0:
         return null()
-    store_i32(box, 8, 200)  # PY_TYPE_VALUEBOX
+    store_i32(box, PYOBJECTHEADER_TYPE_TAG_OFFSET, PY_TYPE_VALUEBOX)
     # py_instance_new already returned a new reference.
     return ptr_add(box, 0)
 
@@ -856,7 +1564,7 @@ def py_instance_getattr_default(inst, name):
         return null()
     if ptr_is_null(name) != 0:
         return null()
-    cls = pcc_gc_load_ptr(inst, ptr_add(inst, 16))
+    cls = pcc_gc_load_ptr(inst, ptr_add(inst, PYINSTANCEOBJECT_CLS_OFFSET))
     if _cstr_is_dunder_class(name) != 0:
         if ptr_is_null(cls) == 0:
             py_incref(cls)
@@ -876,8 +1584,11 @@ def py_instance_getattr_default(inst, name):
         return dyn
     cached_idx: int = _field_cache_lookup(cls, name)
     if cached_idx >= 0:
-        fields_base_cached = ptr_add(inst, 24)
-        cached = pcc_gc_load_ptr(inst, ptr_add(fields_base_cached, cached_idx * 8))
+        fields_base_cached = ptr_add(inst, PYINSTANCEOBJECT_FIELDS_OFFSET)
+        cached = pcc_gc_load_ptr(
+            inst,
+            ptr_add(fields_base_cached, cached_idx * C_POINTER_SIZE),
+        )
         if ptr_is_null(cached) == 0:
             py_incref(cached)
         return cached
@@ -893,8 +1604,8 @@ def py_instance_getattr_default(inst, name):
     idx: int = _lookup_field_index(cls, name)
     if idx >= 0:
         _field_cache_store(cls, name, idx)
-        fields_base = ptr_add(inst, 24)
-        v = pcc_gc_load_ptr(inst, ptr_add(fields_base, idx * 8))
+        fields_base = ptr_add(inst, PYINSTANCEOBJECT_FIELDS_OFFSET)
+        v = pcc_gc_load_ptr(inst, ptr_add(fields_base, idx * C_POINTER_SIZE))
         if ptr_is_null(v) == 0:
             py_incref(v)
         return v
@@ -909,7 +1620,7 @@ def py_instance_getattr_default(inst, name):
                 return got
     if ptr_is_null(class_attr) == 0:
         if is_tagged_int(class_attr) == 0:
-            if load_i32(class_attr, 8) == 9:
+            if load_i32(class_attr, PYOBJECTHEADER_TYPE_TAG_OFFSET) == PY_TYPE_FUNC:
                 bound = py_instance_bind_method(class_attr, inst, name)
                 py_decref(class_attr)
                 return bound
@@ -931,7 +1642,7 @@ def py_instance_getattr_default(inst, name):
     # for names the user class did not define. PY_CLASS_FLAG_DICT_SUBCLASS is
     # bit 2 (value 4) in the class header flags at offset 12. Returns a bound
     # native callable, or NULL -> fall through to __getattr__ / AttributeError.
-    ds_flags: int = load_i32(cls, 12)
+    ds_flags: int = load_i32(cls, PYOBJECTHEADER_FLAGS_OFFSET)
     if (ds_flags & 4) != 0:
         dm = py_dict_subclass_getattr(inst, name)
         if ptr_is_null(dm) == 0:
@@ -949,18 +1660,33 @@ def py_instance_getattr_default(inst, name):
     # call_ptr2 alone treats the object as a code address and crashes. Mirrors
     # class_call_binary_method in py_class.c.
     if is_tagged_int(getattr_method) == 0:
-        if load_i32(getattr_method, 8) == 9:  # PY_TYPE_FUNC
+        if load_i32(getattr_method, PYOBJECTHEADER_TYPE_TAG_OFFSET) == PY_TYPE_FUNC:
             gargs = py_tuple_new(2)
             if ptr_is_null(gargs) != 0:
+                _class_require_result(
+                    null(),
+                    cstr("py_tuple_new"),
+                    cstr("class callback argument tuple allocation failed"),
+                )
                 py_decref(key)
                 return null()
             py_tuple_set_item(gargs, 0, inst)
             py_tuple_set_item(gargs, 1, key)
             got = py_obj_call(getattr_method, gargs, null())
+            _class_require_result(
+                got,
+                cstr("__getattr__"),
+                cstr("class callback returned NULL without setting an exception"),
+            )
             py_decref(gargs)
             py_decref(key)
             return got
     got = call_ptr2(getattr_method, inst, key)
+    _class_require_result(
+        got,
+        cstr("__getattr__"),
+        cstr("class callback returned NULL without setting an exception"),
+    )
     py_decref(key)
     return got
 
@@ -971,7 +1697,7 @@ def py_instance_getattr(inst, name):
         return null()
     if ptr_is_null(name) != 0:
         return null()
-    cls = pcc_gc_load_ptr(inst, ptr_add(inst, 16))
+    cls = pcc_gc_load_ptr(inst, ptr_add(inst, PYINSTANCEOBJECT_CLS_OFFSET))
     if ptr_is_null(cls) != 0:
         return null()
     getattribute_method = _class_lookup_in_mro(cls, cstr("__getattribute__"))
@@ -980,6 +1706,11 @@ def py_instance_getattr(inst, name):
         if ptr_is_null(key) != 0:
             return null()
         got = call_ptr2(getattribute_method, inst, key)
+        _class_require_result(
+            got,
+            cstr("__getattribute__"),
+            cstr("class callback returned NULL without setting an exception"),
+        )
         if ptr_is_null(got) == 0:
             py_decref(key)
             return got
@@ -992,6 +1723,11 @@ def py_instance_getattr(inst, name):
                     if ptr_is_null(getattr_method) == 0:
                         py_clear_exception()
                         fallback = call_ptr2(getattr_method, inst, key)
+                        _class_require_result(
+                            fallback,
+                            cstr("__getattr__"),
+                            cstr("class callback returned NULL without setting an exception"),
+                        )
                         py_decref(key)
                         return fallback
         py_decref(key)
@@ -1005,7 +1741,7 @@ def py_instance_setattr(inst, name, value) -> int:
         return -1
     if ptr_is_null(name) != 0:
         return -1
-    cls = pcc_gc_load_ptr(inst, ptr_add(inst, 16))
+    cls = pcc_gc_load_ptr(inst, ptr_add(inst, PYINSTANCEOBJECT_CLS_OFFSET))
     class_attr = _class_attr_lookup_in_mro(cls, name)
     if ptr_is_null(class_attr) == 0:
         set_method = _descriptor_method(class_attr, cstr("__set__"))
@@ -1016,11 +1752,15 @@ def py_instance_setattr(inst, name, value) -> int:
         py_decref(class_attr)
     idx: int = _lookup_field_index(cls, name)
     if idx >= 0:
-        n_fields: int = load_i32(cls, 72)
+        n_fields: int = load_i32(cls, PYCLASSOBJECT_N_FIELDS_OFFSET)
         if idx >= n_fields:
             return -1
-        fields_base = ptr_add(inst, 24)
-        pcc_gc_store_ptr(inst, ptr_add(fields_base, idx * 8), value)
+        fields_base = ptr_add(inst, PYINSTANCEOBJECT_FIELDS_OFFSET)
+        pcc_gc_store_ptr(
+            inst,
+            ptr_add(fields_base, idx * C_POINTER_SIZE),
+            value,
+        )
         return 0
     if ptr_is_null(value) != 0:
         return -1
@@ -1046,7 +1786,7 @@ def py_instance_delattr(inst, name) -> int:
         return -1
     if ptr_is_null(name) != 0:
         return -1
-    cls = pcc_gc_load_ptr(inst, ptr_add(inst, 16))
+    cls = pcc_gc_load_ptr(inst, ptr_add(inst, PYINSTANCEOBJECT_CLS_OFFSET))
     class_attr = _class_attr_lookup_in_mro(cls, name)
     if ptr_is_null(class_attr) == 0:
         delete_method = _descriptor_method(class_attr, cstr("__delete__"))
@@ -1057,14 +1797,17 @@ def py_instance_delattr(inst, name) -> int:
         py_decref(class_attr)
     idx: int = _lookup_field_index(cls, name)
     if idx >= 0:
-        n_fields: int = load_i32(cls, 72)
+        n_fields: int = load_i32(cls, PYCLASSOBJECT_N_FIELDS_OFFSET)
         if idx >= n_fields:
             return -1
-        fields_base = ptr_add(inst, 24)
-        old = pcc_gc_load_ptr(inst, ptr_add(fields_base, idx * 8))
+        fields_base = ptr_add(inst, PYINSTANCEOBJECT_FIELDS_OFFSET)
+        old = pcc_gc_load_ptr(
+            inst,
+            ptr_add(fields_base, idx * C_POINTER_SIZE),
+        )
         if ptr_is_null(old) != 0:
             return -1
-        store_ptr(fields_base, idx * 8, null())
+        store_ptr(fields_base, idx * C_POINTER_SIZE, null())
         py_decref(old)
         return 0
     dyn_slot = _dynamic_attr_slot(inst)
@@ -1079,13 +1822,14 @@ def py_instance_delattr(inst, name) -> int:
     return rc
 
 
+@c_abi_export("py_class_apply_namespace_dict")
 def py_class_apply_namespace_dict(cls, ns) -> int:
     if not _ptr_is_class(cls):
         return -1
     if ptr_is_null(ns) != 0:
         py_raise(py_exc_new(3, cstr("type.__new__() argument 3 must be dict")))
         return -1
-    if load_i32(ns, 8) != 6:  # PY_TYPE_DICT
+    if load_i32(ns, PYOBJECTHEADER_TYPE_TAG_OFFSET) != PY_TYPE_DICT:
         py_raise(py_exc_new(3, cstr("type.__new__() argument 3 must be dict")))
         return -1
     keys = py_dict_keys(ns)
@@ -1124,7 +1868,8 @@ def py_isinstance(obj, cls) -> int:
     obj = pcc_gc_note_relocation_read(obj)
     cls = pcc_gc_note_relocation_read(cls)
     if _ptr_can_have_header(obj):
-        if load_i32(obj, 8) == 12:  # PY_TYPE_EXC: match via exc_class MRO
+        if load_i32(obj, PYOBJECTHEADER_TYPE_TAG_OFFSET) == PY_TYPE_EXC:
+            # Exception instances match through their exception-class MRO.
             if py_exc_matches(obj, cls) != 0:
                 return 1
             return 0
@@ -1132,14 +1877,14 @@ def py_isinstance(obj, cls) -> int:
         return 0
     if not _ptr_is_class(cls):
         return 0
-    obj_cls = pcc_gc_load_ptr(obj, ptr_add(obj, 16))
+    obj_cls = pcc_gc_load_ptr(obj, ptr_add(obj, PYINSTANCEOBJECT_CLS_OFFSET))
     if ptr_eq(obj_cls, cls) != 0:
         return 1
-    n_mro: int = load_i32(obj_cls, 40)
-    mro = load_ptr(obj_cls, 48)
+    n_mro: int = load_i32(obj_cls, PYCLASSOBJECT_N_MRO_OFFSET)
+    mro = load_ptr(obj_cls, PYCLASSOBJECT_MRO_OFFSET)
     i: int = 0
     while i < n_mro:
-        m = pcc_gc_load_ptr(obj_cls, ptr_add(mro, i * 8))
+        m = pcc_gc_load_ptr(obj_cls, ptr_add(mro, i * C_POINTER_SIZE))
         if ptr_eq(m, cls) != 0:
             return 1
         i = i + 1
@@ -1156,12 +1901,12 @@ def py_super_lookup(start_cls, from_cls, name):
         return null()
     start_cls = pcc_gc_note_relocation_read(start_cls)
     from_cls = pcc_gc_note_relocation_read(from_cls)
-    n_mro: int = load_i32(start_cls, 40)
-    mro = load_ptr(start_cls, 48)
+    n_mro: int = load_i32(start_cls, PYCLASSOBJECT_N_MRO_OFFSET)
+    mro = load_ptr(start_cls, PYCLASSOBJECT_MRO_OFFSET)
     start: int = -1
     i: int = 0
     while i < n_mro:
-        m = pcc_gc_load_ptr(start_cls, ptr_add(mro, i * 8))
+        m = pcc_gc_load_ptr(start_cls, ptr_add(mro, i * C_POINTER_SIZE))
         if ptr_eq(m, from_cls) != 0:
             start = i
             i = n_mro  # force-exit
@@ -1176,16 +1921,19 @@ def py_super_lookup(start_cls, from_cls, name):
 
     j: int = start + 1
     while j < n_mro:
-        m = pcc_gc_load_ptr(start_cls, ptr_add(mro, j * 8))
+        m = pcc_gc_load_ptr(start_cls, ptr_add(mro, j * C_POINTER_SIZE))
         if ptr_is_null(m) == 0:
-            n_methods: int = load_i32(m, 56)
-            methods = load_ptr(m, 64)
+            n_methods: int = load_i32(m, PYCLASSOBJECT_N_METHODS_OFFSET)
+            methods = load_ptr(m, PYCLASSOBJECT_METHODS_OFFSET)
             k: int = 0
             while k < n_methods:
-                m_off: int = k * 16
-                m_name = load_ptr(methods, m_off)
+                m_off: int = k * PYCLASSMETHOD_SIZE
+                m_name = load_ptr(methods, m_off + PYCLASSMETHOD_NAME_OFFSET)
                 if _strs_eq(m_name, name) != 0:
-                    method_slot = ptr_add(methods, m_off + 8)
+                    method_slot = ptr_add(
+                        methods,
+                        m_off + PYCLASSMETHOD_FUNC_OFFSET,
+                    )
                     func = pcc_gc_note_relocation_read(load_ptr(method_slot, 0))
                     store_ptr(method_slot, 0, func)
                     return func
@@ -1200,22 +1948,46 @@ def py_super_lookup(start_cls, from_cls, name):
 def py_class_dealloc(o) -> None:
     if ptr_is_null(o) != 0:
         return
-    attrs = pcc_gc_load_ptr(o, ptr_add(o, 104))
+    attrs = pcc_gc_load_ptr(o, ptr_add(o, PYCLASSOBJECT_ATTRS_OFFSET))
     if ptr_is_null(attrs) == 0:
-        store_ptr(o, 104, null())
+        store_ptr(o, PYCLASSOBJECT_ATTRS_OFFSET, null())
         py_decref(attrs)
-    bases = load_ptr(o, 32)
+    bases = load_ptr(o, PYCLASSOBJECT_BASES_OFFSET)
     if ptr_is_null(bases) == 0:
         free(bases)
-    mro = load_ptr(o, 48)
+    mro = load_ptr(o, PYCLASSOBJECT_MRO_OFFSET)
     if ptr_is_null(mro) == 0:
         free(mro)
-    methods = load_ptr(o, 64)
+    methods = load_ptr(o, PYCLASSOBJECT_METHODS_OFFSET)
     if ptr_is_null(methods) == 0:
         free(methods)
-    field_names = load_ptr(o, 80)
+    field_names = load_ptr(o, PYCLASSOBJECT_FIELD_NAMES_OFFSET)
     if ptr_is_null(field_names) == 0:
         free(field_names)
+    pcc_gc_free_object_memory(o)
+
+
+def _descriptor_release_slot(owner, offset: int) -> None:
+    slot = ptr_add(owner, offset)
+    value = pcc_gc_load_ptr(owner, slot)
+    store_ptr(owner, offset, null())
+    if ptr_is_null(value) == 0:
+        py_decref(value)
+
+
+@c_abi_export("py_descriptor_dealloc")
+def py_descriptor_dealloc(o) -> None:
+    if ptr_is_null(o) != 0:
+        return
+    tag: int = load_i32(o, PYOBJECTHEADER_TYPE_TAG_OFFSET)
+    if tag == PY_TYPE_PROPERTY:
+        _descriptor_release_slot(o, PYPROPERTYOBJECT_FGET_OFFSET)
+        _descriptor_release_slot(o, PYPROPERTYOBJECT_FSET_OFFSET)
+        _descriptor_release_slot(o, PYPROPERTYOBJECT_FDEL_OFFSET)
+    elif tag == PY_TYPE_CLASSMETHOD:
+        _descriptor_release_slot(o, PYCLASSMETHODOBJECT_FUNC_OFFSET)
+    elif tag == PY_TYPE_STATICMETHOD:
+        _descriptor_release_slot(o, PYSTATICMETHODOBJECT_FUNC_OFFSET)
     pcc_gc_free_object_memory(o)
 
 
@@ -1225,22 +1997,25 @@ def py_instance_dealloc(o) -> None:
         return
     py_weakref_invalidate(o)
     py_user_del_dispatch(o)
-    if load_i64(o, 0) > 0:
+    if load_i64(o, PYOBJECTHEADER_REFCOUNT_OFFSET) > 0:
         py_gc_track(o)
         return
     if _ptr_is_instance(o):
-        cls = pcc_gc_load_ptr(o, ptr_add(o, 16))
-        n_fields: int = load_i32(cls, 72)
-        fields_base = ptr_add(o, 24)
+        cls = pcc_gc_load_ptr(o, ptr_add(o, PYINSTANCEOBJECT_CLS_OFFSET))
+        n_fields: int = load_i32(cls, PYCLASSOBJECT_N_FIELDS_OFFSET)
+        fields_base = ptr_add(o, PYINSTANCEOBJECT_FIELDS_OFFSET)
         i: int = 0
         while i < n_fields:
-            v = pcc_gc_load_ptr(o, ptr_add(fields_base, i * 8))
+            v = pcc_gc_load_ptr(
+                o,
+                ptr_add(fields_base, i * C_POINTER_SIZE),
+            )
             if ptr_is_null(v) == 0:
                 # Null the slot before decref so a finalizer that re-enters
                 # py_instance_dealloc (its __del__ arg-tuple holds self and
                 # drops self back to 0 on free) reads NULL and does not
                 # double-release this field. Mirrors py_class_dealloc.
-                store_ptr(fields_base, i * 8, null())
+                store_ptr(fields_base, i * C_POINTER_SIZE, null())
                 py_decref(v)
             i = i + 1
         dyn_slot = _dynamic_attr_slot(o)
@@ -1256,20 +2031,20 @@ def py_instance_dealloc(o) -> None:
 def py_dataclass_replace(obj, n_overrides: int, names, values):
     if not _ptr_is_instance(obj):
         return null()
-    cls = pcc_gc_load_ptr(obj, ptr_add(obj, 16))
+    cls = pcc_gc_load_ptr(obj, ptr_add(obj, PYINSTANCEOBJECT_CLS_OFFSET))
     dst = py_instance_new(cls)
     if ptr_is_null(dst) != 0:
         return null()
 
-    n_fields: int = load_i32(cls, 72)
-    src_fields = ptr_add(obj, 24)
-    dst_fields = ptr_add(dst, 24)
+    n_fields: int = load_i32(cls, PYCLASSOBJECT_N_FIELDS_OFFSET)
+    src_fields = ptr_add(obj, PYINSTANCEOBJECT_FIELDS_OFFSET)
+    dst_fields = ptr_add(dst, PYINSTANCEOBJECT_FIELDS_OFFSET)
     i: int = 0
     while i < n_fields:
-        v = pcc_gc_load_ptr(obj, ptr_add(src_fields, i * 8))
+        v = pcc_gc_load_ptr(obj, ptr_add(src_fields, i * C_POINTER_SIZE))
         if ptr_is_null(v) == 0:
             py_incref(v)
-            store_ptr(dst_fields, i * 8, v)
+            store_ptr(dst_fields, i * C_POINTER_SIZE, v)
         i = i + 1
     src_dyn_slot = _dynamic_attr_slot(obj)
     dst_dyn_slot = _dynamic_attr_slot(dst)
@@ -1283,10 +2058,10 @@ def py_dataclass_replace(obj, n_overrides: int, names, values):
     while j < n_overrides:
         name_ptr = null()
         if ptr_is_null(names) == 0:
-            name_ptr = load_ptr(names, j * 8)
+            name_ptr = load_ptr(names, j * C_POINTER_SIZE)
         val_ptr = null()
         if ptr_is_null(values) == 0:
-            val_ptr = load_ptr(values, j * 8)
+            val_ptr = load_ptr(values, j * C_POINTER_SIZE)
         idx: int = _lookup_field_index(cls, name_ptr)
         if idx < 0:
             py_decref(dst)
@@ -1294,7 +2069,7 @@ def py_dataclass_replace(obj, n_overrides: int, names, values):
         # Inline py_instance_set_field — avoid passing idx (which is
         # i64 here, but py_instance_set_field is i32 per ABI).
         if idx < n_fields:
-            f_off: int = idx * 8
+            f_off: int = idx * C_POINTER_SIZE
             old = load_ptr(dst_fields, f_off)
             if ptr_is_null(val_ptr) == 0:
                 py_incref(val_ptr)
@@ -1311,40 +2086,40 @@ def py_dataclass_replace_from_dict(obj, overrides):
         return null()
     if not _ptr_can_have_header(overrides):
         return null()
-    if load_i32(overrides, 8) != 6:  # PY_TYPE_DICT
+    if load_i32(overrides, PYOBJECTHEADER_TYPE_TAG_OFFSET) != PY_TYPE_DICT:
         return null()
 
-    cls = pcc_gc_load_ptr(obj, ptr_add(obj, 16))
+    cls = pcc_gc_load_ptr(obj, ptr_add(obj, PYINSTANCEOBJECT_CLS_OFFSET))
     dst = py_instance_new(cls)
     if ptr_is_null(dst) != 0:
         return null()
 
-    n_fields: int = load_i32(cls, 72)
-    src_fields = ptr_add(obj, 24)
-    dst_fields = ptr_add(dst, 24)
+    n_fields: int = load_i32(cls, PYCLASSOBJECT_N_FIELDS_OFFSET)
+    src_fields = ptr_add(obj, PYINSTANCEOBJECT_FIELDS_OFFSET)
+    dst_fields = ptr_add(dst, PYINSTANCEOBJECT_FIELDS_OFFSET)
     i: int = 0
     while i < n_fields:
-        v = pcc_gc_load_ptr(obj, ptr_add(src_fields, i * 8))
+        v = pcc_gc_load_ptr(obj, ptr_add(src_fields, i * C_POINTER_SIZE))
         if ptr_is_null(v) == 0:
             py_incref(v)
-            store_ptr(dst_fields, i * 8, v)
+            store_ptr(dst_fields, i * C_POINTER_SIZE, v)
         i = i + 1
 
-    entries = load_ptr(overrides, 40)
-    entries_used: int = load_i64(overrides, 48)
+    entries = load_ptr(overrides, PYDICTOBJECT_ENTRIES_OFFSET)
+    entries_used: int = load_i64(overrides, PYDICTOBJECT_ENTRIES_USED_OFFSET)
     j: int = 0
     while j < entries_used:
-        ent_off: int = j * 24
-        key = load_ptr(entries, ent_off + 8)
+        ent_off: int = j * DICTENTRY_SIZE
+        key = load_ptr(entries, ent_off + DICTENTRY_KEY_OFFSET)
         if ptr_is_null(key) == 0:
-            val_ptr = load_ptr(entries, ent_off + 16)
+            val_ptr = load_ptr(entries, ent_off + DICTENTRY_VALUE_OFFSET)
             name_ptr = py_str_utf8(key)
             idx: int = _lookup_field_index(cls, name_ptr)
             if idx < 0:
                 py_decref(dst)
                 return null()
             if idx < n_fields:
-                f_off: int = idx * 8
+                f_off: int = idx * C_POINTER_SIZE
                 old = load_ptr(dst_fields, f_off)
                 if ptr_is_null(val_ptr) == 0:
                     py_incref(val_ptr)
@@ -1363,74 +2138,84 @@ def py_dataclass_replace_from_dict(obj, overrides):
 
 @c_abi_export("py_class_new")
 def py_class_new(name, bases, n_bases: int, field_names, n_fields: int):
-    c = pcc_gc_alloc(120, 10, 0)
+    c = pcc_gc_alloc(PYCLASSOBJECT_SIZE, PY_TYPE_CLASS, 0)
     if ptr_is_null(c) != 0:
         return null()
-    memset(ptr_add(c, 16), 0, 104)
-    store_i64(c, 0, 1)
-    store_i32(c, 8, 10)  # PY_TYPE_CLASS
+    memset(
+        ptr_add(c, PYCLASSOBJECT_NAME_OFFSET),
+        0,
+        PYCLASSOBJECT_SIZE - PYCLASSOBJECT_NAME_OFFSET,
+    )
+    store_i64(c, PYOBJECTHEADER_REFCOUNT_OFFSET, 1)
+    store_i32(c, PYOBJECTHEADER_TYPE_TAG_OFFSET, PY_TYPE_CLASS)
     # Class/type objects are effectively process-lifetime and are referenced
     # by every instance via a *borrowed* (uncounted) class pointer at inst+16.
     # Mark them PY_FLAG_IMMORTAL so a stray over-release cannot drive a live
     # class to refcount 0 and free it out from under its instances -- which
     # zeroes the class field table (n_fields/field_names) and makes every
     # subsequent getattr on any instance fail / segfault. Mirrors py_class.c.
-    store_i32(c, 12, load_i32(c, 12) | 1)  # PY_FLAG_IMMORTAL
-    store_ptr(c, 16, name)
-    store_i32(c, 24, n_bases)
-    store_i32(c, 72, n_fields)
-    store_ptr(c, 104, null())  # attrs
-    store_ptr(c, 112, null())  # metaclass
+    store_i32(
+        c,
+        PYOBJECTHEADER_FLAGS_OFFSET,
+        load_i32(c, PYOBJECTHEADER_FLAGS_OFFSET) | PY_FLAG_IMMORTAL,
+    )
+    store_ptr(c, PYCLASSOBJECT_NAME_OFFSET, name)
+    store_i32(c, PYCLASSOBJECT_N_BASES_OFFSET, n_bases)
+    store_i32(c, PYCLASSOBJECT_N_FIELDS_OFFSET, n_fields)
+    store_ptr(c, PYCLASSOBJECT_ATTRS_OFFSET, null())
+    store_ptr(c, PYCLASSOBJECT_METACLASS_OFFSET, null())
 
     # Copy bases array.
     if n_bases > 0:
         if ptr_is_null(bases) == 0:
-            bases_copy = malloc(n_bases * 8)
+            bases_copy = malloc(n_bases * C_POINTER_SIZE)
             if ptr_is_null(bases_copy) == 0:
                 ii: int = 0
                 while ii < n_bases:
-                    bv = pcc_gc_note_relocation_read(load_ptr(bases, ii * 8))
-                    store_ptr(bases_copy, ii * 8, bv)
+                    bv = pcc_gc_note_relocation_read(
+                        load_ptr(bases, ii * C_POINTER_SIZE)
+                    )
+                    store_ptr(bases_copy, ii * C_POINTER_SIZE, bv)
                     ii = ii + 1
-                store_ptr(c, 32, bases_copy)
+                store_ptr(c, PYCLASSOBJECT_BASES_OFFSET, bases_copy)
                 pcc_gc_backend4_zpage_register_owner_payload_span(
                     c,
                     bases_copy,
-                    n_bases * 8,
+                    n_bases * C_POINTER_SIZE,
                 )
-        if ptr_is_null(load_ptr(c, 32)) != 0:
+        if ptr_is_null(load_ptr(c, PYCLASSOBJECT_BASES_OFFSET)) != 0:
             free(c)
             return null()
 
     # Copy field_names array.
     if n_fields > 0:
         if ptr_is_null(field_names) == 0:
-            fn_copy = malloc(n_fields * 8)
+            fn_copy = malloc(n_fields * C_POINTER_SIZE)
             if ptr_is_null(fn_copy) == 0:
                 jj: int = 0
                 while jj < n_fields:
-                    fv = load_ptr(field_names, jj * 8)
-                    store_ptr(fn_copy, jj * 8, fv)
+                    fv = load_ptr(field_names, jj * C_POINTER_SIZE)
+                    store_ptr(fn_copy, jj * C_POINTER_SIZE, fv)
                     jj = jj + 1
-                store_ptr(c, 80, fn_copy)
+                store_ptr(c, PYCLASSOBJECT_FIELD_NAMES_OFFSET, fn_copy)
 
     user_tag: int = _alloc_user_tag()
-    store_i32(c, 92, user_tag)
+    store_i32(c, PYCLASSOBJECT_TYPE_TAG_ALLOC_OFFSET, user_tag)
 
     n_slots: int = n_fields + 1
     if n_slots < 0:
         n_slots = 1
-    inst_size: int = 24 + n_slots * 8
+    inst_size: int = PYINSTANCEOBJECT_SIZE + n_slots * C_POINTER_SIZE
     if inst_size > 0x7FFFFFFF:
         inst_size = 0x7FFFFFFF
-    store_i32(c, 88, inst_size)
+    store_i32(c, PYCLASSOBJECT_INSTANCE_SIZE_OFFSET, inst_size)
 
     # ---- C3 linearize inline ----
     # Allocate MergeSeq array (n_bases + 1 entries, 16 bytes each).
     tail = null()
     tail_len: int = 0
     if n_bases > 0:
-        linear_bases = load_ptr(c, 32)
+        linear_bases = load_ptr(c, PYCLASSOBJECT_BASES_OFFSET)
         if ptr_is_null(linear_bases) != 0:
             linear_bases = bases
         nseqs: int = n_bases + 1
@@ -1444,9 +2229,11 @@ def py_class_new(name, bases, n_bases: int, field_names, n_fields: int):
         cap_total: int = 0
         kk: int = 0
         while kk < n_bases:
-            b = pcc_gc_note_relocation_read(load_ptr(linear_bases, kk * 8))
-            b_mro = load_ptr(b, 48)
-            b_n_mro: int = load_i32(b, 40)
+            b = pcc_gc_note_relocation_read(
+                load_ptr(linear_bases, kk * C_POINTER_SIZE)
+            )
+            b_mro = load_ptr(b, PYCLASSOBJECT_MRO_OFFSET)
+            b_n_mro: int = load_i32(b, PYCLASSOBJECT_N_MRO_OFFSET)
             seq_off: int = kk * 16
             store_ptr(seqs, seq_off, b_mro)
             store_i32(seqs, seq_off + 8, 0)
@@ -1461,7 +2248,7 @@ def py_class_new(name, bases, n_bases: int, field_names, n_fields: int):
 
         if cap_total <= 0:
             cap_total = 1
-        acc = malloc(cap_total * 8)
+        acc = malloc(cap_total * C_POINTER_SIZE)
         if ptr_is_null(acc) != 0:
             free(seqs)
             free(c)
@@ -1493,7 +2280,9 @@ def py_class_new(name, bases, n_bases: int, field_names, n_fields: int):
                     ln2: int = load_i32(seqs, so3 + 12)
                     if hd2 < ln2:
                         items = load_ptr(seqs, so3)
-                        c_cand = pcc_gc_note_relocation_read(load_ptr(items, hd2 * 8))
+                        c_cand = pcc_gc_note_relocation_read(
+                            load_ptr(items, hd2 * C_POINTER_SIZE)
+                        )
                         ok: int = 1
                         check_j: int = 0
                         while check_j < nseqs:
@@ -1505,7 +2294,7 @@ def py_class_new(name, bases, n_bases: int, field_names, n_fields: int):
                                 tail_i: int = hd3 + 1
                                 while tail_i < ln3:
                                     tv = pcc_gc_note_relocation_read(
-                                        load_ptr(items3, tail_i * 8)
+                                        load_ptr(items3, tail_i * C_POINTER_SIZE)
                                     )
                                     if ptr_eq(tv, c_cand) != 0:
                                         ok = 0
@@ -1525,7 +2314,7 @@ def py_class_new(name, bases, n_bases: int, field_names, n_fields: int):
                     free(seqs)
                     free(c)
                     return null()
-                store_ptr(acc, acc_len * 8, cand)
+                store_ptr(acc, acc_len * C_POINTER_SIZE, cand)
                 acc_len = acc_len + 1
                 # Consume head where matches cand.
                 consume_i: int = 0
@@ -1535,7 +2324,9 @@ def py_class_new(name, bases, n_bases: int, field_names, n_fields: int):
                     ln4: int = load_i32(seqs, so5 + 12)
                     if hd4 < ln4:
                         items5 = load_ptr(seqs, so5)
-                        cur = pcc_gc_note_relocation_read(load_ptr(items5, hd4 * 8))
+                        cur = pcc_gc_note_relocation_read(
+                            load_ptr(items5, hd4 * C_POINTER_SIZE)
+                        )
                         if ptr_eq(cur, cand) != 0:
                             store_i32(seqs, so5 + 8, hd4 + 1)
                     consume_i = consume_i + 1
@@ -1551,7 +2342,7 @@ def py_class_new(name, bases, n_bases: int, field_names, n_fields: int):
             append_root = 1
 
     mro_len: int = 1 + tail_len + append_root
-    mro = malloc(mro_len * 8)
+    mro = malloc(mro_len * C_POINTER_SIZE)
     if ptr_is_null(mro) != 0:
         if ptr_is_null(tail) == 0:
             free(tail)
@@ -1560,26 +2351,92 @@ def py_class_new(name, bases, n_bases: int, field_names, n_fields: int):
     store_ptr(mro, 0, c)
     mi: int = 0
     while mi < tail_len:
-        v = load_ptr(tail, mi * 8)
-        store_ptr(mro, (1 + mi) * 8, v)
+        v = load_ptr(tail, mi * C_POINTER_SIZE)
+        store_ptr(mro, (1 + mi) * C_POINTER_SIZE, v)
         mi = mi + 1
     if append_root != 0:
-        store_ptr(mro, (mro_len - 1) * 8, root)
-    store_ptr(c, 48, mro)
-    store_i32(c, 40, mro_len)
-    pcc_gc_backend4_zpage_register_owner_payload_span(c, mro, mro_len * 8)
+        store_ptr(mro, (mro_len - 1) * C_POINTER_SIZE, root)
+    store_ptr(c, PYCLASSOBJECT_MRO_OFFSET, mro)
+    store_i32(c, PYCLASSOBJECT_N_MRO_OFFSET, mro_len)
+    pcc_gc_backend4_zpage_register_owner_payload_span(
+        c,
+        mro,
+        mro_len * C_POINTER_SIZE,
+    )
 
     if ptr_is_null(tail) == 0:
         free(tail)
     return c
 
 
+@c_abi_export("py_class_new_from_objects")
+def py_class_new_from_objects(name_obj, bases_obj, namespace):
+    if not _ptr_can_have_header(name_obj) or load_i32(name_obj, PYOBJECTHEADER_TYPE_TAG_OFFSET) != PY_TYPE_STR:
+        py_raise(py_exc_new(3, cstr("type.__new__() argument 1 must be str")))
+        return null()
+    name = py_str_utf8(name_obj)
+    if ptr_is_null(name) != 0:
+        return null()
+    n_bases: int = 0
+    bases_kind: int = 0
+    none_obj = global_load_ptr("py_None")
+    if ptr_is_null(bases_obj) != 0 or ptr_eq(bases_obj, none_obj) != 0:
+        n_bases = 0
+    elif _ptr_can_have_header(bases_obj) and load_i32(bases_obj, PYOBJECTHEADER_TYPE_TAG_OFFSET) == PY_TYPE_TUPLE:
+        n_bases = py_tuple_len(bases_obj)
+        bases_kind = 1
+    elif _ptr_can_have_header(bases_obj) and load_i32(bases_obj, PYOBJECTHEADER_TYPE_TAG_OFFSET) == PY_TYPE_LIST:
+        n_bases = py_list_len(bases_obj)
+        bases_kind = 2
+    else:
+        py_raise(py_exc_new(3, cstr("type.__new__() argument 2 must be tuple")))
+        return null()
+    if n_bases < 0 or n_bases > 2147483647:
+        py_raise(py_exc_new(3, cstr("too many base classes")))
+        return null()
+    base_array = null()
+    if n_bases > 0:
+        base_array = malloc(n_bases * 8)
+        if ptr_is_null(base_array) != 0:
+            return null()
+        i: int = 0
+        valid: int = 1
+        while i < n_bases:
+            item = null()
+            if bases_kind == 1:
+                item = py_tuple_get(bases_obj, i)
+            else:
+                item = py_list_get(bases_obj, i)
+            if not _ptr_is_class(item):
+                if ptr_is_null(item) == 0:
+                    py_decref(item)
+                valid = 0
+                i = n_bases
+            else:
+                store_ptr(base_array, i * 8, item)
+            i = i + 1
+        if valid == 0:
+            free(base_array)
+            py_raise(py_exc_new(3, cstr("type.__new__() base must be class")))
+            return null()
+    cls = py_class_new_abi(name, base_array, n_bases, null(), 0)
+    if ptr_is_null(base_array) == 0:
+        free(base_array)
+    if ptr_is_null(cls) != 0:
+        return null()
+    if ptr_is_null(namespace) == 0 and ptr_eq(namespace, none_obj) == 0:
+        if py_class_apply_namespace_dict(cls, namespace) != 0:
+            py_decref(cls)
+            return null()
+    return cls
+
+
 @c_abi_export("py_class_mark_slots_only")
 def py_class_mark_slots_only(cls) -> None:
     if ptr_is_null(cls) != 0:
         return
-    flags: int = load_i32(cls, 12)
-    store_i32(cls, 12, flags | 2)
+    flags: int = load_i32(cls, PYOBJECTHEADER_FLAGS_OFFSET)
+    store_i32(cls, PYOBJECTHEADER_FLAGS_OFFSET, flags | 2)
 
 
 @c_abi_export("py_class_mark_dict_subclass")
@@ -1589,5 +2446,5 @@ def py_class_mark_dict_subclass(cls) -> None:
     # to a backing dict in the instance's __dict__ slot (see py_protocol.c).
     if ptr_is_null(cls) != 0:
         return
-    flags: int = load_i32(cls, 12)
-    store_i32(cls, 12, flags | 4)
+    flags: int = load_i32(cls, PYOBJECTHEADER_FLAGS_OFFSET)
+    store_i32(cls, PYOBJECTHEADER_FLAGS_OFFSET, flags | 4)

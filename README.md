@@ -32,11 +32,21 @@ proves and what it does not.
 - **LLVM-free self backend.** An in-tree native emitter (AArch64 Darwin and
   x86_64 Linux subsets) validated against the LLVM-backed path. LLVM is an
   oracle, not a hard dependency.
+- **Freestanding zero-libc direction.** The production runtime is being moved
+  from hand-written C and vendored libc objects into freestanding pcc-Python.
+  A bounded x86_64 Linux tracer already proves a static no-libpython/zero-libc
+  process-entry path; full-runtime closure remains active work. Darwin retains
+  explicitly named libSystem ABI calls and is never labeled zero-libc.
 - **Native accelerator path.** A host/device-split Kernel IR lowers a small
   `@gpu.kernel` subset to Metal and launches real GPU kernels on-device
   (macOS/Metal, hardware-gated), with TVM/TIRx and TileLang used only as
   reference *oracles* — never imported, linked, or executed as runtime
   dependencies.
+- **Experimental native GUI.** A pcc-Python GUI stack covers layout, controls,
+  declarative components, scheduling, events, styling, commands, and app
+  lifecycle. The macOS `mac_diff_app` canary compiles with pcc1/self/no-libpython
+  and renders through an AppKit/Metal bridge, with explicitly bounded native
+  interaction and pixel-correctness claims.
 - **No-libpython by default.** Python inputs compile to native binaries that do
   not embed CPython; idioms outside the native subset fail loudly instead of
   silently bridging to CPython.
@@ -196,10 +206,13 @@ For a pinned offline/reproducibility gate, the repository also retains
 | C frontend | Mature relative to the rest of the repo; validated through C tests, GCC/Clang-derived suites, and real projects (Lua, SQLite, PostgreSQL `libpq`, zlib, lz4, zstd, PCRE, OpenSSL, readline, nginx). |
 | Python frontend | Experimental. Typed code can lower to native IR; unsupported idioms fail by default and only route through the CPython bridge when `--python-libpython=auto/on` is explicit. |
 | Runtime | Active migration from C runtime sources to pcc-Python modules under `pcc/py_runtime/py/`, using `pcc.unsafe` and `pcc.extern` for low-level operations. |
+| Libc ownership | In progress. A host-pcc0, self-backend, no-libpython x86_64 Linux tracer is proven statically linked with no `PT_INTERP`, `DT_NEEDED`, undefined symbols, hand-written C startup, or libc object. This is not yet the full runtime/five-GC closure. Darwin intentionally retains an enumerated libSystem ABI boundary and is not a zero-libc target. |
 | Self backend | Experimental LLVM-free emission for AArch64 Darwin and x86_64 Linux subsets; used by bootstrap/build gates. The public default backend is LLVM unless `self` is selected. |
 | Bootstrap | macOS arm64 three-stage `pcc1 → pcc2 → pcc3` completes in both the default and strict self-backend paths; strict-path `pcc2`/`pcc3` IR is byte-identical with 0 `py_cpy_*` calls and no `libpython`. Issue 1 closed 2026-05-01. |
 | GC | Five backends (0..4); all pass the full three-stage self-host bootstrap matrix. Backend #0 is the default/rollback reference. |
 | NumPy | `pcc1 -m pip install numpy` uses owned, hash-verified network acquisition of NumPy 2.4.x and installs into the active first-class pcc environment; a bare follow-up `pcc1 app.py` runs `import numpy` + `np.array(...) + scalar` under strict self/no-libpython across GC0..4. Narrow (import/version/array construct/scalar add/element access/iteration/`==`/`repr`); general resolver/build isolation, ufuncs, reductions, dtypes, and broadcasting are not covered; CPython-ABI artifacts stay intentionally rejected (`PCC-PKG-004`). |
+| GUI | Experimental pcc-Python runtime modules provide layout, elements/controls, binding, image/text, declarative components, keyed commit, state lanes, events/effects, style compilation, commands, and app lifecycle. The current product canary is a macOS AppKit/Metal dual-pane diff app; deterministic headless behavior and bounded native bridge reachability exist, while continuous interaction, pixel correctness, full text metrics, and platform portability remain open. |
+| Gateway / `pcc.web` | An experimental pcc-owned HTTP/1 gateway kernel and declarative framework are present in source, including virtual-thread I/O, routing, reverse proxying, DNS, lifecycle, and an explicit OpenSSL-provider ABI. The current source pass is unverified: no focused/current-pcc1/GC0..4/live-network gate has run, so this is not yet a gateway capability or nginx-replacement claim. |
 | GPU kernel IR | Experimental, macOS/Metal only. Kernel-only IR with TIRx-style freeze and `.metallib` finalization; evidence is claim-leveled (`GPU_LEVEL_0`..`GPU_LEVEL_6`). Toolchain/device absence reports `SKIPPED_WITH_REASON`, never success. |
 | Distributed | Metadata-only first slice (`pcc.dist`): single process, CPU-only, no sockets. Every network mode reports `SKIPPED_WITH_REASON`. |
 
@@ -212,13 +225,48 @@ The authoritative machine-readable state is
 
 ## Architecture
 
-```text
-CLI / Python API
-  -> project collection
-  -> C frontend or Python frontend
-  -> optimization / lowering passes
-  -> LLVM, LLVM-C compatibility, or self backend
-  -> MCJIT, object emission, system link, or native executable
+The CPU compiler/runtime path and the bounded accelerator path are separate.
+Dashed arrows below mean an optional compatibility boundary or a validation
+oracle, not a production dependency.
+
+```mermaid
+flowchart TB
+    C_SRC["C sources"] --> ENTRY
+    PY_SRC["Typed Python sources"] --> ENTRY
+    GPU_SRC["@gpu.kernel source"] --> ENTRY
+    ENTRY["CLI / Python API<br/>pcc.cli_core · pcc.api"] --> COLLECT["Project collection and build orchestration<br/>pcc.project"]
+
+    subgraph CPU["CPU compiler and runtime path"]
+        COLLECT --> C_FE["C frontend — mature<br/>preprocess · parse · semantic lowering"]
+        COLLECT --> PY_FE["Typed-Python frontend — experimental<br/>parse · infer · native lowering"]
+        C_FE --> IR["Native LLVM IR and pass pipeline"]
+        PY_FE --> IR
+
+        IR --> LLVM["LLVM / LLVM-CAPI backends<br/>LLVM is the public default"]
+        IR --> SELF["LLVM-free self backend — experimental<br/>AArch64 Darwin · x86_64 Linux subsets"]
+        LLVM -. "validation oracle only" .-> SELF
+
+        LLVM --> EMIT["Native emission"]
+        SELF --> EMIT
+        EMIT --> C_OUT["C outputs<br/>MCJIT · LLVM IR · object · assembly · executable"]
+        EMIT --> PY_LINK["Python native link"]
+
+        GC["Five selectable GC backends<br/>refcount · incremental · concurrent<br/>generational · relocating"] --> RUNTIME["Native Python runtime<br/>freestanding pcc-Python migration in progress"]
+        ABI["Compiler-owned memory · atomic · syscall · host-ABI intrinsics"] --> RUNTIME
+        RUNTIME --> PY_LINK
+        PY_FE -. "only with --python-libpython=auto/on" .-> CPYTHON["Optional CPython compatibility bridge<br/>libpython"]
+        CPYTHON -.-> PY_LINK
+        PY_LINK --> PY_OUT["Python native executable<br/>strict mode: no libpython"]
+
+        PY_OUT -- "when compiling pcc itself" --> BOOT["Self-host contract<br/>pcc0/host → pcc1 → pcc2 → pcc3"]
+    end
+
+    subgraph GPU["Bounded accelerator path"]
+        COLLECT --> KIR["Kernel IR — experimental, kernel-only"]
+        KIR --> METAL["validate → TIRx-shaped freeze → Metal finalize"]
+        METAL --> GPU_OUT["Host executable + .metallib<br/>macOS/Metal · hardware-gated"]
+        ORACLES["TVM / TIRx / TileLang<br/>reference shapes only"] -. "oracle only" .-> KIR
+    end
 ```
 
 | Layer | Main paths | Role |
@@ -307,6 +355,31 @@ backend and pass framework were developed with AI assistance from LLVM's
 published behavior and IR semantics and are tested against — not ported from —
 the LLVM path.
 
+### Freestanding runtime and libc ownership (in progress)
+
+`--python-libpython=off` means the emitted program does not embed or bridge to
+CPython. It does **not** by itself mean that the program is libc-free. pcc's
+stronger ownership target is to compile allocation, object headers, atomics,
+syscalls, threads, safepoints, stack maps, all five GC implementations, dynamic
+loading, and extension ABI entrypoints from freestanding pcc-Python. Raw memory,
+atomic, syscall, and host-ABI operations remain compiler-owned machine
+intrinsics; existing C and vendored libc implementations remain differential
+oracles rather than the intended production runtime.
+
+The currently proven zero-libc artifact is deliberately narrow: in host-pcc0
+Python-frontend, x86_64 Linux self-backend, no-libpython mode,
+`freestanding_linux_start.py` produces a static ELF process-entry tracer with a
+pcc-Python `_start`, raw `write`, and raw `exit_group`. Its gate observes no
+`PT_INTERP`, no `DT_NEEDED`, no undefined symbols, and no hand-written C,
+assembly, or libc runtime object. This does not yet prove the complete Python
+runtime, five-GC matrix, C frontend, or a pcc1 Linux cross-compile. See the
+[bounded evidence](docs/goal/evidence/2026-08-03-linux-zero-libc-python-start.md)
+and the [remaining runtime-closure investigation](docs/investigations/freestanding-runtime-final-no-c-closure.md).
+
+The final platform claims are intentionally different: the supported Linux
+static closure targets zero C/libc runtime dependencies, while Darwin may call
+an explicitly enumerated libSystem ABI and must not be described as zero-libc.
+
 ### GPU kernels (Metal, experimental)
 
 macOS/Metal only, requiring the Xcode Metal toolchain; a missing toolchain or
@@ -350,6 +423,38 @@ route contract and level definitions are in
 env -u LC_ALL uv run pytest tests/kernel -q -n0        # IR/oracle/finalize/package (skips without toolchain)
 env -u LC_ALL uv run pytest tests/gpu_hardware -q -n0  # real Metal launch: Level 4/5/6 gates
 ```
+
+### Native GUI (macOS, experimental)
+
+The pcc-Python runtime contains GUI owners for layout, elements and controls,
+window events, binding, text and images, theme/animation, a composition-tree
+kernel, declarative components, keyed render/commit, queued state lanes,
+targeted events and phased effects, compiled style utilities, typed commands,
+managed state, and application lifecycle. These live under
+`pcc/py_runtime/py/pcc_gui_*.py` and are compiled into the runtime rather than
+implemented as a Python wrapper around a general webview framework.
+
+The end-to-end canary is a native macOS dual-pane file comparison app authored
+in pcc-Python. Its application binary is compiled by pcc1 with the self backend
+and no libpython; AppKit owns the window, a Metal `CAMetalLayer` renders rects,
+and `CATextLayer` supplies the current text path.
+
+```bash
+scripts/bootstrap.sh --stage 1
+cd projects/mac_diff_app
+./build.sh
+./mac_diff_app
+```
+
+This is a bounded experimental path. The deterministic headless canary covers
+component/state/re-render behavior and the native bridge proves a real
+acknowledged render plus lifecycle-event reachability. The current native entry
+does not yet claim continuous interaction, captured pixel correctness,
+proportional or wide-glyph metrics, large-file virtualization, or non-macOS
+portability. It also uses AppKit, Metal, libSystem, and a clang-built Objective-C
+bridge dylib, so **no-libpython GUI does not mean zero-libc GUI**. See the
+[GUI design contract](docs/design/gui-declarative-absorption.md) and
+[`mac_diff_app` guide](projects/mac_diff_app/README.md).
 
 ## Bootstrap
 
@@ -484,10 +589,12 @@ linked `libpython`.
 | `pcc/evaluater/c_evaluator.py`, `pcc/codegen/c_codegen.py` | C compile/evaluate/link and main C lowering. |
 | `pcc/py_frontend/` | Python type inference and native lowering. |
 | `pcc/py_runtime/` | Runtime archive sources (C) and pcc-Python ports. |
+| `pcc/py_runtime/py/pcc_gui_*.py` | Experimental pcc-Python GUI kernel, declarative runtime, styling, commands, and lifecycle. |
 | `pcc/backend/`, `pcc/llvm_capi/` | Experimental self backend and in-repo LLVM-C path. |
 | `pcc/kernel_ir/`, `pcc/gpu_gc/`, `pcc/dist/` | GPU kernel IR, GPU-GC seam, local-only distributed oracles. |
 | `pcc/extern/`, `pcc/unsafe/` | Python→C extern decls and low-level intrinsics. |
 | `utils/fake_libc_include/` | Fake libc headers used by the C frontend. |
+| `projects/mac_diff_app/` | Native macOS AppKit/Metal GUI canary authored in pcc-Python. |
 | `tests/`, `projects/`, `benchmarks/` | Regression/corpus/integration tests, stress targets, perf tooling. |
 
 ## Environment controls
@@ -532,6 +639,8 @@ Current work is governed by
 | Architecture background | [docs/system-architecture.md](docs/system-architecture.md) |
 | Python tutorial / how-to / limitations | [docs/python-tutorial.md](docs/python-tutorial.md), [docs/python-howto.md](docs/python-howto.md), [docs/python-limitations.md](docs/python-limitations.md) |
 | Python compat / NumPy plans | [docs/plans/python-compat-specialization-strategy.md](docs/plans/python-compat-specialization-strategy.md), [docs/plans/numpy_plan.md](docs/plans/numpy_plan.md) |
+| Freestanding runtime / libc ownership | [docs/investigations/freestanding-runtime-final-no-c-closure.md](docs/investigations/freestanding-runtime-final-no-c-closure.md), [Linux zero-libc tracer evidence](docs/goal/evidence/2026-08-03-linux-zero-libc-python-start.md) |
+| Declarative GUI and macOS canary | [docs/design/gui-declarative-absorption.md](docs/design/gui-declarative-absorption.md), [projects/mac_diff_app/README.md](projects/mac_diff_app/README.md) |
 | GPU route contract and Kernel IR | [docs/design/pcc-gpu-next-work.md](docs/design/pcc-gpu-next-work.md), [docs/design/pcc-kernel-ir.md](docs/design/pcc-kernel-ir.md) |
 | Investigation reports | [docs/investigations/](docs/investigations/) |
 | Contributor / agent notes | [AGENTS.md](AGENTS.md) |

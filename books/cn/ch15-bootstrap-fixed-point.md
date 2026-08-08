@@ -90,7 +90,7 @@ def test_bootstrap_fixed_point_baseline():
     assert baseline["no_libpython"]["py_cpy_calls"] == 0
 ```
 
-声明卫生(claim hygiene)在这里有严格的措辞表([codex-goal-prompt.md](../../codex-goal-prompt.md) §0.10):host pcc ≠ pcc1;stage1 通过 ≠ 不动点通过。"pcc 能编译 X"与"pcc1 能编译 X"是两个声明,后者要求 X 的全部依赖都在原生闭包里;"自举到 stage1"与"pcc1→pcc2→pcc3 不动点"也是两个声明,差着两级运行时正确性。[AGENTS.md](../../AGENTS.md) 的规则是:不要从局部玩具复现宣布自举修复完成。
+声明卫生(claim hygiene)在这里有严格的措辞表([goal-prompt.md](../../docs/goal/goal-prompt.md) §0.10):host pcc ≠ pcc1;stage1 通过 ≠ 不动点通过。"pcc 能编译 X"与"pcc1 能编译 X"是两个声明,后者要求 X 的全部依赖都在原生闭包里;"自举到 stage1"与"pcc1→pcc2→pcc3 不动点"也是两个声明,差着两级运行时正确性。[AGENTS.md](../../AGENTS.md) 的规则是:不要从局部玩具复现宣布自举修复完成。
 
 ## 15.3 机制(一):bootstrap.sh 的阶段机器
 
@@ -128,17 +128,20 @@ size + md5 结构比较                → 尺寸不等 = FAIL exit 1
 ```text
 --pcc-python-multi-codegen-worker  → 并行代码生成 worker 重入口
 --pytest ...                        → _run_pytest_from_pcc1(pcc1 启动测试套件)
--m MODULE ...                       → _run_host_python_module_from_pcc1
+-m MODULE ...                       → _run_python_module_from_pcc1
    其中 pip / pcc.package.*         →   原生包外壳(_run_native_pip_shim_from_pcc1 等,见第 17 章)
-   其余模块                          →   subprocess 调 PCC_HOST_PYTHON(默认 python3)
+   其余模块                          →   pcc1 自编译成原生二进制再运行
+                                        (_run_compiled_python_module_from_pcc1,backend=self、libpython=off)
+   --python-libpython=auto/on 时    →   _run_python_module_from_pcc1_with_mode 显式委托 CPython 兼容子进程
+                                        (打印 PCC1_COMPAT_RUNNER_MANIFEST,不谎称 no-libpython)
 C 输入(.c / --sources-from-make /
   -I/-D/-U / 目录)                  → _run_host_pcc_from_pcc1(委托宿主 pcc CLI)
 否则                                → parse_bootstrap_cli_args → 编译 Python 输入
 ```
 
-核心编译路径很短:`parse_bootstrap_cli_args()` 手写 while 循环解析 `--backend` / `--python-libpython` / `--ir-scaffold` / `-o` / `--emit-llvm` 等旗标(没有 argparse——它不在原生闭包里),然后 `_observed_compile_python()` 直接调用 `py_frontend.pipeline` 的 `compile_python`。这个"直接调用"有一条值得全文引用的 docstring:**"This intentionally calls `_compile_python` directly instead of passing it as a first-class callable through `observed_compile`. The self-host path does not yet have a native `callable(*args, **kwargs)` ABI."** 自举子集没有一等函数装箱(第 5 章讲过这个限制),所以可观测性包装只能写成固定形状的直调而非高阶函数。同类痕迹遍布全文件:`_normalized_sys_argv()` 用 `(sys.argv[i] or "") + ""` 逐个拷贝规范化字符串;`_copy_seq()` 用显式索引循环代替切片惯用法;`_run_host_python_module_from_pcc1()` 里一条注释直说"保持 `subprocess.run(check=True)` 的纯语句形状……关键字 `env=` 会把 libpython 回退重新引入 stage1 闭包"。**编译器的 CLI 是用编译器自己能消化的 Python 写成的——这既是约束,也是测试。**
+核心编译路径很短:`parse_bootstrap_cli_args()` 手写 while 循环解析 `--backend` / `--python-libpython` / `--ir-scaffold` / `-o` / `--emit-llvm` 等旗标(没有 argparse——它不在原生闭包里),然后 `_observed_compile_python()` 直接调用 `py_frontend.pipeline` 的 `compile_python`。这个"直接调用"有一条值得全文引用的 docstring:**"This intentionally calls `_compile_python` directly instead of passing it as a first-class callable through `observed_compile`. The self-host path does not yet have a native `callable(*args, **kwargs)` ABI."** 自举子集没有一等函数装箱(第 5 章讲过这个限制),所以可观测性包装只能写成固定形状的直调而非高阶函数。同类痕迹遍布全文件:`_normalized_sys_argv()` 用 `(sys.argv[i] or "") + ""` 逐个拷贝规范化字符串;`_copy_seq()` 用显式索引循环代替切片惯用法。**编译器的 CLI 是用编译器自己能消化的 Python 写成的——这既是约束,也是测试。**
 
-两条委托边界都有防御。`_run_host_pcc_from_pcc1()` 在 `PCC_HOST_PCC` 指向自身时拒绝递归委托;`-m` 的宿主路径走 subprocess 而非进程内 libpython 调用——[AGENTS.md](../../AGENTS.md) 把这条边界上升为规则:`_link_with_self_backend` 不得在编译后的阶段里 import/调用 `pcc.backend.*`,那会把 `py_cpy_*` 拉回 stage1 闭包。subprocess 是刻意选择的隔离层:宿主能力可以被**调用**,但不能被**链接**。
+两条委托边界都有防御。`_run_host_pcc_from_pcc1()` 在 `PCC_HOST_PCC` 指向自身时拒绝递归委托;`-m` 的默认路径已不再借道宿主 Python——通用模块由 pcc1 自己编译成原生二进制再跑(`_run_compiled_python_module_from_pcc1`,`backend=self`、`libpython=off`),宿主委托退化为 `--python-libpython=auto/on` 下的显式选入:只有那时 `_run_python_module_from_pcc1_with_mode` 才起一个 CPython 兼容子进程,并在 `PCC_COMPAT_PYTHON` 指向自身时拒绝递归。这条 opt-in 路径打印 `PCC1_COMPAT_RUNNER_MANIFEST` 把模式写在明面上,pcc1 进程本身仍是 no-libpython。[AGENTS.md](../../AGENTS.md) 把边界上升为规则:`_link_with_self_backend` 不得在编译后的阶段里 import/调用 `pcc.backend.*`,那会把 `py_cpy_*` 拉回 stage1 闭包。subprocess 是刻意选择的隔离层:宿主能力可以被**调用**,但不能被**链接**。
 
 ## 15.5 三项独立证明:0 py_cpy_*、无 libpython、字节同一
 
@@ -154,7 +157,7 @@ README 状态表的 bootstrap 行(Issue 1 于 2026-05-01 关闭)给出的证据�
 
 ## 15.6 差异分类学:先分类,再修
 
-不动点闸门红了之后的第一动作不是修,是分类。[codex-goal-prompt.md](../../codex-goal-prompt.md) 的 "If pcc1 and pcc2 differ" 一节规定了九类,并附一句禁令:**在差异类别查明之前,不得绕着症状打补丁。**
+不动点闸门红了之后的第一动作不是修,是分类。[goal-prompt.md](../../docs/goal/goal-prompt.md) 的 §19.2「Fixed-point classification」一节规定了八类,并附一句禁令:**在差异类别查明之前,不得绕着症状打补丁。**
 
 ```text
 1 semantic execution    语义执行差异(真编译器 bug)
@@ -178,7 +181,7 @@ README 状态表的 bootstrap 行(Issue 1 于 2026-05-01 关闭)给出的证据�
 
 自举状态的权威记录不是文档,是两个被测试消费的冻结 JSON。[AGENTS.md](../../AGENTS.md) 的措辞是"authoritative ... (do not invent)":[tests/bootstrap_gate_baseline.json](../../tests/bootstrap_gate_baseline.json) 记录 2026-05-01 抓取的每后端每阶段尺寸与 `links_libpython` 状态(llvm 与 self 双后端、三阶段全部 `false`,`byte_identical_pcc2_pcc3` 双双为 `true`),并声明单向棘轮语义——任何 `links_libpython` 回到 `true` 都是回归;历史追踪文档 [docs/issues/open-bootstrap-issues.md](../../docs/issues/open-bootstrap-issues.md) 可以滞后,JSON 不可以。选 JSON 而非散文的理由是机器可执行:[tests/python/test_bootstrap_gate_baseline.py](../../tests/python/test_bootstrap_gate_baseline.py) 逐字段核对它,而没人会用 pytest 去核对一段 Markdown。
 
-这个基线测试本身的设计也值得一读:它**只检查已存在的二进制**,缺了就 skip,绝不触发重型构建——闸门的存在不能让每次 pytest 都付出几分钟自举的代价。重型闸门被显式隔离成另一组文件:`tests/python/gc/test_pcc_bootstrap_full_gc{0..4}.py`,每个 GC 后端一个文件,各自跑完整的 `pcc1 -> pcc2 -> pcc3` 真实链条。共享助手在 [tests/python/test_pcc_bootstrap_full.py](../../tests/python/test_pcc_bootstrap_full.py),其模块 docstring 把哲学写成一句话:**"Speed comes from *not skipping anything* — it comes from sharing stage1 and keeping each GC as an independent file/node."** 具体机制:会话级 fixture `shared_stage1_pcc1` 在文件锁下构建一个 GC 后端不可知的共享 pcc1(`_shared_pcc1_is_fresh()` 用源码树最新 mtime 加 libpython 链接检查判定新鲜度);每个 GC 文件把它播种进自己的输出目录,在 `PCC_GC_BACKEND=N` 下经 `bootstrap.sh --reuse-stage1` 跑 stage2、stage3,然后断言三阶段存在、三阶段都不链 libpython、pcc2/pcc3 归一化后字节同一。调度按权重排队(`_GC_BOOTSTRAP_WEIGHT`:gc4=50、gc3=40、gc1=gc2=30、gc0=10,重的先跑),`_bootstrap_active_gc_lease()` 限制同时活跃的链条数(默认至多 3),所有子进程经 `run_process_group_timeout`(600 秒)以进程组为单位超时回收——这台机器的每个零件都对应一次真实的痛:被饿死的重后端、机器上游荡数小时的僵尸 pcc1。
+这个基线测试本身的设计也值得一读:它**只检查已存在的二进制**,缺了就 skip,绝不触发重型构建——闸门的存在不能让每次 pytest 都付出几分钟自举的代价。重型闸门被显式隔离成另一组文件:`tests/python/gc/test_pcc_bootstrap_full_gc{0..4}.py`,每个 GC 后端一个文件,各自跑完整的 `pcc1 -> pcc2 -> pcc3` 真实链条。共享助手在 [tests/python/test_pcc_bootstrap_full.py](../../tests/python/test_pcc_bootstrap_full.py),其模块 docstring 把哲学写成一句话:**"Speed comes from *not skipping anything* — it comes from sharing stage1 and keeping each GC as an independent file/node."** 具体机制:会话级 fixture `shared_stage1_pcc1` 在文件锁下构建一个 GC 后端不可知的共享 pcc1(`_shared_pcc1_is_fresh()` 用源码树最新 mtime 加 libpython 链接检查判定新鲜度);每个 GC 文件把它播种进自己的输出目录,在 `PCC_GC_BACKEND=N` 下经 `bootstrap.sh --reuse-stage1` 跑 stage2、stage3,然后断言三阶段存在、三阶段都不链 libpython、pcc2/pcc3 归一化后字节同一。调度按权重排队(`_GC_BOOTSTRAP_WEIGHT`:gc0=60、gc4=50、gc3=40、gc1=gc2=30,重的先跑),`_bootstrap_active_gc_lease()` 限制同时活跃的链条数(默认至多 3),所有子进程经 `run_process_group_timeout`(2400 秒)以进程组为单位超时回收——这台机器的每个零件都对应一次真实的痛:被饿死的重后端、机器上游荡数小时的僵尸 pcc1。
 
 于是闸门形成三层金字塔:轻量基线核对(秒级,随每次 pytest)、单后端全自举(分钟级,提交级验证,[AGENTS.md](../../AGENTS.md) 列为 commit-level mandatory)、五 GC 全自举矩阵(最重,运行时/GC/对象生命周期声明的完成证据)。与之互补的语义对照棘轮是 [tests/python/test_self_host_oracle_diff.py](../../tests/python/test_self_host_oracle_diff.py)(仓库地图称其为 core Python semantic oracle / pcc1-pcc2 parity ratchet)。
 
@@ -216,7 +219,7 @@ pcc 的结构里有两个**缓解信任问题但不解决它**的事实,措辞�
 
 ## 15.10 小结
 
-自举不动点是 pcc 把"系统相干"变成机器可判定命题的装置。四个阶段各有语义:pcc0(CPython 宿主)→ pcc1 证明源码落在自身子集且闭世界成立;pcc1 → pcc2 证明原生运行时扛得住编译编译器的负载;pcc2 → pcc3 加字节比较证明自产编译器行为自稳定——不动点定义在自产编译器之间,允许 pcc1 带外来宿主指纹。机制层,`bootstrap.sh` 提供阶段机器(陈旧产物防御、发布屏障、三级验证阶梯),`cli_bootstrap.py` 是一个必须能被自己编译的 CLI,其方言处处是自举子集的指纹。证据是三项独立声明:IR 中 0 `py_cpy_*`(生成代码层闭世界)、无 libpython 链接(产物层独立)、签名归一化后字节同一(自指层确定性),各锁一层、互不蕴含。pcc1/pcc2 差异先分类后修,九类分类学连 unknown 都是合法答案;闸门体系三层金字塔以冻结 JSON 为权威状态、以单向棘轮防回退、以五 GC 矩阵为最重完成证据。与 Thompson 的边界必须诚实:不动点证明相干与确定,不证明可信;可刷新的信任根与双后端多样性缓解而不解决信任问题。两个案例研究从两侧夹住同一条纪律:回归先做因果审计、堆叠失败拆成两条证据链、永不弱化语义换绿灯;无声的回退渗漏靠基线为零的棘轮拦截。
+自举不动点是 pcc 把"系统相干"变成机器可判定命题的装置。四个阶段各有语义:pcc0(CPython 宿主)→ pcc1 证明源码落在自身子集且闭世界成立;pcc1 → pcc2 证明原生运行时扛得住编译编译器的负载;pcc2 → pcc3 加字节比较证明自产编译器行为自稳定——不动点定义在自产编译器之间,允许 pcc1 带外来宿主指纹。机制层,`bootstrap.sh` 提供阶段机器(陈旧产物防御、发布屏障、三级验证阶梯),`cli_bootstrap.py` 是一个必须能被自己编译的 CLI,其方言处处是自举子集的指纹。证据是三项独立声明:IR 中 0 `py_cpy_*`(生成代码层闭世界)、无 libpython 链接(产物层独立)、签名归一化后字节同一(自指层确定性),各锁一层、互不蕴含。pcc1/pcc2 差异先分类后修,八类分类学连 unknown 都是合法答案;闸门体系三层金字塔以冻结 JSON 为权威状态、以单向棘轮防回退、以五 GC 矩阵为最重完成证据。与 Thompson 的边界必须诚实:不动点证明相干与确定,不证明可信;可刷新的信任根与双后端多样性缓解而不解决信任问题。两个案例研究从两侧夹住同一条纪律:回归先做因果审计、堆叠失败拆成两条证据链、永不弱化语义换绿灯;无声的回退渗漏靠基线为零的棘轮拦截。
 
 ## 练习
 
@@ -224,7 +227,7 @@ pcc 的结构里有两个**缓解信任问题但不解决它**的事实,措辞�
 
 2. **读源码验证**:[tests/python/test_bootstrap_gate_baseline.py](../../tests/python/test_bootstrap_gate_baseline.py) 的 `_byte_identical_after_normalize()` 在临时目录里对**副本**做 `codesign --remove-signature` 再比较。结合 15.3 的发布屏障,解释为什么绝不能对 `build/bootstrap-*/pcc{2,3}` 原件做签名剥离。
 
-3. **追踪闭包**:[pcc/cli_bootstrap.py](../../pcc/cli_bootstrap.py) 的 `_run_host_python_module_from_pcc1()` 用 `["env", "PYTHONPATH=" + os.getcwd(), host, "-m", module_name]` 而不是 `subprocess.run(..., env=...)`。结合该处注释与第 14 章的回退路由,说明 `env=` 关键字会经过哪条低层化路径触发 libpython 回退,以及为什么外部 `env` 命令是闭包安全的等价物。
+3. **追踪闭包**:[pcc/cli_bootstrap.py](../../pcc/cli_bootstrap.py) 的 `-m MODULE` 默认路径 `_run_compiled_python_module_from_pcc1()` 把通用模块用 `backend=self`、`libpython=off` 编译成原生二进制再运行,而不委托宿主 Python。结合第 14 章的回退路由,说明这条默认路径为什么天然闭包安全;再说明 `--python-libpython=auto/on` 下的兼容子进程 `_run_python_module_from_pcc1_with_mode()` 靠 `PCC1_COMPAT_RUNNER_MANIFEST` 守住了哪条声明边界——为什么它必须显式声明模式,而不能默默借道 CPython。
 
 4. **设计权衡论证**:15.1 论证了 pcc1 ≠ pcc2 是被允许的。假设要把闸门加强为"pcc1 == pcc2(签名归一化后)",列出至少三类必须先消除的 pcc0/pcc1 执行环境差异,并论证这笔投入对相干性证据的边际收益为什么低于(或高于)把同样投入花在五 GC 矩阵上。
 

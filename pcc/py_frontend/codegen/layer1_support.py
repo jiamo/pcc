@@ -269,7 +269,7 @@ _PY_AST_STATIC_CLASS_FIELDS = {
     "UnaryOp": ("span", "ty", "op", "operand"),
     "Compare": ("span", "ty", "op", "lhs", "rhs"),
     "BoolExpr": ("span", "ty", "op", "left", "right"),
-    "Call": ("span", "ty", "func", "args", "kwargs"),
+    "Call": ("span", "ty", "func", "args", "kwargs", "operand_order"),
     "Attr": ("span", "ty", "obj", "name"),
     "Subscript": ("span", "ty", "obj", "idx"),
     "Slice": ("span", "ty", "lo", "hi", "step"),
@@ -812,6 +812,22 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
             (),
         ),
     },
+    # ``cli_bootstrap.py`` keeps only the public dispatch facade; the native
+    # pytest harness lives in this closure-safe sibling.  The explicit
+    # signature keeps the standalone bootstrap probe from routing the import
+    # through libpython while the real multi-file stage1 build supplies the
+    # implementation.
+    "pcc.cli_bootstrap_pytest": {
+        "run_pcc1_pytest": _function_export(
+            ("int",),
+            (("dyn",), ("str",), ("int", 64, True)),
+            (
+                _export_arg("argv", ("dyn",)),
+                _export_arg("executable", ("str",)),
+                _export_arg("timeout_seconds", ("int", 64, True)),
+            ),
+        ),
+    },
     "pcc.cli_bootstrap_array_core": {
         "_run_native_package_array_core_from_pcc1": _function_export(
             ("int",),
@@ -923,6 +939,26 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
             (_export_arg("manifest_path", ("str",)),),
         ),
     },
+    "pcc.py_frontend.pipeline_frontend_workers": {
+        "SOURCE_WORKER_AUTO_SAFE_JOBS": {
+            "kind": "constant",
+            "value_kind": "int",
+            "value": 2,
+        },
+        "split_codegen_chunks_by_source_size": _function_export(
+            ("dyn",),
+            (("dyn",), ("dyn",), ("int",)),
+            (
+                _export_arg("src_paths", ("dyn",)),
+                _export_arg("chunks", ("dyn",)),
+                _export_arg(
+                    "threshold_bytes",
+                    ("int",),
+                    has_default=True,
+                ),
+            ),
+        ),
+    },
     "pcc.py_frontend.codegen.runtime_abi": {
         "declare_runtime": _function_export(
             ("dict", ("str",), ("dyn",)),
@@ -935,6 +971,25 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
             (
                 _export_arg("module", ("dyn",)),
                 _export_arg("name", ("str",)),
+            ),
+        ),
+        "is_freestanding_gc_runtime_global": _function_export(
+            ("bool",),
+            (("str",),),
+            (_export_arg("symbol", ("str",)),),
+        ),
+        "is_freestanding_gc_readonly_runtime_import": _function_export(
+            ("bool",),
+            (("str",),),
+            (_export_arg("symbol", ("str",)),),
+        ),
+        "is_freestanding_gc_cross_object_runtime_import": _function_export(
+            ("bool",),
+            (("str",), ("str",), ("str",)),
+            (
+                _export_arg("symbol", ("str",)),
+                _export_arg("parameters_source", ("str",)),
+                _export_arg("return_source", ("str",)),
             ),
         ),
     },
@@ -1112,6 +1167,49 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
         "IR_RUNTIME_COMPAT_MODULE": _str_constant_export("pcc.llvm_capi.compat"),
         "TEST_FACADE_IMPORT_MODULES": _string_tuple_global_export(),
         "UNSAFE_SCAFFOLD_MODULES": _string_tuple_global_export(),
+    },
+    "pcc.codegen.c_varargs": {
+        "postprocess_varargs_ir": _function_export(
+            ("str",),
+            (("str",),),
+            (
+                _export_arg("text", ("str",)),
+                _export_arg("", kind="kw_only"),
+                _export_arg("report", ("dyn",), has_default=True),
+            ),
+        ),
+    },
+    "pcc.py_frontend.codegen.self_module_contracts": {
+        "IR_SCAFFOLD_CONTRACT": _str_constant_export("ir-scaffold-forced"),
+        "PY_AST_FIELD_ORDER_CONTRACT": _str_constant_export(
+            "py-ast-field-order"
+        ),
+        "L1_CODEGEN_HOST_ATTR_CONTRACT": _str_constant_export(
+            "l1-codegen-host-attrs"
+        ),
+        "SELF_MODULE_CONTRACTS": _dict_str_dyn_global_export(),
+        "PY_AST_FIELD_OVERRIDE_MODULE": _str_constant_export(
+            "pcc.py_frontend.py_ast"
+        ),
+        "L1_CODEGEN_HOST_ATTR_MODULE": _str_constant_export(
+            "pcc.py_frontend.codegen.layer1"
+        ),
+        "module_has_contract": _function_export(
+            ("bool",),
+            (("dyn",), ("str",)),
+            (
+                _export_arg("module_name"),
+                _export_arg("contract", ("str",)),
+            ),
+        ),
+        "module_for_class_symbol_contract": _function_export(
+            ("dyn",),
+            (("str",), ("str",)),
+            (
+                _export_arg("global_name", ("str",)),
+                _export_arg("contract", ("str",)),
+            ),
+        ),
     },
     "pcc.py_frontend.codegen.layer1": {
         "L1CodeGen": _class_export(
@@ -1412,15 +1510,60 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
             ),
         ),
     },
+    # Raw per-module self-host diagnostics compile ``pipeline.py`` and
+    # ``cli_bootstrap.py`` without assembling the recursive stdlib closure.
+    # They still need the same forward declaration used by the real closure
+    # when native subprocess lowering constructs a typed check=True failure.
+    # The executable no-libpython path supplies the definition from
+    # pcc/py_stdlib/subprocess.py; this entry is metadata only.
+    "subprocess": {
+        "CalledProcessError": {
+            "kind": "class",
+            "owning_module": "subprocess",
+            "export_name": "CalledProcessError",
+            "class_name": "CalledProcessError",
+            "qualified_name": "subprocess.CalledProcessError",
+            "base_names": ("Exception",),
+            "field_names": ("returncode", "cmd", "output", "stderr"),
+            "field_types": (("returncode", ("int", 64, True)),),
+            "methods": (
+                {
+                    "name": "__init__",
+                    "symbol": "user_subprocess_CalledProcessError___init__",
+                    "kind": "instance",
+                    "return_ty": ("none",),
+                    "param_types": (
+                        ("dyn",),
+                        ("int", 64, True),
+                        ("dyn",),
+                        ("dyn",),
+                        ("dyn",),
+                    ),
+                    "call_sig": (
+                        _export_arg("self"),
+                        _export_arg("returncode", ("int", 64, True)),
+                        _export_arg("cmd"),
+                        _export_arg("output", has_default=True),
+                        _export_arg("stderr", has_default=True),
+                    ),
+                    "box_int_abi": False,
+                },
+            ),
+            "box_int_abi": False,
+        },
+    },
 }
 
 
 _PCC_FRONTEND_STATIC_NATIVE_MODULES = frozenset(
     {
         "pcc.py_frontend.pipeline",
+        "pcc.py_frontend.pipeline_frontend_workers",
         "pcc.py_frontend.compile_cache",
         "pcc.py_frontend.codegen.layer1_support",
         "pcc.py_frontend.codegen.host_contract",
+        "pcc.py_frontend.codegen.self_module_contracts",
+        "pcc.codegen.c_varargs",
         "pcc.py_frontend.codegen.layer1_constants",
         "pcc.py_frontend.codegen.layer1",
         "pcc.py_frontend.codegen.layer1_entrypoints",
@@ -1433,6 +1576,7 @@ _PCC_FRONTEND_STATIC_NATIVE_MODULES = frozenset(
         "pcc.py_frontend.type_infer",
         "pcc.py_frontend.types",
         "pcc.cli_bootstrap",
+        "pcc.cli_bootstrap_pytest",
         "pcc.cli_bootstrap_array_core",
         "pcc.py_frontend.codegen._l1_codegen_static_methods",
         "pcc.backend.self_backend_aarch64_darwin_flow",
@@ -1443,6 +1587,7 @@ _PCC_FRONTEND_STATIC_NATIVE_MODULES = frozenset(
         "pcc.py_frontend.export_meta",
         "pcc.package_schema",
         "pcc.__main__",
+        "pcc.cli_contract",
     }
 )
 
@@ -1478,35 +1623,7 @@ if _layer1_exports is not None:
 
 
 def _default_native_module_exports(module_name: str | None):
-    if not (
-        module_name == "pcc.py_frontend.pipeline"
-        or module_name == "pcc.py_frontend.compile_cache"
-        or module_name == "pcc.py_frontend.codegen.layer1_support"
-        or module_name == "pcc.py_frontend.codegen.host_contract"
-        or module_name == "pcc.py_frontend.codegen.layer1_constants"
-        or module_name == "pcc.py_frontend.codegen.layer1"
-        or module_name == "pcc.py_frontend.codegen.layer1_entrypoints"
-        or module_name == "pcc.py_frontend.codegen.layer1_init"
-        or module_name == "pcc.py_frontend.codegen.expr_dispatch_lowering"
-        or module_name == "pcc.py_frontend.codegen.generation_lowering"
-        or module_name == "pcc.py_frontend.codegen.stmt_dispatch_lowering"
-        or module_name == "pcc.py_frontend.codegen.class_gen"
-        or module_name == "pcc.py_frontend.codegen.marshal"
-        or module_name == "pcc.py_frontend.type_infer"
-        or module_name == "pcc.py_frontend.types"
-        or module_name == "pcc.cli_bootstrap"
-        or module_name == "pcc.cli_bootstrap_array_core"
-        or module_name == "pcc.py_frontend.codegen._l1_codegen_static_methods"
-        or module_name == "pcc.backend.self_backend_aarch64_darwin_flow"
-        or module_name == "pcc.backend.self_backend_stackprep"
-        or module_name == "pcc.__main__"
-        or module_name == "pcc.parse.py_lex"
-        or module_name == "pcc.parse.py_lift"
-        or module_name == "pcc.parse.py_parse"
-        or module_name == "pcc.py_frontend.export_meta"
-        or module_name == "pcc.package_schema"
-        or module_name == "pcc.cli_contract"
-    ):
+    if module_name not in _PCC_FRONTEND_STATIC_NATIVE_MODULES:
         return None
     return _PCC_FRONTEND_STATIC_NATIVE_EXPORTS
 

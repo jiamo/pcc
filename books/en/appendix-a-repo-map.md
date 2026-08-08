@@ -41,9 +41,11 @@ Organized by subsystem; paths are relative to the repository root.
 |---|---|
 | [pcc/py_runtime/include/py_runtime.h](../../pcc/py_runtime/include/py_runtime.h) | Public header: object header, type tags, `PCC_GC_KIND_*` |
 | [pcc/py_runtime/src/py_internal.h](../../pcc/py_runtime/src/py_internal.h) | Runtime-internal layouts (e.g. `PyClassObject`) |
-| `pcc/py_runtime/src/*.c` | C runtime (objects, GC, threads, exceptions, ...) |
-| [pcc/py_runtime/src/py_gc_backend.c](../../pcc/py_runtime/src/py_gc_backend.c) | The five GC backends |
-| `pcc/py_runtime/py/*.py` | pcc-Python runtime ports (mirrors of C; for self-hosting) |
+| `pcc/py_runtime/src/*.c` | Transitional/host-C implementations and differential oracles; not member sources for the final production pcc-Python archive |
+| [pcc/py_runtime/Makefile](../../pcc/py_runtime/Makefile) | `PY_MODULES`, `FREESTANDING_PY_MODULES`, provenance, and production archive assembly |
+| `pcc/py_runtime/py/py_*.py` | Semantic pcc-Python: object, container, exception, and C-API behavior |
+| `pcc/py_runtime/py/freestanding_*.py` | Freestanding pcc-Python: allocator, threads, platform/libc-like substrate, and five-GC policy |
+| [pcc/py_runtime/py/freestanding_gc_object_slots.py](../../pcc/py_runtime/py/freestanding_gc_object_slots.py) | Unified production object-slot visitation contract |
 | [pcc/extern/](../../pcc/extern), [pcc/unsafe/](../../pcc/unsafe) | Python→C extern declarations; compiler-recognized intrinsics |
 | [docs/refs_docs/gc-research/](../../docs/refs_docs/gc-research) | Reference implementations for the five GCs (Lua, Go, OCaml, ZGC, CPython) |
 
@@ -68,14 +70,27 @@ Organized by subsystem; paths are relative to the repository root.
 | Path | Role |
 |---|---|
 | [pcc/package/](../../pcc/package), [pcc/capi_abi.py](../../pcc/capi_abi.py), [pcc/capi_surface.py](../../pcc/capi_surface.py) | Package path and C-API surface |
-| [pcc/py_runtime/src/py_capi_shim.c](../../pcc/py_runtime/src/py_capi_shim.c), `py_extension_loader.c`, `py_cpy_handle.c` | C-API shim, extension loading, CpyHandle |
+| `pcc/py_runtime/py/py_capi_*_runtime.py`, `py_extension_loader_runtime.py` | Production pcc-Python C-API ABI and extension-loader owners |
+| [pcc/py_runtime/src/py_capi_shim.c](../../pcc/py_runtime/src/py_capi_shim.c), `py_extension_loader.c` | Host-C oracle/transitional implementations, not production pcc-Python archive owners |
+
+## GUI and application execution (Chapter 20)
+
+| Path | Role |
+|---|---|
+| [pcc/py_runtime/gui_declarative_contract_v1.json](../../pcc/py_runtime/gui_declarative_contract_v1.json) | Declarative GUI v1 records, state machines, capacities, and error ABI |
+| [pcc/py_runtime/py/pcc_gui_kit.py](../../pcc/py_runtime/py/pcc_gui_kit.py) | Canonical reclaimable composition-tree kernel, layout, clipping, hit paths, and render walk |
+| `pcc/py_runtime/py/pcc_gui_{components,scheduler,events}.py` | Keyed atomic commit, state lanes, listeners, and effect lifecycle |
+| `pcc/py_runtime/py/pcc_gui_{style,commands,app_lifecycle}.py` | Utility compiler/cache, managed command resolution, and webview-free run lifecycle |
+| [projects/mac_diff_app/](../../projects/mac_diff_app) | Declarative dual-pane diff canary and AppKit/Metal boundary |
+| [docs/design/gui-declarative-absorption.md](../../docs/design/gui-declarative-absorption.md) | React/Tailwind/Tauri mechanism-absorption boundary, nonclaims, and task route |
 
 ## Methodology documents (Chapter 18)
 
 | Path | Role |
 |---|---|
 | [AGENTS.md](../../AGENTS.md) | Repository rules and north star (Project Intent) |
-| [codex-goal-prompt.md](../../codex-goal-prompt.md) | Goal contract and work protocol (§0.10 claim-hygiene table) |
+| [docs/goal/goal-prompt.md](../../docs/goal/goal-prompt.md) | Goal contract and work protocol (§0.10 claim-hygiene table) |
+| [docs/goal/task-board.yaml](../../docs/goal/task-board.yaml) | Structured task execution queue (`scripts/goal_state.py next` selects work) |
 | [docs/current-goal-state.md](../../docs/current-goal-state.md) | Current goal audit and routing |
 | [docs/debugging-playbook.md](../../docs/debugging-playbook.md) | Debugging playbook (12 techniques) |
 | [docs/investigation-workflow.md](../../docs/investigation-workflow.md) | Investigation workflow (three modes and template) |

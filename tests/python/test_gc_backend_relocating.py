@@ -5,6 +5,10 @@ import subprocess
 import textwrap
 from pathlib import Path
 
+from pcc.tools.runtime_archive_provenance import (
+    PRODUCTION_POLICY,
+    verify_runtime_archive_manifest,
+)
 from tests.runtime_build_cache import cached_c_runtime, cached_threaded_pcc_python_runtime
 
 REPO_ROOT = Path(__file__).absolute().parents[2]
@@ -46,6 +50,22 @@ def _build_runtime(tmp_path: Path) -> Path:
 
 def _build_pcc_py_runtime(tmp_path: Path) -> Path:
     global _PCC_PY_RUNTIME_BUILD_CACHE
+    explicit = os.environ.get("PCC_RUNTIME_ARCHIVE")
+    if explicit:
+        archive = Path(explicit).resolve()
+        assert archive.name == "libpy_runtime_pcc_py.a"
+        manifest = verify_runtime_archive_manifest(
+            archive,
+            runtime_root=RUNTIME_DIR,
+        )
+        assert manifest["policy"] == PRODUCTION_POLICY
+        assert all(
+            record["source_kind"] == "pcc-python"
+            and record["producer_kind"] == "pcc-python-library-ir-to-obj"
+            and record["uses_host_cc"] is False
+            for record in manifest["members"]
+        )
+        return archive.parent
     if (
         _PCC_PY_RUNTIME_BUILD_CACHE is not None
         and (_PCC_PY_RUNTIME_BUILD_CACHE / "libpy_runtime_pcc_py.a").is_file()
@@ -53,6 +73,161 @@ def _build_pcc_py_runtime(tmp_path: Path) -> Path:
         return _PCC_PY_RUNTIME_BUILD_CACHE
     _PCC_PY_RUNTIME_BUILD_CACHE = cached_threaded_pcc_python_runtime()
     return _PCC_PY_RUNTIME_BUILD_CACHE
+
+
+def _assert_pcc_python_memoryview_owned_buffer_follows_relocation(
+    tmp_path: Path,
+    work_runtime: Path,
+):
+    src = tmp_path / "pcc_python_memoryview_relocation_probe.c"
+    exe = tmp_path / "pcc_python_memoryview_relocation_probe.out"
+    src.write_text(
+        textwrap.dedent(
+            """
+            #include "py_runtime.h"
+            #include "py_internal.h"
+            #include <stdint.h>
+
+            typedef struct {
+                void *buf;
+                PyObject *obj;
+                int64_t len;
+                int64_t itemsize;
+                int32_t readonly;
+                int32_t ndim;
+                char *format;
+                int64_t *shape;
+                int64_t *strides;
+                int64_t *suboffsets;
+                void *internal;
+            } ProbePyBuffer;
+
+            typedef struct {
+                PyObjectHeader h;
+                PyObject *base;
+                ProbePyBuffer *owned_buffer;
+            } ProbeMemoryViewObject;
+
+            extern ProbePyBuffer *pcc_PyMemoryView_GET_BUFFER(PyObject *obj);
+            extern int64_t pcc_gc_object_known_size(PyObject *obj);
+            extern int64_t pcc_gc_backend4_relocation_set_add(PyObject *obj);
+            extern void *pcc_gc_backend4_relocation_set_find(PyObject *obj);
+            extern void pcc_gc_backend4_remap_referents(PyObject *obj);
+
+            static int check_memoryview_relocation(void) {
+                PyObject *base_root = 0;
+                PyObject *inner_root = 0;
+                PyObject *outer_root = 0;
+                pcc_gc_scheduler_root_register(&base_root);
+                pcc_gc_scheduler_root_register(&inner_root);
+                pcc_gc_scheduler_root_register(&outer_root);
+                PyObject *base = py_bytes_new("abc", 3);
+                if (base == 0) return 10;
+                pcc_gc_store_root(&base_root, base);
+                PyObject *inner = py_memoryview_new(base);
+                if (inner == 0) return 11;
+                pcc_gc_store_root(&inner_root, inner);
+                base = pcc_gc_load_ptr(0, &base_root);
+                inner = pcc_gc_load_ptr(0, &inner_root);
+                PyObject *outer = py_memoryview_new(inner);
+                if (outer == 0) return 12;
+                pcc_gc_store_root(&outer_root, outer);
+                base = pcc_gc_load_ptr(0, &base_root);
+                inner = pcc_gc_load_ptr(0, &inner_root);
+                outer = pcc_gc_load_ptr(0, &outer_root);
+                if (base == 0 || inner == 0 || outer == 0) return 13;
+                pcc_gc_release(base);
+                pcc_gc_release(inner);
+                pcc_gc_release(outer);
+                base = pcc_gc_load_ptr(0, &base_root);
+                inner = pcc_gc_load_ptr(0, &inner_root);
+                outer = pcc_gc_load_ptr(0, &outer_root);
+                if (pcc_gc_object_known_size(inner) <= 0) return 14;
+                if (pcc_gc_object_known_size(outer) <= 0) return 15;
+
+                ProbePyBuffer *buffer = pcc_PyMemoryView_GET_BUFFER(outer);
+                if (buffer == 0 || buffer->obj != inner) return 16;
+                if (buffer->buf != (void *)((char *)base + 24)) return 17;
+
+                ProbeMemoryViewObject *old_outer =
+                    (ProbeMemoryViewObject *)outer;
+
+                pcc_gc_reset_relocation_set();
+                /* The set prepends and production drains head-first: adding
+                 * outer then inner exercises the real inner->outer order. */
+                if (pcc_gc_backend4_relocation_set_add(outer) != 1) return 18;
+                if (pcc_gc_backend4_relocation_set_add(inner) != 1) return 19;
+                if (pcc_gc_backend4_relocation_set_find(inner) == 0) return 20;
+                int64_t inner_size = pcc_gc_object_known_size(inner);
+                if (inner_size <= 0) return 21;
+                PyObject *moved_inner = pcc_gc_relocate_copy(inner, inner_size);
+                if (moved_inner == 0) return 22;
+                if (moved_inner == inner) return 23;
+
+                pcc_gc_backend4_remap_referents(outer);
+                if (old_outer->base != moved_inner) return 24;
+                if (buffer->obj != moved_inner) return 25;
+                if (buffer->buf != (void *)((char *)base + 24)) return 26;
+
+                int64_t outer_size = pcc_gc_object_known_size(outer);
+                if (outer_size <= 0) return 27;
+                PyObject *moved_outer = pcc_gc_relocate_copy(
+                    outer, outer_size
+                );
+                if (moved_outer == 0) return 28;
+                if (moved_outer == outer) return 29;
+                ProbeMemoryViewObject *new_outer =
+                    (ProbeMemoryViewObject *)moved_outer;
+                if (old_outer->owned_buffer != 0) return 30;
+                if (new_outer->owned_buffer != buffer) return 31;
+                if (new_outer->base != moved_inner) return 32;
+                if (buffer->obj != moved_inner) return 33;
+                if (buffer->buf != (void *)((char *)base + 24)) return 34;
+                if (buffer->len != 3 || buffer->shape == 0) return 35;
+                if (*buffer->shape != 3 || buffer->strides == 0) return 36;
+                if (*buffer->strides != 1) return 37;
+                return 1;
+            }
+
+            int main(void) {
+                if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) {
+                    return 2;
+                }
+                int result = check_memoryview_relocation();
+                return result == 1 ? 0 : result;
+            }
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    build = subprocess.run(
+        [
+            _cc(),
+            "-std=c11",
+            f"-I{work_runtime / 'include'}",
+            f"-I{work_runtime / 'src'}",
+            str(src),
+            str(work_runtime / "libpy_runtime_pcc_py.a"),
+            "-lpthread",
+            "-o",
+            str(exe),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert build.returncode == 0, build.stderr
+
+    result = subprocess.run(
+        [str(exe)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, (
+        f"exit={result.returncode} stdout={result.stdout!r} "
+        f"stderr={result.stderr!r}"
+    )
 
 
 def _assert_backend_four_task_and_scheduler_queue_follow_forwarding(
@@ -1103,6 +1278,14 @@ def test_pcc_python_colored_relocating_task_and_scheduler_queue_follow_forwardin
         work_runtime,
         "libpy_runtime_pcc_py.a",
         extra_link_args=["-pthread"],
+    )
+
+
+def test_pcc_python_memoryview_owned_buffer_follows_relocation(tmp_path):
+    work_runtime = _build_pcc_py_runtime(tmp_path)
+    _assert_pcc_python_memoryview_owned_buffer_follows_relocation(
+        tmp_path,
+        work_runtime,
     )
 
 

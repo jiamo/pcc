@@ -2,8 +2,10 @@ import os
 import sys
 from pathlib import Path
 
-this_dir = os.path.dirname(__file__)
-parent_dir = os.path.dirname(this_dir)
+this_dir = os.path.dirname(os.path.abspath(__file__))
+# tests/{c,python}/<file>.py -> repo root is two levels up. This used to
+# rely on tests/conftest.py's global Path.resolve/dirname shim.
+parent_dir = os.path.dirname(os.path.dirname(this_dir))
 sys.path.insert(0, parent_dir)
 from pcc.evaluater.c_evaluator import CEvaluator
 from tests.c_testsuite_cases import run_pcc

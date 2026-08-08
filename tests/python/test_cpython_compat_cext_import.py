@@ -1,18 +1,13 @@
 """cpython-compat dlopen'd C-extension import must use libpython's real C-API.
 
-Regression for the bug where pcc's no-libpython C-API shim (``py_capi_shim.o``,
-~286 ``Py*`` symbols using pcc's object model with no libpython delegation) was
-inherited into the cpython-compat runtime archive
-(``libpy_runtime_pcc_py_libpython.a``) and SHADOWED libpython's real C-API for
-dlopen'd extensions. CPython extensions are built ``-undefined dynamic_lookup``,
-so their ``Py*`` symbols resolve from the executable's globals; with the shim
-present they bound to pcc's shim, which ran pcc-object-model ops on the real
-CPython module object libpython created, so every ``.so`` C-extension module init
-failed ("execution of module ... failed without setting an exception").
+Regression for the bug where pcc's native C-API definitions shadowed
+libpython's real C-API for dlopen'd extensions. CPython extensions are built
+``-undefined dynamic_lookup``, so exported ``Py*`` symbols from the executable
+won over libpython and ran pcc-object-model operations on real CPython objects.
 
-The Makefile now drops ``py_capi_shim.o`` from the ``_libpython`` archive so
-libpython's real C-API wins. The no-libpython archive keeps the shim, so
-self-host is unaffected. See
+The compatibility archive retains pcc's C-API objects for native runtime
+semantics, while the final linker makes those symbols non-exported so CPython
+extensions bind libpython. See
 ``docs/investigations/python-cpython-compat-import-numpy-multiarray-init-fails.md``.
 
 This uses ``unicodedata`` - a stdlib C extension present in any CPython, so no
@@ -21,6 +16,7 @@ output against the same program under CPython (differential).
 """
 from __future__ import annotations
 
+import marshal as host_marshal
 import shutil
 import subprocess
 import sys
@@ -81,6 +77,122 @@ def test_cpython_compat_imports_stdlib_c_extension(tmp_path):
     # 'A' is 'Lu', name() is 'LATIN CAPITAL LETTER A'. Compare to CPython.
     assert result.stdout == cpython, f"pcc {result.stdout!r} != CPython {cpython!r}"
     assert "Lu" in result.stdout
+
+
+@pytest.mark.pcc_gate(
+    unavailable=None
+    if _have_libpython()
+    else "cpython-compat requires libpython headers/lib"
+)
+def test_cpython_compat_preserves_native_runtime_semantics(tmp_path):
+    """libpython mode must isolate, not delete, pcc's native C-API owners."""
+    from pcc.py_frontend.pipeline import compile_python
+
+    src = tmp_path / "mixed.py"
+    exe = tmp_path / "mixed.out"
+    payloads = [
+        repr(host_marshal.dumps(value))
+        for value in (
+            None,
+            True,
+            1.5,
+            "bridge",
+            [1, 2],
+            (3, 4),
+            {"answer": 42},
+            {7},
+            2**100,
+            -(2**100),
+        )
+    ]
+    src.write_text(
+        textwrap.dedent(
+            f"""
+            import marshal
+            import unicodedata
+
+            def main() -> None:
+                values = [3, 1, 2]
+                getattr(values, "sort")()
+                print(values)
+                bridged = [
+                    marshal.loads({payloads[0]}),
+                    marshal.loads({payloads[1]}),
+                    marshal.loads({payloads[2]}),
+                    marshal.loads({payloads[3]}),
+                    marshal.loads({payloads[4]}),
+                    marshal.loads({payloads[5]}),
+                    marshal.loads({payloads[6]}),
+                    marshal.loads({payloads[7]}),
+                    marshal.loads({payloads[8]}),
+                    marshal.loads({payloads[9]}),
+                ]
+                print(bridged)
+                print(unicodedata.category("A"))
+
+            if __name__ == "__main__":
+                main()
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+
+    compile_python(str(src), str(exe), libpython_mode="on")
+    expected = subprocess.run(
+        [sys.executable, str(src)], capture_output=True, text=True, timeout=30
+    )
+    result = subprocess.run(
+        [str(exe)], capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0, (
+        "cpython-compat lost pcc-native runtime semantics:\n"
+        f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}"
+    )
+    assert result.stdout == expected.stdout
+
+    symbols = subprocess.run(
+        ["nm", "-g", str(exe)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=True,
+    ).stdout.splitlines()
+    public_capi_definitions = []
+    for line in symbols:
+        fields = line.split()
+        if len(fields) < 2 or fields[-2] == "U":
+            continue
+        symbol = fields[-1]
+        bare = symbol[1:] if symbol.startswith("_") else symbol
+        if bare.startswith("Py") or bare.startswith("_Py"):
+            public_capi_definitions.append(symbol)
+    assert not public_capi_definitions
+
+
+def test_libpython_program_main_initializes_cpython_before_module_code(tmp_path):
+    """The process main thread must win CPython initialization."""
+    from pcc.py_frontend.pipeline import compile_python
+
+    src = tmp_path / "main_thread_init.py"
+    out = tmp_path / "main_thread_init.ll"
+    src.write_text("print('ok')\n", encoding="utf-8")
+
+    compile_python(
+        str(src),
+        str(out),
+        emit_llvm_only=True,
+        libpython_mode="on",
+    )
+
+    ir_text = out.read_text(encoding="utf-8")
+    main_start = ir_text.index("define i32 @main(")
+    main_end = ir_text.index("\n}", main_start)
+    main_ir = ir_text[main_start:main_end]
+    args_call = main_ir.index("call void @py_set_program_args")
+    init_call = main_ir.index("call void @py_cpy_ensure_init")
+    print_call = main_ir.index("call void @py_print")
+    assert args_call < init_call < print_call
+    assert main_ir.count("call void @py_cpy_ensure_init") == 1
 
 
 def test_chained_cpython_call_method_dispatches_via_libpython(tmp_path):

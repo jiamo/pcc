@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 from pathlib import Path
 import subprocess
@@ -146,19 +147,27 @@ def test_native_pcc1_finds_runtime_resources_under_installed_prefix(tmp_path):
 def test_installed_wheel_runtime_marker_is_schema_and_target_labeled(tmp_path):
     archive = tmp_path / "libpy_runtime_pcc_py.a"
     archive.write_bytes(b"archive")
+    manifest = Path(str(archive) + ".provenance.json")
+    manifest.write_bytes(b"manifest\n")
+    inventory = Path(str(archive) + ".capi_syms")
+    inventory.write_bytes(b"PyRuntime_Anchor\n")
     marker = Path(str(archive) + ".wheel")
     marker.write_text(
-        "pcc.runtime-wheel-artifact.v1\n"
+        "pcc.runtime-wheel-artifact.v2\n"
+        + "target="
         + _runtime_archive_target_id()
-        + "\nsha256:"
-        + ("a" * 64)
+        + "\narchive-sha256="
+        + hashlib.sha256(archive.read_bytes()).hexdigest()
+        + "\nmanifest-sha256="
+        + hashlib.sha256(manifest.read_bytes()).hexdigest()
+        + "\ncapi-inventory-sha256="
+        + hashlib.sha256(inventory.read_bytes()).hexdigest()
         + "\n",
         encoding="utf-8",
     )
 
     assert _runtime_archive_wheel_stamp_matches(str(archive))
-    marker.write_text(
-        "pcc.runtime-wheel-artifact.v1\nwrong-target\nsha256:" + ("a" * 64) + "\n",
-        encoding="utf-8",
-    )
+    marker.write_text(marker.read_text(encoding="utf-8").replace(
+        "target=" + _runtime_archive_target_id(), "target=wrong-target"
+    ), encoding="utf-8")
     assert not _runtime_archive_wheel_stamp_matches(str(archive))

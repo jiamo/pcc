@@ -19,5 +19,8 @@ Editorial machinery:
 
 Conventions: source references use file path + identifier name (never line
 numbers); code identifiers, CLI flags, and environment variables appear
-verbatim. The book corresponds to the repository state of June 2026; where
-book and code disagree, the code wins.
+verbatim. Chapters 14 and 20, their cross-references, and the repository map
+were refreshed against the repository state of August 2026 to cover the
+freestanding pcc-Python/zero-libc direction and the declarative GUI stack.
+Untouched chapters may still contain older snapshots; where book and code
+disagree, the code and mode-labeled gate evidence win.

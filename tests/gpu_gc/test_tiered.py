@@ -103,6 +103,14 @@ def test_release_drops_entry_at_zero_refcount():
     assert d.contains(h)  # still 1 ref
     d.release(h)
     assert not d.contains(h)  # dropped
+    with pytest.raises(DirectoryError, match="cannot release unknown block"):
+        d.release(h)
+
+
+def test_release_rejects_unknown_digest():
+    d = BlockDirectory()
+    with pytest.raises(DirectoryError, match="cannot release unknown block"):
+        d.release("missing")
 
 
 def test_recompute_reregisters_under_same_hash_after_invalidation():

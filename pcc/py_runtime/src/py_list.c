@@ -227,7 +227,7 @@ void py_list_append(PyObject *lst, PyObject *item) {
     PyListObject *l = (PyListObject *)lst;
     assert(l->h.type_tag == PY_TYPE_LIST);
     if (grow_if_needed(l, l->length + 1) != 0) {
-        /* TODO(phase3): raise MemoryError */
+        py_raise(py_exc_new(PY_EXC_MEMORYERROR, "list append: out of memory"));
         return;
     }
     l->items[l->length] = NULL;
@@ -240,7 +240,8 @@ PyObject *py_list_get(PyObject *lst, int64_t i) {
     PyListObject *l = (PyListObject *)lst;
     int64_t idx = normalize_index(i, l->length, 0);
     if (idx < 0) {
-        /* TODO(phase3): raise IndexError */
+        /* Deliberately non-raising: internal callers pre-check bounds and
+         * probe with NULL. The raising subscript path is py_list_getitem. */
         return NULL;
     }
     PyObject *v = pcc_gc_load_ptr(lst, &l->items[idx]);
@@ -533,7 +534,7 @@ void py_list_extend(PyObject *a, PyObject *b) {
         /* Guard against self-extend: snapshot length before iterating. */
         int64_t bl = lb->length;
         if (grow_if_needed(la, la->length + bl) != 0) {
-            /* TODO(phase3): raise MemoryError. */
+            py_raise(py_exc_new(PY_EXC_MEMORYERROR, "list extend: out of memory"));
             return;
         }
         for (int64_t i = 0; i < bl; i++) {
@@ -554,6 +555,7 @@ void py_list_extend(PyObject *a, PyObject *b) {
         PyTupleObject *tb = (PyTupleObject *)b;
         int64_t bl = tb->len;
         if (grow_if_needed(la, la->length + bl) != 0) {
+            py_raise(py_exc_new(PY_EXC_MEMORYERROR, "list extend: out of memory"));
             return;
         }
         for (int64_t i = 0; i < bl; i++) {
@@ -600,7 +602,7 @@ void py_list_insert(PyObject *lst, int64_t i, PyObject *item) {
     int64_t idx = normalize_index(i, l->length, 1);
 
     if (grow_if_needed(l, l->length + 1) != 0) {
-        /* TODO(phase3): raise MemoryError. */
+        py_raise(py_exc_new(PY_EXC_MEMORYERROR, "list insert: out of memory"));
         return;
     }
 
@@ -622,7 +624,7 @@ PyObject *py_list_pop(PyObject *lst, int64_t i) {
     PyListObject *l = (PyListObject *)lst;
 
     if (l->length == 0) {
-        /* TODO(phase3): raise IndexError("pop from empty list"). */
+        py_raise(py_exc_new(PY_EXC_INDEXERROR, "pop from empty list"));
         return NULL;
     }
 
@@ -634,7 +636,7 @@ PyObject *py_list_pop(PyObject *lst, int64_t i) {
     } else {
         idx = normalize_index(i, l->length, 0);
         if (idx < 0) {
-            /* TODO(phase3): raise IndexError. */
+            py_raise(py_exc_new(PY_EXC_INDEXERROR, "pop index out of range"));
             return NULL;
         }
     }

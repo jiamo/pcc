@@ -46,6 +46,7 @@ _ACTIONS = {
     "py_cpy_call_kwdict": "call",
     "py_cpy_call_kwdict_plus": "call",
     "py_cpy_call_list_kwdict": "call",
+    "py_cpy_binop": "binary",
     # Subscript.
     "py_cpy_setitem": "subscript",
     "py_cpy_getitem": "subscript",
@@ -81,6 +82,9 @@ _PLUMBING = {
     "py_cpy_decref": "decref",
     "py_cpy_incref": "incref",
     "py_cpy_ensure_init": "ensure_init",
+    "py_cpy_handle_new": "handle",
+    "py_cpy_handle_get": "handle",
+    "py_cpy_handle_set_release_fn": "handle",
 }
 _BRIDGE_SYMBOLS = {
     "py_cpy_to_pcc_obj",
@@ -93,6 +97,22 @@ _CALL_RE = re.compile(
     r"(?:%(?P<ssa>[a-zA-Z0-9_.\-]+)\s*=\s*)?"
     r"(?:tail\s+)?call\s+[^\n]*?@(?P<sym>py_cpy_[a-z0-9_]+)\s*\("
 )
+
+
+def classify_py_cpy_symbol(symbol: str) -> tuple[str, str]:
+    """Classify one emitted bridge call, failing closed on new ABI edges.
+
+    Standalone module probes intentionally lack closed-world export context,
+    so a single dynamic action can generate many conversion and ownership
+    calls.  Keeping the two classes explicit prevents correct cleanup from
+    looking like a new Python fallback while ensuring a newly added
+    ``py_cpy_*`` entry cannot silently disappear from the action ratchet.
+    """
+    if symbol in _ACTIONS:
+        return "action", _ACTIONS[symbol]
+    if symbol in _PLUMBING:
+        return "plumbing", _PLUMBING[symbol]
+    raise ValueError(f"unclassified py_cpy symbol: {symbol}")
 
 
 def _read_ir(path: str) -> str:
@@ -140,8 +160,8 @@ def _scan(ir_text: str) -> dict:
         ssa = m.group("ssa")
         by_sym[sym] += 1
         total += 1
-        if sym in _ACTIONS:
-            kind = _ACTIONS[sym]
+        classification, kind = classify_py_cpy_symbol(sym)
+        if classification == "action":
             by_action[kind] += 1
             prefix = _ssa_prefix(ssa, depth=2)
             by_ssa_prefix[prefix] += 1
@@ -149,8 +169,8 @@ def _scan(ir_text: str) -> dict:
             if target:
                 by_target[target] += 1
                 action_target_pairs[(kind, target)] += 1
-        elif sym in _PLUMBING:
-            by_plumbing[_PLUMBING[sym]] += 1
+        else:
+            by_plumbing[kind] += 1
 
     actions_total = sum(by_action.values())
     plumbing_total = sum(by_plumbing.values())

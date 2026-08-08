@@ -20,13 +20,21 @@ from __future__ import annotations
 import subprocess
 import textwrap
 
-def _compile_and_run(tmp_path, source: str) -> subprocess.CompletedProcess[str]:
+def _compile_and_run(
+    tmp_path, source: str, *, backend: str = "llvm"
+) -> subprocess.CompletedProcess[str]:
     from pcc.py_frontend.pipeline import compile_python
 
     src = tmp_path / "prog.py"
     exe = tmp_path / "prog.out"
     src.write_text(textwrap.dedent(source).lstrip(), encoding="utf-8")
-    compile_python(str(src), str(exe), ir_scaffold_mode="on")
+    compile_python(
+        str(src),
+        str(exe),
+        ir_scaffold_mode="on",
+        libpython_mode="off",
+        backend=backend,
+    )
     return subprocess.run(
         [str(exe)], capture_output=True, text=True, timeout=20,
     )
@@ -213,3 +221,42 @@ def test_reduce_hook(tmp_path):
         """)
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip() == "hello"
+
+
+def test_copy_pickle_pcc_python_owner_self_backend(tmp_path):
+    result = _compile_and_run(
+        tmp_path,
+        """
+        import copy
+        import pickle
+
+        class Tag:
+            def __init__(self, name):
+                self.name = name
+            def __copy__(self):
+                return Tag(self.name + ":copy")
+            def __reduce__(self):
+                return (Tag, (self.name,))
+
+        def main() -> None:
+            cycle = []
+            cycle.append(cycle)
+            cloned = copy.deepcopy(cycle)
+            print(cloned is cycle)
+            print(cloned[0] is cloned)
+            print(copy.copy(Tag("x")).name)
+            restored = pickle.loads(pickle.dumps(Tag("wire")))
+            print(restored.name)
+
+        if __name__ == "__main__":
+            main()
+        """,
+        backend="self",
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().splitlines() == [
+        "False",
+        "True",
+        "x:copy",
+        "wire",
+    ]

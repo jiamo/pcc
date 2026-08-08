@@ -43,6 +43,11 @@ from ..py_ast import (
 )
 from . import marshal
 from .errors import L1CodegenError
+from .exact_int_lowering import (
+    allocate_forced_exact_int_locals,
+    bind_forced_exact_int_parameter,
+    forced_exact_int_local_names,
+)
 from .expr_helper_lowering import emit_python_floordiv_i64_unchecked
 from .runtime_abi import declare_runtime_global
 
@@ -115,6 +120,11 @@ def _low_ir_type_for_expr(expr: Expr) -> Optional[int]:
     if isinstance(ty, BoolType):
         return pcc_low_ir.LOW_I1
     if isinstance(ty, IntType):
+        # LOW_I64 currently carries signed arithmetic/comparison semantics.
+        # Keep explicit unsigned values on the full lowering path until the
+        # compact IR records signedness as part of its type.
+        if ty.name == "pcc.u64":
+            return None
         return pcc_low_ir.LOW_I64
     if isinstance(ty, FloatType):
         return _LOW_F64
@@ -205,14 +215,12 @@ def _low_ir_expr_to_value(
                 operand = _low_ir_coerce_value(operand, target_ty)
                 if operand is None:
                     return None
+            if target_ty == _LOW_F64:
+                return pcc_low_ir.LowUnary(_LOW_F64, "-", operand)
             return pcc_low_ir.LowBinOp(
                 target_ty,
                 "-",
-                (
-                    pcc_low_ir.LowF64Const(0.0)
-                    if target_ty == _LOW_F64
-                    else pcc_low_ir.LowConst(target_ty, 0)
-                ),
+                pcc_low_ir.LowConst(target_ty, 0),
                 operand,
             )
         if expr.op == "+":
@@ -673,7 +681,7 @@ def _low_ir_emit_value(
             return builder.sitofp(inner, _DOUBLE, name="low.sitofp")
         if value.op == "-":
             if isinstance(inner.type, ir.DoubleType):
-                return builder.fsub(ir.Constant(_DOUBLE, 0.0), inner, name="low.fneg")
+                return builder.fneg(inner, name="low.fneg")
             return builder.sub(ir.Constant(inner.type, 0), inner, name="low.neg")
         return inner
     if isinstance(value, pcc_low_ir.LowBinOp):
@@ -947,6 +955,11 @@ class UserFunctionLoweringMixin:
     ) -> bool:
         if not _low_ir_enabled():
             return False
+        # Low-IR direct-symbol resolution has no live module-binding model.
+        # Keep a module containing a repeated ``def`` on the normal lowering
+        # path, where calls load the current rooted module-global callable.
+        if self._duplicate_module_function_names:
+            return False
         if c_abi_sym is not None:
             return False
         if box_int_abi:
@@ -1092,24 +1105,34 @@ class UserFunctionLoweringMixin:
             saved_trace_expr_kind = ""
 
         _func_codegen_log(self, debug_codegen, fd.name, "enter")
-        fn = self.functions[fd.name]
+        fn = self._funcdef_functions.get(id(fd))
+        if fn is None:
+            fn = self.functions[fd.name]
         _func_codegen_log(self, debug_codegen, fd.name, "generator check begin")
         # Preserve state needed by nested codegen and diagnostics.
         saved_builder = self.builder
         saved_fn = self.current_function
         saved_fd = self.current_func_def
         saved_entry_block = getattr(self, "_current_entry_block", None)
+        saved_try_err_block = getattr(self, "_try_err_block", None)
+        saved_cpy_operand_cleanup_block = getattr(
+            self,
+            "_cpy_operand_cleanup_block",
+            None,
+        )
         saved_env = self.env
         saved_env_class_hint = self.env_class_hint
         saved_env_class_object_hint = self.env_class_object_hint
         saved_env_list_elem_class_hint = self.env_list_elem_class_hint
         saved_box_int_locals = self._box_int_locals
         saved_exact_int_flags = self._exact_int_env_flags
+        saved_planned_exact_int_local_names = self._planned_exact_int_local_names
         saved_ir_builder_flags = self._ir_builder_env_flags
         saved_threading_list_elem_flags = self._threading_list_elem_flags
         saved_weak_dict_flags = self._weak_dict_env_flags
         saved_cpy_env_flags = dict(getattr(self, "_cpy_env_flags", {}))
         saved_cpy_values = set(getattr(self, "_cpy_values", set()))
+        saved_owned_cpy_values = set(getattr(self, "_owned_cpy_values", set()))
         saved_async_body_depth = getattr(self, "_async_body_depth", 0)
         saved_owned_local_names = self._owned_local_names
         saved_owned_local_has_value = self._owned_local_has_value
@@ -1118,6 +1141,11 @@ class UserFunctionLoweringMixin:
             self,
             "_owned_local_flag_allocas",
             {},
+        )
+        saved_for_target_owned_names = getattr(
+            self,
+            "_for_target_owned_names",
+            set(),
         )
         saved_gc_rooted_local_names = self._gc_rooted_local_names
         saved_gc_rooted_local_order = getattr(self, "_gc_rooted_local_order", [])
@@ -1160,6 +1188,8 @@ class UserFunctionLoweringMixin:
 
         self.current_function = fn
         self.current_func_def = fd
+        self._try_err_block = None
+        self._cpy_operand_cleanup_block = None
         # An exception handler cannot span a Python function boundary.  Keep
         # this codegen-time stack function-local as well: a retained IR value
         # from an outer/nested emission is invalid in ``fn`` and must never be
@@ -1177,11 +1207,17 @@ class UserFunctionLoweringMixin:
             ).get(fd.name, "instance")
 
         try:
-            if fd.name in getattr(
-                self,
-                "_generator_func_names",
-                set(),
-            ) or self._funcdef_has_yield_sentinel(fd):
+            is_generator = self._funcdef_has_yield_sentinel(fd)
+            if (
+                not is_generator
+                and fd.name not in self._duplicate_module_function_names
+            ):
+                is_generator = fd.name in getattr(
+                    self,
+                    "_generator_func_names",
+                    set(),
+                )
+            if is_generator:
                 _func_codegen_log(
                     self, debug_codegen, fd.name, "generator wrapper begin"
                 )
@@ -1204,6 +1240,7 @@ class UserFunctionLoweringMixin:
                 # auto-mode diagnostic at 149 IR modules.
                 self._owned_local_flag_slots = {}
                 self._owned_local_flag_allocas = {}
+                self._for_target_owned_names = set()
                 self._gc_rooted_local_names = set()
                 self._gc_rooted_local_order = []
                 self._borrowed_gc_rooted_local_names = set()
@@ -1211,6 +1248,7 @@ class UserFunctionLoweringMixin:
                 self._except_binding_names = set()
                 self._cpy_env_flags = {}
                 self._cpy_values = set()
+                self._owned_cpy_values = set()
                 self._emit_generator_wrapper_function(fd, fn)
                 _func_codegen_log(self, debug_codegen, fd.name, "generator wrapper end")
                 return
@@ -1234,6 +1272,12 @@ class UserFunctionLoweringMixin:
                 return
 
             self._current_global_names = self._collect_explicit_global_names(fd.body)
+            forced_exact_int_names = forced_exact_int_local_names(
+                self,
+                fd,
+                self._current_global_names,
+            )
+            forced_exact_int_name_set = set(forced_exact_int_names)
 
             # Pick an entry-block name that can't collide with a parameter
             # or local variable of the same name. LLVM keeps labels in the
@@ -1257,15 +1301,20 @@ class UserFunctionLoweringMixin:
             self._weak_dict_env_flags = dict(saved_weak_dict_flags)
             self._cpy_env_flags = {}
             self._cpy_values = set()
+            self._owned_cpy_values = set()
             self._ir_builder_env_flags = {}
             self._box_int_locals = box_int_abi
-            self._exact_int_env_flags = {}
+            self._exact_int_env_flags = {
+                name: True for name in forced_exact_int_names
+            }
+            self._planned_exact_int_local_names = forced_exact_int_name_set
             self._async_body_depth = saved_async_body_depth + (1 if fd.is_async else 0)
             self.loop_stack = []
             self._owned_local_names = set()
             self._owned_local_has_value = set()
             self._owned_local_flag_slots = {}
             self._owned_local_flag_allocas = {}
+            self._for_target_owned_names = set()
             self._gc_rooted_local_names = set()
             self._gc_rooted_local_order = []
             self._borrowed_gc_rooted_local_names = set()
@@ -1353,6 +1402,14 @@ class UserFunctionLoweringMixin:
                     if auto_root_borrowed_params:
                         self._ensure_borrowed_local_gc_root(ast_arg.name, slot, _CSTR)
                     continue
+                if bind_forced_exact_int_parameter(
+                    self,
+                    ast_arg,
+                    ir_arg,
+                    ir_ty,
+                    bind_ty,
+                ):
+                    continue
                 slot = self._alloca_in_entry(ir_ty, name=f"{ast_arg.name}.addr")
                 self.builder.store(ir_arg, slot)
                 if debug_codegen:
@@ -1391,19 +1448,43 @@ class UserFunctionLoweringMixin:
                 if threading_elem_kind is not None:
                     self._threading_list_elem_flags[ast_arg.name] = threading_elem_kind
             _func_codegen_log(self, debug_codegen, fd.name, "params end")
+
+            # Allocate every non-parameter exact-int local before emitting any
+            # branch or loop.  The null value means "not assigned yet" only;
+            # all valid incoming scalar values are boxed into this same slot,
+            # so a fallthrough/zero-iteration edge can never select a synthetic
+            # null in place of an earlier integer binding.
+            allocate_forced_exact_int_locals(
+                self,
+                forced_exact_int_names,
+                self._current_global_names,
+            )
             self._emit_thread_safepoint()
 
             # Emit body.
+            # A leading string expression is function metadata, not an
+            # executable statement.  ``_emit_native_func_value`` publishes it
+            # as ``__doc__`` when a Python function object is materialized;
+            # the native body must never allocate/release that literal on
+            # entry (and freestanding functions cannot reference the managed
+            # string runtime at all).
+            body_stmts = fd.body
+            if (
+                body_stmts
+                and isinstance(body_stmts[0], ExprStmt)
+                and isinstance(body_stmts[0].expr, StrLit)
+            ):
+                body_stmts = body_stmts[1:]
             if debug_codegen:
                 _func_codegen_log(self, debug_codegen, fd.name, "body len begin")
                 _func_codegen_log(
                     self,
                     debug_codegen,
                     fd.name,
-                    "body len " + str(len(fd.body)),
+                    "body len " + str(len(body_stmts)),
                 )
                 body_index = 0
-                for raw_stmt in fd.body:
+                for raw_stmt in body_stmts:
                     span = getattr(raw_stmt, "span", None)
                     loc = ""
                     if span is not None:
@@ -1438,7 +1519,7 @@ class UserFunctionLoweringMixin:
                     )
                 _func_codegen_log(self, debug_codegen, fd.name, "terminated probe end")
                 direct_index = 0
-                for direct_stmt in fd.body:
+                for direct_stmt in body_stmts:
                     if self._builder_block_is_terminated():
                         _func_codegen_log(
                             self,
@@ -1480,7 +1561,7 @@ class UserFunctionLoweringMixin:
                     )
                     direct_index += 1
             else:
-                self._emit_stmts(fd.body)
+                self._emit_stmts(body_stmts)
             _func_codegen_log(self, debug_codegen, fd.name, "body end")
             if debug_codegen:
                 try:
@@ -1522,7 +1603,15 @@ class UserFunctionLoweringMixin:
                     self.builder.ret_void()
                 elif isinstance(fn.function_type.return_type, ir.PointerType):
                     self._emit_owned_local_cleanup()
-                    self.builder.ret(self._emit_none_literal())
+                    if (
+                        getattr(self, "_freestanding_module", False)
+                        and c_abi_sym is not None
+                    ):
+                        self.builder.ret(
+                            ir.Constant(fn.function_type.return_type, None)
+                        )
+                    else:
+                        self.builder.ret(self._emit_none_literal())
                 else:
                     self._emit_owned_local_cleanup()
                     self.builder.ret(self._zero_of(fn.function_type.return_type))
@@ -1537,6 +1626,8 @@ class UserFunctionLoweringMixin:
             self.current_function = saved_fn
             self.current_func_def = saved_fd
             self._current_entry_block = saved_entry_block
+            self._try_err_block = saved_try_err_block
+            self._cpy_operand_cleanup_block = saved_cpy_operand_cleanup_block
             self._current_global_names = saved_global_names
             self.env = saved_env
             self.env_class_hint = saved_env_class_hint
@@ -1546,14 +1637,19 @@ class UserFunctionLoweringMixin:
             self._weak_dict_env_flags = saved_weak_dict_flags
             self._cpy_env_flags = saved_cpy_env_flags
             self._cpy_values = saved_cpy_values
+            self._owned_cpy_values = saved_owned_cpy_values
             self._ir_builder_env_flags = saved_ir_builder_flags
             self._box_int_locals = saved_box_int_locals
             self._exact_int_env_flags = saved_exact_int_flags
+            self._planned_exact_int_local_names = (
+                saved_planned_exact_int_local_names
+            )
             self._async_body_depth = saved_async_body_depth
             self._owned_local_names = saved_owned_local_names
             self._owned_local_has_value = saved_owned_local_has_value
             self._owned_local_flag_slots = saved_owned_local_flag_slots
             self._owned_local_flag_allocas = saved_owned_local_flag_allocas
+            self._for_target_owned_names = saved_for_target_owned_names
             self._gc_rooted_local_names = saved_gc_rooted_local_names
             self._gc_rooted_local_order = saved_gc_rooted_local_order
             self._borrowed_gc_rooted_local_names = saved_borrowed_gc_rooted_local_names
@@ -1714,6 +1810,16 @@ class UserFunctionLoweringMixin:
             f"user_{(self.ast_module.name or 'mod').replace('.', '_')}"
             f"_{orig_name}_native_adapter"
         )
+        # The Python name is a live binding and may be reused by a later
+        # ``def``.  The native symbol is the stable identity of this exact
+        # FuncDef body, so repeated definitions must not share the legacy
+        # name-keyed adapter.
+        adapter_fd = self._native_symbol_funcdefs.get(full_fn.name)
+        if (
+            adapter_fd is not None
+            and adapter_fd.name in self._duplicate_module_function_names
+        ):
+            adapter_name = full_fn.name + "_native_adapter"
         existing = self.module.globals.get(adapter_name)
         if isinstance(existing, ir.Function):
             return existing
@@ -1877,10 +1983,14 @@ class UserFunctionLoweringMixin:
         ``functools.partial``), the PyFunc entry itself must return that
         coroutine shell instead of running the async body immediately.
         """
-        adapter_name = (
-            f"user_{(self.ast_module.name or 'mod').replace('.', '_')}"
-            f"_{orig_name}_async_value_adapter"
-        )
+        native_suffix = "_native_adapter"
+        if body_adapter.name.endswith(native_suffix):
+            adapter_name = (
+                body_adapter.name[: -len(native_suffix)]
+                + "_async_value_adapter"
+            )
+        else:
+            adapter_name = body_adapter.name + "_async_value_adapter"
         existing = self.module.globals.get(adapter_name)
         if isinstance(existing, ir.Function):
             return existing
@@ -1929,13 +2039,11 @@ class UserFunctionLoweringMixin:
         finally:
             self._prefer_native_callable_values = old_prefer_native
         if raw in getattr(self, "_cpy_values", ()):
-            obj = self.builder.call(
-                self.runtime["py_cpy_to_pcc_obj"],
-                [raw],
-                name=self._fresh("func.default.bridge"),
+            return self._emit_value_as_pcc_object_or_bridge(
+                raw,
+                expr.ty,
+                "func.default.bridge",
             )
-            self.builder.call(self.runtime["py_cpy_decref"], [raw])
-            return obj
         return marshal.marshal_to_object(
             self.builder,
             self.module,
@@ -2107,7 +2215,7 @@ class UserFunctionLoweringMixin:
 
         self.builder.position_at_end(create_bb)
         created = self._emit_native_func_signature(original_args)
-        self.builder.call(self.runtime["pcc_gc_pin"], [created])
+        self._gc_pin(created)
         self.builder.store(created, cache_gv)
         create_exit = self.builder.block
         self.builder.branch(done_bb)
@@ -2125,7 +2233,12 @@ class UserFunctionLoweringMixin:
         full_fn: ir.Function,
         free_names: tuple[str, ...],
     ) -> ir.Value:
-        fd = self._find_user_funcdef(resolved_name)
+        # Metadata (arity/defaults/docstring/async) belongs to the exact
+        # FuncDef behind ``full_fn``.  A name lookup returns the first or last
+        # rebinding and can silently give another definition's contract.
+        fd = self._native_symbol_funcdefs.get(full_fn.name)
+        if fd is None:
+            fd = self._find_user_funcdef(resolved_name)
         runtime_args = tuple(a for a in fd.args if a.name != "")
         original_arity = max(len(runtime_args) - len(free_names), 0)
         original_args = runtime_args[:original_arity]
@@ -2220,8 +2333,9 @@ class UserFunctionLoweringMixin:
             return fn_obj
 
         is_module_top_level = False
+        fd_id = id(fd)
         for top_stmt in self.ast_module.body:
-            if isinstance(top_stmt, FuncDef) and top_stmt.name == resolved_name:
+            if isinstance(top_stmt, FuncDef) and id(top_stmt) == fd_id:
                 is_module_top_level = True
                 break
         if not is_module_top_level or free_names:
@@ -2230,6 +2344,8 @@ class UserFunctionLoweringMixin:
         safe_mod = (self.ast_module.name or "mod").replace(".", "_").replace("-", "_")
         safe_name = resolved_name.replace(".", "_").replace("-", "_")
         cache_name = "__pcc_native_func_value_cache_" + safe_mod + "_" + safe_name
+        if fd.name in self._duplicate_module_function_names:
+            cache_name = cache_name + "." + full_fn.name
         existing_cache = self.module.globals.get(cache_name)
         if isinstance(existing_cache, ir.GlobalVariable):
             cache_gv = existing_cache
@@ -2264,7 +2380,7 @@ class UserFunctionLoweringMixin:
 
         self.builder.position_at_end(created_bb)
         self.builder.call(self.runtime["py_incref"], [fn_obj])
-        self.builder.call(self.runtime["pcc_gc_pin"], [fn_obj])
+        self._gc_pin(fn_obj)
         self.builder.store(fn_obj, cache_gv)
         created_exit = self.builder.block
         self.builder.branch(done_bb)
@@ -2660,7 +2776,7 @@ class UserFunctionLoweringMixin:
             )
         runtime_formals = [a for a in ast_func_def.args if a.name != ""]
         args_ir: list[ir.Value] = []
-        owned_arg_temps: list[ir.Value] = []
+        pinned_arg_temps: list[tuple[ir.Value, bool]] = []
         for index, (ast_arg, arg_def, ir_arg) in enumerate(
             zip(resolved_args, runtime_formals, fn.args)
         ):
@@ -2668,33 +2784,46 @@ class UserFunctionLoweringMixin:
             param_ir_ty = self._function_arg_ir_type_or_none(fn, index, ir_arg)
             if param_ir_ty is None:
                 param_ir_ty = self._abi_ir_type(target_ty, box_int_abi=False)
-            v = self._emit_arg_for_abi_param(ast_arg, target_ty, param_ir_ty)
+            v = self._emit_arg_for_abi_param_with_cleanup(
+                ast_arg,
+                target_ty,
+                param_ir_ty,
+                tuple(pinned_arg_temps),
+            )
             if (
-                getattr(self, "_last_call_arg_owned_temp", False)
+                not getattr(self, "_freestanding_module", False)
+                and not getattr(self, "_module_has_c_abi_export", False)
                 and isinstance(v.type, ir.PointerType)
                 and v not in getattr(self, "_cpy_values", ())
             ):
-                owned_arg_temps.append(v)
+                owned = getattr(self, "_last_call_arg_owned_temp", False)
+                self._gc_pin(v)
+                pinned_arg_temps.append((v, owned))
             args_ir.append(v)
         call_name = (
             ""
             if isinstance(fn.function_type.return_type, ir.VoidType)
             else self._fresh(f"{display_name}_ret")
         )
-        result = self._call_user(fn, args_ir, call_name)
-        for owned_arg in owned_arg_temps:
-            self._gc_release(
-                owned_arg,
-                self._release_context_label("direct_call_arg"),
-            )
+        result = self._call_user(
+            fn,
+            args_ir,
+            call_name,
+            pinned_arg_temps=tuple(pinned_arg_temps),
+        )
+        for arg_value, owned in pinned_arg_temps:
+            self._gc_unpin(arg_value)
+            if owned:
+                self._gc_release(
+                    arg_value,
+                    self._release_context_label("direct_call_arg"),
+                )
         if self._user_func_returns_cpython(
             ast_func_def,
             runtime_formals,
             resolved_args,
         ):
-            if not hasattr(self, "_cpy_values"):
-                self._cpy_values = set()
-            self._cpy_values.add(result)
+            self._mark_owned_cpy_value(result)
         return result
 
     def _call_would_use_callee_defaults(

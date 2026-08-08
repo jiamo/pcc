@@ -68,7 +68,7 @@ enum {
 
 ## 1.3 七项义务
 
-论题靠七项义务落地。每一项在 [codex-goal-prompt.md](../../codex-goal-prompt.md) 中都有对应的轨道(track)与闸门;这里给出本书视角的速览,机制留给对应章节。
+论题靠七项义务落地。每一项在 [goal-prompt.md](../../docs/goal/goal-prompt.md) 中都有对应的轨道(track)与闸门;这里给出本书视角的速览,机制留给对应章节。
 
 1. **兼容性声明必须模式标注(mode-labeled)。** 一条声明必须说明它在哪个模式下成立:host pcc ≠ pcc1;cpython-compat ≠ pcc-native;libpython ≠ no-libpython;LLVM 后端 ≠ self 后端;stage1 ≠ pcc1→pcc2→pcc3 不动点。1.4 节展开。
 
@@ -90,7 +90,7 @@ enum {
 
 把"诚实"写进体系结构,听起来像把道德条款塞进技术文档。但 pcc 的处境使它成为一个工程必需品:这个系统同时存在太多正交的执行模式。编译器本身可以由宿主 CPython 运行(host pcc)或以自举产物运行(pcc1);Python 输入可以走严格 no-libpython 路径或显式 CPython 桥;后端可以是 `llvm`、`llvm_capi` 或 `self`;包的接受面分 cpython-compat 与 pcc-native;自举证据分 stage1 与完整不动点。一条不带模式标注的声明("pcc 能跑 NumPy 了")在这个空间里不是信息,是噪声——它会把后续的工程决策路由到错误的方向上。
 
-因此 [codex-goal-prompt.md](../../codex-goal-prompt.md) §0.10 把声明卫生(claim hygiene)写成一张不等式表,每条声明必须映射到一个闸门:
+因此 [goal-prompt.md](../../docs/goal/goal-prompt.md) §0.10 把声明卫生(claim hygiene)写成一张不等式表,每条声明必须映射到一个闸门:
 
 ```text
 host pcc pass          != pcc1 pass
@@ -130,24 +130,18 @@ def _diagnostic_for_cpython_extension_abi(path: str) -> dict[str, object]:
 
 [README.md](../../README.md) 明说这个阻塞是有意的:它防止一个 CPython ABI 工件被误报成 pcc-native 的 NumPy 支持。一个为演示而设计的系统会把这条路悄悄打通;一个为可验证性而设计的系统把它做成显式错误码。
 
-## 1.5 运行时分四层:把 C 收缩成内核
+## 1.5 运行时分四层:让生产实现迁入 pcc-Python
 
-一个常见误解是把 no-libpython 理解成"最终二进制里没有 C 运行时"。pcc 的契约恰恰相反:no-libpython 意味着不依赖 CPython 运行时,而不是零 C。长期目标是把 C 级运行时**最小化**为一个小的 ABI 内核,同时让 Python 语义迁移进 pcc-Python、由 pcc 自己编译。[AGENTS.md](../../AGENTS.md) 要求区分四层,并警告"C 运行时"这个词的笼统用法会把它们混为一谈:
+no-libpython 只表示不依赖 CPython,并不自动表示 zero-libc。pcc 的长期契约比“最小 C kernel”更强:生产运行时——包括分配、线程、安全点、五 GC、libc-like substrate 与 C-API ABI shim——迁往严格 freestanding pcc-Python;编译器只保留原始内存、原子、系统调用与 host ABI 等机器内建。C 与 vendored libc 源码保留为差分 oracle,但最终退出生产链接。
 
 ```text
-C 级内核            保留并最小化:平台/ABI、内存分配、原子操作/引用计数屏障、
-                    线程原语、dlopen、系统调用、安全点/栈图、GC 槽位与根原语。
-                    不得知道任何高层 Python 语义(没有 list/dict/dunder/
-                    值类/导入策略;没有 if package == "numpy")。
-C 语义运行时        收缩:手写 C 的 list/dict/str/dunder/异常语义
-                    -> 迁往 pcc-Python。
-pcc-Python 运行时   增长:迁移目标;Python 语义以 pcc-Python 撰写,
-                    可自托管、可测试、由 pcc 编译。
-C-API shim          保留但规约化/生成:扩展所见的 ABI 表面;
-                    != CPython/libpython。
+compiler intrinsics   保留:raw memory / atomics / syscall / machine ABI
+freestanding pcc-Py   增长:allocator / threads / safepoints / GC / ABI shims
+semantic pcc-Python   增长:list / dict / str / dunder / exception / import
+C/libc sources        从生产依赖移除;保留为有来源标注的 oracle
 ```
 
-物理上,这对应 `pcc/py_runtime/src/*.c`(C 实现)与 `pcc/py_runtime/py/*.py`(pcc-Python 移植)两棵镜像树。镜像纪律是刚性的:大多数运行时模块同时存在 C 版与 pcc-Python 版,两者必须保持同步——对象布局逐字节一致(见第 7 章),行为语义一致(见第 14 章)。防止漂移的核心装置是 **5-GC 生产平等规则**:全部五个 GC 后端、C 内核与 pcc-Python 镜像必须消费**同一套**基于槽位的追踪/更新契约(`py_obj_visit_slots`/`py_obj_update_slot`,加上根、帧与原生句柄注册),系统里永远不允许出现第二套并行的对象图规则供其漂移。C 内核与 pcc-Python 语义运行时之间由一套有规约的运行时 ABI(Layer 1)连接,目的正是杜绝"两个平行的 Python 语义运行时各自演化"这一失败模式。四层模型的完整展开见第 14 章,槽位契约见第 10 章。
+平台边界必须单独标注:Linux 的最终目标是没有生产 C/libc 对象、`PT_INTERP`、`DT_NEEDED` 和未定义符号的受支持静态闭包;Darwin 仍通过具名 libSystem ABI 进入操作系统,不得称作 zero-libc。五个 GC 后端消费一套由生产 pcc-Python 拥有的槽位 trace/update 与 root/frame/native-handle 契约;C 版本只参与差分。no-libpython、pcc-Python-owned runtime 与 zero-libc 的完整证据阶梯见第 14 章,槽位契约见第 10 章。
 
 ## 1.6 定位:与 PyPy、Cython、Nuitka、mypyc 的差异
 
@@ -175,6 +169,8 @@ Linux 部署失败 -> self 后端    五 GC 矩阵   -> 运行时可信度
 ```
 
 这个结构在 1.8.2 节的案例研究里能看得很具体:一次真实 NumPy 导入的失败,被拆解成一串通用机制缺口(警告模块、typing 标记、路径操作、正则子集……),每个缺口的修复都变成一条可复用的编译器能力,而不是一个 NumPy 补丁。从一个方向读,这是工业工作:用户想要的包离可导入更近了一步;从另一个方向读,这是研究产出:一张实测的地图,标出 no-libpython 的 Python 还缺哪些导入机制语义。两种读法谁也离不开谁——所以两个论题的连接点是同一条规则:**每条声明都必须说清它证明了什么、没证明什么。**
+
+声明式 GUI 也按同一逻辑进入这条主线。它不是把 webview 或 JavaScript 运行时带回来,而是用 pcc-Python 拥有 composition、调度、事件、样式、command 和生命周期,只把 AppKit/CoreGraphics/Metal 留在命名明确的本地 ABI 边界。它已经有可读源码和机器契约,正式验收任务仍开放;第 20 章展开其机制与声明边界。
 
 ## 1.8 历史与教训
 
@@ -222,7 +218,7 @@ def value_model_status() -> dict[str, object]:
 
 ## 1.9 小结
 
-pcc 的论题是把 Python 的执行变成可拥有的:原生、可审计、可自托管、no-libpython。支撑论题的是五个分水岭——自举不动点、五 GC 对比运行时、可选值模型、作为第一类执行根的 self 后端、长跑效率——和把它们变成日常守则的七项义务。性能在这个系统里是已证语义的后果;诚实不是文档礼仪,而是用不等式表、JSON 基线、回退棘轮和闸门实现的体系结构构件。运行时按四层划分:C 内核保留并最小化,C 语义运行时收缩,pcc-Python 运行时增长,C-API shim 保留并规约化。与既有工具相比,pcc 押注的坐标轴是"没有 CPython 的 Python 执行",并为此接受其类型化前端今天仍是实验性子集的现实。两个案例研究展示了同一件事的两面:声明卫生被违反时如何被装置捕获,被遵守时如何把一次真实失败转化为一串可复用的能力。后续各章将把本章的每个名词展开成机制——并在各自的"历史与教训"里继续检验这套纪律。
+pcc 的论题是把 Python 的执行变成可拥有的:原生、可审计、可自托管、no-libpython。支撑论题的是五个分水岭——自举不动点、五 GC 对比运行时、可选值模型、作为第一类执行根的 self 后端、长跑效率——和把它们变成日常守则的七项义务。性能在这个系统里是已证语义的后果;诚实不是文档礼仪,而是用不等式表、JSON 基线、回退棘轮和闸门实现的体系结构构件。生产运行时的目标实现语言是 pcc-Python:freestanding 层拥有低层设施,semantic 层拥有 Python 语义,compiler intrinsics 只表达机器边界,C/libc 退为 oracle。与既有工具相比,pcc 押注的坐标轴是"没有 CPython 的 Python 执行",并为此接受其类型化前端今天仍是实验性子集的现实。两个案例研究展示了同一件事的两面:声明卫生被违反时如何被装置捕获,被遵守时如何把一次真实失败转化为一串可复用的能力。后续各章将把本章的每个名词展开成机制——并在各自的"历史与教训"里继续检验这套纪律。
 
 ## 练习
 

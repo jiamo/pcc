@@ -16,22 +16,17 @@ _DOUBLE = ir.DoubleType()
 
 
 class NativeMathLoweringMixin:
+    # `_get_pow_function` intentionally lives only in
+    # ExprHelperLoweringMixin: two identical copies across mixins is a
+    # silent-divergence trap, and the source lint in
+    # tests/python/test_layer1_mixin_state_protocol.py now rejects it
+    # (ARCH-P3-LAYER1-STATE-PROTOCOL).
     def _get_sqrt_function(self) -> ir.Function:
         name = "sqrt"
         existing = self.module.globals.get(name)
         if isinstance(existing, ir.Function):
             return existing
         fnty = ir.FunctionType(_DOUBLE, [_DOUBLE])
-        fn = ir.Function(self.module, fnty, name=name)
-        fn.linkage = "external"
-        return fn
-
-    def _get_pow_function(self) -> ir.Function:
-        name = "pow"
-        existing = self.module.globals.get(name)
-        if isinstance(existing, ir.Function):
-            return existing
-        fnty = ir.FunctionType(_DOUBLE, [_DOUBLE, _DOUBLE])
         fn = ir.Function(self.module, fnty, name=name)
         fn.linkage = "external"
         return fn
@@ -58,6 +53,75 @@ class NativeMathLoweringMixin:
     ) -> Optional[ir.Value]:
         if kind == "math.prod":
             return self._emit_native_math_prod(args, kwargs)
+        if kind == "math.copysign" and len(args) == 2 and not kwargs:
+            magnitude_raw = self._emit_expr(args[0])
+            magnitude = self._to_double(magnitude_raw, args[0].ty)
+            sign_raw = self._emit_expr(args[1])
+            sign = self._to_double(sign_raw, args[1].ty)
+            magnitude_bits = self.builder.bitcast(
+                magnitude,
+                _I64,
+                name=self._fresh("math.copysign.magnitude.bits"),
+            )
+            sign_bits = self.builder.bitcast(
+                sign,
+                _I64,
+                name=self._fresh("math.copysign.sign.bits"),
+            )
+            cleared = self.builder.and_(
+                magnitude_bits,
+                ir.Constant(_I64, ((0x7FFFFFFF << 32) | 0xFFFFFFFF)),
+                name=self._fresh("math.copysign.magnitude"),
+            )
+            selected_sign = self.builder.and_(
+                sign_bits,
+                ir.Constant(_I64, ((0x80000000 << 32) | 0x0)),
+                name=self._fresh("math.copysign.sign"),
+            )
+            result_bits = self.builder.or_(
+                cleared,
+                selected_sign,
+                name=self._fresh("math.copysign.bits"),
+            )
+            return self.builder.bitcast(
+                result_bits,
+                _DOUBLE,
+                name=self._fresh("math.copysign"),
+            )
+        if kind in ("math.isfinite", "math.isinf", "math.isnan") and len(args) == 1 and not kwargs:
+            raw = self._emit_expr(args[0])
+            value = self._to_double(raw, args[0].ty)
+            bits = self.builder.bitcast(
+                value,
+                _I64,
+                name=self._fresh(kind + ".bits"),
+            )
+            magnitude = self.builder.and_(
+                bits,
+                ir.Constant(_I64, ((0x7FFFFFFF << 32) | 0xFFFFFFFF)),
+                name=self._fresh(kind + ".magnitude"),
+            )
+            infinity = ir.Constant(_I64, ((0x7FF00000 << 32) | 0x0))
+            if kind == "math.isfinite":
+                return self.builder.icmp_unsigned(
+                    "<",
+                    magnitude,
+                    infinity,
+                    name=self._fresh("math.isfinite"),
+                )
+            if kind == "math.isinf":
+                return self.builder.icmp_unsigned(
+                    "==",
+                    magnitude,
+                    infinity,
+                    name=self._fresh("math.isinf"),
+                )
+            return self.builder.icmp_unsigned(
+                ">",
+                magnitude,
+                infinity,
+                name=self._fresh("math.isnan"),
+            )
         if kind == "math.trunc" and len(args) == 1 and not kwargs:
             raw = self._emit_expr(args[0])
             value = self._to_double(raw, args[0].ty)

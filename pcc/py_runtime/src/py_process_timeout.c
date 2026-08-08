@@ -1,12 +1,12 @@
-/* Shared subprocess timeout primitive for the C and pcc-Python runtimes.
+/* Transitional subprocess timeout helper for the C and pcc-Python runtimes.
  *
- * Process creation, process groups, signals, and waitpid are C-kernel duties;
- * keep one implementation here instead of duplicating them in the semantic
- * pcc-Python runtime. The child gets its own process group so timeout cleanup
- * reaches grandchildren as well as the immediate command.
+ * The child gets its own process group so timeout cleanup reaches
+ * grandchildren as well as the immediate command. Platform wait/signal
+ * ownership is already routed to freestanding pcc-Python in the production
+ * archive; spawn and argv construction remain to migrate.
  */
 
-#include "py_runtime.h"
+#include "py_internal.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -65,41 +65,63 @@ static char **build_exec_argv(PyObject *argv, int64_t *count_out) {
 }
 
 static int64_t monotonic_millis(void) {
-    struct timespec now;
-    if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return -1;
-    return (int64_t)now.tv_sec * 1000 + (int64_t)now.tv_nsec / 1000000;
+    int64_t now_us = pcc_runtime_monotonic_us();
+    return now_us > 0 ? now_us / 1000 : -1;
 }
 
-static int64_t normalized_wait_status(int status) {
+#ifndef PCC_USE_FREESTANDING_PLATFORM_PROCESS
+int64_t py_process_normalize_wait_status(int64_t raw_status) {
+    if (raw_status == -1) return 127;
+    int status = (int)raw_status;
     if (WIFEXITED(status)) return (int64_t)WEXITSTATUS(status);
     if (WIFSIGNALED(status)) return -(int64_t)WTERMSIG(status);
     return 127;
 }
+#endif
+
+static int64_t runtime_waitpid(pid_t pid, int *status, int options) {
+#ifdef PCC_USE_FREESTANDING_PLATFORM_PROCESS
+    return pcc_platform_waitpid((int64_t)pid, (int32_t *)status,
+                                (int64_t)options);
+#else
+    pid_t waited;
+    do {
+        waited = waitpid(pid, status, options);
+    } while (waited < 0 && errno == EINTR);
+    return (int64_t)waited;
+#endif
+}
+
+static int64_t runtime_kill(pid_t pid, int signal_number) {
+#ifdef PCC_USE_FREESTANDING_PLATFORM_PROCESS
+    return pcc_platform_kill((int64_t)pid, (int64_t)signal_number);
+#else
+    return (int64_t)kill(pid, signal_number);
+#endif
+}
 
 static int wait_for_exit(pid_t pid, int *status, int64_t deadline_ms) {
-    struct timespec pause = {0, PCC_TIMEOUT_POLL_NS};
     for (;;) {
-        pid_t waited = waitpid(pid, status, WNOHANG);
-        if (waited == pid) return 1;
-        if (waited < 0 && errno != EINTR) return -1;
+        int64_t waited = runtime_waitpid(pid, status, WNOHANG);
+        if (waited == (int64_t)pid) return 1;
+        if (waited < 0) return -1;
         int64_t now_ms = monotonic_millis();
         if (now_ms < 0 || now_ms >= deadline_ms) return 0;
-        nanosleep(&pause, NULL);
+        (void)pcc_runtime_sleep_ns(PCC_TIMEOUT_POLL_NS);
     }
 }
 
 static void terminate_process_group(pid_t pid, int *status) {
     /* POSIX_SPAWN_SETPGROUP made pid the process-group id. Keep the direct-pid
      * signal as a defensive fallback if a platform rejects group delivery. */
-    if (kill(-pid, SIGTERM) != 0 && errno != ESRCH) kill(pid, SIGTERM);
+    if (runtime_kill(-pid, SIGTERM) != 0) runtime_kill(pid, SIGTERM);
     int64_t now_ms = monotonic_millis();
     int64_t deadline_ms = now_ms < 0 ? 0 : now_ms + PCC_TIMEOUT_TERM_GRACE_MS;
     int waited = wait_for_exit(pid, status, deadline_ms);
-    if (waited == 1 || (waited < 0 && errno == ECHILD)) return;
+    if (waited == 1 || waited < 0) return;
 
-    if (kill(-pid, SIGKILL) != 0 && errno != ESRCH) kill(pid, SIGKILL);
-    while (waitpid(pid, status, 0) < 0 && errno == EINTR) {
-    }
+    if (runtime_kill(-pid, SIGKILL) != 0) runtime_kill(pid, SIGKILL);
+    (void)runtime_waitpid(pid, status, 0);
 }
 
 int64_t py_subprocess_run_timeout(
@@ -145,9 +167,21 @@ int64_t py_subprocess_run_timeout(
     pid_t pid = -1;
     int spawn_error = setup_error;
     if (spawn_error == 0) {
+#ifdef PCC_USE_FREESTANDING_PLATFORM_ENV
+        char **spawn_env = pcc_platform_env_snapshot();
+        if (spawn_env == NULL) {
+            spawn_error = ENOMEM;
+        } else {
+            spawn_error = posix_spawnp(
+                &pid, items[0], &actions, &attr, items, spawn_env
+            );
+            pcc_platform_env_snapshot_free(spawn_env);
+        }
+#else
         spawn_error = posix_spawnp(
             &pid, items[0], &actions, &attr, items, environ
         );
+#endif
     }
     posix_spawn_file_actions_destroy(&actions);
     posix_spawnattr_destroy(&attr);
@@ -162,7 +196,7 @@ int64_t py_subprocess_run_timeout(
     }
     int status = 0;
     int waited = wait_for_exit(pid, &status, start_ms + timeout_ms);
-    if (waited == 1) return normalized_wait_status(status);
+    if (waited == 1) return py_process_normalize_wait_status(status);
     if (waited < 0) return 127;
 
     terminate_process_group(pid, &status);

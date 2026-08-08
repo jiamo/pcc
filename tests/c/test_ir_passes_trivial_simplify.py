@@ -14,7 +14,7 @@ opcode histogram / CFG shape as upstream for this subset. The pass is
 a documented subset, so full textual equality is not required.
 """
 
-import shutil
+import pytest
 import unittest
 
 from pcc.ir_passes.parity import assert_ir_parity, run_pcc_ir_pass
@@ -24,7 +24,9 @@ from pcc.ir_passes.trivial_simplify import (
 )
 
 
-_OPT_AVAILABLE = shutil.which("opt") is not None
+from pcc.passes.llvm_text_pipeline import find_opt_binary
+
+_OPT = find_opt_binary()
 
 
 _ADD_ZERO_IR = """
@@ -136,7 +138,7 @@ class RunPassTests(unittest.TestCase):
         self.assertIn("add i32", out)
 
 
-@unittest.skipUnless(_OPT_AVAILABLE, "requires LLVM 'opt' on PATH")
+@pytest.mark.pcc_gate(unavailable=None if _OPT else "matching LLVM opt not installed")
 class UpstreamParityTests(unittest.TestCase):
     """Parity against ``opt -passes=instsimplify`` on the subset we cover."""
 

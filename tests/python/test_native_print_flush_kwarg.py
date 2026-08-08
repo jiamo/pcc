@@ -21,6 +21,8 @@ Runs under ``--backend self --python-libpython=off`` in DEFAULT runtime mode
 from __future__ import annotations
 import os, subprocess
 
+from pcc.py_frontend.pipeline import compile_python
+
 
 def _run(tmp_path, source):
     src = tmp_path / "pf.py"; src.write_text(source, encoding="utf-8")
@@ -70,3 +72,30 @@ def test_print_flush_splat(tmp_path):
         "main()\n",
     )
     assert out.split("\n")[:2] == ["1 2 3", "1, 2, 3!"], out
+
+
+def test_native_scalar_print_ir_has_no_printf_calls(tmp_path):
+    """PCC-owned print paths must not create a second libc stdio buffer."""
+    src = tmp_path / "print_ir.py"
+    src.write_text(
+        "def main():\n"
+        "    print()\n"
+        "    print(7)\n"
+        "    print(True)\n"
+        "    print(2.5)\n"
+        "main()\n",
+        encoding="utf-8",
+    )
+    out = tmp_path / "print_ir.ll"
+    compile_python(
+        str(src),
+        str(out),
+        emit_llvm_only=True,
+        backend="self",
+        libpython_mode="off",
+        ir_scaffold_mode="on",
+    )
+    llvm_ir = out.read_text(encoding="utf-8")
+    assert "call i32 (ptr, ...) @printf" not in llvm_ir
+    assert llvm_ir.count("call void (ptr) @py_print(") >= 3
+    assert "call void (ptr, ptr, ptr) @py_print_many(" in llvm_ir

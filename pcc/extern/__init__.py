@@ -170,10 +170,44 @@ def c_abi_export(symbol: str):
     return _wrap
 
 
+def c_abi_variadic_export(symbol: str):
+    """Export a pcc-Python function as a variadic C-ABI symbol.
+
+    The decorated function's declared parameters are the fixed C arguments;
+    its unnamed arguments are consumed with ``pcc.unsafe.va_*`` intrinsics.
+    Like :func:`c_abi_export`, this decorator is a CPython-level no-op whose
+    meaning is consumed by pcc codegen.
+    """
+    def _wrap(fn):
+        fn.__pcc_c_abi_symbol__ = symbol
+        fn.__pcc_c_abi_variadic__ = True
+        return fn
+    return _wrap
+
+
+def c_abi_typed_export(symbol: str, restype: str, argtypes: tuple[str, ...]):
+    """Export a function with an exact C ABI signature.
+
+    ``restype`` and ``argtypes`` use LLVM-sized names (``void``, ``ptr``,
+    ``i8``/``i16``/``i32``/``i64``, ``f32`` and ``f64``), plus recursive
+    structural aggregates such as ``{f64,f64}``.  This is intended for
+    runtime ABI surfaces whose C representation differs from Python's native
+    lanes; codegen consumes the literal signature from the decorator.
+    """
+    def _wrap(fn):
+        fn.__pcc_c_abi_symbol__ = symbol
+        fn.__pcc_c_abi_restype__ = restype
+        fn.__pcc_c_abi_argtypes__ = argtypes
+        return fn
+    return _wrap
+
+
 __all__ = [
     "ExternFn",
     "extern",
     "c_abi_export",
+    "c_abi_variadic_export",
+    "c_abi_typed_export",
     "c_void", "c_bool",
     "c_int8", "c_int16", "c_int32", "c_int64",
     "c_uint8", "c_uint16", "c_uint32", "c_uint64",

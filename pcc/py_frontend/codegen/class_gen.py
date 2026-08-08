@@ -116,9 +116,21 @@ from ..py_ast import (
 )
 from ..py_ast_contract import PY_AST_FIELD_NAME_OVERRIDES
 from . import marshal
+from .exact_int_lowering import (
+    allocate_forced_exact_int_locals,
+    bind_forced_exact_int_parameter,
+    forced_exact_int_local_names,
+)
 from .builtin_exceptions import builtin_exc_tag_or_missing
+from .errors import L1CodegenError
 from .host_contract import L1_CODEGEN_HOST_ATTRS
 from .runtime_abi import declare_runtime_global
+from .self_module_contracts import (
+    L1_CODEGEN_HOST_ATTR_CONTRACT,
+    PY_AST_FIELD_ORDER_CONTRACT,
+    module_for_class_symbol_contract,
+    module_has_contract,
+)
 
 _I1 = ir.IntType(1)
 _I8 = ir.IntType(8)
@@ -182,7 +194,7 @@ def _classgen_extern_field_names(
     class_name: str,
     field_names: tuple,
 ) -> tuple:
-    if owning_module == "pcc.py_frontend.py_ast":
+    if module_has_contract(owning_module, PY_AST_FIELD_ORDER_CONTRACT):
         override_names = PY_AST_FIELD_NAME_OVERRIDES.get(str(class_name))
         if override_names is not None and tuple(field_names) != tuple(override_names):
             return tuple(override_names)
@@ -209,14 +221,18 @@ def _classgen_class_name_from_info(info) -> str:
 def _classgen_effective_field_names(info) -> tuple:
     fields = tuple(getattr(info, "field_names", ()) or ())
     owning_module = getattr(info, "owning_module", None)
-    if owning_module != "pcc.py_frontend.py_ast":
+    if not module_has_contract(owning_module, PY_AST_FIELD_ORDER_CONTRACT):
         try:
             global_name = str(info.global_var.name)
         except Exception:
             global_name = ""
-        if global_name.startswith(".class.pcc_py_frontend_py_ast."):
-            owning_module = "pcc.py_frontend.py_ast"
-    if owning_module == "pcc.py_frontend.py_ast":
+        encoded_owner = module_for_class_symbol_contract(
+            global_name,
+            PY_AST_FIELD_ORDER_CONTRACT,
+        )
+        if encoded_owner is not None:
+            owning_module = encoded_owner
+    if module_has_contract(owning_module, PY_AST_FIELD_ORDER_CONTRACT):
         class_name = _classgen_class_name_from_info(info)
         override_names = PY_AST_FIELD_NAME_OVERRIDES.get(str(class_name))
         if override_names is not None:
@@ -302,6 +318,16 @@ def _extern_class_decl_plan(
         decoded_param_types = []
         for raw_ty in mdesc["param_types"]:
             decoded_param_types.append(decode_type(raw_ty))
+        # A plain bool survives the schema round trip even where type
+        # descriptors degrade to dyn under the self-hosted compiler; fall
+        # back to the decoded node for schemas written before the field.
+        if "returns_none" in mdesc:
+            returns_none = bool(mdesc["returns_none"])
+        else:
+            returns_none = (
+                _classgen_type_name(return_ty) in ("None", "NoneType")
+                or _is_ast_node(return_ty, NoneType)
+            )
         method_plans.append(
             (
                 mname,
@@ -311,6 +337,8 @@ def _extern_class_decl_plan(
                 return_ty,
                 mdesc.get("symbol")
                 or f"user_{owning_module.replace('.', '_').replace('-', '_')}_{class_name}_{mname}",
+                returns_none,
+                bool(mdesc.get("may_park", False)),
             )
         )
     cached = (
@@ -392,62 +420,10 @@ def _classgen_valueclass_payload_ir_type(ty: Type) -> Optional[ir.Type]:
         if field_ir_ty is None:
             return None
         field_ir_types.append(field_ir_ty)
-    n_fields = len(field_ir_types)
-    if n_fields == 1:
-        return ir.LiteralStructType((field_ir_types[0],))
-    if n_fields == 2:
-        return ir.LiteralStructType((field_ir_types[0], field_ir_types[1]))
-    if n_fields == 3:
-        return ir.LiteralStructType(
-            (
-                field_ir_types[0],
-                field_ir_types[1],
-                field_ir_types[2],
-            )
-        )
-    if n_fields == 4:
-        return ir.LiteralStructType(
-            (
-                field_ir_types[0],
-                field_ir_types[1],
-                field_ir_types[2],
-                field_ir_types[3],
-            )
-        )
-    if n_fields == 5:
-        return ir.LiteralStructType(
-            (
-                field_ir_types[0],
-                field_ir_types[1],
-                field_ir_types[2],
-                field_ir_types[3],
-                field_ir_types[4],
-            )
-        )
-    if n_fields == 6:
-        return ir.LiteralStructType(
-            (
-                field_ir_types[0],
-                field_ir_types[1],
-                field_ir_types[2],
-                field_ir_types[3],
-                field_ir_types[4],
-                field_ir_types[5],
-            )
-        )
-    if n_fields == 7:
-        return ir.LiteralStructType(
-            (
-                field_ir_types[0],
-                field_ir_types[1],
-                field_ir_types[2],
-                field_ir_types[3],
-                field_ir_types[4],
-                field_ir_types[5],
-                field_ir_types[6],
-            )
-        )
-    return None
+    # Keep this self-host mirror on the same dynamic scaffold constructor as
+    # TypeAbiLoweringMixin.  Unsupported field *types* still return None; an
+    # otherwise valid valueclass never changes ABI merely at field eight.
+    return ir.LiteralStructType(field_ir_types)
 
 
 def _classgen_valueclass_field_payload_ir_type(field_ty: Type) -> Optional[ir.Type]:
@@ -1886,6 +1862,11 @@ class ClassInfo:
         # 'property_getter'. Drives argument marshalling and call-site
         # dispatch. Populated by :meth:`_declare_method`.
         self.method_kinds: dict[str, str] = {}
+        # Cross-module method descriptors carry the same closed-world
+        # continuation ABI bit as function exports.  Local methods are keyed
+        # by exact FuncDef ids on the parent codegen; extern methods use this
+        # explicit name set because their FuncDef nodes are synthesized.
+        self.may_park_methods: set[str] = set()
         # For @property methods, track the getter function separately
         # from the stored-name slot so attribute access fires the
         # getter rather than a field lookup.
@@ -2055,14 +2036,15 @@ class ClassLowering:
         # Walk the class body: collect fields from __init__ self-writes
         # and class-level annotations. Ensure __slots__ are added first.
         self._collect_fields_and_declare_methods(cd, info)
-        if self.parent.ast_module.name == "pcc.py_frontend.py_ast":
-            info.owning_module = "pcc.py_frontend.py_ast"
+        source_module_name = self.parent.ast_module.name
+        if module_has_contract(source_module_name, PY_AST_FIELD_ORDER_CONTRACT):
+            info.owning_module = source_module_name
             info.export_class_name = cd.name
             override_names = PY_AST_FIELD_NAME_OVERRIDES.get(cd.name)
             if override_names is not None:
                 info.field_names = list(override_names)
         if (
-            self.parent.ast_module.name == "pcc.py_frontend.codegen.layer1"
+            module_has_contract(source_module_name, L1_CODEGEN_HOST_ATTR_CONTRACT)
             and cd.name == "L1CodeGen"
         ):
             for host_attr_name in L1_CODEGEN_HOST_ATTRS:
@@ -3263,12 +3245,15 @@ class ClassLowering:
             )
             param_types.append(ir_ty)
 
-        is_generator = _funcdef_has_yield_sentinel(fd)
+        is_generator = (
+            self.parent._funcdef_has_yield_sentinel(fd)
+            or cd.name + "." + fd.name
+            in getattr(self.parent, "_vthread_may_park_method_keys", set())
+        )
         if is_generator:
             ret_ty = _PTR
         elif (
-            fd.return_ty is None
-            or _classgen_type_name(fd.return_ty) in ("None", "NoneType")
+            _classgen_type_name(fd.return_ty) in ("None", "NoneType")
             or _is_ast_node(fd.return_ty, NoneType)
         ):
             ret_ty = _VOID
@@ -3525,8 +3510,21 @@ class ClassLowering:
         if primary_key == local or local not in self.classes:
             self.classes[local] = info
 
-        for mname, kind, raw_box_int_abi, decoded_param_types, ret, sym in method_plans:
+        # Indexed access instead of a wide for-target unpack: 7-element
+        # tuple unpacking in a for header is a known self-host hazard
+        # (pcc1 tuple-unpack investigations).
+        for method_plan in method_plans:
+            mname = method_plan[0]
+            kind = method_plan[1]
+            raw_box_int_abi = method_plan[2]
+            decoded_param_types = method_plan[3]
+            ret = method_plan[4]
+            sym = method_plan[5]
+            plan_returns_none = method_plan[6]
+            plan_may_park = bool(method_plan[7])
             info.method_kinds[mname] = kind
+            if plan_may_park:
+                info.may_park_methods.add(mname)
             box_int_abi = (
                 self.parent._should_box_python_ints()
                 if raw_box_int_abi is None
@@ -3548,11 +3546,25 @@ class ClassLowering:
                     )
                     for t in decoded_param_types[1:]
                 ]
-            ret_ir = (
-                _VOID
-                if ret is None
-                else self.parent._abi_ir_type(ret, box_int_abi=box_int_abi)
+            # Mirror declare_method's return lowering exactly: a ``-> None``
+            # (or unannotated) definition emits ``ret void``, so the
+            # cross-module declaration must be void too — declaring it as
+            # PyObject* made callers root leftover x0 (cross-module
+            # return-ABI drift; see
+            # docs/investigations/libpy-runtime-pcc-archive-pure-c-chain-crashes.md).
+            # ``plan_returns_none`` is a schema-carried bool because type
+            # descriptors degrade to dyn under the self-hosted compiler.
+            method_is_async = bool(
+                mname in synth_defs and synth_defs[mname].is_async
             )
+            if plan_may_park:
+                ret_ir = _PTR
+            elif plan_returns_none and method_is_async:
+                ret_ir = _PTR
+            elif plan_returns_none:
+                ret_ir = _VOID
+            else:
+                ret_ir = self.parent._abi_ir_type(ret, box_int_abi=box_int_abi)
             fnty = ir.FunctionType(ret_ir, param_types, var_arg=False)
             existing = mod_module.globals.get(sym)
             if isinstance(existing, ir.Function):
@@ -3643,6 +3655,9 @@ class ClassLowering:
         saved_loops = parent.loop_stack
         saved_box_int_locals = parent._box_int_locals
         saved_exact_int_flags = parent._exact_int_env_flags
+        saved_planned_exact_int_local_names = (
+            parent._planned_exact_int_local_names
+        )
         saved_ir_builder_flags = getattr(parent, "_ir_builder_env_flags", {})
         saved_class = getattr(parent, "current_class", None)
         saved_global_names = getattr(parent, "_current_global_names", set())
@@ -3655,6 +3670,11 @@ class ClassLowering:
             parent,
             "_owned_local_flag_allocas",
             {},
+        )
+        saved_for_target_owned_names = getattr(
+            parent,
+            "_for_target_owned_names",
+            set(),
         )
         saved_gc_rooted_local_names = parent._gc_rooted_local_names
         saved_gc_rooted_local_order = getattr(parent, "_gc_rooted_local_order", [])
@@ -3710,7 +3730,11 @@ class ClassLowering:
         kind = info.method_kinds.get(fd.name, "instance")
 
         try:
-            if _funcdef_has_yield_sentinel(fd):
+            if (
+                parent._funcdef_has_yield_sentinel(fd)
+                or cd.name + "." + fd.name
+                in getattr(parent, "_vthread_may_park_method_keys", set())
+            ):
                 parent._emit_generator_wrapper_function(
                     fd,
                     fn,
@@ -3740,6 +3764,11 @@ class ClassLowering:
             parent._current_global_names = parent._collect_explicit_global_names(
                 fd.body
             )
+            forced_exact_int_names = forced_exact_int_local_names(
+                parent,
+                fd,
+                parent._current_global_names,
+            )
             parent.env = {}
             parent.env_class_hint = {}
             parent.env_class_object_hint = {}
@@ -3752,12 +3781,16 @@ class ClassLowering:
             parent._owned_local_has_value = set()
             parent._owned_local_flag_slots = {}
             parent._owned_local_flag_allocas = {}
+            parent._for_target_owned_names = set()
             parent._gc_rooted_local_names = set()
             parent._gc_rooted_local_order = []
             parent._borrowed_gc_rooted_local_names = set()
             parent._pinned_gc_rooted_local_names = set()
             parent._container_temp_root_slot_names = []
-            parent._exact_int_env_flags = {}
+            parent._exact_int_env_flags = {
+                name: True for name in forced_exact_int_names
+            }
+            parent._planned_exact_int_local_names = set(forced_exact_int_names)
             parent._async_body_depth = saved_async_body_depth + (
                 1 if fd.is_async else 0
             )
@@ -3822,8 +3855,6 @@ class ClassLowering:
                     if ir_ty is None:
                         raise AttributeError("type")
                     _classgen_ensure_value_type(ir_arg, ir_ty)
-                    slot = parent.builder.alloca(ir_ty, name=f"{ast_arg.name}.addr")
-                    parent.builder.store(ir_arg, slot)
                     _decl_ir_ty, bind_ty = parent._param_ir_and_bind_type(
                         ast_arg,
                         require_annotation=False,
@@ -3832,7 +3863,32 @@ class ClassLowering:
                     )
                     if bind_method_arg(ir_arg, ast_arg, ir_ty, bind_ty):
                         continue
+                    if bind_forced_exact_int_parameter(
+                        parent,
+                        ast_arg,
+                        ir_arg,
+                        ir_ty,
+                        bind_ty,
+                    ):
+                        continue
+                    slot = parent.builder.alloca(ir_ty, name=f"{ast_arg.name}.addr")
+                    parent.builder.store(ir_arg, slot)
                     parent.env[ast_arg.name] = (slot, ir_ty, bind_ty)
+                    if auto_root_borrowed_params and parent._is_object(bind_ty):
+                        parent._ensure_borrowed_local_gc_root(
+                            ast_arg.name,
+                            slot,
+                            ir_ty,
+                        )
+                    if (
+                        auto_root_borrowed_params
+                        and parent._is_valueclass_payload_type(bind_ty)
+                    ):
+                        parent._ensure_valueclass_payload_gc_roots(
+                            ast_arg.name,
+                            slot,
+                            bind_ty,
+                        )
             else:
                 # First argument is the receiver (``self`` or ``cls``).
                 recv_name = runtime_args[0].name if runtime_args else "self"
@@ -3865,8 +3921,31 @@ class ClassLowering:
                     recv_bind_ty,
                 ):
                     pass
+                elif runtime_args and bind_forced_exact_int_parameter(
+                    parent,
+                    runtime_args[0],
+                    recv_arg,
+                    recv_ir_ty,
+                    recv_bind_ty,
+                ):
+                    pass
                 else:
                     parent.env[recv_name] = (self_slot, recv_ir_ty, recv_bind_ty)
+                    if auto_root_borrowed_params and parent._is_object(recv_bind_ty):
+                        parent._ensure_borrowed_local_gc_root(
+                            recv_name,
+                            self_slot,
+                            recv_ir_ty,
+                        )
+                    if (
+                        auto_root_borrowed_params
+                        and parent._is_valueclass_payload_type(recv_bind_ty)
+                    ):
+                        parent._ensure_valueclass_payload_gc_roots(
+                            recv_name,
+                            self_slot,
+                            recv_bind_ty,
+                        )
 
                 for offset, (ir_arg, ast_arg) in enumerate(
                     zip(fn.args[1:], runtime_args[1:])
@@ -3876,8 +3955,6 @@ class ClassLowering:
                     if ir_ty is None:
                         raise AttributeError("type")
                     _classgen_ensure_value_type(ir_arg, ir_ty)
-                    slot = parent.builder.alloca(ir_ty, name=f"{ast_arg.name}.addr")
-                    parent.builder.store(ir_arg, slot)
                     _decl_ir_ty, bind_ty = parent._param_ir_and_bind_type(
                         ast_arg,
                         require_annotation=False,
@@ -3886,8 +3963,38 @@ class ClassLowering:
                     )
                     if bind_method_arg(ir_arg, ast_arg, ir_ty, bind_ty):
                         continue
+                    if bind_forced_exact_int_parameter(
+                        parent,
+                        ast_arg,
+                        ir_arg,
+                        ir_ty,
+                        bind_ty,
+                    ):
+                        continue
+                    slot = parent.builder.alloca(ir_ty, name=f"{ast_arg.name}.addr")
+                    parent.builder.store(ir_arg, slot)
                     parent.env[ast_arg.name] = (slot, ir_ty, bind_ty)
+                    if auto_root_borrowed_params and parent._is_object(bind_ty):
+                        parent._ensure_borrowed_local_gc_root(
+                            ast_arg.name,
+                            slot,
+                            ir_ty,
+                        )
+                    if (
+                        auto_root_borrowed_params
+                        and parent._is_valueclass_payload_type(bind_ty)
+                    ):
+                        parent._ensure_valueclass_payload_gc_roots(
+                            ast_arg.name,
+                            slot,
+                            bind_ty,
+                        )
 
+            allocate_forced_exact_int_locals(
+                parent,
+                forced_exact_int_names,
+                parent._current_global_names,
+            )
             parent._lambda_lexical_shadow_names = set(parent._current_param_names)
             parent._emit_thread_safepoint()
 
@@ -3981,9 +4088,7 @@ class ClassLowering:
                 if isinstance(fn.function_type.return_type, ir.VoidType):
                     parent._emit_owned_local_cleanup()
                     parent.builder.ret_void()
-                elif fd.is_async and isinstance(
-                    fn.function_type.return_type, ir.PointerType
-                ):
+                elif isinstance(fn.function_type.return_type, ir.PointerType):
                     parent._emit_owned_local_cleanup()
                     none_gv = declare_runtime_global(parent.module, "py_None")
                     parent.builder.ret(parent.builder.load(none_gv))
@@ -4007,6 +4112,9 @@ class ClassLowering:
             parent.loop_stack = saved_loops
             parent._box_int_locals = saved_box_int_locals
             parent._exact_int_env_flags = saved_exact_int_flags
+            parent._planned_exact_int_local_names = (
+                saved_planned_exact_int_local_names
+            )
             parent._async_body_depth = saved_async_body_depth
             parent._ir_builder_env_flags = saved_ir_builder_flags
             parent.current_class = saved_class  # type: ignore[attr-defined]
@@ -4016,6 +4124,7 @@ class ClassLowering:
             parent._owned_local_has_value = saved_owned_local_has_value
             parent._owned_local_flag_slots = saved_owned_local_flag_slots
             parent._owned_local_flag_allocas = saved_owned_local_flag_allocas
+            parent._for_target_owned_names = saved_for_target_owned_names
             parent._gc_rooted_local_names = saved_gc_rooted_local_names
             parent._gc_rooted_local_order = saved_gc_rooted_local_order
             parent._borrowed_gc_rooted_local_names = (
@@ -4081,6 +4190,12 @@ class ClassLowering:
         try:
             # Emit per-class init in declaration order.
             for cd in self._iter_class_defs():
+                if cd.name in getattr(
+                    self.parent,
+                    "_hoisted_class_capture_params",
+                    {},
+                ):
+                    continue
                 info = self.classes[cd.name]
                 self._emit_class_init(cd, info)
 
@@ -4095,6 +4210,60 @@ class ClassLowering:
         if info is None:
             return
         self._emit_class_init(cd, info)
+
+    def emit_local_class_statement_init(self, cd: ClassDef) -> None:
+        """Construct and bind a function-local class at its source position."""
+        info = self.classes.get(cd.name)
+        if info is None:
+            raise L1CodegenError(
+                "function-local class has no predeclared metadata: " + cd.name
+            )
+        cls_ptr = self._emit_class_init(cd, info, publish_global=False)
+        if cls_ptr is None:
+            return
+
+        parent = self.parent
+        slot = parent.env.get(cd.name)
+        if slot is None:
+            alloca = parent._alloca_in_entry(
+                _PTR,
+                name=cd.name + ".class.addr",
+                init_null=True,
+            )
+            parent.env[cd.name] = (
+                alloca,
+                _PTR,
+                ClassType(
+                    name=cd.name,
+                    module=parent.ast_module.name or "",
+                ),
+            )
+        else:
+            alloca, ir_ty, _declared_ty = slot
+            if not _classgen_ir_type_is_pointer(ir_ty):
+                raise L1CodegenError(
+                    "function-local class binding has non-object storage: "
+                    + cd.name
+                )
+
+        parent._ensure_owned_local_gc_root(cd.name, alloca, _PTR)
+        owned_flag = parent._ensure_owned_local_flag(cd.name, alloca)
+        parent.builder.call(parent.runtime["pcc_gc_pin"], [cls_ptr])
+        parent.builder.call(
+            parent.runtime["pcc_gc_store_root"],
+            [parent._as_gc_ptr(alloca), cls_ptr],
+        )
+        parent.builder.call(parent.runtime["pcc_gc_unpin"], [cls_ptr])
+        # The root store retained the replacement and released any previous
+        # binding.  Consume the fresh class-construction result.
+        parent._gc_release(
+            cls_ptr,
+            parent._release_context_label("local-class:" + cd.name),
+        )
+        parent._owned_local_names.add(cd.name)
+        parent._owned_local_has_value.add(cd.name)
+        parent.builder.store(ir.Constant(_I1, 1), owned_flag)
+        parent.env_class_object_hint[cd.name] = info.name
 
     def _iter_class_defs(self):
         """Return every top-level ``ClassDef`` in the module body."""
@@ -4126,10 +4295,16 @@ class ClassLowering:
         )
         self.parent.builder.position_at_end(cont)
 
-    def _emit_class_init(self, cd: ClassDef, info: ClassInfo) -> None:
+    def _emit_class_init(
+        self,
+        cd: ClassDef,
+        info: ClassInfo,
+        *,
+        publish_global: bool = True,
+    ) -> Optional[ir.Value]:
         if info.metaclass_name == _METACLASS_CONFLICT:
             self._emit_metaclass_conflict_typeerror(cd)
-            return
+            return None
         builder = self.parent.builder
         runtime = self.parent.runtime
 
@@ -4162,10 +4337,7 @@ class ClassLowering:
             base_info = self.classes.get(b.ident)
             if base_info is not None:
                 base_values.append(
-                    builder.load(
-                        base_info.global_var,
-                        name=self._fresh(f".base.{b.ident}"),
-                    )
+                    self._load_class_object(base_info, f".base.{b.ident}")
                 )
                 continue
             exc_tag = _builtin_exception_tag_for_base_name(b.ident)
@@ -4380,16 +4552,63 @@ class ClassLowering:
                     f"Layer 1 cannot resolve class decorator "
                     f"{decorator.ident!r} on {cd.name!r}"
                 )
+            previous_cls_ptr = cls_ptr
+            builder.call(runtime["pcc_gc_pin"], [previous_cls_ptr])
             cls_ptr = self.parent._call_user(
                 decorator_fn,
-                [cls_ptr],
+                [previous_cls_ptr],
                 self._fresh(f"class.decorator.{cd.name}.{decorator.ident}"),
                 cd.span,
                 root_result=True,
+                pinned_arg_temps=((previous_cls_ptr, True),),
+            )
+            builder.call(runtime["pcc_gc_unpin"], [previous_cls_ptr])
+            self.parent._gc_release(
+                previous_cls_ptr,
+                self.parent._release_context_label(
+                    "class-decorator-input:" + cd.name
+                ),
             )
 
-        # 8. Store the decorated/rebound object into the class global.
-        builder.store(cls_ptr, info.global_var)
+        # 8. Module classes publish into their global.  Synthetic local
+        # classes return the fresh object to a rooted function-local binding.
+        if publish_global:
+            builder.store(cls_ptr, info.global_var)
+        return cls_ptr
+
+    def _load_class_object(
+        self,
+        info: ClassInfo,
+        name_hint: str,
+    ) -> ir.Value:
+        """Load a class object, preferring an active function-local binding."""
+        parent = self.parent
+        if parent.current_func_def is not None:
+            slot = parent.env.get(info.name)
+            if slot is not None:
+                alloca, ir_ty, _declared_ty = slot
+                if _classgen_ir_type_is_pointer(ir_ty):
+                    if info.name in getattr(
+                        parent,
+                        "_gc_rooted_local_names",
+                        set(),
+                    ):
+                        return parent.builder.call(
+                            parent.runtime["pcc_gc_load_ptr"],
+                            [
+                                ir.Constant(_PTR, None),
+                                parent._as_gc_ptr(alloca),
+                            ],
+                            name=self._fresh(name_hint),
+                        )
+                    return parent.builder.load(
+                        alloca,
+                        name=self._fresh(name_hint),
+                    )
+        return parent.builder.load(
+            info.global_var,
+            name=self._fresh(name_hint),
+        )
 
     def _maybe_emit_class_metaclass_slot(
         self,
@@ -4402,9 +4621,9 @@ class ClassLowering:
         meta_info = self.classes.get(metaclass_name)
         if meta_info is None or meta_info is info:
             return
-        meta_cls = self.parent.builder.load(
-            meta_info.global_var,
-            name=self._fresh(f".metaclass.{info.name}.{metaclass_name}"),
+        meta_cls = self._load_class_object(
+            meta_info,
+            f".metaclass.{info.name}.{metaclass_name}",
         )
         self.parent.builder.call(
             self.parent.runtime["py_class_set_metaclass"],
@@ -5154,9 +5373,9 @@ class ClassLowering:
         ns_info = self.classes.get(ns_class_name)
         if ns_info is None:
             return None
-        meta_cls_ptr = self.parent.builder.load(
-            meta_info.global_var,
-            name=self._fresh(f".meta.{metaclass_name}"),
+        meta_cls_ptr = self._load_class_object(
+            meta_info,
+            f".meta.{metaclass_name}",
         )
         name_expr = self._class_name_expr(cd)
         bases_expr = self._class_bases_tuple_expr(cd)
@@ -5204,9 +5423,9 @@ class ClassLowering:
             return None
         if "__prepare__" not in meta_info.methods or "__new__" not in meta_info.methods:
             return None
-        meta_cls_ptr = self.parent.builder.load(
-            meta_info.global_var,
-            name=self._fresh(f".meta.{metaclass_name}"),
+        meta_cls_ptr = self._load_class_object(
+            meta_info,
+            f".meta.{metaclass_name}",
         )
         name_expr = self._class_name_expr(cd)
         bases_expr = self._class_bases_tuple_expr(cd)
@@ -5302,9 +5521,9 @@ class ClassLowering:
             return None
         if "__new__" not in meta_info.methods:
             return None
-        meta_cls_ptr = self.parent.builder.load(
-            meta_info.global_var,
-            name=self._fresh(f".meta.{metaclass_name}"),
+        meta_cls_ptr = self._load_class_object(
+            meta_info,
+            f".meta.{metaclass_name}",
         )
         name_expr = self._class_name_expr(cd)
         bases_expr = self._class_bases_tuple_expr(cd)
@@ -5348,9 +5567,9 @@ class ClassLowering:
             return None
         if "__new__" not in meta_info.methods:
             return None
-        meta_cls_ptr = self.parent.builder.load(
-            meta_info.global_var,
-            name=self._fresh(f".meta.{metaclass_name}"),
+        meta_cls_ptr = self._load_class_object(
+            meta_info,
+            f".meta.{metaclass_name}",
         )
         name_expr = self._class_name_expr(cd)
         bases_expr = self._class_bases_tuple_expr(cd)
@@ -5392,9 +5611,9 @@ class ClassLowering:
         if meta_info is None:
             return None
         builder = self.parent.builder
-        meta_cls_ptr = builder.load(
-            meta_info.global_var,
-            name=self._fresh(f".meta.{metaclass_name}"),
+        meta_cls_ptr = self._load_class_object(
+            meta_info,
+            f".meta.{metaclass_name}",
         )
         name_expr = self._class_name_expr(cd)
         bases_expr = self._class_bases_tuple_expr(cd)
@@ -5720,9 +5939,9 @@ class ClassLowering:
             value_ty,
         )
         self.parent.builder.store(obj, gv)
-        cls_ptr = self.parent.builder.load(
-            info.global_var,
-            name=self._fresh(f".cls.{info.name}.setattr"),
+        cls_ptr = self._load_class_object(
+            info,
+            f".cls.{info.name}.setattr",
         )
         self.parent.builder.call(
             self.parent.runtime["py_class_setattr"],
@@ -5809,7 +6028,7 @@ class ClassLowering:
             raise NotImplementedError(
                 f"isinstance: class {class_name!r} not found in module"
             )
-        cls_ptr = builder.load(info.global_var, name=self._fresh(f".cls.{class_name}"))
+        cls_ptr = self._load_class_object(info, f".cls.{class_name}")
         res_i64 = builder.call(
             runtime["py_isinstance"],
             [obj_val, cls_ptr],
@@ -5978,7 +6197,7 @@ class ClassLowering:
             raise NotImplementedError(
                 "instantiation: class " + class_name + " not found in module"
             )
-        cls_ptr = builder.load(info.global_var, name=self._fresh(".cls." + class_name))
+        cls_ptr = self._load_class_object(info, ".cls." + class_name)
         inst = builder.call(
             runtime["py_instance_new"],
             [cls_ptr],
@@ -6377,7 +6596,12 @@ class ClassLowering:
     def _find_method_def(self, class_name: str, method_name: str):
         # Prefer the expanded ClassDef when we synthesized extras via
         # @dataclass etc., so callers see the synthetic methods.
-        info = self.classes.get(class_name)
+        # ``in`` + subscript instead of ``dict.get`` throughout this
+        # method: under the self-hosted compiler ``.get`` has returned
+        # None for present keys (probe-proven 2026-08-01).
+        info = None
+        if class_name in self.classes:
+            info = self.classes[class_name]
         if info is not None:
             for candidate_name, candidate_def in info.method_defs:
                 if candidate_name == method_name:
@@ -6390,9 +6614,14 @@ class ClassLowering:
         # stubs registered by ``declare_extern_class`` when the class
         # isn't part of this module's AST.
         if info is not None and info.extern_method_defs:
-            synth = info.extern_method_defs.get(method_name)
-            if synth is not None:
-                return synth
+            # ``in`` + subscript instead of ``dict.get``: under the
+            # self-hosted compiler ``.get`` has returned None for present
+            # keys (probe-proven 2026-08-01; same class as the recorded
+            # dict.get mis-lowering pitfall).
+            if method_name in info.extern_method_defs:
+                synth = info.extern_method_defs[method_name]
+                if synth is not None:
+                    return synth
         for stmt in self.parent.ast_module.body:
             if (
                 getattr(stmt, "body", None) is not None

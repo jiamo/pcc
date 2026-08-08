@@ -3,14 +3,19 @@
 Narrow os.path runtime helpers: join, basename, and exists. Non-string
 path objects are coerced through py_obj_str before reading UTF-8 bytes.
 """
+from pcc.py_runtime.py.py_abi_constants import (
+    PY_TYPE_INT,
+    PY_TYPE_LIST,
+    PY_TYPE_STR,
+    PY_TYPE_TUPLE,
+)
 from pcc.extern import (
     extern, c_abi_export, c_double, c_ptr, c_int32, c_int64, c_void,
 )
 from pcc.unsafe import (
-    access,
+    chmod_file,
     cstr,
     free,
-    getenv,
     global_load_ptr,
     is_tagged_int,
     load_i8,
@@ -22,8 +27,12 @@ from pcc.unsafe import (
     null,
     ptr_add,
     ptr_is_null,
+    realloc,
     store_i8,
     store_i64,
+    rename_file,
+    sync_file,
+    unlinkat,
 )
 
 
@@ -50,18 +59,20 @@ py_str_utf8        = extern("py_str_utf8",        (c_ptr,),         c_ptr)
 py_exc_new         = extern("py_exc_new",         (c_int64, c_ptr), c_ptr)
 py_raise_owned     = extern("py_raise_owned",     (c_ptr,),         c_void)
 mkdir_sys          = extern("mkdir",              (c_ptr, c_int32), c_int32)
+access             = extern("pcc_platform_access", (c_ptr, c_int64), c_int64)
+getenv             = extern("pcc_platform_getenv", (c_ptr,), c_ptr)
 
 
 def _type_of(obj) -> int:
     if is_tagged_int(obj):
-        return 2       # PY_TYPE_INT
+        return PY_TYPE_INT       # PY_TYPE_INT
     return load_i32(obj, 8)
 
 
 def _coerce_path_str(o):
     if ptr_is_null(o) != 0:
         return null(), null()
-    if _type_of(o) == 4:           # PY_TYPE_STR
+    if _type_of(o) == PY_TYPE_STR:           # PY_TYPE_STR
         return o, null()
     owned = py_obj_str(o)
     return owned, owned
@@ -73,9 +84,9 @@ def _path_seq_len(parts) -> int:
     if is_tagged_int(parts):
         return -1
     tag: int = _type_of(parts)
-    if tag == 5:                  # PY_TYPE_LIST
+    if tag == PY_TYPE_LIST:                  # PY_TYPE_LIST
         return load_i64(parts, 16)
-    if tag == 7:                  # PY_TYPE_TUPLE
+    if tag == PY_TYPE_TUPLE:                  # PY_TYPE_TUPLE
         return load_i64(parts, 16)
     return -1
 
@@ -86,16 +97,16 @@ def _path_seq_borrow(parts, i: int):
     if is_tagged_int(parts):
         return null()
     tag: int = _type_of(parts)
-    if tag == 5:                  # PY_TYPE_LIST
+    if tag == PY_TYPE_LIST:                  # PY_TYPE_LIST
         items = load_ptr(parts, 32)
         return pcc_gc_load_ptr(parts, ptr_add(items, i * 8))
-    if tag == 7:                  # PY_TYPE_TUPLE
+    if tag == PY_TYPE_TUPLE:                  # PY_TYPE_TUPLE
         return pcc_gc_load_ptr(parts, ptr_add(parts, 24 + i * 8))
     return null()
 
 
 @c_abi_export("py_os_makedirs")
-def py_os_makedirs(path, exist_ok: int):
+def py_os_makedirs(path, mode: int, exist_ok: int):
     item, owned = _coerce_path_str(path)
     if ptr_is_null(item) != 0:
         if ptr_is_null(owned) == 0:
@@ -130,7 +141,8 @@ def py_os_makedirs(path, exist_ok: int):
         if i == end or load_i8(buf, i) == 47:
             saved: int = load_i8(buf, i)
             store_i8(buf, i, 0)
-            if mkdir_sys(buf, 511) != 0:
+            component_mode: int = mode if i == end else 511
+            if mkdir_sys(buf, component_mode) != 0:
                 kind: int = py_path_stat_kind(buf)
                 if kind != 2 or (i == end and exist_ok == 0):
                     store_i8(buf, i, saved)
@@ -147,6 +159,64 @@ def py_os_makedirs(path, exist_ok: int):
     free(buf)
     if ptr_is_null(owned) == 0:
         py_decref(owned)
+    return global_load_ptr("py_None")
+
+
+@c_abi_export("py_os_unlink")
+def py_os_unlink(path):
+    item, owned = _coerce_path_str(path)
+    if ptr_is_null(item) != 0:
+        py_decref(owned)
+        py_raise_owned(py_exc_new(3, cstr("path must be string-like")))
+        return null()
+    result: int = unlinkat(py_str_utf8(item), 0)
+    py_decref(owned)
+    if result != 0:
+        py_raise_owned(py_exc_new(14, cstr("could not unlink path")))
+        return null()
+    return global_load_ptr("py_None")
+
+
+@c_abi_export("py_os_replace")
+def py_os_replace(source, destination):
+    source_item, source_owned = _coerce_path_str(source)
+    destination_item, destination_owned = _coerce_path_str(destination)
+    if ptr_is_null(source_item) != 0 or ptr_is_null(destination_item) != 0:
+        py_decref(source_owned)
+        py_decref(destination_owned)
+        py_raise_owned(py_exc_new(3, cstr("paths must be string-like")))
+        return null()
+    result: int = rename_file(
+        py_str_utf8(source_item), py_str_utf8(destination_item)
+    )
+    py_decref(source_owned)
+    py_decref(destination_owned)
+    if result != 0:
+        py_raise_owned(py_exc_new(14, cstr("could not replace path")))
+        return null()
+    return global_load_ptr("py_None")
+
+
+@c_abi_export("py_os_chmod")
+def py_os_chmod(path, mode: int):
+    item, owned = _coerce_path_str(path)
+    if ptr_is_null(item) != 0:
+        py_decref(owned)
+        py_raise_owned(py_exc_new(3, cstr("path must be string-like")))
+        return null()
+    result: int = chmod_file(py_str_utf8(item), mode)
+    py_decref(owned)
+    if result != 0:
+        py_raise_owned(py_exc_new(14, cstr("could not change path mode")))
+        return null()
+    return global_load_ptr("py_None")
+
+
+@c_abi_export("py_os_fsync")
+def py_os_fsync(fd: int):
+    if sync_file(fd) != 0:
+        py_raise_owned(py_exc_new(14, cstr("could not synchronize file")))
+        return null()
     return global_load_ptr("py_None")
 
 
@@ -782,6 +852,369 @@ def py_os_path_commonprefix(paths):
     out = py_str_new(first_data, common_len)
     if ptr_is_null(first_owned) == 0:
         py_decref(first_owned)
+    return out
+
+
+@c_abi_export("py_os_path_commonpath")
+def py_os_path_commonpath(paths):
+    """Return the shared POSIX component prefix of a list or tuple."""
+    n: int = _path_seq_len(paths)
+    if n <= 0:
+        return py_str_new(null(), 0)
+
+    first, first_owned = _coerce_path_str(_path_seq_borrow(paths, 0))
+    if ptr_is_null(first) != 0:
+        if ptr_is_null(first_owned) == 0:
+            py_decref(first_owned)
+        return null()
+    first_data = ptr_add(first, 40)
+    first_len: int = load_i64(first, 16)
+    prefix_len: int = first_len
+
+    i: int = 1
+    while i < n:
+        item, owned = _coerce_path_str(_path_seq_borrow(paths, i))
+        if ptr_is_null(item) != 0:
+            if ptr_is_null(owned) == 0:
+                py_decref(owned)
+            if ptr_is_null(first_owned) == 0:
+                py_decref(first_owned)
+            return null()
+        data = ptr_add(item, 40)
+        item_len: int = load_i64(item, 16)
+        limit: int = prefix_len
+        if item_len < limit:
+            limit = item_len
+        j: int = 0
+        while j < limit and load_i8(first_data, j) == load_i8(data, j):
+            j = j + 1
+        prefix_len = j
+        if ptr_is_null(owned) == 0:
+            py_decref(owned)
+        if prefix_len == 0:
+            break
+        i = i + 1
+
+    if prefix_len > 0:
+        diverged: int = 0
+        k: int = 1
+        while k < n:
+            current, current_owned = _coerce_path_str(_path_seq_borrow(paths, k))
+            if ptr_is_null(current) != 0:
+                if ptr_is_null(current_owned) == 0:
+                    py_decref(current_owned)
+                if ptr_is_null(first_owned) == 0:
+                    py_decref(first_owned)
+                return null()
+            current_len: int = load_i64(current, 16)
+            if current_len > prefix_len:
+                if load_i8(ptr_add(current, 40), prefix_len) != 47:
+                    diverged = 1
+            if ptr_is_null(current_owned) == 0:
+                py_decref(current_owned)
+            k = k + 1
+        if prefix_len < first_len:
+            if load_i8(first_data, prefix_len) != 47:
+                diverged = 1
+        if diverged != 0:
+            while prefix_len > 0 and load_i8(first_data, prefix_len - 1) != 47:
+                prefix_len = prefix_len - 1
+        while prefix_len > 1 and load_i8(first_data, prefix_len - 1) == 47:
+            prefix_len = prefix_len - 1
+
+    out = py_str_new(first_data, prefix_len)
+    if ptr_is_null(first_owned) == 0:
+        py_decref(first_owned)
+    return out
+
+
+def _path_env_name_char(value: int) -> int:
+    if value == 95:  # '_'
+        return 1
+    if value >= 65 and value <= 90:
+        return 1
+    if value >= 97 and value <= 122:
+        return 1
+    if value >= 48 and value <= 57:
+        return 1
+    return 0
+
+
+def _path_cstr_len(value) -> int:
+    length: int = 0
+    while load_i8(value, length) != 0:
+        length = length + 1
+    return length
+
+
+@c_abi_export("py_os_path_expandvars")
+def py_os_path_expandvars(path):
+    """Expand POSIX ``$name`` and ``${name}`` environment references."""
+    item, owned = _coerce_path_str(path)
+    if ptr_is_null(item) != 0:
+        if ptr_is_null(owned) == 0:
+            py_decref(owned)
+        return null()
+    data = ptr_add(item, 40)
+    n: int = load_i64(item, 16)
+
+    has_dollar: int = 0
+    probe: int = 0
+    while probe < n:
+        if load_i8(data, probe) == 36:  # '$'
+            has_dollar = 1
+            break
+        probe = probe + 1
+    if has_dollar == 0:
+        out = py_str_new(data, n)
+        if ptr_is_null(owned) == 0:
+            py_decref(owned)
+        return out
+
+    cap: int = n + 16
+    if cap < 16:
+        cap = 16
+    buf = malloc(cap)
+    if ptr_is_null(buf) != 0:
+        if ptr_is_null(owned) == 0:
+            py_decref(owned)
+        return null()
+
+    out_len: int = 0
+    i: int = 0
+    failed: int = 0
+    while i < n:
+        seg = ptr_add(data, i)
+        seg_len: int = 1
+        advance: int = 1
+        current: int = load_i8(data, i)
+        if current == 36 and i + 1 < n:
+            next_value: int = load_i8(data, i + 1)
+            if next_value == 123:  # '{'
+                end: int = i + 2
+                while end < n and load_i8(data, end) != 125:  # '}'
+                    end = end + 1
+                if end < n:
+                    name_len: int = end - (i + 2)
+                    name = malloc(name_len + 1)
+                    if ptr_is_null(name) != 0:
+                        failed = 1
+                    else:
+                        memmove(name, ptr_add(data, i + 2), name_len)
+                        store_i8(name, name_len, 0)
+                        value = getenv(name)
+                        free(name)
+                        if ptr_is_null(value) == 0:
+                            seg = value
+                            seg_len = _path_cstr_len(value)
+                        else:
+                            seg = ptr_add(data, i)
+                            seg_len = end - i + 1
+                        advance = end - i + 1
+            elif _path_env_name_char(next_value) != 0:
+                end2: int = i + 1
+                while end2 < n and _path_env_name_char(load_i8(data, end2)) != 0:
+                    end2 = end2 + 1
+                name_len2: int = end2 - (i + 1)
+                name2 = malloc(name_len2 + 1)
+                if ptr_is_null(name2) != 0:
+                    failed = 1
+                else:
+                    memmove(name2, ptr_add(data, i + 1), name_len2)
+                    store_i8(name2, name_len2, 0)
+                    value2 = getenv(name2)
+                    free(name2)
+                    if ptr_is_null(value2) == 0:
+                        seg = value2
+                        seg_len = _path_cstr_len(value2)
+                    else:
+                        seg = ptr_add(data, i)
+                        seg_len = end2 - i
+                    advance = end2 - i
+
+        if failed != 0:
+            break
+        while out_len + seg_len + 1 > cap:
+            new_cap: int = cap * 2
+            grown = realloc(buf, new_cap)
+            if ptr_is_null(grown) != 0:
+                failed = 1
+                break
+            buf = grown
+            cap = new_cap
+        if failed != 0:
+            break
+        memmove(ptr_add(buf, out_len), seg, seg_len)
+        out_len = out_len + seg_len
+        i = i + advance
+
+    if failed != 0:
+        free(buf)
+        if ptr_is_null(owned) == 0:
+            py_decref(owned)
+        return null()
+    out2 = py_str_new(buf, out_len)
+    free(buf)
+    if ptr_is_null(owned) == 0:
+        py_decref(owned)
+    return out2
+
+
+def _path_split_normalized_components(data, n: int, offsets, lengths) -> int:
+    count: int = 0
+    i: int = 0
+    while i < n:
+        while i < n and load_i8(data, i) == 47:
+            i = i + 1
+        if i >= n:
+            break
+        start: int = i
+        while i < n and load_i8(data, i) != 47:
+            i = i + 1
+        part_len: int = i - start
+        if part_len == 1 and load_i8(data, start) == 46:
+            continue
+        if part_len == 2:
+            if load_i8(data, start) == 46 and load_i8(data, start + 1) == 46:
+                if count > 0:
+                    count = count - 1
+                continue
+        store_i64(offsets, count * 8, start)
+        store_i64(lengths, count * 8, part_len)
+        count = count + 1
+    return count
+
+
+def _path_bytes_equal(left, right, length: int) -> int:
+    i: int = 0
+    while i < length:
+        if load_i8(left, i) != load_i8(right, i):
+            return 0
+        i = i + 1
+    return 1
+
+
+@c_abi_export("py_os_path_relpath")
+def py_os_path_relpath(path, start):
+    """Return the normalized POSIX component difference from start to path."""
+    path_item, path_owned = _coerce_path_str(path)
+    start_item, start_owned = _coerce_path_str(start)
+    if ptr_is_null(path_item) != 0 or ptr_is_null(start_item) != 0:
+        if ptr_is_null(path_owned) == 0:
+            py_decref(path_owned)
+        if ptr_is_null(start_owned) == 0:
+            py_decref(start_owned)
+        return null()
+
+    path_data = ptr_add(path_item, 40)
+    path_len: int = load_i64(path_item, 16)
+    start_data = ptr_add(start_item, 40)
+    start_len: int = load_i64(start_item, 16)
+    path_offsets = malloc((path_len + 1) * 8)
+    path_lengths = malloc((path_len + 1) * 8)
+    start_offsets = malloc((start_len + 1) * 8)
+    start_lengths = malloc((start_len + 1) * 8)
+    if (
+        ptr_is_null(path_offsets) != 0
+        or ptr_is_null(path_lengths) != 0
+        or ptr_is_null(start_offsets) != 0
+        or ptr_is_null(start_lengths) != 0
+    ):
+        free(path_offsets)
+        free(path_lengths)
+        free(start_offsets)
+        free(start_lengths)
+        if ptr_is_null(path_owned) == 0:
+            py_decref(path_owned)
+        if ptr_is_null(start_owned) == 0:
+            py_decref(start_owned)
+        return null()
+
+    path_count: int = _path_split_normalized_components(
+        path_data, path_len, path_offsets, path_lengths
+    )
+    start_count: int = _path_split_normalized_components(
+        start_data, start_len, start_offsets, start_lengths
+    )
+    common: int = 0
+    while common < path_count and common < start_count:
+        component_len: int = load_i64(path_lengths, common * 8)
+        if component_len != load_i64(start_lengths, common * 8):
+            break
+        path_component = ptr_add(
+            path_data, load_i64(path_offsets, common * 8)
+        )
+        start_component = ptr_add(
+            start_data, load_i64(start_offsets, common * 8)
+        )
+        if _path_bytes_equal(path_component, start_component, component_len) == 0:
+            break
+        common = common + 1
+
+    up: int = start_count - common
+    tail: int = path_count - common
+    total: int = up + tail
+    if total == 0:
+        free(path_offsets)
+        free(path_lengths)
+        free(start_offsets)
+        free(start_lengths)
+        if ptr_is_null(path_owned) == 0:
+            py_decref(path_owned)
+        if ptr_is_null(start_owned) == 0:
+            py_decref(start_owned)
+        return py_str_new(cstr("."), 1)
+
+    output_len: int = 2 * up + total - 1
+    j: int = common
+    while j < path_count:
+        output_len = output_len + load_i64(path_lengths, j * 8)
+        j = j + 1
+    out = py_str_new(null(), output_len)
+    if ptr_is_null(out) != 0:
+        free(path_offsets)
+        free(path_lengths)
+        free(start_offsets)
+        free(start_lengths)
+        if ptr_is_null(path_owned) == 0:
+            py_decref(path_owned)
+        if ptr_is_null(start_owned) == 0:
+            py_decref(start_owned)
+        return null()
+
+    destination = ptr_add(out, 40)
+    pos: int = 0
+    written: int = 0
+    k: int = 0
+    while k < up:
+        if written > 0:
+            store_i8(destination, pos, 47)
+            pos = pos + 1
+        store_i8(destination, pos, 46)
+        store_i8(destination, pos + 1, 46)
+        pos = pos + 2
+        written = written + 1
+        k = k + 1
+    j2: int = common
+    while j2 < path_count:
+        if written > 0:
+            store_i8(destination, pos, 47)
+            pos = pos + 1
+        part_len2: int = load_i64(path_lengths, j2 * 8)
+        part_offset2: int = load_i64(path_offsets, j2 * 8)
+        memmove(ptr_add(destination, pos), ptr_add(path_data, part_offset2), part_len2)
+        pos = pos + part_len2
+        written = written + 1
+        j2 = j2 + 1
+
+    free(path_offsets)
+    free(path_lengths)
+    free(start_offsets)
+    free(start_lengths)
+    if ptr_is_null(path_owned) == 0:
+        py_decref(path_owned)
+    if ptr_is_null(start_owned) == 0:
+        py_decref(start_owned)
     return out
 
 

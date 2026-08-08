@@ -18,7 +18,7 @@ State the problem precisely. Python's `int` is semantically an arbitrary-precisi
 
 **Alternative two: box everything.** Every `int` is a heap bignum; every addition is a runtime call. Semantically unimpeachable; performance regresses to interpreter magnitude, and the "performance bridge" obligation 7 promises never materializes.
 
-**Alternative three: the projection model.** This is the answer pcc distilled from Valhalla, written down in the V-track section of [codex-goal-prompt.md](../../codex-goal-prompt.md): **separate the semantic type from the physical representation**. A semantic type may have two physical projections — a value projection and an object projection — switched at explicit seams by the compiler and runtime; optimization is allowed to change the representation, never the semantics. Concretely, for three types:
+**Alternative three: the projection model.** This is the answer pcc distilled from Valhalla, written down in the V-track section of [goal-prompt.md](../../docs/goal/goal-prompt.md): **separate the semantic type from the physical representation**. A semantic type may have two physical projections — a value projection and an object projection — switched at explicit seams by the compiler and runtime; optimization is allowed to change the representation, never the semantics. Concretely, for three types:
 
 ```text
 Python int         semantics = arbitrary precision, ALWAYS
@@ -136,7 +136,7 @@ The causal chain is three source-confirmed steps:
 2. The integer tail of `_emit_binop_value()` in `binary_op_lowering.py`: `lv = _to_int64(lhs); rv = _to_int64(rhs); return self._emit_binop_int(op, lv, rv)`.
 3. `_emit_binop_int()` emits raw `builder.add`/`builder.sub`/`builder.mul` for `+`/`-`/`*` — bare i64 instructions, no overflow check, no slow path.
 
-In the projection model's vocabulary: this path equates the Python **semantic type** `int` with the **machine representation** i64. The value projection has no deopt point, so overflow wraps. This is precisely alternative one from 16.1 — the Java-`int` direction the north star forbids by name — sneaking back in through the typed-ABI side door. The V-track in [codex-goal-prompt.md](../../codex-goal-prompt.md) calls this path out as "exactly the confusion the projection model forbids."
+In the projection model's vocabulary: this path equates the Python **semantic type** `int` with the **machine representation** i64. The value projection has no deopt point, so overflow wraps. This is precisely alternative one from 16.1 — the Java-`int` direction the north star forbids by name — sneaking back in through the typed-ABI side door. The V-track in [goal-prompt.md](../../docs/goal/goal-prompt.md) calls this path out as "exactly the confusion the projection model forbids."
 
 It is worth stressing why no local patch can fix it, because the investigation nailed this down with two failed experiments (2026-05-31): removing `*`/`<<` from the safe-op set of `_typed_int_expr_is_i64_safe` had zero effect; excluding `*` from `_expr_is_native_typed_int_shape` had zero effect. The reason is a representation constraint: a correct bignum result **does not fit in an i64 return register**. As long as `mul`'s signature is `i64(i64, i64)`, no tightening at the analysis layer changes the fact that the result has nowhere to go. The fix must be at the representation/ABI level: `int` parameters, returns, and slots move from i64 to a `PyObject*` that can carry a tagged value or a bignum.
 
@@ -171,7 +171,7 @@ The existence of this section is the style contract executing itself: a known de
 
 ## 16.4 Explicit Machine Integers: the `pcc.i64` / `pcc.u64` Contract
 
-Once the projection model assigns arbitrary precision to `int`, fixed-width semantics need a legal home. The contract is written in the V-track of [codex-goal-prompt.md](../../codex-goal-prompt.md): `pcc.i64` / `pcc.u64` are explicit machine-integer semantic types with a single raw i64/u64 projection, and **the overflow policy — wrap, trap, checked, or saturating — is written into the type itself**, visible in source. Java/C-style fixed-width behavior is permitted to live here and only here; it may never be the default meaning of `int`.
+Once the projection model assigns arbitrary precision to `int`, fixed-width semantics need a legal home. The contract is written in the V-track of [goal-prompt.md](../../docs/goal/goal-prompt.md): `pcc.i64` / `pcc.u64` are explicit machine-integer semantic types with a single raw i64/u64 projection, and **the overflow policy — wrap, trap, checked, or saturating — is written into the type itself**, visible in source. Java/C-style fixed-width behavior is permitted to live here and only here; it may never be the default meaning of `int`.
 
 An honest label: as of this writing, `pcc.i64`/`pcc.u64` is a design contract, **not yet implemented** — a search of the [pcc/](../../pcc) source tree finds no corresponding type implementation; only the goal document carries the specification. It is not part of fixing the 16.3 defect (that fix is about making `int` stop meaning i64); it is an independent V-track type-system addition: a place where code that genuinely wants machine semantics — bit manipulation, hashing, runtime-kernel code talking to a C ABI — can say so without lying.
 

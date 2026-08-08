@@ -1,6 +1,6 @@
 # 第 13 章 self 后端:没有 LLVM 的原生发射
 
-第 12 章里 LLVM 是 pcc 的发射引擎;本章它退为参照物。[pcc/backend/](../../pcc/backend) 下的 self 后端是一个不调用 LLVM 库的原生汇编发射器:读入 LLVM IR 文本,直接写出 AArch64 Darwin(及一个 x86_64 Linux 子集)汇编。它存在的理由写在七义务的第 4 条——self 后端必须成为第一类执行根,LLVM 是 oracle 而不是所有者。本章讲清三件事:为什么自举(bootstrap)不动点逼出了这个后端;一个刻意不做寄存器分配的"asm 优先"发射器如何切层(目标无关的解析/布局/栈槽层,目标特定的发射族,文本窥孔层);以及两条边界义务——`--backend=self` 之后禁止静默回退(fallback)LLVM,`_link_with_self_backend` 不得把 `pcc.backend.*` 拉回 stage1 闭包。后端的输入从哪来(Python 前端低层化,见第 6 章)与自举闸门(gate)本身(见第 15 章)不在本章。
+第 12 章里 LLVM 是 pcc 的发射引擎;本章它退为参照物。[pcc/backend/](../../pcc/backend) 下的 self 后端是一个不调用 LLVM 库的原生汇编发射器:读入 LLVM IR 文本,直接写出 AArch64 Darwin(及一个 x86_64 Linux 子集)汇编。它存在的理由写在七义务的第 4 条——self 后端必须成为第一类执行根,LLVM 是 oracle 而不是所有者。本章讲清三件事:为什么自举(bootstrap)不动点逼出了这个后端;一个刻意不做全局寄存器分配的"asm 优先"发射器如何切层(目标无关的解析/布局/栈槽层,目标特定的发射族,文本窥孔层);以及两条边界义务——`--backend=self` 之后禁止静默回退(fallback)LLVM,`_link_with_self_backend` 不得把 `pcc.backend.*` 拉回 stage1 闭包。后端的输入从哪来(Python 前端低层化,见第 6 章)与自举闸门(gate)本身(见第 15 章)不在本章。
 
 ## 本章导读:self 后端的边界与指令面
 
@@ -12,7 +12,7 @@
 
 ## 13.1 问题与设计空间:为什么要自己写后端
 
-先回答"LLVM 明明能用,为什么还要写一个"。答案不在性能,在所有权链条的最后一环。pcc 的论题(见第 1 章)要求编译产物 native、auditable、self-hostable、no-libpython;自举链 pcc1→pcc2→pcc3 要求 pcc1——一个不链接 libpython 的原生二进制——能自己完成原生发射。如果发射必须经过 LLVM 库,那么每个编译阶段都要么链接一个巨大的外部 C++ 代码库,要么在运行时加载它;不动点里永远嵌着一个 pcc 不拥有、不可逐行审计的黑盒。[codex-goal-prompt.md](../../codex-goal-prompt.md) §10 把这条路堵死:"LLVM may be used as an oracle and fallback baseline, but it must not become the final dependency."
+先回答"LLVM 明明能用,为什么还要写一个"。答案不在性能,在所有权链条的最后一环。pcc 的论题(见第 1 章)要求编译产物 native、auditable、self-hostable、no-libpython;自举链 pcc1→pcc2→pcc3 要求 pcc1——一个不链接 libpython 的原生二进制——能自己完成原生发射。如果发射必须经过 LLVM 库,那么每个编译阶段都要么链接一个巨大的外部 C++ 代码库,要么在运行时加载它;不动点里永远嵌着一个 pcc 不拥有、不可逐行审计的黑盒。[goal-prompt.md](../../docs/goal/goal-prompt.md) §10 把这条路堵死:"LLVM may be used as an oracle and fallback baseline, but it must not become the final dependency."
 
 但"不依赖 LLVM"必须按声明卫生拆开说,因为 LLVM 在这里以三种身份出现,去留各不相同:
 
@@ -36,7 +36,7 @@
 
 **分析层**(`self_backend_analysis.py`)只做轻量级数据流:`instruction_defined_value()` / `instruction_used_values()` / `terminator_used_values()` 按指令种类枚举定义与使用;`collect_used_values()` 给出全函数使用集(没人用的结果不分配槽位、不发射计算);`collect_block_local_last_uses()` 找出"只在定义块内使用"的值及其最后使用点——这是下一步槽位复用的全部依据。没有全局活跃区间,没有干涉图:这是刻意的预算分配,正确性优先,质量靠后面的窥孔挽回一部分。
 
-**栈槽分配**(`self_backend_stackprep.py` 的 `assign_stack_slots()`)是 self 后端最重要的一个设计决定的载体:**不做寄存器分配,每个被使用的 SSA 值落一个帧内栈槽**。参数先入槽;`aggregate_returned_indirect(ret_type)` 为真时再留一个 `hidden_sret_slot` 存放调用方传来的返回缓冲指针;随后逐块逐指令为每个有使用者的结果值登记槽位。唯一的优化是块内复用:`alloc_value_slot()` 先查 `block_local_last_uses`,块内死亡的值在最后使用点之后把槽位归还 `free_slots` 自由表,后来者尺寸与对齐都不超时可以接住。帧总尺寸最后对齐到 16 字节。这个"全部落栈"的模型换来的是发射的彻底局部性:每条指令的代码生成只需"从槽位装入固定暂存寄存器→计算→存回目标槽位",既不需要跨指令的寄存器状态,也保证了输出的确定性——`tests/c/test_self_backend.py::test_self_backend_stack_slot_assignment_is_hash_seed_stable` 专门钉住槽位分配不随哈希种子漂移,因为发射顺序的任何不确定都会直接打碎 pcc2/pcc3 的字节比较(见第 15 章)。
+**栈槽分配**(`self_backend_stackprep.py` 的 `assign_stack_slots()`)是 self 后端最重要的一个设计决定的载体:**不做寄存器分配,每个被使用的 SSA 值落一个帧内栈槽**。参数先入槽;`aggregate_returned_indirect(ret_type)` 为真时再留一个 `hidden_sret_slot` 存放调用方传来的返回缓冲指针;随后逐块逐指令为每个有使用者的结果值登记槽位。唯一的优化是块内复用:`alloc_value_slot()` 先查 `block_local_last_uses`,块内死亡的值在最后使用点之后把槽位归还 `free_slots` 自由表,后来者尺寸与对齐都不超时可以接住。帧总尺寸最后对齐到 16 字节。这个"全部落栈"的模型换来的是发射的彻底局部性:每条指令的代码生成只需"从槽位装入固定暂存寄存器→计算→存回目标槽位",既不需要跨指令的寄存器状态,也保证了输出的确定性——`tests/c/test_self_backend.py::test_self_backend_stack_slot_assignment_is_hash_seed_stable` 专门钉住槽位分配不随哈希种子漂移,因为发射顺序的任何不确定都会直接打碎 pcc2/pcc3 的字节比较(见第 15 章)。近期新增了一个不推翻"全部落栈"模型的限定项:`self_backend_aarch64_darwin_regalloc.py` 加了一层**可选的**保守块内寄存器投影——每个值仍照旧分配栈槽,但一个整数/指针 SSA 值只要其整个生命期被证明留在单个受支持的基本块内,就可以额外落在一个调用者保存寄存器(x1–x8,无调用的标量低层化本就不用它们)里;任何含调用、phi、原子或未归类指令的块整块被拒,所以栈槽模型仍是正确性底座——这依旧不是 13.1 里被放弃的图着色分配器。
 
 **模块符号**(`self_backend_module_symbols.py`)解决多模块链接的命名冲突:`prepare_module_symbols()` 把模块公开符号集排序后取 SHA-1,得到 `__pccmod_<hash前缀>_` 作为本模块 internal 符号的前缀。两个模块各自的 `internal` 函数同名不再冲突,且前缀由内容决定而非随机数——又一次为字节级确定性让路。
 
@@ -119,7 +119,7 @@ Python 自举路径([pcc/py_frontend/pipeline.py](../../pcc/py_frontend/pipeline
 
 ### 义务一:`--backend=self` 之后禁止静默回退 LLVM
 
-S-track([codex-goal-prompt.md](../../codex-goal-prompt.md) §10)把它写成首批 P0 闸门:S-P0-A 要求"喂给 self 后端一个不支持的 IR 形状,必须得到 self 后端的诊断、不得产出成功工件、不得回退 LLVM"。机制上这条义务分三层兑现:选择层,`resolve_backend()` 的显式选入(13.1);指令层,无处不在的 `BackendUnavailable`(参数化到函数名与块名);链接层,`_link_native()` 的封闭二分支与 `_link_with_self_backend` 失败时的 `PyPipelineError`(`"self backend native emission failed"`、`"self backend link failed"`)。为什么这条纪律值得占一个 P0?因为静默回退会让 S-track 的全部证据失真:一个"用 self 后端通过"的自举,如果其中三个模块悄悄走了 clang,那么字节比较、no-libpython 扫描、性能阈值全部测的是混合物。[AGENTS.md](../../AGENTS.md) 义务 4 的措辞——"No silent fallback to LLVM after `--backend=self`"——和声明卫生表里的 `S-CLAIM_RISK`(LLVM-backed / clang-linked / host-assisted 结果被误标成 self-backend 完成)说的是同一件事:回退本身不可耻,**未标注的**回退才是。
+S-track([goal-prompt.md](../../docs/goal/goal-prompt.md) §10)把它写成首批 P0 闸门:S-P0-A 要求"喂给 self 后端一个不支持的 IR 形状,必须得到 self 后端的诊断、不得产出成功工件、不得回退 LLVM"。机制上这条义务分三层兑现:选择层,`resolve_backend()` 的显式选入(13.1);指令层,无处不在的 `BackendUnavailable`(参数化到函数名与块名);链接层,`_link_native()` 的封闭二分支与 `_link_with_self_backend` 失败时的 `PyPipelineError`(`"self backend native emission failed"`、`"self backend link failed"`)。为什么这条纪律值得占一个 P0?因为静默回退会让 S-track 的全部证据失真:一个"用 self 后端通过"的自举,如果其中三个模块悄悄走了 clang,那么字节比较、no-libpython 扫描、性能阈值全部测的是混合物。[AGENTS.md](../../AGENTS.md) 义务 4 的措辞——"No silent fallback to LLVM after `--backend=self`"——和声明卫生表里的 `S-CLAIM_RISK`(LLVM-backed / clang-linked / host-assisted 结果被误标成 self-backend 完成)说的是同一件事:回退本身不可耻,**未标注的**回退才是。
 
 ### 义务二:subprocess 边界——别把 `pcc.backend.*` 拉回 stage1 闭包
 

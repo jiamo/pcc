@@ -69,7 +69,7 @@ Each backend mirrors a real reference implementation — CPython, Lua 5.4, Go (g
 
 ## 1.3 The Seven Obligations
 
-The thesis lands through seven obligations. Each is operationalized by a track and gates in [codex-goal-prompt.md](../../codex-goal-prompt.md); here is the book's-eye view, with mechanisms deferred to their chapters.
+The thesis lands through seven obligations. Each is operationalized by a track and gates in [goal-prompt.md](../../docs/goal/goal-prompt.md); here is the book's-eye view, with mechanisms deferred to their chapters.
 
 1. **Compatibility claims must be mode-labeled.** A claim must say which mode produced it: host pcc ≠ pcc1; cpython-compat ≠ pcc-native; libpython ≠ no-libpython; LLVM backend ≠ self backend; stage1 ≠ the pcc1→pcc2→pcc3 fixed point. Section 1.4 expands on this.
 
@@ -91,7 +91,7 @@ These seven are not a vision list; they are a veto. When a change would trade on
 
 Writing "honesty" into an architecture sounds like smuggling a morals clause into a technical document. pcc's situation makes it an engineering necessity: the system carries too many orthogonal execution modes at once. The compiler itself may run under host CPython (host pcc) or as a bootstrap artifact (pcc1); Python input may take the strict no-libpython path or the explicit CPython bridge; the backend may be `llvm`, `llvm_capi`, or `self`; the package acceptance surface splits into cpython-compat and pcc-native; bootstrap evidence splits into stage1 and the full fixed point. In a space like this, an unlabeled claim ("pcc can run NumPy now") is not information — it is noise, and it routes subsequent engineering decisions in the wrong direction.
 
-[codex-goal-prompt.md](../../codex-goal-prompt.md) §0.10 therefore writes claim hygiene as a table of inequalities; every claim must map onto a gate:
+[goal-prompt.md](../../docs/goal/goal-prompt.md) §0.10 therefore writes claim hygiene as a table of inequalities; every claim must map onto a gate:
 
 ```text
 host pcc pass          != pcc1 pass
@@ -131,26 +131,18 @@ def _diagnostic_for_cpython_extension_abi(path: str) -> dict[str, object]:
 
 [README.md](../../README.md) says outright that this blocker is intentional: it prevents a CPython ABI artifact from being misreported as pcc-native NumPy support. A system designed for demos would quietly open that path; a system designed for verifiability turns it into an explicit error code.
 
-## 1.5 The Runtime in Four Layers: Shrinking C to a Kernel
+## 1.5 The Runtime in Four Layers: Moving Production into pcc-Python
 
-A common misreading of no-libpython is "the final binary contains no C runtime." pcc's contract says the opposite: no-libpython means not depending on the CPython runtime — not zero C. The long-term goal is to **minimize** the C-level runtime into a small ABI kernel while Python semantics migrate into pcc-Python and are compiled by pcc itself. [AGENTS.md](../../AGENTS.md) requires distinguishing four layers, and warns that the loose phrase "the C runtime" conflates them:
+No-libpython means only that an artifact does not depend on CPython; it does not automatically mean zero-libc. pcc's long-term contract is stronger than a minimized C kernel. The production runtime—including allocation, threads, safepoints, all five collectors, the libc-like substrate, and C-API ABI shims—moves into strict freestanding pcc-Python. The compiler retains only machine intrinsics for raw memory, atomics, system calls, and host ABI operations. C and vendored-libc sources remain differential oracles but ultimately leave the production link.
 
 ```text
-C-level kernel        KEEP (minimize): platform/ABI, allocation, atomics &
-                      refcount barriers, threading primitives, dlopen,
-                      syscalls, safepoints/stack maps, GC slot & root
-                      primitives. Knows no high-level Python semantics
-                      (no list/dict/dunder/valueclass/import policy;
-                      no `if package == "numpy"`).
-C semantic runtime    SHRINK: hand-written C list/dict/str/dunder/exception
-                      semantics -> migrate to pcc-Python.
-pcc-Python runtime    GROW: the migration target; Python semantics authored
-                      in pcc-Python, self-hostable, testable, compiled by pcc.
-C-API shim            KEEP but spec/generate: the ABI surface extensions see;
-                      != CPython/libpython.
+compiler intrinsics   KEEP: raw memory / atomics / syscall / machine ABI
+freestanding pcc-Py   GROW: allocator / threads / safepoints / GC / ABI shims
+semantic pcc-Python   GROW: list / dict / str / dunder / exception / import
+C/libc sources        REMOVE from production; retain as attributed oracles
 ```
 
-Physically this corresponds to two mirrored trees: `pcc/py_runtime/src/*.c` (the C implementations) and `pcc/py_runtime/py/*.py` (the pcc-Python ports). The mirroring discipline is rigid: most runtime modules exist in both forms, and the two must stay in sync — byte-exact object layouts (Chapter 7) and matching behavioral semantics (Chapter 14). The device that prevents drift is the **5-GC Production Equality Rule**: all five GC backends, the C kernel, and the pcc-Python mirror must consume **one** slot-based trace/update contract (`py_obj_visit_slots` / `py_obj_update_slot`, plus root, frame, and native-handle registration), so there is never a second, parallel set of object-graph rules left free to drift. The C kernel and the pcc-Python semantic runtime are connected by a specified runtime ABI (Layer 1) precisely to rule out the failure mode of two parallel Python semantic runtimes evolving independently. The four-layer model is developed in full in Chapter 14; the slot contract in Chapter 10.
+The platform boundary must be labeled separately. Linux targets a supported static closure with no production C/libc object, `PT_INTERP`, `DT_NEEDED`, or undefined symbol. Darwin deliberately enters the operating system through named libSystem ABI calls and must not be called zero-libc. All five collectors consume one production pcc-Python slot trace/update and root/frame/native-handle contract; C participates only as a differential oracle. Chapter 14 develops the evidence ladder from no-libpython through pcc-Python ownership to zero-libc; Chapter 10 covers the slot contract.
 
 ## 1.6 Positioning: How pcc Differs from PyPy, Cython, Nuitka, and mypyc
 
@@ -179,6 +171,8 @@ perf miss       -> value-model gap       package ABI reports   -> ecosystem trus
 ```
 
 Section 1.8.2 makes this structure concrete: one real NumPy import failure decomposes into a series of generic mechanism gaps (the warnings module, typing markers, path operations, a regex subset, ...), and each gap's fix becomes a reusable compiler capability rather than a NumPy patch. Read in one direction, that is industrial work: a package a user wants gets closer to importing. Read in the other direction, it is research output: a measured map of exactly which import-machinery semantics a no-libpython Python still lacks. Neither reading survives without the other — which is why the hinge connecting the two theses is a single rule: **every claim must say exactly what it proves and what it does not prove.**
+
+The declarative GUI follows the same logic. It does not bring back a webview or JavaScript runtime: pcc-Python owns composition, scheduling, events, styles, commands, and lifecycle, while AppKit/CoreGraphics/Metal remain named native ABI boundaries. Readable source and a machine contract exist today, while formal acceptance tasks remain open; Chapter 20 develops the mechanism and its claim boundary.
 
 ## 1.8 History and Lessons
 
@@ -226,7 +220,7 @@ Status itself became a testable assertion target. The story has a recursive foot
 
 ## 1.9 Summary
 
-pcc's thesis is to make Python execution ownable: native, auditable, self-hostable, no-libpython. The thesis stands on five dividing lines — the bootstrap fixed point, the five-GC comparative runtime, the opt-in value model, the self backend as a first-class execution root, and long-running efficiency — and on seven obligations that turn them into daily rules. Performance, in this system, is a consequence of proven semantics; honesty is not documentation etiquette but an architectural component implemented with inequality tables, JSON baselines, fallback ratchets, and gates. The runtime divides into four layers: the C kernel is kept and minimized, the C semantic runtime shrinks, the pcc-Python runtime grows, and the C-API shim is kept and specified. Against existing tools, pcc bets on the axis of "Python execution without CPython," and accepts the present reality that its typed frontend remains an experimental subset. The two case studies show the same thing from both sides: what the instrumentation does when claim hygiene is violated, and what the discipline produces when it is obeyed — a real failure converted into a chain of reusable capabilities. The chapters that follow expand every noun in this chapter into mechanism, and keep testing this discipline in their own History and Lessons sections.
+pcc's thesis is to make Python execution ownable: native, auditable, self-hostable, no-libpython. The thesis stands on five dividing lines — the bootstrap fixed point, the five-GC comparative runtime, the opt-in value model, the self backend as a first-class execution root, and long-running efficiency — and on seven obligations that turn them into daily rules. Performance, in this system, is a consequence of proven semantics; honesty is not documentation etiquette but an architectural component implemented with inequality tables, JSON baselines, fallback ratchets, and gates. The target implementation language of the production runtime is pcc-Python: the freestanding layer owns low-level facilities, the semantic layer owns Python behavior, compiler intrinsics express only the machine boundary, and C/libc becomes oracle material. Against existing tools, pcc bets on the axis of "Python execution without CPython," and accepts the present reality that its typed frontend remains an experimental subset. The two case studies show the same thing from both sides: what the instrumentation does when claim hygiene is violated, and what the discipline produces when it is obeyed — a real failure converted into a chain of reusable capabilities. The chapters that follow expand every noun in this chapter into mechanism, and keep testing this discipline in their own History and Lessons sections.
 
 ## Exercises
 

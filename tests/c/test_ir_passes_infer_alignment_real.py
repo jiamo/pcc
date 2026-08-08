@@ -1,6 +1,6 @@
 """Real-transform tests for InferAlignmentPass (subset)."""
 
-import shutil
+import pytest
 import unittest
 
 from pcc.ir_passes.infer_alignment import (
@@ -10,7 +10,9 @@ from pcc.ir_passes.infer_alignment import (
 from pcc.ir_passes.parity import assert_ir_parity
 
 
-_OPT = shutil.which("opt")
+from pcc.passes.llvm_text_pipeline import find_opt_binary
+
+_OPT = find_opt_binary()
 
 
 class InferAlignmentTests(unittest.TestCase):
@@ -160,7 +162,7 @@ entry:
         self.assertIsNone(pass_.rewritten_ir)
 
 
-@unittest.skipUnless(_OPT, "requires LLVM opt")
+@pytest.mark.pcc_gate(unavailable=None if _OPT else "matching LLVM opt not installed")
 class UpstreamParityTests(unittest.TestCase):
     def test_alloca_load_matches_upstream(self):
         report = assert_ir_parity("""

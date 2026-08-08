@@ -150,6 +150,204 @@ def _for_loop_dict_items_object(iter_expr):
     return func.obj
 
 
+def _for_target_error_cleanup(host, target_ident: str, alloca: ir.Value) -> None:
+    """Make a replaceable owned for-target safe on the shared error exit.
+
+    Most for-targets are discovered while lowering the body, after an earlier
+    expression may already have materialised ``err.exit``.  Record the target
+    separately from exact-int locals and retro-patch a branchless release at
+    the *start* of an existing error block, before any frame-leave calls.
+    """
+    if not hasattr(host, "_for_target_owned_names"):
+        host._for_target_owned_names = set()
+    host._for_target_owned_names.add(target_ident)
+    fn = host.current_function
+    if fn is None:
+        return
+    if not hasattr(host, "_fn_err_exit_for_target_slots"):
+        host._fn_err_exit_for_target_slots = {}
+    patched = host._fn_err_exit_for_target_slots.setdefault(fn.name, [])
+    for done in patched:
+        if done is alloca:
+            return
+    err_bb = host._fn_err_exit_blocks.get(fn.name)
+    if err_bb is None:
+        # Creation sees _for_target_owned_names and emits the same cleanup;
+        # it also back-patches every already-registered root leave.
+        host._ensure_fn_err_exit()
+        patched.append(alloca)
+        return
+    save_block = host.builder._block
+    if err_bb._instrs:
+        host.builder.position_before(err_bb._instrs[0])
+    else:
+        host.builder.position_at_end(err_bb)
+    owned_flag = host._ensure_owned_local_flag(target_ident, alloca)
+    is_owned = host.builder.load(
+        owned_flag,
+        name=host._fresh(target_ident + ".for.err.owned"),
+    )
+    current = host.builder.call(
+        host.runtime["pcc_gc_load_ptr"],
+        [
+            ir.Constant(_CSTR, None),
+            host._as_gc_ptr(
+                alloca,
+                name=host._fresh(target_ident + ".for.err.gc.slot"),
+            ),
+        ],
+        name=host._fresh(target_ident + ".for.err.current"),
+    )
+    release_value = host.builder.select(
+        is_owned,
+        current,
+        ir.Constant(_CSTR, None),
+        name=host._fresh(target_ident + ".for.err.release.value"),
+    )
+    host._gc_release(
+        release_value,
+        host._release_context_label("for-target:" + target_ident),
+    )
+    host.builder.store(ir.Constant(_I1, 0), owned_flag)
+    patched.append(alloca)
+    host.builder.position_at_end(save_block)
+
+
+def _for_prepare_owned_object_target(host, target_ident: str, target_ty: Type):
+    """Return one owned, updateable object slot for all loop-entry edges.
+
+    If the name already denotes a scalar, box that value before the loop so a
+    zero-iteration edge preserves it.  Borrowed object bindings are promoted
+    into a fresh owned slot.  An already-owned object slot is reused.  The
+    resulting runtime flag distinguishes an actually bound value from an
+    unexecuted loop whose target had no pre-loop binding.
+    """
+    existing = host.env.get(target_ident)
+    if (
+        existing is not None
+        and isinstance(existing[1], ir.PointerType)
+        and target_ident in getattr(host, "_owned_local_names", set())
+        and target_ident
+        not in getattr(host, "_borrowed_gc_rooted_local_names", set())
+    ):
+        alloca = existing[0]
+        host.env[target_ident] = (alloca, _CSTR, target_ty)
+        host._owned_local_has_value.add(target_ident)
+        if not hasattr(host, "_for_target_owned_names"):
+            host._for_target_owned_names = set()
+        host._for_target_owned_names.add(target_ident)
+        host._ensure_owned_local_gc_root(target_ident, alloca, _CSTR)
+        host._ensure_owned_local_flag(target_ident, alloca)
+        _for_target_error_cleanup(host, target_ident, alloca)
+        if isinstance(target_ty, IntType):
+            host._exact_int_env_flags[target_ident] = True
+        else:
+            host._exact_int_env_flags.pop(target_ident, None)
+        host._clear_cpy_for_target_binding(target_ident)
+        return host.env[target_ident]
+
+    initial_obj = None
+    if existing is not None:
+        old_alloca, old_ir_ty, old_decl_ty = existing
+        if isinstance(old_ir_ty, ir.PointerType):
+            if target_ident in getattr(host, "_cpy_env_flags", {}):
+                raise L1CodegenError(
+                    "cannot join a CPython-backed for-target with a native "
+                    f"object binding for {target_ident!r}"
+                )
+            old_value = host.builder.call(
+                host.runtime["pcc_gc_load_ptr"],
+                [
+                    ir.Constant(_CSTR, None),
+                    host._as_gc_ptr(
+                        old_alloca,
+                        name=host._fresh(target_ident + ".for.pre.gc.slot"),
+                    ),
+                ],
+                name=host._fresh(target_ident + ".for.pre.object"),
+            )
+            initial_obj = host._gc_retain(
+                old_value,
+                name=host._fresh(target_ident + ".for.pre.retain"),
+            )
+        else:
+            old_value = host.builder.load(
+                old_alloca,
+                name=host._fresh(target_ident + ".for.pre.scalar"),
+            )
+            initial_obj = marshal.marshal_to_object(
+                host.builder,
+                host.module,
+                host.runtime,
+                old_value,
+                old_decl_ty,
+            )
+
+    alloca = host._alloca_in_entry(
+        _CSTR,
+        name=f"{target_ident}.for.obj.addr",
+        init_null=True,
+    )
+    host.env[target_ident] = (alloca, _CSTR, target_ty)
+    host._owned_local_names.add(target_ident)
+    host._owned_local_has_value.add(target_ident)
+    if not hasattr(host, "_for_target_owned_names"):
+        host._for_target_owned_names = set()
+    host._for_target_owned_names.add(target_ident)
+    host._ensure_owned_local_gc_root(target_ident, alloca, _CSTR)
+    owned_flag = host._ensure_owned_local_flag(target_ident, alloca)
+    if initial_obj is not None:
+        host.builder.call(host.runtime["pcc_gc_pin"], [initial_obj])
+        host.builder.call(
+            host.runtime["pcc_gc_store_root"],
+            [host._as_gc_ptr(alloca), initial_obj],
+        )
+        host.builder.store(ir.Constant(_I1, 1), owned_flag)
+        host.builder.call(host.runtime["pcc_gc_unpin"], [initial_obj])
+        # ``pcc_gc_store_root`` retains the value for the slot.  The boxed
+        # scalar / promoted borrowed binding supplied ``initial_obj`` as an
+        # owned temporary, so transfer that original reference after the
+        # rooted owner is established.
+        host._gc_release(
+            initial_obj,
+            host._release_context_label("for-target-initial:" + target_ident),
+        )
+    _for_target_error_cleanup(host, target_ident, alloca)
+    if isinstance(target_ty, IntType):
+        host._exact_int_env_flags[target_ident] = True
+    else:
+        host._exact_int_env_flags.pop(target_ident, None)
+    host._threading_env_flags.pop(target_ident, None)
+    host._threading_list_elem_flags.pop(target_ident, None)
+    host._clear_cpy_for_target_binding(target_ident)
+    return host.env[target_ident]
+
+
+def _for_store_owned_target(host, target_ident: str, slot, value: ir.Value) -> None:
+    """Transfer one owned runtime object into a replaceable loop target."""
+    alloca = slot[0]
+    host.builder.call(host.runtime["pcc_gc_pin"], [value])
+    # The target slot is either null or owns its current value.  Root-store is
+    # the single replacement operation: it retains ``value`` for the slot and
+    # releases the prior slot owner.  Calling the generic owned-local release
+    # first would leave the stale pointer in the slot, so root-store would
+    # release the old object a second time.
+    host.builder.call(
+        host.runtime["pcc_gc_store_root"],
+        [host._as_gc_ptr(alloca), value],
+    )
+    owned_flag = host._ensure_owned_local_flag(target_ident, alloca)
+    host.builder.store(ir.Constant(_I1, 1), owned_flag)
+    host.builder.call(host.runtime["pcc_gc_unpin"], [value])
+    # The getter/iterator result arrived owned.  Root-store created the local
+    # slot's independent owner, so consume the transferred temporary exactly
+    # once.
+    host._gc_release(
+        value,
+        host._release_context_label("for-target-incoming:" + target_ident),
+    )
+
+
 class ForLoopLoweringMixin:
     def _clear_cpy_for_target_binding(self, target_ident: str) -> None:
         """Native for-target rebinding must overwrite CPython local state."""
@@ -313,6 +511,21 @@ class ForLoopLoweringMixin:
                         f"CPython-backed loop variable {nm!r} after a "
                         "yield suspension yet"
                     )
+        pre_target = self.env.get(target_name)
+        if pre_target is not None:
+            pre_is_cpy = target_name in getattr(self, "_cpy_env_flags", {})
+            if (
+                not isinstance(pre_target[1], ir.PointerType)
+                or (gen_ctx is None and not pre_is_cpy)
+            ):
+                # Raw CPython pointers and native pcc objects/scalars cannot
+                # share one slot or one compile-time domain flag.  Refuse this
+                # mixed-domain zero/nonzero join rather than storing a pointer
+                # into a scalar slot or mis-tagging a preserved native value.
+                raise L1CodegenError(
+                    "CPython for-target representation join requires an "
+                    f"already-CPython binding for {target_name!r}"
+                )
         fn = self.current_function
         iter_obj = self.builder.call(
             self.runtime["py_cpy_iter"],
@@ -612,19 +825,32 @@ class ForLoopLoweringMixin:
         self.builder.store(ir.Constant(_I64, 0), idx_slot)
 
         target_ident = stmt.target.ident
-        slot = self.env.get(target_ident)
-        if slot is None:
-            # Allocate as PyObject* when element is dyn, else native.
-            if isinstance(elem_ty, DynType):
-                target_ir_ty = _CSTR
-            else:
-                target_ir_ty = self._storage_ir_type(elem_ty)
-            alloca = self._alloca_in_entry(
-                target_ir_ty,
-                name=f"{target_ident}.addr",
+        target_ty = stmt.target.ty
+        target_ir_ty = self._storage_ir_type(target_ty)
+        existing = self.env.get(target_ident)
+        target_is_object = isinstance(target_ir_ty, ir.PointerType) or (
+            existing is not None and isinstance(existing[1], ir.PointerType)
+        )
+        if target_is_object:
+            slot = _for_prepare_owned_object_target(
+                self,
+                target_ident,
+                target_ty,
             )
-            self.env[target_ident] = (alloca, target_ir_ty, elem_ty)
-            slot = self.env[target_ident]
+        else:
+            slot = existing
+            if slot is None:
+                alloca = self._alloca_in_entry(
+                    target_ir_ty,
+                    name=f"{target_ident}.addr",
+                )
+                self.env[target_ident] = (alloca, target_ir_ty, target_ty)
+                slot = self.env[target_ident]
+            elif not self._ir_type_matches(slot[1], target_ir_ty):
+                raise L1CodegenError(
+                    "for-target representation join was not boxed for "
+                    f"{target_ident!r}"
+                )
         threading_target_kind = self._threading_kind_for_type(elem_ty)
         if threading_target_kind is None and isinstance(stmt.iter, Name):
             threading_target_kind = self._threading_list_elem_flags.get(stmt.iter.ident)
@@ -682,8 +908,14 @@ class ForLoopLoweringMixin:
                 [iter_obj, cur],
                 name=self._fresh("for.elem"),
             )
-            if isinstance(elem_ty, DynType) or isinstance(target_ir_ty, ir.PointerType):
-                self.builder.store(elem_obj, target_alloca)
+            self._emit_post_call_err_check(stmt.span)
+            if isinstance(target_ir_ty, ir.PointerType):
+                _for_store_owned_target(
+                    self,
+                    target_ident,
+                    slot,
+                    elem_obj,
+                )
             elif self._is_valueclass_payload_type(elem_ty):
                 native_val = self._emit_object_to_valueclass_payload(
                     elem_obj,
@@ -698,6 +930,10 @@ class ForLoopLoweringMixin:
                         elem_ty,
                     )
                 self.builder.store(native_val, target_alloca)
+                self._gc_release(
+                    elem_obj,
+                    self._release_context_label("for-list-element"),
+                )
             else:
                 native_val = marshal.marshal_from_object(
                     self.builder,
@@ -707,6 +943,10 @@ class ForLoopLoweringMixin:
                     elem_ty,
                 )
                 self.builder.store(native_val, target_alloca)
+                self._gc_release(
+                    elem_obj,
+                    self._release_context_label("for-list-element"),
+                )
         if self._is_valueclass_payload_type(slot[2]):
             self._ensure_valueclass_payload_gc_roots(
                 target_ident,
@@ -734,21 +974,11 @@ class ForLoopLoweringMixin:
         self.builder.position_at_end(end_bb)
 
     def _ensure_object_for_target(self, target_ident: str):
-        slot = self.env.get(target_ident)
-        if slot is None or not self._ir_type_matches(slot[1], _CSTR):
-            alloca = self._alloca_in_entry(
-                _CSTR,
-                name=f"{target_ident}.addr",
-            )
-            self.env[target_ident] = (alloca, _CSTR, DynType(name="dyn"))
-            slot = self.env[target_ident]
-        else:
-            self.env[target_ident] = (slot[0], _CSTR, DynType(name="dyn"))
-            slot = self.env[target_ident]
-        self._threading_env_flags.pop(target_ident, None)
-        self._threading_list_elem_flags.pop(target_ident, None)
-        self._clear_cpy_for_target_binding(target_ident)
-        return slot
+        return _for_prepare_owned_object_target(
+            self,
+            target_ident,
+            DynType(name="dyn"),
+        )
 
     def _emit_for_dict_items_direct(self, stmt: For, dict_expr: Expr) -> None:
         target_names = _for_loop_dict_items_target_names(stmt.target)
@@ -808,13 +1038,14 @@ class ForLoopLoweringMixin:
         self.builder.cbranch(key_is_null, step_bb, body_bb)
 
         self.builder.position_at_end(body_bb)
+        _for_store_owned_target(self, key_name, key_slot, key_obj)
         value_obj = self.builder.call(
             self.runtime["py_dict_entry_value_at"],
             [dict_val, cur],
             name=self._fresh("for.dict.items.value"),
         )
-        self.builder.store(key_obj, key_slot[0])
-        self.builder.store(value_obj, value_slot[0])
+        self._emit_post_call_err_check(stmt.span)
+        _for_store_owned_target(self, value_name, value_slot, value_obj)
         self.loop_stack.append((step_bb, end_bb, self._loop_finally_base()))
         self._emit_stmts(stmt.body)
         self.loop_stack.pop()
@@ -860,15 +1091,11 @@ class ForLoopLoweringMixin:
         self.builder.store(ir.Constant(_I64, 0), idx_slot)
 
         target_ident = stmt.target.ident
-        slot = self.env.get(target_ident)
-        if slot is None:
-            alloca = self._alloca_in_entry(
-                _CSTR,
-                name=f"{target_ident}.addr",
-            )
-            self.env[target_ident] = (alloca, _CSTR, DynType(name="dyn"))
-            slot = self.env[target_ident]
-        self._clear_cpy_for_target_binding(target_ident)
+        slot = _for_prepare_owned_object_target(
+            self,
+            target_ident,
+            stmt.target.ty,
+        )
 
         cond_bb = fn.append_basic_block(name=self._fresh("for.obj.cond"))
         body_bb = fn.append_basic_block(name=self._fresh("for.obj.body"))
@@ -898,8 +1125,12 @@ class ForLoopLoweringMixin:
             [iter_val, idx_box],
             name=self._fresh("for.obj.elem"),
         )
-        alloca, _, _ = slot
-        self.builder.store(elem, alloca)
+        self._gc_release(
+            idx_box,
+            self._release_context_label("for-index-box"),
+        )
+        self._emit_post_call_err_check(stmt.span)
+        _for_store_owned_target(self, target_ident, slot, elem)
         self.loop_stack.append((step_bb, end_bb, self._loop_finally_base()))
         self._emit_stmts(stmt.body)
         self.loop_stack.pop()
@@ -980,33 +1211,11 @@ class ForLoopLoweringMixin:
             self.builder.store(ir.Constant(_I1, 1), owned_flag)
 
         target_ident = stmt.target.ident
-        slot = self.env.get(target_ident)
-        if slot is None or not self._ir_type_matches(slot[1], _CSTR):
-            alloca = self._alloca_in_entry(
-                _CSTR,
-                name=f"{target_ident}.addr",
-                init_null=True,
-            )
-            self.env[target_ident] = (alloca, _CSTR, DynType(name="dyn"))
-            slot = self.env[target_ident]
-        self._clear_cpy_for_target_binding(target_ident)
-        target_manages_owned = target_ident not in getattr(
-            self, "_current_param_names", set()
-        ) and target_ident not in getattr(self, "_current_global_names", set())
-        target_owned_flag = None
-        if target_manages_owned:
-            # py_obj_next returns an owned reference.  Treat the for-target
-            # as a normal replaceable owned local: it must be an updateable
-            # frame root while the body allocates, each iteration releases
-            # the previous binding, and function cleanup releases the final
-            # item.  The runtime flag keeps zero-iteration loops safe.
-            self._ensure_owned_local_gc_root(target_ident, slot[0], _CSTR)
-            self._owned_local_names.add(target_ident)
-            self._owned_local_has_value.add(target_ident)
-            target_owned_flag = self._ensure_owned_local_flag(
-                target_ident,
-                slot[0],
-            )
+        slot = _for_prepare_owned_object_target(
+            self,
+            target_ident,
+            stmt.target.ty,
+        )
 
         header_bb = fn.append_basic_block(name=self._fresh("for.obj.next"))
         body_bb = fn.append_basic_block(name=self._fresh("for.obj.body"))
@@ -1039,21 +1248,7 @@ class ForLoopLoweringMixin:
         self.builder.cbranch(is_null, maybe_end_bb, body_bb)
 
         self.builder.position_at_end(body_bb)
-        if target_manages_owned:
-            # Releasing the prior target can run arbitrary finalization.  Pin
-            # the newly returned owned item until it reaches the rooted slot,
-            # then publish it with the root write barrier.
-            self.builder.call(self.runtime["pcc_gc_pin"], [item])
-            self._emit_release_owned_local_if_flagged(target_ident, slot[0])
-            self.builder.call(
-                self.runtime["pcc_gc_note_write_barrier"],
-                [ir.Constant(_CSTR, None), item],
-            )
-            self.builder.store(item, slot[0])
-            self.builder.store(ir.Constant(_I1, 1), target_owned_flag)
-            self.builder.call(self.runtime["pcc_gc_unpin"], [item])
-        else:
-            self.builder.store(item, slot[0])
+        _for_store_owned_target(self, target_ident, slot, item)
         self.loop_stack.append((latch_bb, end_bb, self._loop_finally_base()))
         self._emit_stmts(stmt.body)
         self.loop_stack.pop()
@@ -1129,22 +1324,13 @@ class ForLoopLoweringMixin:
         )
         idx_slot = self._alloca_in_entry(_I64, name="for.str.idx.addr")
         self.builder.store(ir.Constant(_I64, 0), idx_slot)
-        one_box = self.builder.call(
-            self.runtime["py_int_from_i64"],
-            [ir.Constant(_I64, 1)],
-            name=self._fresh("for.str.step"),
-        )
 
         target_ident = stmt.target.ident
-        slot = self.env.get(target_ident)
-        if slot is None:
-            alloca = self._alloca_in_entry(
-                _CSTR,
-                name=f"{target_ident}.addr",
-            )
-            self.env[target_ident] = (alloca, _CSTR, StrType(name="str"))
-            slot = self.env[target_ident]
-        self._clear_cpy_for_target_binding(target_ident)
+        slot = _for_prepare_owned_object_target(
+            self,
+            target_ident,
+            stmt.target.ty,
+        )
 
         cond_bb = fn.append_basic_block(name=self._fresh("for.str.cond"))
         body_bb = fn.append_basic_block(name=self._fresh("for.str.body"))
@@ -1180,11 +1366,13 @@ class ForLoopLoweringMixin:
         )
         ch = self.builder.call(
             self.runtime["py_str_slice"],
-            [iter_val, lo_box, hi_box, one_box],
+            [iter_val, lo_box, hi_box, ir.Constant(_CSTR, None)],
             name=self._fresh("for.str.ch"),
         )
-        alloca, _, _ = slot
-        self.builder.store(ch, alloca)
+        self._gc_release(lo_box, self._release_context_label("for-str-lo"))
+        self._gc_release(hi_box, self._release_context_label("for-str-hi"))
+        self._emit_post_call_err_check(stmt.span)
+        _for_store_owned_target(self, target_ident, slot, ch)
         self.loop_stack.append((step_bb, end_bb, self._loop_finally_base()))
         self._emit_stmts(stmt.body)
         self.loop_stack.pop()
@@ -1251,9 +1439,12 @@ class ForLoopLoweringMixin:
             next_info.name,
             "__next__",
         )
-        target_ty: Type = DynType(name="dyn")
+        next_target_ty: Type = DynType(name="dyn")
         if next_fd is not None and isinstance(next_fd.return_ty, Type):
-            target_ty = next_fd.return_ty
+            next_target_ty = next_fd.return_ty
+        target_ty: Type = stmt.target.ty
+        if isinstance(target_ty, DynType) and self.env.get(stmt.target.ident) is None:
+            target_ty = next_target_ty
         target_ir_ty = (
             _CSTR
             if isinstance(target_ty, IntType) and self._int_exprs_are_boxed()
@@ -1261,15 +1452,31 @@ class ForLoopLoweringMixin:
         )
 
         target_ident = stmt.target.ident
-        slot = self.env.get(target_ident)
-        if slot is None or slot[1] != target_ir_ty:
-            alloca = self._alloca_in_entry(
-                target_ir_ty,
-                name=f"{target_ident}.addr",
+        existing = self.env.get(target_ident)
+        if isinstance(target_ir_ty, ir.PointerType) or (
+            existing is not None and isinstance(existing[1], ir.PointerType)
+        ):
+            slot = _for_prepare_owned_object_target(
+                self,
+                target_ident,
+                target_ty,
             )
-            self.env[target_ident] = (alloca, target_ir_ty, target_ty)
-            slot = self.env[target_ident]
-        self._clear_cpy_for_target_binding(target_ident)
+            target_ir_ty = _CSTR
+        else:
+            slot = existing
+            if slot is None:
+                alloca = self._alloca_in_entry(
+                    target_ir_ty,
+                    name=f"{target_ident}.addr",
+                )
+                self.env[target_ident] = (alloca, target_ir_ty, target_ty)
+                slot = self.env[target_ident]
+            elif not self._ir_type_matches(slot[1], target_ir_ty):
+                raise L1CodegenError(
+                    "native iterator target requires an object representation "
+                    f"join for {target_ident!r}"
+                )
+            self._clear_cpy_for_target_binding(target_ident)
 
         fn = self.current_function
         header_bb = fn.append_basic_block(name=self._fresh("for.iter.header"))
@@ -1296,9 +1503,20 @@ class ForLoopLoweringMixin:
             (),
         )
         self._try_err_block = prev_err_block
-        if item.type != target_ir_ty:
-            item = self._coerce(item, target_ty, target_ty)
-        self.builder.store(item, slot[0])
+        if isinstance(target_ir_ty, ir.PointerType):
+            if not isinstance(item.type, ir.PointerType):
+                item = marshal.marshal_to_object(
+                    self.builder,
+                    self.module,
+                    self.runtime,
+                    item,
+                    next_target_ty,
+                )
+            _for_store_owned_target(self, target_ident, slot, item)
+        else:
+            if item.type != target_ir_ty:
+                item = self._coerce(item, next_target_ty, target_ty)
+            self.builder.store(item, slot[0])
         self.builder.branch(body_bb)
 
         self.builder.position_at_end(body_bb)
@@ -1390,15 +1608,11 @@ class ForLoopLoweringMixin:
             raise NotImplementedError("async iterator needs __anext__")
 
         target_ident = stmt.target.ident
-        slot = self.env.get(target_ident)
-        if slot is None or not self._ir_type_matches(slot[1], _CSTR):
-            alloca = self._alloca_in_entry(
-                _CSTR,
-                name=f"{target_ident}.addr",
-            )
-            self.env[target_ident] = (alloca, _CSTR, DynType(name="dyn"))
-            slot = self.env[target_ident]
-        self._clear_cpy_for_target_binding(target_ident)
+        slot = _for_prepare_owned_object_target(
+            self,
+            target_ident,
+            stmt.target.ty,
+        )
 
         fn = self.current_function
         header_bb = fn.append_basic_block(name=self._fresh("async.for.next"))
@@ -1430,7 +1644,7 @@ class ForLoopLoweringMixin:
         self.builder.branch(body_bb)
 
         self.builder.position_at_end(body_bb)
-        self.builder.store(item, slot[0])
+        _for_store_owned_target(self, target_ident, slot, item)
         self.loop_stack.append((latch_bb, end_bb, self._loop_finally_base()))
         self._emit_stmts(stmt.body)
         self.loop_stack.pop()
@@ -1726,56 +1940,50 @@ class ForLoopLoweringMixin:
         else:
             raise L1CodegenError(f"range() takes 1–3 args; got {len(call.args)}")
 
-        # Allocate the loop variable. In normal Python-int mode the range
-        # counter stays native i64 as the hot-loop fast path, while the
-        # user-visible target is refreshed with a tagged int object on each
-        # iteration.
+        # The range induction counter is compiler state, not the Python-visible
+        # loop target.  Keep them separate on every path.  Reusing a fresh
+        # target's alloca for the counter made assignments in the loop body
+        # change iteration itself (``for i in range(3): i = 100``), and a
+        # nested same-name loop overwrote the outer counter.  It also published
+        # ``start`` on a zero-iteration edge even though the target had never
+        # been bound by the loop.
         target_name = stmt.target.ident
-        boxed_range_target = self._int_exprs_are_boxed()
+        target_ty = stmt.target.ty
+        existing = self.env.get(target_name)
+        target_storage_ty = self._storage_ir_type(target_ty)
+        boxed_range_target = (
+            self._int_exprs_are_boxed()
+            or isinstance(target_storage_ty, ir.PointerType)
+            or (existing is not None and isinstance(existing[1], ir.PointerType))
+        )
+        counter_alloca = self._alloca_in_entry(
+            _I64,
+            name=f"{target_name}.range.addr",
+        )
         if boxed_range_target:
-            counter_alloca = self._alloca_in_entry(
-                _I64,
-                name=f"{target_name}.range.addr",
+            target_slot = _for_prepare_owned_object_target(
+                self,
+                target_name,
+                target_ty,
             )
-            existing = self.env.get(target_name)
-            if existing is None or not isinstance(existing[1], ir.PointerType):
+            target_alloca = target_slot[0]
+        else:
+            if existing is None:
                 target_alloca = self._alloca_in_entry(
-                    _CSTR,
+                    _I64,
                     name=f"{target_name}.addr",
                 )
                 self.env[target_name] = (
                     target_alloca,
-                    _CSTR,
-                    IntType(name="int"),
-                )
-            else:
-                target_alloca = existing[0]
-        else:
-            existing = self.env.get(target_name)
-            if existing is None:
-                counter_alloca = self._alloca_in_entry(
-                    _I64,
-                    name=f"{target_name}.addr",
-                )
-                self.env[target_name] = (
-                    counter_alloca,
                     _I64,
                     IntType(name="int"),
                 )
             else:
-                counter_alloca, ir_ty, _decl = existing
-                if ir_ty is not _I64:
-                    # Python loop targets are normal rebindings. A prior
-                    # object-typed binding must not poison a later range fast
-                    # path for the same name.
-                    counter_alloca = self._alloca_in_entry(
-                        _I64,
-                        name=f"{target_name}.addr",
-                    )
-                    self.env[target_name] = (
-                        counter_alloca,
-                        _I64,
-                        IntType(name="int"),
+                target_alloca, ir_ty, _decl = existing
+                if not self._ir_type_matches(ir_ty, _I64):
+                    raise L1CodegenError(
+                        "range for-target representation join was not boxed "
+                        f"for {target_name!r}"
                     )
         self._clear_cpy_for_target_binding(target_name)
         self.builder.store(start_val, counter_alloca)
@@ -1821,8 +2029,18 @@ class ForLoopLoweringMixin:
                 [cur_body],
                 name=self._fresh("range.int.obj"),
             )
-            self.builder.store(cur_obj, target_alloca)
-            self._exact_int_env_flags[target_name] = True
+            _for_store_owned_target(
+                self,
+                target_name,
+                target_slot,
+                cur_obj,
+            )
+        else:
+            cur_body = self.builder.load(
+                counter_alloca,
+                name=self._fresh(f"{target_name}.body"),
+            )
+            self.builder.store(cur_body, target_alloca)
         self._emit_stmts(stmt.body)
         if not self._builder_block_is_terminated():
             self.builder.branch(step_bb)

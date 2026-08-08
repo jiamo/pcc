@@ -285,6 +285,11 @@ class TypedIntAbiMixin:
         # Optional[bool] sentinel logic and pcc1 miscompiled the None test,
         # silently forcing typed-int functions back to the boxed ABI.
         mode = _typed_int_unboxed_abi_mode()
+        bounded_proof = False
+        for bounded_name in self._bounded_int_abi_function_names:
+            if bounded_name == fd.name:
+                bounded_proof = True
+                break
         result = False
         if mode != "off":
             result = True
@@ -294,7 +299,7 @@ class TypedIntAbiMixin:
                 result = False
             if len(fd.decorators) != 0:
                 result = False
-            if mode == "unsafe-i64":
+            if mode == "unsafe-i64" or bounded_proof:
                 if not isinstance(fd.return_ty, (IntType, FloatType)):
                     result = False
             else:
@@ -311,7 +316,7 @@ class TypedIntAbiMixin:
                     ):
                         result = False
                         break
-                    if mode == "unsafe-i64":
+                    if mode == "unsafe-i64" or bounded_proof:
                         if not _type_is_typed_int_abi_param(arg.annotation):
                             result = False
                             break
@@ -327,7 +332,7 @@ class TypedIntAbiMixin:
                             result = False
                             break
             if (
-                mode == "unsafe-i64"
+                (mode == "unsafe-i64" or bounded_proof)
                 and result
                 and self._typed_int_abi_call_arg_safety
             ):

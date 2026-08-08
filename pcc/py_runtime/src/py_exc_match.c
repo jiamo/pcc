@@ -25,7 +25,7 @@ static PyClassObject *exc_to_class(PyObject *o) {
         PyExceptionObject *exc = (PyExceptionObject *)o;
         return (PyClassObject *)pcc_gc_load_ptr(o, (PyObject **)&exc->exc_class);
     }
-    if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER) {
+    if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER_CLASS_START) {
         /* A raised user exception subclass is a PyInstanceObject; project it
          * to its class so py_exc_matches can walk the MRO (which includes the
          * Exception base) for ``except MyError`` / ``except Exception``. */

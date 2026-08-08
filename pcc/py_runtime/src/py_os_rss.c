@@ -1,12 +1,11 @@
 #include "py_internal.h"
 
 /* G-P3-LONGRUN slice 2 (docs/plans/gc-longrun-benchmark-plan.md):
- * process RSS sampling for the long-running GC workloads. C-only
- * helper (no pcc-Python mirror); long-run binaries poll these through
- * the runtime ABI and emit CSV time series.
+ * process RSS sampling for the long-running GC workloads. This is the
+ * readable host-C oracle; the production no-libpython archive owns the same
+ * ABI in py/freestanding_platform_rss.py.
  *
- * Returns -1 when the platform query fails; the Linux branch is
- * UNTESTED until S-P2-LINUX provides a gated host. */
+ * Returns -1 when the platform query fails. */
 
 #if defined(__APPLE__)
 #include <mach/mach.h>
