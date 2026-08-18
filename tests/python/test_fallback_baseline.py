@@ -34,9 +34,8 @@ from pathlib import Path
 import pytest
 
 
-# Both closure fixtures compile the complete stage1 source closure.  Keep all
-# assertions on one xdist worker so each module-scoped snapshot is produced
-# once instead of once per worker.
+# Closure fixtures lazily cache standalone, multi-file and contextual phases.
+# Keep assertions on one xdist worker so each requested phase runs only once.
 pytestmark = pytest.mark.xdist_group(name="fallback_baseline")
 
 _REPO_ROOT = Path(__file__).absolute().parents[2]
@@ -202,11 +201,18 @@ def _check_contextual_per_module(
     enforce_ratchet: bool,
     require_zero: bool,
 ) -> None:
-    from pcc.py_frontend.pipeline import contextual_host_for_module
+    from pcc.py_frontend.pipeline import (
+        PROBE_POLICY_CONTEXTUAL_MIXIN,
+        contextual_host_for_module,
+        per_module_probe_policy,
+    )
 
     failures: list[str] = []
     for mod in sorted(contextual_modules):
-        if not contextual_host_for_module(mod):
+        if (
+            per_module_probe_policy(mod) == PROBE_POLICY_CONTEXTUAL_MIXIN
+            and not contextual_host_for_module(mod)
+        ):
             failures.append(f"{mod}: contextual probe has no host contract")
         actual = actual_by_module.get(mod)
         if actual is None:
@@ -320,6 +326,117 @@ def test_pipeline_and_codegen_host_contract_do_not_drift():
     )
 
 
+def test_self_backend_data_plane_uses_closed_world_probe_policy():
+    """Self-backend siblings need exports, never an L1CodeGen host binding."""
+    from pcc.py_frontend import pipeline
+    from pcc.py_frontend.codegen import host_contract
+
+    modules = (
+        "pcc.backend.self_backend_kernel",
+        "pcc.backend.self_backend_precise_stackmaps",
+        "pcc.backend.arm64_asm_driver",
+        "pcc.backend.arm64_encode",
+        "pcc.backend.native_object",
+        "pcc.backend.macho_spec",
+    )
+    for module_name in modules:
+        assert (
+            pipeline.per_module_probe_policy(module_name)
+            == host_contract.PROBE_POLICY_CLOSED_WORLD
+        )
+        assert pipeline.contextual_host_for_module(module_name) == ""
+    assert pipeline.contextual_per_module_modules(modules) == list(modules)
+
+
+def test_self_backend_native_data_plane_closed_world_fallback_zero():
+    """The migrated kernel consumers are native with their real schemas."""
+    import importlib.util as _imputil
+
+    from pcc.py_frontend.pipeline import (
+        compile_contextual_per_module_fallback_counts,
+    )
+
+    spec = _imputil.spec_from_file_location(
+        "_probe_native_data_plane_fallbacks",
+        str(_REPO_ROOT / "scripts" / "probe_stage1_closure.py"),
+    )
+    probe_mod = _imputil.module_from_spec(spec)
+    spec.loader.exec_module(probe_mod)
+    srcs, mods = probe_mod._tightened_closure(
+        str(_REPO_ROOT / "pcc" / "__main__.py")
+    )
+    targets = {
+        "pcc.backend.self_backend_aarch64_darwin_flow",
+        "pcc.backend.self_backend_aarch64_darwin_materialize",
+        "pcc.backend.self_backend_aarch64_darwin_regalloc",
+        "pcc.backend.self_backend_emit",
+        "pcc.backend.self_backend_kernel",
+        "pcc.backend.self_backend_precise_stackmaps",
+        "pcc.backend.self_backend_stackprep",
+        "pcc.backend.self_backend_target_passes",
+        "pcc.backend.self_backend_verify",
+    }
+
+    counts = compile_contextual_per_module_fallback_counts(
+        srcs,
+        mods,
+        targets,
+        ir_scaffold_mode="on",
+        strict_no_libpython=True,
+    )
+
+    assert counts == {module_name: 0 for module_name in targets}
+
+
+def test_native_object_encoding_closed_world_fallback_zero(tmp_path):
+    """Owned encoding siblings consume actual arena/relocation export schemas."""
+    from scripts.probe_stage1_closure import _tightened_closure
+    from pcc.py_frontend.pipeline import compile_contextual_per_module_fallback_counts
+
+    srcs, mods = _tightened_closure(str(_REPO_ROOT / "pcc" / "__main__.py"))
+    targets = {
+        "pcc.backend.arm64_asm_driver",
+        "pcc.backend.arm64_encode",
+        "pcc.backend.native_object",
+        "pcc.backend.macho_spec",
+    }
+    assert targets <= set(mods)
+    counts = compile_contextual_per_module_fallback_counts(
+        srcs, mods, targets, ir_scaffold_mode="on", strict_no_libpython=True,
+        emit_ir_dir=str(tmp_path),
+    )
+    assert counts == {name: 0 for name in targets}
+
+
+def test_pipeline_feature_surfaces_remain_native_in_real_context(tmp_path):
+    """Standalone import artifacts must have real native feature bodies."""
+    from scripts.probe_stage1_closure import _tightened_closure
+    from pcc.py_frontend.pipeline import compile_contextual_per_module_fallback_counts
+
+    owners = {
+        "pcc.py_frontend.pipeline_context": "build_closed_world_context",
+        "pcc.py_frontend.pipeline_closed_world": "_closed_world_module_dependencies",
+        "pcc.py_frontend.pipeline_frontend_parallel": "_load_noop_action_result",
+        "pcc.py_frontend.pipeline_frontend_worker_execution": "run_codegen_worker",
+    }
+    srcs, mods = _tightened_closure(str(_REPO_ROOT / "pcc" / "__main__.py"))
+    counts = compile_contextual_per_module_fallback_counts(
+        srcs, mods, set(owners), ir_scaffold_mode="on", strict_no_libpython=True,
+        emit_ir_dir=str(tmp_path),
+    )
+    assert counts == {name: 0 for name in owners}
+    for module, name in owners.items():
+        text = (tmp_path / (module.replace(".", "_") + ".ll")).read_text()
+        symbol = "user_" + module.replace(".", "_") + "_" + name
+        body = re.search(
+            r"^define[^\n]*@" + re.escape(symbol)
+            + r"\([^\n]*\n(.*?)^\}", text, re.MULTILINE | re.DOTALL,
+        )
+        assert body is not None, symbol
+        assert "strict.nolib.stub" not in body.group(1), symbol
+        assert "@py_cpy_" not in body.group(1), symbol
+
+
 def test_l1_codegen_host_contract_covers_constructor_state_fields():
     """Keep L1CodeGen's constructor fields in the contextual host schema."""
     from pcc.py_frontend.codegen.host_contract import L1_CODEGEN_HOST_ATTRS
@@ -344,6 +461,70 @@ def test_l1_codegen_host_contract_covers_constructor_state_fields():
 
     missing = sorted(assigned.difference(L1_CODEGEN_HOST_ATTRS))
     assert not missing
+
+
+def _l1_codegen_mixin_classes():
+    """Every class whose methods run with ``self`` being the L1CodeGen host.
+
+    Walks L1CodeGen's bases and the mixin stack's bases transitively so a new
+    direct base (not only stack members) is covered.
+    """
+    from pcc.py_frontend.codegen.layer1 import L1CodeGen
+
+    seen = []
+    pending = list(L1CodeGen.__bases__)
+    while pending:
+        cls = pending.pop()
+        if cls is object or cls in seen:
+            continue
+        seen.append(cls)
+        pending.extend(cls.__bases__)
+    return seen
+
+
+def test_l1_codegen_host_contract_covers_every_mixin_self_state():
+    """Any ``self.<attr>`` a host mixin writes must be a contract attribute.
+
+    Under the self-hosted stage the mixin's ``self`` is the L1CodeGen host, and
+    a contract attribute is stored at its contract slot.  An attribute a mixin
+    writes but the contract does not list is stored at the mixin's OWN field
+    index instead, aliasing whichever host slot shares that number: the
+    debug-info mixin's ``_di_file``/``_di_compile_unit``/``_di_scope``/
+    ``_di_subprograms`` landed on host slots 0-3 and turned
+    ``_active_handler_excs`` into a 401-entry dict inside pcc1.
+    """
+    from pcc.py_frontend.codegen.host_contract import L1_CODEGEN_HOST_ATTRS
+
+    missing: dict[str, set[str]] = {}
+    for cls in _l1_codegen_mixin_classes():
+        try:
+            source = textwrap.dedent(inspect.getsource(cls))
+        except (OSError, TypeError):
+            continue
+        tree = ast.parse(source)
+        written = set()
+        for node in ast.walk(tree):
+            targets = []
+            if isinstance(node, ast.Assign):
+                targets = list(node.targets)
+            elif isinstance(node, ast.AnnAssign):
+                targets = [node.target]
+            elif isinstance(node, ast.AugAssign):
+                targets = [node.target]
+            for target in targets:
+                if (
+                    isinstance(target, ast.Attribute)
+                    and isinstance(target.value, ast.Name)
+                    and target.value.id == "self"
+                ):
+                    written.add(target.attr)
+        gap = written.difference(L1_CODEGEN_HOST_ATTRS)
+        if gap:
+            missing[cls.__name__] = gap
+    assert not missing, (
+        "host mixin state outside L1_CODEGEN_HOST_ATTRS (aliases host slots "
+        "under pcc1): " + repr(missing)
+    )
 
 
 def test_l1_codegen_lambda_counters_are_initialized():
@@ -591,30 +772,27 @@ def test_native_module_constant_bindings_are_contextual_host_state():
     assert hasattr(L1CodeGen, "_init_l1_state")
 
 
-def _per_module_and_multi(srcs, mods, *, ir_scaffold_mode: str):
-    """Codegen each module independently and as a multi-file bundle.
-
-    Returns ``(per_module_dict, multi_ok, total_fallbacks_or_none)``.
-    ``ir_scaffold_mode`` selects ``off`` (the historical baseline) or
-    ``on`` (the closed-world dispatch path); each gets its own ratchet.
-    """
+def _per_module_counts(srcs, mods, *, ir_scaffold_mode: str):
+    """Compile only the independent modules, preserving action classification."""
     from pcc.py_frontend import type_infer as _type_infer
     from pcc.py_frontend.codegen import layer1 as _layer1
     from pcc.parse.py_lift import parse_and_lift
-    import importlib.util as _imputil
-
-    spec = _imputil.spec_from_file_location(
-        "_probe_stage1_closure",
-        str(_REPO_ROOT / "scripts" / "probe_stage1_closure.py"),
-    )
-    probe_mod = _imputil.module_from_spec(spec)
-    spec.loader.exec_module(probe_mod)
 
     per_module: dict[str, int] = {}
     per_module_actions: dict[str, int] = {}
     per_module_plumbing: dict[str, int] = {}
     per_module_ok = 0
+    live_progress = os.environ.get("PCC_TEST_LIVE_PROGRESS") == "1"
+    module_count = len(srcs)
+    module_index = 0
     for src, mod in zip(srcs, mods):
+        module_index += 1
+        if live_progress:
+            print(
+                f"[fallback:{ir_scaffold_mode}] per-module "
+                f"{module_index}/{module_count} {mod}",
+                flush=True,
+            )
         try:
             with open(src, "r", encoding="utf-8") as f:
                 source = f.read()
@@ -636,6 +814,33 @@ def _per_module_and_multi(srcs, mods, *, ir_scaffold_mode: str):
             per_module[mod] = -1
             per_module_actions[mod] = -1
             per_module_plumbing[mod] = -1
+    if live_progress:
+        print(f"[fallback:{ir_scaffold_mode}] per-module complete", flush=True)
+    return {
+        "per_module_ok": per_module_ok,
+        "per_module": per_module,
+        "per_module_actions": per_module_actions,
+        "per_module_plumbing": per_module_plumbing,
+    }
+
+
+def _load_closure_probe():
+    import importlib.util as _imputil
+
+    spec = _imputil.spec_from_file_location(
+        "_probe_stage1_closure",
+        str(_REPO_ROOT / "scripts" / "probe_stage1_closure.py"),
+    )
+    probe_mod = _imputil.module_from_spec(spec)
+    spec.loader.exec_module(probe_mod)
+    return probe_mod
+
+
+def _multi_file_counts(srcs, mods, *, ir_scaffold_mode: str):
+    """Compile only the complete bundle under the original temporary mode."""
+    probe_mod = _load_closure_probe()
+    live_progress = os.environ.get("PCC_TEST_LIVE_PROGRESS") == "1"
+    module_count = len(srcs)
     # The multi-file path doesn't take an ir_scaffold_mode kw today;
     # set the env var the pipeline reads so multi-file inherits the
     # mode for the duration of the call.
@@ -651,6 +856,12 @@ def _per_module_and_multi(srcs, mods, *, ir_scaffold_mode: str):
     # on raw codegen output.
     os.environ["PCC_PYTHON_IR_PASSES"] = "off"
     try:
+        if live_progress:
+            print(
+                f"[fallback:{ir_scaffold_mode}] multi-file "
+                f"{module_count} modules",
+                flush=True,
+            )
         multi_ok, ir_text, _ = probe_mod._try_full_multi_compile(srcs, mods)
     finally:
         if saved is None:
@@ -666,16 +877,9 @@ def _per_module_and_multi(srcs, mods, *, ir_scaffold_mode: str):
         if multi_ok
         else {"total": None, "bridge": None, "non_bridge": None}
     )
+    if live_progress:
+        print(f"[fallback:{ir_scaffold_mode}] multi-file complete", flush=True)
     return {
-        "per_module_ok": per_module_ok,
-        "per_module": per_module,
-        "per_module_actions": per_module_actions,
-        "per_module_plumbing": per_module_plumbing,
-        "contextual_per_module": _contextual_per_module_counts(
-            srcs,
-            mods,
-            ir_scaffold_mode=ir_scaffold_mode,
-        ),
         "multi_ok": multi_ok,
         "total_fallbacks": split["total"],
         "bridge_calls": split["bridge"],
@@ -684,26 +888,47 @@ def _per_module_and_multi(srcs, mods, *, ir_scaffold_mode: str):
     }
 
 
+class _ClosureCompileResults(dict):
+    """Evaluate and cache only the phase requested by an existing assertion."""
+
+    def __init__(self, srcs, mods, *, ir_scaffold_mode: str):
+        super().__init__(files=len(srcs), module_names=tuple(mods))
+        self._srcs = srcs
+        self._mods = mods
+        self._mode = ir_scaffold_mode
+
+    def __missing__(self, key):
+        if key in ("per_module_ok", "per_module", "per_module_actions", "per_module_plumbing"):
+            phase = _per_module_counts(self._srcs, self._mods, ir_scaffold_mode=self._mode)
+        elif key in ("multi_ok", "total_fallbacks", "bridge_calls", "non_bridge_fallbacks", "ir_lines"):
+            phase = _multi_file_counts(self._srcs, self._mods, ir_scaffold_mode=self._mode)
+        elif key == "contextual_per_module":
+            live_progress = os.environ.get("PCC_TEST_LIVE_PROGRESS") == "1"
+            if live_progress:
+                print(f"[fallback:{self._mode}] contextual per-module counts", flush=True)
+            counts = _contextual_per_module_counts(
+                self._srcs, self._mods, ir_scaffold_mode=self._mode,
+            )
+            phase = {"contextual_per_module": counts}
+            if live_progress:
+                print(f"[fallback:{self._mode}] contextual complete", flush=True)
+        else:
+            raise KeyError(key)
+        self.update(phase)
+        return self[key]
+
+
 @pytest.fixture(scope="module")
 def closure_compile():
-    """Run the tight stage1 closure once per test module (OFF mode)."""
+    """Cache independently requested tight-closure phases in OFF mode."""
     sys.path.insert(0, str(_REPO_ROOT))
     sys.path.insert(0, str(_REPO_ROOT / "scripts"))
-    import importlib.util as _imputil
-
-    spec = _imputil.spec_from_file_location(
-        "_probe_stage1_closure",
-        str(_REPO_ROOT / "scripts" / "probe_stage1_closure.py"),
-    )
-    probe_mod = _imputil.module_from_spec(spec)
-    spec.loader.exec_module(probe_mod)
+    probe_mod = _load_closure_probe()
 
     entry = str(_REPO_ROOT / "pcc" / "__main__.py")
     srcs, mods = probe_mod._tightened_closure(entry)
 
-    info = _per_module_and_multi(srcs, mods, ir_scaffold_mode="off")
-    info["files"] = len(srcs)
-    return info
+    return _ClosureCompileResults(srcs, mods, ir_scaffold_mode="off")
 
 
 @pytest.fixture(scope="module")
@@ -711,21 +936,12 @@ def closure_compile_on():
     """Same as ``closure_compile`` but with ir_scaffold_mode='on'."""
     sys.path.insert(0, str(_REPO_ROOT))
     sys.path.insert(0, str(_REPO_ROOT / "scripts"))
-    import importlib.util as _imputil
-
-    spec = _imputil.spec_from_file_location(
-        "_probe_stage1_closure",
-        str(_REPO_ROOT / "scripts" / "probe_stage1_closure.py"),
-    )
-    probe_mod = _imputil.module_from_spec(spec)
-    spec.loader.exec_module(probe_mod)
+    probe_mod = _load_closure_probe()
 
     entry = str(_REPO_ROOT / "pcc" / "__main__.py")
     srcs, mods = probe_mod._tightened_closure(entry)
 
-    info = _per_module_and_multi(srcs, mods, ir_scaffold_mode="on")
-    info["files"] = len(srcs)
-    return info
+    return _ClosureCompileResults(srcs, mods, ir_scaffold_mode="on")
 
 
 def test_closure_per_module_codegen_passes(closure_compile):
@@ -790,7 +1006,7 @@ def test_per_module_fallbacks_under_ratchet(closure_compile):
 def test_contextual_per_module_fallbacks_under_ratchet(closure_compile):
     baseline = _load_baseline()
     contextual_modules = _contextual_policy_modules(
-        closure_compile["per_module"].keys()
+        closure_compile["module_names"]
     )
     _check_contextual_per_module(
         closure_compile["contextual_per_module"],
@@ -1001,7 +1217,7 @@ def test_on_mode_contextual_per_module_fallbacks_under_ratchet(
 ):
     baseline = _load_baseline()
     contextual_modules = _contextual_policy_modules(
-        closure_compile_on["per_module"].keys()
+        closure_compile_on["module_names"]
     )
     _check_contextual_per_module(
         closure_compile_on["contextual_per_module"],

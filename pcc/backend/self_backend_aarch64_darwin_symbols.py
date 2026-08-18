@@ -8,6 +8,14 @@ from .self_backend_parse import check_simple_symbol_name
 
 def asm_symbol(name: str, module_symbols: PreparedModuleSymbols) -> str:
     check_simple_symbol_name(name)
+    return asm_symbol_prevalidated(name, module_symbols)
+
+
+def asm_symbol_prevalidated(
+    name: str, module_symbols: PreparedModuleSymbols
+) -> str:
+    """Mangle a symbol already validated at the parse boundary."""
+
     if name in module_symbols.internal_symbols:
         return f"_{module_symbols.internal_prefix}{name}"
     return f"_{name}"

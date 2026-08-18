@@ -14,6 +14,9 @@ Private exception codes remain owned by this Unicode-search contract:
   PY_EXC_TYPEERROR = 3, PY_EXC_VALUEERROR = 2,
   PY_EXC_INDEXERROR = 5
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_STR,
 )
@@ -44,6 +47,8 @@ py_str_find = extern("py_str_find", (c_ptr, c_ptr), c_int64)
 py_str_rfind = extern("py_str_rfind", (c_ptr, c_ptr), c_int64)
 py_decref = extern("py_decref", (c_ptr,), c_void)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 PyUnicode_Substring = extern("PyUnicode_Substring", (c_ptr, c_int64, c_int64), c_ptr)
 PyUnicode_GetLength = extern("PyUnicode_GetLength", (c_ptr,), c_int64)
@@ -59,15 +64,15 @@ def _is_str(obj) -> int:
 
 
 def _type_error(message) -> None:
-    py_raise(py_exc_new(3, message))  # PY_EXC_TYPEERROR
+    py_raise_owned(py_exc_new(3, message))  # PY_EXC_TYPEERROR
 
 
 def _value_error(message) -> None:
-    py_raise(py_exc_new(2, message))  # PY_EXC_VALUEERROR
+    py_raise_owned(py_exc_new(2, message))  # PY_EXC_VALUEERROR
 
 
 def _index_error(message) -> None:
-    py_raise(py_exc_new(5, message))  # PY_EXC_INDEXERROR
+    py_raise_owned(py_exc_new(5, message))  # PY_EXC_INDEXERROR
 
 
 def _utf8_next_u4(data, length: int, pos_ptr, out_ptr) -> int:

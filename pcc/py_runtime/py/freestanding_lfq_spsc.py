@@ -17,6 +17,8 @@ Owned surface (stable C ABI names):
   pcc_spsc_full, pcc_spsc_count
 """
 
+__pcc_runtime_port__ = True
+
 from pcc.extern import c_abi_typed_export, c_int64, c_ptr, c_void, extern
 from pcc.unsafe import (
     load_ptr,

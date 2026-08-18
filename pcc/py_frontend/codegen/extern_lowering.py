@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from pcc.llvm_capi.compat import ir
 
-from ..py_ast import Assign, BoolLit, Call, Name, StrLit, TupleExpr
+from ..py_ast import Assign, BoolLit, Call, DynType, Name, StrLit, TupleExpr
 
 
 _VOID = ir.VoidType()
@@ -34,6 +34,8 @@ class ExternScaffoldMixin:
         "c_double": _DOUBLE,
         "c_ptr": _CSTR,  # opaque i8*
         "c_str": _CSTR,
+        "c_obj": _CSTR,  # PyObject* result marker
+        "c_rawptr": _CSTR,  # raw address result marker (typed int)
     }
 
     def _maybe_register_extern_assign(self, stmt: "Assign") -> bool:
@@ -151,7 +153,38 @@ class ExternScaffoldMixin:
             if isinstance(ret_ty, ir.VoidType)
             else self._fresh(f"extern.{symbol}.ret")
         )
-        return self.builder.call(fn, ir_args, name=call_name)
+        result = self.builder.call(fn, ir_args, name=call_name)
+        if restype_name == "c_rawptr" and self._raw_addresses_are_ints():
+            # Raw address results are ``int`` outside runtime-port mode.
+            result = self.builder.ptrtoint(
+                result, _I64, name=self._fresh(f"extern.{symbol}.addr")
+            )
+        return result
+
+    def _pointer_or_address_operand(self, v: ir.Value, ty: "Type") -> ir.Value:
+        """Lower a pointer-shaped operand from an object, an int address, or
+        a dynamic value that may carry a tagged small-int address."""
+        v_ty = getattr(v, "type", None)
+        if isinstance(v_ty, ir.IntType):
+            if v_ty.width != 64:
+                v = self.builder.sext(v, _I64, name=self._fresh("extern.addr.sext"))
+            return self.builder.inttoptr(v, _CSTR, name=self._fresh("extern.addr.ptr"))
+        if (
+            isinstance(v_ty, ir.PointerType)
+            and isinstance(ty, DynType)
+            and self._raw_addresses_are_ints()
+        ):
+            if not self._ir_type_matches(v_ty, _CSTR):
+                v = self.builder.bitcast(v, _CSTR, name=self._fresh("extern.dyn.cast"))
+            bits = self.builder.ptrtoint(v, _I64, name=self._fresh("extern.dyn.bits"))
+            tag = self.builder.and_(bits, ir.Constant(_I64, 1), name=self._fresh("extern.dyn.tag"))
+            is_tagged = self.builder.icmp_unsigned(
+                "!=", tag, ir.Constant(_I64, 0), name=self._fresh("extern.dyn.is_tagged")
+            )
+            untagged = self.builder.ashr(bits, ir.Constant(_I64, 1), name=self._fresh("extern.dyn.untag"))
+            address = self.builder.inttoptr(untagged, _CSTR, name=self._fresh("extern.dyn.addr"))
+            return self.builder.select(is_tagged, address, v, name=self._fresh("extern.dyn.ptr"))
+        return v
 
     def _coerce_to_extern(
         self,
@@ -165,11 +198,32 @@ class ExternScaffoldMixin:
         sext, pcc str → i8*, bool zext."""
         if isinstance(want, ir.VoidType):
             return v
-        if ctype_name in {"c_str", "c_ptr"}:
-            # pcc str is already i8* (points to PyStrObject); for the
-            # narrow P6C.1 case we want the underlying C string, not
-            # the PyStrObject. This requires a runtime helper — for
-            # now pass through and document the sharp edge.
+        if ctype_name in {"c_str", "c_ptr", "c_obj", "c_rawptr"}:
+            # A pointer-shaped parameter accepts either an object pointer or a
+            # raw address.  Raw addresses are ``int`` in normal mode, so an
+            # integer-typed value is converted with ``inttoptr``; a dynamic
+            # value may carry a tagged small int holding an address (an
+            # untyped helper parameter), which is untagged at run time.
+            # pcc str is already i8* (points to PyStrObject); the underlying
+            # C string still requires a runtime helper (P6C.1 sharp edge).
+            # Pointer-lane modules (ports, freestanding) pass the operand
+            # through untouched: their declarations may reuse an earlier ABI
+            # declaration of the symbol whose parameter is not a pointer.
+            if not self._raw_addresses_are_ints():
+                return v
+            if ctype_name == "c_rawptr":
+                # Declared raw: an untyped value carrying a tagged address is
+                # untagged at run time.
+                return self._pointer_or_address_operand(v, ty)
+            # c_ptr / c_obj / c_str parameters receive PyObject* values.  A
+            # tagged small int IS a legitimate object argument here (an int fd,
+            # a boxed count), so no run-time untagging; only a statically
+            # int-typed raw address is converted.
+            v_ty = getattr(v, "type", None)
+            if isinstance(v_ty, ir.IntType):
+                if v_ty.width != 64:
+                    v = self.builder.sext(v, _I64, name=self._fresh("extern.addr.sext"))
+                return self.builder.inttoptr(v, _CSTR, name=self._fresh("extern.addr.ptr"))
             return v
         if isinstance(want, ir.IntType):
             i64 = self._to_int64(v, ty)

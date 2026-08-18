@@ -15,6 +15,7 @@ from pcc.unsafe import (
     global_load_ptr,
     global_store_ptr,
     load_i32,
+    load_i64,
     load_ptr,
     malloc,
     memset,
@@ -41,6 +42,18 @@ pcc_py_gc_minor_graph_unlock = extern(
 def pcc_gc_cycle_requested_store_release(value: i64) -> None:
     slot = global_addr("pcc_gc_cycle_requested")
     atomic_store_i32(slot, 0, value, "release")
+
+
+@c_abi_export("pcc_gc_root_registry_note_mutation_locked")
+def pcc_gc_root_registry_note_mutation_locked() -> None:
+    revision: i64 = load_i64(
+        global_addr("pcc_gc_root_registry_revision"), 0
+    )
+    if revision == 9223372036854775807:
+        revision = 1
+    else:
+        revision = revision + 1
+    store_i64(global_addr("pcc_gc_root_registry_revision"), 0, revision)
 
 
 @c_abi_export("pcc_gc_root_slot_count_from_map")
@@ -76,6 +89,7 @@ def pcc_gc_scheduler_root_link_locked(node) -> None:
     if ptr_is_null(head) == 0:
         store_ptr(head, 16, node)
     global_store_ptr("pcc_gc_scheduler_root_head", node)
+    pcc_gc_root_registry_note_mutation_locked()
 
 
 @c_abi_export("pcc_gc_scheduler_root_unlink_locked")
@@ -84,6 +98,16 @@ def pcc_gc_scheduler_root_unlink_locked(node) -> i64:
         return 0
     previous = load_ptr(node, 16)
     next_node = load_ptr(node, 8)
+    if ptr_eq(
+        global_load_ptr("pcc_gc_backend3_scheduler_root_scan_cursor"),
+        node,
+    ) != 0:
+        global_store_ptr(
+            "pcc_gc_backend3_scheduler_root_scan_cursor", next_node
+        )
+        store_i64(
+            global_addr("pcc_gc_backend3_scheduler_root_scan_slot"), 0, 0
+        )
     if ptr_is_null(previous) == 0:
         store_ptr(previous, 8, next_node)
     elif ptr_eq(global_load_ptr("pcc_gc_scheduler_root_head"), node) != 0:
@@ -104,6 +128,7 @@ def pcc_gc_scheduler_root_unlink_locked(node) -> i64:
         store_ptr(next_node, 16, previous)
     store_ptr(node, 8, null())
     store_ptr(node, 16, null())
+    pcc_gc_root_registry_note_mutation_locked()
     return 1
 
 
@@ -182,6 +207,7 @@ def pcc_gc_register_continuation_root(frame_map, slots) -> None:
     pcc_py_gc_minor_graph_lock()
     store_ptr(node, 16, global_load_ptr("pcc_gc_continuation_root_head"))
     global_store_ptr("pcc_gc_continuation_root_head", node)
+    pcc_gc_root_registry_note_mutation_locked()
     pcc_gc_cycle_requested_store_release(1)
     pcc_py_gc_minor_graph_unlock()
 
@@ -191,20 +217,38 @@ def pcc_gc_unregister_continuation_root(slots) -> None:
     gc_backend_current()
     if ptr_is_null(slots) != 0:
         return
+    dead = null()
     pcc_py_gc_minor_graph_lock()
     previous = null()
     node = global_load_ptr("pcc_gc_continuation_root_head")
     while ptr_is_null(node) == 0:
         next_node = load_ptr(node, 16)
         if ptr_eq(load_ptr(node, 8), slots) != 0:
+            if ptr_eq(
+                global_load_ptr(
+                    "pcc_gc_backend3_continuation_root_scan_cursor"
+                ),
+                node,
+            ) != 0:
+                global_store_ptr(
+                    "pcc_gc_backend3_continuation_root_scan_cursor",
+                    next_node,
+                )
+                store_i64(
+                    global_addr("pcc_gc_backend3_frame_root_scan_slot"),
+                    0,
+                    0,
+                )
             if ptr_is_null(previous) != 0:
                 global_store_ptr("pcc_gc_continuation_root_head", next_node)
             else:
                 store_ptr(previous, 16, next_node)
-            free(node)
+            dead = node
+            pcc_gc_root_registry_note_mutation_locked()
             pcc_gc_cycle_requested_store_release(1)
-            pcc_py_gc_minor_graph_unlock()
-            return
+            break
         previous = node
         node = next_node
     pcc_py_gc_minor_graph_unlock()
+    if ptr_is_null(dead) == 0:
+        free(dead)

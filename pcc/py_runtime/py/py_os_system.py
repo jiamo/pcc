@@ -1,5 +1,7 @@
 """Python object semantics for os.uname() and os.cpu_count()."""
 
+__pcc_runtime_port__ = True
+
 from pcc.extern import extern, c_abi_export, c_ptr, c_int64, c_void
 from pcc.unsafe import cstr, null, ptr_is_null, stack_alloc, strlen
 

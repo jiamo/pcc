@@ -148,6 +148,27 @@ class StringMethodLoweringMixin:
         self._gc_unpin(result)
         return result
 
+    def _emit_native_bytes_join(self, recv: ir.Value, arg_expr: Expr, prefix: str):
+        """Call ``py_bytes_join`` with the same rooting discipline as str.join.
+
+        Only statically typed bytes/bytearray receivers reach this helper;
+        a DynType ``.join`` stays on the str path because the two names
+        overlap and a runtime tag split is not owned here.
+        """
+        items = _str_method_arg(self, arg_expr)
+        self._gc_pin(items)
+        result = self.builder.call(
+            self.runtime["py_bytes_join"],
+            [recv, items],
+            name=self._fresh(prefix + ".join"),
+        )
+        self._gc_pin(result)
+        self._gc_unpin(items)
+        self._gc_release_if_owned(items, arg_expr)
+        self._gc_unpin(result)
+        self._emit_post_call_err_check(getattr(arg_expr, "span", None))
+        return result
+
     def _extract_splitlines_keepends(self, expr: Call):
         """Return the ``keepends`` constant bool for a
         ``splitlines(True)`` / ``splitlines(keepends=…)`` call, or ``None``

@@ -9,6 +9,8 @@ Owned surface (stable C ABI names):
   _PyObject_New, _PyObject_NewVar, _PyObject_GC_New, _PyDict_GetItem_KnownHash
 """
 
+__pcc_runtime_port__ = True
+
 from pcc.extern import c_abi_typed_export, c_int64, c_ptr, extern
 
 PyType_GenericAlloc = extern("PyType_GenericAlloc", (c_ptr, c_int64), c_ptr)

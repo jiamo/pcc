@@ -110,14 +110,14 @@ def _emit_ir(source: str, monkeypatch, tmp_path) -> str:
     optimizer later folds away.
     """
     monkeypatch.chdir(tmp_path)
-    CEvaluator().evaluate(source, optimize=False, llvmdump=True)
+    CEvaluator().evaluate(source, optimize=False, llvmdump=tmp_path)
     return (tmp_path / "temp.ir").read_text(encoding="utf-8")
 
 
 def _emit_asm(source: str, monkeypatch, tmp_path) -> str:
     """Emitted target assembly (``temp.bcode``) for ``source``."""
     monkeypatch.chdir(tmp_path)
-    CEvaluator().evaluate(source, optimize=False, llvmdump=True)
+    CEvaluator().evaluate(source, optimize=False, llvmdump=tmp_path)
     return (tmp_path / "temp.bcode").read_text(encoding="utf-8")
 
 

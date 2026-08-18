@@ -20,7 +20,10 @@ def _run(tmp_path, source):
     exe = tmp_path / "p_bin"; env = os.environ.copy(); env.pop("LC_ALL", None)
     b = subprocess.run(["uv","run","pcc","--backend","self","--python-libpython=off","--ir-scaffold=on",str(src),"-o",str(exe)], text=True, capture_output=True, timeout=420, env=env)
     assert b.returncode == 0, b.stderr
-    r = subprocess.run([str(exe)], text=True, capture_output=True, timeout=30, env=env)
+    run_env = {**env, "PCC_GC_BACKEND": "4"}
+    r = subprocess.run(
+        [str(exe)], text=True, capture_output=True, timeout=30, env=run_env
+    )
     assert r.returncode == 0, r.stderr
     return r.stdout
 

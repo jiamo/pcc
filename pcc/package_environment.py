@@ -338,6 +338,34 @@ def apply_locked_environment_resource_defaults() -> list[str]:
     return applied
 
 
+def package_environment_fingerprint() -> str:
+    """Cheap identity of every input the ``environ=None`` resolution reads.
+
+    Callers may cache resolution results keyed on this string: two calls with
+    equal fingerprints resolve identical ``package_sites`` (the
+    environment.json merge only adds ``lock_provenance``; it never alters the
+    site list).  Keep this list in exact sync with the os.environ reads in
+    ``resolve_package_environment`` below.
+    """
+    return "\x1f".join(
+        (
+            str(os.environ.get("HOME") or ""),
+            str(os.environ.get("PCC_PACKAGE_TARGET_PYTHON") or ""),
+            str(os.environ.get("PCC_NATIVE_ABI_VERSION") or ""),
+            str(os.environ.get("PCC_PACKAGE_ABI_MODE") or ""),
+            str(os.environ.get("PCC_TARGET_TRIPLE") or ""),
+            str(os.environ.get("PCC_TARGET_ARCH") or ""),
+            str(os.environ.get("PCC_ENVIRONMENT") or ""),
+            str(os.environ.get("VIRTUAL_ENV") or ""),
+            str(os.environ.get("PCC_DATA_HOME") or ""),
+            str(os.environ.get("XDG_DATA_HOME") or ""),
+            str(os.environ.get("PCC_PACKAGE_SITE") or ""),
+            str(os.environ.get("PCC_PACKAGE_CACHE") or ""),
+            str(os.environ.get("XDG_CACHE_HOME") or ""),
+        )
+    )
+
+
 def package_site_roots(
     environ: dict[str, str] | None = None,
     target_triple: str | None = None,

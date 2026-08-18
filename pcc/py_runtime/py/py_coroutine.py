@@ -12,6 +12,8 @@ Coroutine object layout:
     total size: 64 bytes
 """
 
+__pcc_runtime_port__ = True
+
 from pcc.extern import extern, c_abi_export, c_int32, c_int64, c_ptr, c_void
 from pcc.py_runtime.py.py_abi_constants import (
     PYOBJECTHEADER_FLAGS_OFFSET,
@@ -56,6 +58,8 @@ py_incref = extern("py_incref", (c_ptr,), c_void)
 py_decref = extern("py_decref", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_runtime_error_if_unset = extern(
     "py_runtime_error_if_unset", (c_ptr, c_ptr), c_ptr
 )
@@ -68,6 +72,9 @@ py_clear_exception = extern("py_clear_exception", (), c_void)
 py_obj_getattr = extern("py_obj_getattr", (c_ptr, c_ptr), c_ptr)
 py_obj_call = extern("py_obj_call", (c_ptr, c_ptr, c_ptr), c_ptr)
 py_gc_track = extern("py_gc_track", (c_ptr,), c_void)
+pcc_gc_publish_initialized = extern(
+    "pcc_gc_publish_initialized", (c_ptr,), c_void
+)
 pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
 pcc_gc_load_ptr = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_ptr)
 pcc_gc_store_ptr = extern("pcc_gc_store_ptr", (c_ptr, c_ptr, c_ptr), c_void)
@@ -107,12 +114,12 @@ def _type_of(obj) -> int:
 
 def _raise_typeerror(message) -> None:
     exc = py_exc_new(3, message)  # PY_EXC_TYPEERROR
-    py_raise(exc)
+    py_raise_owned(exc)
 
 
 def _raise_runtimeerror(message) -> None:
     exc = py_exc_new(7, message)  # PY_EXC_RUNTIMEERROR
-    py_raise(exc)
+    py_raise_owned(exc)
 
 
 def _coroutine_require_result(result, helper_name, message):
@@ -192,6 +199,7 @@ def py_coroutine_new_native(name, entry, captures_tuple, args_tuple):
     if made_args != 0:
         py_decref(args_tuple)
     py_gc_track(coro)
+    pcc_gc_publish_initialized(coro)
     return coro
 
 
@@ -454,6 +462,7 @@ def _py_continuation_new_with_abi(frame_map, slots, resume_pc, resume_abi: int):
         pcc_gc_store_ptr(cont, ptr_add(chunk_slots, i * 8), value)
         i = i + 1
     py_gc_track(cont)
+    pcc_gc_publish_initialized(cont)
     if py_continuation_unmount(cont, null(), resume_pc) != 0:
         py_decref(cont)
         return null()
@@ -563,7 +572,7 @@ def py_continuation_get_slot(cont, index: int):
     n_slots: int = load_i64(chunk, 8)
     if index < 0 or index >= n_slots:
         exc = py_exc_new(5, cstr("continuation slot out of range"))
-        py_raise(exc)
+        py_raise_owned(exc)
         return null()
     slots = load_ptr(chunk, 16)
     value = pcc_gc_load_ptr(cont, ptr_add(slots, index * 8))
@@ -584,7 +593,7 @@ def py_continuation_set_slot(cont, index: int, value) -> int:
     n_slots: int = load_i64(chunk, 8)
     if index < 0 or index >= n_slots:
         exc = py_exc_new(5, cstr("continuation slot out of range"))
-        py_raise(exc)
+        py_raise_owned(exc)
         return -1
     slots = load_ptr(chunk, 16)
     pcc_gc_store_ptr(cont, ptr_add(slots, index * 8), value)
@@ -625,6 +634,7 @@ def py_task_new(coro):
         coro = global_load_ptr("py_None")
     pcc_gc_store_ptr(task, ptr_add(task, 16), coro)
     py_gc_track(task)
+    pcc_gc_publish_initialized(task)
     return task
 
 

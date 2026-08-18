@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-
 def test_pipeline_dependency_closure_facade_has_single_function_owners():
     from pcc.py_frontend import pipeline
     from pcc.py_frontend import pipeline_dependency_closure as closure

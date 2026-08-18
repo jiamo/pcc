@@ -1,4 +1,5 @@
 """Owned-local and GC-root helper lowering for Layer-1 codegen."""
+
 from __future__ import annotations
 
 from typing import Optional
@@ -14,6 +15,7 @@ from ..py_ast import (
     Call,
     ClassType,
     DictExpr,
+    DictType,
     DynType,
     Expr,
     FloatType,
@@ -23,6 +25,7 @@ from ..py_ast import (
     Name,
     NoneLit,
     NoneType,
+    SetType,
     StrLit,
     StrType,
     Subscript,
@@ -30,7 +33,6 @@ from ..py_ast import (
     TupleType,
     Type,
 )
-
 
 _I1 = ir.IntType(1)
 _I8 = ir.IntType(8)
@@ -163,6 +165,21 @@ class OwnershipLoweringMixin:
         )
         self.builder.call(self.runtime["pcc_gc_release"], [obj])
 
+    def _note_owned_object_value(self, value: ir.Value) -> None:
+        """Record an emitted pcc object value that carries one owner.
+
+        Expression shape is insufficient at representation joins: an IfExpr
+        can select a retained borrowed local on one edge and a fresh call
+        result on the other.  The emitting Module normalizes those edges and
+        records the resulting SSA value here so assignment and borrowing
+        consumers transfer/release the actual owner instead of guessing from
+        the outer AST node.
+        """
+        self._owned_dynamic_call_values.add(value)
+
+    def _value_is_owned_object(self, value: ir.Value) -> bool:
+        return value in self._owned_dynamic_call_values
+
     def _note_owned_dynamic_call_value(self, value: ir.Value) -> None:
         """Record that *value* came from ``py_obj_call`` on the dynamic path.
 
@@ -174,33 +191,36 @@ class OwnershipLoweringMixin:
         records the value here instead of the classifier guessing from the AST.
         Mirrors the existing ``_cpy_values`` / ``_owned_cpy_values`` split.
         """
-        self._owned_dynamic_call_values.add(value)
+        self._note_owned_object_value(value)
 
     def _value_is_owned_dynamic_call(self, value: ir.Value) -> bool:
-        return value in self._owned_dynamic_call_values
+        return self._value_is_owned_object(value)
+
+    def _owned_release_needed(self, obj: ir.Value, source_expr: Expr) -> bool:
+        """True when ``_gc_release_if_owned(obj, source_expr)`` emits a release.
+
+        Callers that root a fresh result only so a following release cannot
+        pull it from under a relocating collector ask this first: when no
+        release follows, the root frame is pure protocol.
+        """
+        if obj is None or not isinstance(obj.type, ir.PointerType):
+            return False
+        if obj in getattr(self, "_cpy_values", ()):
+            return False
+        if self._value_is_owned_object(obj):
+            return True
+        if not self._raw_scaffold_object_rhs_is_owned(source_expr):
+            return False
+        return self._expr_returns_owned_object(source_expr)
 
     def _gc_release_if_owned(self, obj: ir.Value, source_expr: Expr) -> None:
-        if obj is None:
+        if not self._owned_release_needed(obj, source_expr):
             return
-        if not isinstance(obj.type, ir.PointerType):
-            return
-        if self._value_is_owned_dynamic_call(obj):
-            # Unconditionally owned, and not inferable from the AST shape; skip
-            # the shape classifier entirely.  Discarding this reference is what
-            # leaked the whole result object of every dynamic method call used
-            # as a statement.
-            if obj not in getattr(self, "_cpy_values", ()):
-                self._gc_release(
-                    obj, self._release_expr_label("owned.dyncall", source_expr)
-                )
-            return
-        if not self._raw_scaffold_object_rhs_is_owned(source_expr):
-            return
-        if not self._expr_returns_owned_object(source_expr):
-            return
-        if obj in getattr(self, "_cpy_values", ()):
-            return
-        self._gc_release(obj, self._release_expr_label("owned", source_expr))
+        # An emitter-recorded owner is unconditionally owned and not inferable
+        # from the AST shape.  Discarding this reference is what leaked the
+        # whole result object of every dynamic method call used as a statement.
+        label = "owned.emitted" if self._value_is_owned_object(obj) else "owned"
+        self._gc_release(obj, self._release_expr_label(label, source_expr))
 
     def _native_re_call_returns_owned_object(self, expr) -> bool:
         """True when *expr* is a call the native ``re`` lowering will emit.
@@ -301,6 +321,8 @@ class OwnershipLoweringMixin:
             if isinstance(expr.func, Name) and expr.func.ident == "_dataclass_field_value":
                 return False
             if isinstance(expr.func, Attr):
+                if self._builtin_container_method_returns_owned_object(expr):
+                    return True
                 method_ret_ty = self._method_call_return_type(expr)
                 if method_ret_ty is not None:
                     return self._user_return_type_is_owned_object(method_ret_ty)
@@ -369,6 +391,51 @@ class OwnershipLoweringMixin:
             return True
         if isinstance(expr, Attr):
             return self._attr_expr_returns_owned_object(expr)
+        return False
+
+    def _builtin_container_method_returns_owned_object(
+        self, expr: Call
+    ) -> bool:
+        """True for builtin list/dict/set methods whose native lowering returns
+        a NEW owned reference of DynType.
+
+        The shape classifier answers "not owned" for a DynType method-call
+        result, so these were never released: `x = box.pop()` / `d.get(k)` /
+        `s.pop()` leaked their whole result object (delayed or missed
+        finalization). Every method listed here returns a uniformly owned ref
+        on ALL edges -- verified against the runtime and the native lowerings:
+        py_list_pop transfers owned; py_dict_get_default increfs its default
+        (so dict.get is owned on hit AND miss); dict.setdefault increfs the
+        default on its miss edge; py_dict_pop/py_dict_popitem/py_set_pop
+        transfer owned. `dict.pop(k, default)` is DELIBERATELY EXCLUDED: its
+        two-arg lowering returns the BORROWED default on the miss edge, so
+        classifying it owned would over-release the caller's default. The gates
+        (receiver type + name + arg count) mirror the native emitters' own
+        applicability so this never claims owned for a path that fell through
+        to generic borrowed dispatch.
+        """
+        func = expr.func
+        if not isinstance(func, Attr):
+            return False
+        if getattr(expr, "kwargs", None):
+            return False
+        recv_ty = getattr(func.obj, "ty", None)
+        name = func.name
+        nargs = len(expr.args)
+        if isinstance(recv_ty, ListType):
+            return name == "pop" and nargs in (0, 1)
+        if isinstance(recv_ty, DictType):
+            if name == "get" and nargs in (1, 2):
+                return True
+            if name == "setdefault" and nargs in (1, 2):
+                return True
+            if name == "pop" and nargs == 1:
+                return True
+            if name == "popitem" and nargs == 0:
+                return True
+            return False
+        if isinstance(recv_ty, SetType):
+            return name == "pop" and nargs == 0
         return False
 
     def _return_type_is_owned_object(self, ty: Optional[Type]) -> bool:
@@ -522,16 +589,24 @@ class OwnershipLoweringMixin:
             return False
         if self._expr_returns_owned_object(expr):
             return True
-        if (
-            isinstance(value_ty, IntType)
-            and isinstance(expr, Name)
-            and self._int_expr_needs_exact_object_boundary(expr)
-        ):
-            # Exact-int locals are pointer-form borrowed loads.  Container
-            # stores retain them just like every other borrowed object; only
-            # the freshly boxed/raw scalar and fresh exact-expression lanes
-            # below need a balancing release.
-            return False
+        if isinstance(value_ty, IntType) and isinstance(expr, Name):
+            if self._int_expr_needs_exact_object_boundary(expr):
+                # Exact-int locals are pointer-form borrowed loads.  Container
+                # stores retain them just like every other borrowed object;
+                # only the freshly boxed/raw scalar and fresh exact-expression
+                # lanes below need a balancing release.
+                return False
+            # Any other name whose slot already holds an object pointer -- an
+            # ``int`` parameter above all -- is a borrowed load too.  Treating
+            # it as a fresh box released ``a`` after ``[a, a]`` appended it: a
+            # no-op for a tagged small int, an over-release that freed the
+            # caller's bignum while the list still referenced it.
+            slot = self.env.get(expr.ident)
+            if slot is not None:
+                return not isinstance(slot[1], ir.PointerType)
+            module_global = self._module_globals.get(expr.ident)
+            if module_global is not None:
+                return not isinstance(module_global[0].value_type, ir.PointerType)
         return isinstance(value_ty, (IntType, FloatType, BoolType, NoneType))
 
     def _pcc_pointer_source_needs_pin(self, expr: Expr) -> bool:
@@ -603,6 +678,14 @@ class OwnershipLoweringMixin:
         # that import pcc.extern just to reach native APIs, track only
         # object-producing expressions we can identify with reasonable
         # confidence.
+        if isinstance(expr, Subscript):
+            receiver_ty = getattr(expr.obj, "ty", None)
+            if isinstance(receiver_ty, (ListType, TupleType, DictType)):
+                # Exact-container public getitem helpers return a NEW ref even
+                # when a C-ABI/raw-scaffold module otherwise applies its
+                # conservative result-type filter.  The exact receiver shape
+                # is the ownership proof for Dyn and object projections alike.
+                return True
         if self._module_has_c_abi_export:
             return isinstance(expr, (ListExpr, DictExpr, TupleExpr, StrLit, BytesLit))
         if isinstance(expr, (ListExpr, DictExpr, TupleExpr, StrLit, BytesLit)):
@@ -613,10 +696,9 @@ class OwnershipLoweringMixin:
             return False
         if not isinstance(expr, Call):
             return self._expr_returns_owned_object(expr)
-        if (
-            self._weakref_constructor_kind_for_expr(expr) is not None
-            or self._weakref_call_expr_returns_owned_object(expr)
-        ):
+        if self._weakref_constructor_kind_for_expr(
+            expr
+        ) is not None or self._weakref_call_expr_returns_owned_object(expr):
             return True
         if isinstance(expr.func, Attr):
             expr_ty = getattr(expr, "ty", None)
@@ -726,18 +808,8 @@ class OwnershipLoweringMixin:
         # producing "Value.bitcast: too many positional args" during the
         # pcc1→pcc2 stage. Save/restore the builder's insertion point
         # around the entry-block emission.
-        fn = self.current_function
-        entry = fn.blocks[0]
         saved_block = self.builder._block
-        terminator = None
-        for instr in reversed(entry._instrs):
-            if self._instruction_is_terminator(instr):
-                terminator = instr
-                break
-        if terminator is not None:
-            self.builder.position_before(terminator)
-        else:
-            self.builder.position_at_end(entry)
+        self._position_at_entry_hoist_point()
         frame_map_ptr = frame_map
         if frame_map_ptr.type != _CSTR:
             frame_map_ptr = self.builder.bitcast(
@@ -1251,9 +1323,29 @@ class OwnershipLoweringMixin:
         # _ir_builder_env_flags under pcc-py self-host, so method calls on
         # it fall through scaffold dispatch into CPython fallback (see
         # _emit_entry_gc_frame_enter for the same pattern).
+        saved_block = self.builder._block
+        self._position_at_entry_hoist_point()
+        self.builder.store(value, ptr)
+        self.builder.position_at_end(saved_block)
+
+    def _position_at_entry_hoist_point(self) -> None:
+        """Position the builder where entry-hoisted protocol code belongs.
+
+        The text oracle splits the entry block at the first raise-capable
+        call, so "before the entry terminator" lands ahead of every
+        exceptional path.  A direct/no-text function keeps executing in the
+        same logical block past its inline error edges; there the same point
+        is immediately before the first edge's trigger, otherwise before the
+        terminator, otherwise the end of the block.
+        """
         fn = self.current_function
         entry = fn.blocks[0]
-        saved_block = self.builder._block
+        anchor = None
+        if self._entry_inline_edge_anchor_function is fn:
+            anchor = self._entry_inline_edge_anchor_record
+        if anchor is not None:
+            self.builder.position_before(anchor)
+            return
         terminator = None
         for instr in reversed(entry._instrs):
             if self._instruction_is_terminator(instr):
@@ -1263,5 +1355,3 @@ class OwnershipLoweringMixin:
             self.builder.position_before(terminator)
         else:
             self.builder.position_at_end(entry)
-        self.builder.store(value, ptr)
-        self.builder.position_at_end(saved_block)

@@ -16,6 +16,8 @@ Constants (inlined per the pcc-Python runtime-module contract):
   PY_EXC_VALUEERROR = 2, PY_EXC_SYSTEMERROR = 9, PY_EXC_OVERFLOWERROR = 10
 """
 
+__pcc_runtime_port__ = True
+
 from pcc.extern import c_abi_typed_export, c_int64, c_ptr, c_void, extern
 from pcc.unsafe import (
     cstr,
@@ -39,6 +41,8 @@ from pcc.unsafe import (
 py_str_new = extern("py_str_new", (c_ptr, c_int64), c_ptr)
 py_decref = extern("py_decref", (c_ptr,), c_void)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 PyMem_Malloc = extern("PyMem_Malloc", (c_int64,), c_ptr)
 PyMem_Realloc = extern("PyMem_Realloc", (c_ptr, c_int64), c_ptr)
@@ -50,15 +54,15 @@ PyUnicode_Substring = extern("PyUnicode_Substring", (c_ptr, c_int64, c_int64), c
 
 
 def _value_error(message) -> None:
-    py_raise(py_exc_new(2, message))  # PY_EXC_VALUEERROR
+    py_raise_owned(py_exc_new(2, message))  # PY_EXC_VALUEERROR
 
 
 def _system_error(message) -> None:
-    py_raise(py_exc_new(7, message))  # PY_EXC_SYSTEMERROR
+    py_raise_owned(py_exc_new(7, message))  # PY_EXC_SYSTEMERROR
 
 
 def _overflow_error(message) -> None:
-    py_raise(py_exc_new(15, message))  # PY_EXC_OVERFLOWERROR
+    py_raise_owned(py_exc_new(15, message))  # PY_EXC_OVERFLOWERROR
 
 
 def _utf8_write(out, ch: int) -> int:

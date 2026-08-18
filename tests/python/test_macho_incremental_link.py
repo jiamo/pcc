@@ -19,7 +19,11 @@ from pcc.backend.macho_obj import (
     TEXT_SECTION_FLAGS,
     TextSymbol,
 )
-from pcc.backend.native_object import NativeObject
+from pcc.backend.native_object import (
+    NativeObject,
+    decode_packed_native_object,
+    encode_native_object,
+)
 
 
 _RET = b"\xc0\x03\x5f\xd6"
@@ -135,6 +139,46 @@ def test_same_layout_edit_reuses_merged_state_and_is_cold_link_identical(
     assert exact_image == cold_image
 
 
+def test_packed_same_layout_edit_reuses_merged_state(
+    tmp_path: Path,
+) -> None:
+    def packed(value: NativeObject):
+        return decode_packed_native_object(encode_native_object(value))
+
+    prepare_calls = 0
+
+    def counted_prepare(objects, *, archives=()):
+        nonlocal prepare_calls
+        prepare_calls += 1
+        return prepare_executable_object(objects, archives=archives)
+
+    first_objects = [packed(_caller()), packed(_helper(_NOP))]
+    first = IncrementalMachOLinker(
+        tmp_path / "cache", "test-link-source-v1",
+    )
+    first.link(
+        first_objects,
+        prepare=counted_prepare,
+        finalize=link_prepared_executable,
+        validate=_validate_linked_image,
+    )
+
+    edited_objects = [packed(_caller()), packed(_helper(_MOV_X0_X0))]
+    edited = IncrementalMachOLinker(
+        tmp_path / "cache", "test-link-source-v1",
+    )
+    edited_image = edited.link(
+        edited_objects,
+        prepare=counted_prepare,
+        finalize=link_prepared_executable,
+        validate=_validate_linked_image,
+    )
+
+    assert edited.stats.merged_hits == 1
+    assert edited.stats.incremental_fallbacks == 0
+    assert prepare_calls == 1
+    assert edited_image == link_executable(edited_objects)
+
 def test_layout_change_is_a_cold_prepare_not_an_approximate_patch(
     tmp_path: Path,
 ) -> None:
@@ -231,6 +275,25 @@ def test_semantically_invalid_native_object_cache_is_reassembled(
     assert build_count == 2
     assert session.stats.assembly_hits == 0
     assert session.stats.assembly_misses == 1
+
+
+def test_assembly_cache_can_return_a_validated_packed_view(
+    tmp_path: Path,
+) -> None:
+    from pcc.backend.native_object import PackedNativeObject
+
+    cache_dir = tmp_path / "cache"
+    first = IncrementalMachOLinker(cache_dir, "test-link-source-v1")
+    first.native_object_from_assembly("caller", lambda _text: _caller())
+
+    session = IncrementalMachOLinker(cache_dir, "test-link-source-v1")
+    _path, cached, replace_valid = session.probe_assembly_cache(
+        "caller", packed=True,
+    )
+
+    assert isinstance(cached, PackedNativeObject)
+    assert not replace_valid
+    assert session.stats.assembly_hits == 1
 
 
 def test_semantic_identity_keys_exact_images_and_disables_layout_patch(

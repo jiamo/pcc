@@ -386,7 +386,14 @@ def test_trash_defer_helpers_match_port_and_exclude_cext_tags_source():
     trash_body = py_obj_c[trash_start:py_obj_c.index("static void pcc_dealloc_dispatch", trash_start)]
     assert "pcc_capi_is_cext_type_tag((int64_t)type_tag) != 0" in trash_body
     assert trash_body.index("pcc_capi_is_cext_type_tag") < trash_body.index("switch (type_tag)")
-    assert "default:\n            return type_tag >= PY_TYPE_USER;" in trash_body
+    assert (
+        # Both the C helper and the pcc-Python mirror (_dealloc_should_defer in
+        # py_obj_dealloc.py) compare against PY_TYPE_USER_CLASS_START (104), not
+        # PY_TYPE_USER (100).  The reserved range between them is not a concrete
+        # user class, so deferring on it would be wrong; the test still pinned
+        # the older boundary.
+        "default:\n            return type_tag >= PY_TYPE_USER_CLASS_START;"
+    ) in trash_body
 
     split_start = py_obj_dealloc_c.index("static int pcc_dealloc_should_defer(")
     split_body = py_obj_dealloc_c[
@@ -395,7 +402,14 @@ def test_trash_defer_helpers_match_port_and_exclude_cext_tags_source():
     assert "pcc_capi_is_cext_type_tag((int64_t)type_tag) != 0" in split_body
     assert split_body.index("pcc_capi_is_cext_type_tag") < split_body.index("switch (type_tag)")
     assert "return 1;" in split_body
-    assert "default:\n            return type_tag >= PY_TYPE_USER;" in split_body
+    assert (
+        # Both the C helper and the pcc-Python mirror (_dealloc_should_defer in
+        # py_obj_dealloc.py) compare against PY_TYPE_USER_CLASS_START (104), not
+        # PY_TYPE_USER (100).  The reserved range between them is not a concrete
+        # user class, so deferring on it would be wrong; the test still pinned
+        # the older boundary.
+        "default:\n            return type_tag >= PY_TYPE_USER_CLASS_START;"
+    ) in split_body
 
     port_start = py_obj_dealloc_py.index("def _dealloc_should_defer(tag: int) -> bool:")
     port_body = py_obj_dealloc_py[
@@ -403,4 +417,4 @@ def test_trash_defer_helpers_match_port_and_exclude_cext_tags_source():
     ]
     assert "pcc_capi_is_cext_type_tag = extern(" in py_obj_dealloc_py
     assert "pcc_capi_is_cext_type_tag(tag) != 0" in port_body
-    assert port_body.index("pcc_capi_is_cext_type_tag(tag) != 0") < port_body.index("if tag >= 100:")
+    assert port_body.index("pcc_capi_is_cext_type_tag(tag) != 0") < port_body.index("if tag >= PY_TYPE_USER_CLASS_START")

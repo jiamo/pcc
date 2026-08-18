@@ -283,12 +283,20 @@ class SubscriptLoweringMixin:
         the post-call exception edge, and receiver ownership in one place;
         callers only decide whether to coerce the returned object.
 
-        Returns ``(raw_object, semantic_element_type_or_none)`` or ``None``
-        when the receiver is outside this finite exact-container family.
+        Returns ``(raw_object, semantic_element_type_or_none, None, None)``
+        or ``None`` when the receiver is outside this finite exact-container
+        family.  The raw object is a NEW reference the caller owns.  An owned
+        key or receiver temporary is released here, with the result pinned
+        across the release so a collector the release triggers cannot move
+        it.  (The two trailing slots are the retired result-root protocol:
+        store_root, frame_enter_lifo, reload, store_root(null),
+        frame_leave_lifo around every subscript, whether or not anything was
+        released in between.)
         """
         obj_ty = expr.obj.ty
         span = getattr(expr, "span", None)
         elem_ty: Optional[Type] = None
+        key_obj: Optional[ir.Value] = None
         if isinstance(obj_ty, ListType):
             idx = self._emit_index_expr_as_i64(expr.idx)
             got = self.builder.call(
@@ -319,12 +327,35 @@ class SubscriptLoweringMixin:
         else:
             return None
 
+        # A key produced by another getitem/call is a NEW reference that this
+        # site consumes (``d[keys[i]]`` never released it: a key with
+        # ``__del__`` was never finalized).
+        release_key = key_obj is not None and self._owned_release_needed(
+            key_obj, expr.idx
+        )
+        release_receiver = self._owned_release_needed(obj, expr.obj)
+        release_on_error = tuple(
+            value
+            for value, needed in ((key_obj, release_key), (obj, release_receiver))
+            if needed
+        )
         # These public getitem variants raise IndexError/KeyError.  Keep the
         # exception edge paired with symbol selection so no caller can regress
         # to a silent NULL result.
-        self._emit_post_call_err_check(span)
+        self._emit_post_call_err_check(span, release_on_error=release_on_error)
+        if not release_key and not release_receiver:
+            # Nothing is released between here and the caller's use of the
+            # result, so nothing can run a collector on this thread.
+            return got, elem_ty, None, None
+        # Pin the NEW result while the operand temporaries are released: a
+        # release may run a finalizer or a collection, and a relocating
+        # backend must not move an object held only in this register.
+        self._gc_pin(got)
+        if release_key:
+            self._gc_release_if_owned(key_obj, expr.idx)
         self._gc_release_if_owned(obj, expr.obj)
-        return got, elem_ty
+        self._gc_unpin(got)
+        return got, elem_ty, None, None
 
     def _emit_subscript_store(self, target: Subscript, value_expr: Expr) -> None:
         rhs = self._emit_expr_as_pcc_object(value_expr)
@@ -500,6 +531,9 @@ class SubscriptLoweringMixin:
             # statement so an unhashable key is catchable instead of leaving
             # a stale TypeError behind a seemingly successful assignment.
             self._emit_post_call_err_check(target.span)
+            # The dict retained the key; a key temporary (``d[keys[i]] = v``)
+            # is a NEW reference this site must consume.
+            self._gc_release_if_owned(key_obj, idx_expr)
             release_rhs()
             return
         if isinstance(obj_ty, TupleType):
@@ -519,6 +553,7 @@ class SubscriptLoweringMixin:
         key_obj = self._emit_subscript_key_object(idx_expr)
         self.builder.call(self.runtime["py_obj_setitem"], [obj, key_obj, rhs_obj])
         self._emit_post_call_err_check(target.span)
+        self._gc_release_if_owned(key_obj, idx_expr)
         release_rhs()
 
     def _emit_slice_bound_object(self, expr: Optional[Expr]) -> ir.Value:
@@ -825,7 +860,22 @@ class SubscriptLoweringMixin:
         obj_ty = expr.obj.ty
         exact_container = self._emit_exact_container_subscript_load_object(expr, obj)
         if exact_container is not None:
-            got, elem_ty = exact_container
+            got, elem_ty, _root, _root_ptr = exact_container
+            unboxes_native_scalar = (
+                elem_ty is not None
+                and self._is_native_scalar_type(elem_ty)
+                and not (isinstance(elem_ty, IntType) and self._int_exprs_are_boxed())
+            )
+            if unboxes_native_scalar:
+                # Exact-container public getitem helpers return a NEW object
+                # reference.  Native scalar coercion consumes only its value,
+                # so balance the original owner after the synchronous unbox.
+                coerced = self._coerce_from_object(got, elem_ty)
+                self._gc_release(
+                    got,
+                    self._release_context_label("exact-container-subscript"),
+                )
+                return coerced
             if elem_ty is None:
                 return got
             return self._coerce_from_object(got, elem_ty)
@@ -856,20 +906,37 @@ class SubscriptLoweringMixin:
             )
             self._gc_release_if_owned(obj, expr.obj)
             return result
+        # Dynamic operand: the raising subscript entry points convert the
+        # getitem primitives' silent NULL (missing key, out-of-range index,
+        # non-subscriptable object) into KeyError/IndexError/TypeError, and the
+        # post-call check routes it to the handler or function exit like every
+        # other raise-capable call.  An unconditionally owned operand
+        # temporary is released on the exceptional edge as well.
+        release_on_error = (
+            (obj,) if self._value_is_owned_object(obj) else ()
+        )
         if isinstance(expr.idx.ty, (IntType, BoolType)):
             idx_i64 = self._emit_index_expr_as_i64(expr.idx)
             result = self.builder.call(
-                self.runtime["py_obj_getitem_i64"],
+                self.runtime["py_obj_subscript_i64"],
                 [obj, idx_i64],
-                name=self._fresh("obj.getitem.i64"),
+                name=self._fresh("obj.subscript.i64"),
+            )
+            self._emit_post_call_err_check(
+                getattr(expr, "span", None),
+                release_on_error=release_on_error,
             )
             self._gc_release_if_owned(obj, expr.obj)
             return result
         key_obj = self._emit_subscript_key_object(expr.idx)
         result = self.builder.call(
-            self.runtime["py_obj_getitem"],
+            self.runtime["py_obj_subscript"],
             [obj, key_obj],
-            name=self._fresh("obj.getitem"),
+            name=self._fresh("obj.subscript"),
+        )
+        self._emit_post_call_err_check(
+            getattr(expr, "span", None),
+            release_on_error=release_on_error,
         )
         self._gc_release_if_owned(obj, expr.obj)
         return result

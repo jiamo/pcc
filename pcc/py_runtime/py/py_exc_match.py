@@ -9,6 +9,9 @@ PyExceptionObject layout (offset 16 -> exc_class).
 Public object type tags and class/instance layout offsets come from the
 generated ``py_abi_constants`` module.
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PYCLASSOBJECT_MRO_OFFSET,
     PYINSTANCEOBJECT_CLS_OFFSET,

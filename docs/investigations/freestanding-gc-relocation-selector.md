@@ -63,3 +63,19 @@ Proposal No.1 landed.  Backend 4 candidate policy and page-grouped selection
 are strict freestanding pcc-Python.  Evacuation drain, ZPage lifecycle,
 one-epoch forwarding retirement, and shared barrier policy remain explicit
 open work; the parent task stays `DONE_WEAK`.
+
+## Update 2026-08-28 — locally defined diagnostic counters need exact registry entries
+
+The later FRESH_ALLOC diagnosability slice added two `define_global_i64`
+counters to this strict object, but did not add their names to the finite raw
+GC-global registry.  A fresh build correctly failed closed on their
+`@pcc_gc_backend4_*_g` address references.  Both exact names are now registered
+in `FREESTANDING_GC_I64_GLOBALS`; the closure test distinguishes locally owned
+globals from undefined raw imports and proves both exported counter functions
+and globals are owned by `freestanding_gc_relocation_selector.o`.
+
+LLVM/self closure, the complete isolated archive-owner test, a forced
+186-object single-codegen-checksum rebuild and archive provenance verification
+pass.  This restores the intended boundary without allowing arbitrary
+managed-looking globals.  Full GC4 behavior remains open under the existing
+task, so the status of that slice is `DONE_WEAK`.

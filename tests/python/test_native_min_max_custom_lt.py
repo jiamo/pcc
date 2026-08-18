@@ -19,12 +19,15 @@ from __future__ import annotations
 import os, subprocess
 
 
-def _run(tmp_path, source):
+def _run(tmp_path, source, *, backend=None):
     src = tmp_path / "p.py"; src.write_text(source, encoding="utf-8")
     exe = tmp_path / "p_bin"; env = os.environ.copy(); env.pop("LC_ALL", None)
     b = subprocess.run(["uv","run","pcc","--backend","self","--python-libpython=off","--ir-scaffold=on",str(src),"-o",str(exe)], text=True, capture_output=True, timeout=420, env=env)
     assert b.returncode == 0, b.stderr
-    r = subprocess.run([str(exe)], text=True, capture_output=True, timeout=30, env=env)
+    run_env = env if backend is None else {**env, "PCC_GC_BACKEND": backend}
+    r = subprocess.run(
+        [str(exe)], text=True, capture_output=True, timeout=30, env=run_env
+    )
     assert r.returncode == 0, r.stderr
     return r.stdout
 
@@ -81,3 +84,29 @@ def test_min_max_custom_iterator_regression(tmp_path):
         "    print(max(Counter(5)))\n"   # 5
         "main()\n")
     assert out.split("\n")[:2] == ["1", "5"], out
+
+
+def test_min_max_custom_iterator_iteration_reenters_gc4(tmp_path):
+    out = _run(
+        tmp_path,
+        "import gc\n"
+        "class Values:\n"
+        "    def __init__(self, vals):\n"
+        "        self.vals = vals\n"
+        "        self.i = 0\n"
+        "    def __iter__(self):\n"
+        "        return self\n"
+        "    def __next__(self):\n"
+        "        if self.i >= len(self.vals):\n"
+        "            raise StopIteration\n"
+        "        gc.collect()\n"
+        "        value = self.vals[self.i]\n"
+        "        self.i += 1\n"
+        "        return value\n"
+        "def main():\n"
+        "    print(min(Values([3, 1, 2])))\n"
+        "    print(max(Values([3, 1, 2])))\n"
+        "main()\n",
+        backend="4",
+    )
+    assert out.split("\n")[:2] == ["1", "3"], out

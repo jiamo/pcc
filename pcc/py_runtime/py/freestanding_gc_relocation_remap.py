@@ -4,10 +4,14 @@ from pcc import i64
 from pcc.extern import c_abi_export, c_int64, c_ptr, c_void, extern
 from pcc.unsafe import (
     abi_constant,
+    global_addr,
+    global_load_ptr,
     is_tagged_int,
     load_i32,
+    load_i64,
     load_ptr,
     null,
+    ptr_eq,
     ptr_is_null,
     store_ptr,
 )
@@ -28,6 +32,12 @@ pcc_gc_visit_object_slots = extern(
 )
 pcc_gc_memoryview_refresh_owned_buffer = extern(
     "pcc_gc_memoryview_refresh_owned_buffer", (c_ptr,), c_int64
+)
+pcc_py_gc_minor_graph_lock = extern(
+    "pcc_py_gc_minor_graph_lock", (), c_void
+)
+pcc_py_gc_minor_graph_unlock = extern(
+    "pcc_py_gc_minor_graph_unlock", (), c_void
 )
 
 
@@ -105,6 +115,52 @@ def pcc_gc_backend4_remap_heal_slot(base, offset: i64) -> None:
 @c_abi_export("pcc_gc_backend4_remap_slot")
 def pcc_gc_backend4_remap_slot(slot, role: i64, context) -> None:
     pcc_gc_backend4_remap_heal_slot(slot, 0)
+
+
+@c_abi_export("pcc_gc_backend4_remap_cext_ctx_valid")
+def _pcc_gc_backend4_remap_cext_ctx_valid(context) -> i64:
+    obj = load_ptr(context, 0)
+    if (
+        load_i32(global_addr("pcc_gc_backend4_remap_active"), 0) == 0
+        or load_i64(global_addr("pcc_gc_backend4_remap_epoch"), 0)
+        != load_i64(context, 8)
+        or ptr_eq(
+            global_load_ptr("pcc_gc_backend4_remap_pending_obj"), obj
+        ) == 0
+        or load_i32(global_addr("pcc_gc_backend_selected"), 0) != 4
+        or load_i64(global_addr("pcc_gc_object_list_revision"), 0)
+        != load_i64(context, 16)
+        or ptr_eq(global_load_ptr("pcc_gc_forwarding_head"), load_ptr(context, 24))
+        == 0
+        or load_i32(global_addr("pcc_gc_forwarding_population"), 0)
+        != load_i64(context, 32)
+        or load_i64(global_addr("pcc_gc_backend4_reseed_page_revision"), 0)
+        != load_i64(context, 40)
+        or load_i64(
+            global_addr("pcc_gc_backend4_reseed_relocation_revision"), 0
+        ) != load_i64(context, 48)
+    ):
+        return 0
+    return 1
+
+
+@c_abi_export("pcc_gc_backend4_remap_cext_slot_transaction")
+def pcc_gc_backend4_remap_cext_slot_transaction(
+    slot, role: i64, context
+) -> None:
+    if ptr_is_null(slot) != 0 or ptr_is_null(context) != 0:
+        return
+    pcc_py_gc_minor_graph_lock()
+    if _pcc_gc_backend4_remap_cext_ctx_valid(context) != 0:
+        pcc_gc_backend4_remap_heal_slot(slot, 0)
+    pcc_py_gc_minor_graph_unlock()
+
+
+@c_abi_export("pcc_gc_backend4_remap_cext_referents_unlocked")
+def pcc_gc_backend4_remap_cext_referents_unlocked(obj, context) -> None:
+    pcc_gc_visit_object_slots(
+        obj, pcc_gc_backend4_remap_cext_slot_transaction, context
+    )
 
 
 @c_abi_export("pcc_gc_backend4_remap_referents")

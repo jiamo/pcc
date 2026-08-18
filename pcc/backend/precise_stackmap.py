@@ -204,6 +204,44 @@ def stable_id_prefix_state(namespace: str, *parts: str) -> int:
     )
 
 
+def stable_id_prefix_limb(
+    namespace: str,
+    part: str,
+    high_limb: bool,
+) -> int:
+    """Hash a two-field prefix and return one 32-bit FNV limb.
+
+    The self-hosted compiler must not first pack these limbs into an unsigned
+    64-bit Python int: when the high bit is set that crosses its bignum/value
+    projection, and splitting the packed value later can lose both limbs.
+    Recomputing this once-per-function prefix twice is cheap and keeps every
+    intermediate below 2**42.
+    """
+    if (
+        not isinstance(namespace, str)
+        or not namespace
+        or "\0" in namespace
+        or not isinstance(part, str)
+        or not part
+        or "\0" in part
+    ):
+        raise PreciseStackMapError(
+            "stack-map identity fields must be non-empty and contain no NUL"
+        )
+    high = _STABLE_ID_INIT_HIGH
+    low = _STABLE_ID_INIT_LOW
+    for byte in (namespace + "\0" + part).encode("utf-8"):
+        low ^= byte
+        low_product = low * 0x1B3
+        high = (
+            high * 0x1B3
+            + (low_product >> 32)
+            + ((low << 8) & 0xFFFFFFFF)
+        ) & 0xFFFFFFFF
+        low = low_product & 0xFFFFFFFF
+    return high if high_limb else low
+
+
 def stable_id_resume(state: int, *parts: str) -> int:
     """Finish an identity begun by :func:`stable_id_prefix_state`.
 
@@ -286,6 +324,56 @@ def safepoint_id(symbol: str, ordinal: int, kind: int) -> int:
     if kind not in SAFEPOINT_KINDS:
         raise PreciseStackMapError(f"unknown safepoint kind {kind}")
     return scoped_stable_id("safepoint", symbol, str(ordinal), str(kind))
+
+
+def safepoint_id_from_prefix_limbs(
+    prefix_high: int,
+    prefix_low: int,
+    ordinal: int,
+    kind: int,
+) -> int:
+    """Finish a safepoint FNV identity without string/bytes projection.
+
+    ``prefix_high``/``prefix_low`` are the two 32-bit limbs returned by
+    splitting ``stable_id_prefix_state("safepoint", symbol)``.  The remaining
+    wire text is exactly ``NUL + decimal(ordinal) + NUL + decimal(kind)``.
+    Feeding those ASCII digits numerically preserves the public stable ID but
+    avoids two ``str`` objects, two separator concatenations and two UTF-8
+    byte objects per compiler safepoint.
+    """
+    high = prefix_high
+    low = prefix_low
+    field_index = 0
+    while field_index < 2:
+        # NUL separator preceding each remaining identity field.
+        low_product = low * 0x1B3
+        high = (
+            high * 0x1B3
+            + (low_product >> 32)
+            + ((low << 8) & 0xFFFFFFFF)
+        ) & 0xFFFFFFFF
+        low = low_product & 0xFFFFFFFF
+
+        field_value = ordinal if field_index == 0 else kind
+        divisor = 1
+        while field_value >= divisor * 10:
+            divisor *= 10
+        while divisor > 0:
+            digit = field_value // divisor
+            byte = 48 + digit
+            low ^= byte
+            low_product = low * 0x1B3
+            high = (
+                high * 0x1B3
+                + (low_product >> 32)
+                + ((low << 8) & 0xFFFFFFFF)
+            ) & 0xFFFFFFFF
+            low = low_product & 0xFFFFFFFF
+            field_value %= divisor
+            divisor //= 10
+        field_index += 1
+    value = (high & 0x7FFFFFFF) * 0x100000000 + low
+    return value or 1
 
 
 def _check_uint(value: int, bits: int, label: str, *, nonzero: bool = False) -> None:
@@ -758,6 +846,265 @@ def decode_stack_map(
     return result
 
 
+def validate_stack_map_payload(
+    payload: bytes,
+    *,
+    expected_arch: int | None = None,
+    final_image: bool = False,
+) -> None:
+    """Validate one wire payload without materialising its decoded map.
+
+    This is the executable-publication boundary for an already merged v2
+    table.  It preserves every structural and semantic check performed by
+    :func:`decode_stack_map`, but validates the shared location table through
+    its record slices instead of constructing millions of frozen dataclasses
+    and then walking them a second time.  A location slice's semantics depend
+    only on its table range, target architecture, and owning frame size, so a
+    repeated ``(index, count, frame_size)`` is checked once.
+    """
+
+    if not isinstance(payload, bytes):
+        raise PreciseStackMapError("stack-map payload must be immutable bytes")
+    header, cursor = _take(payload, 0, _HEADER, "stack-map header")
+    magic, version, arch, pointer_size, function_count, table_count, _hres = header
+    if magic != MAGIC:
+        raise PreciseStackMapError("bad pcc stack-map magic")
+    if version != VERSION:
+        raise PreciseStackMapError(f"unsupported pcc stack-map version {version}")
+    if pointer_size != POINTER_SIZE:
+        raise PreciseStackMapError("unsupported stack-map pointer size")
+    if arch not in ARCH_NAMES:
+        raise PreciseStackMapError(f"unknown stack-map architecture {arch}")
+    if expected_arch is not None and arch != expected_arch:
+        raise PreciseStackMapError("stack-map architecture does not match target")
+    if function_count > MAX_FUNCTIONS:
+        raise PreciseStackMapError("too many stack-map functions")
+    if table_count > MAX_LOCATIONS:
+        raise PreciseStackMapError("too many stack-map locations")
+
+    # Match decode_stack_map's fail-closed structural pass first.  Semantic
+    # validation below may then index the shared table without turning a
+    # malformed size/count into an accidental slice or unpack error.
+    total_records = 0
+    total_locations = 0
+    for _ in range(function_count):
+        function_fields, cursor = _take(
+            payload, cursor, _FUNCTION, "function record"
+        )
+        record_count = function_fields[4]
+        total_records += record_count
+        if total_records > MAX_RECORDS:
+            raise PreciseStackMapError("too many stack-map records")
+        for _ in range(record_count):
+            record_fields, cursor = _take(
+                payload, cursor, _RECORD, "safepoint record"
+            )
+            location_count = record_fields[4]
+            reserved_count = record_fields[5]
+            reserved_short = record_fields[8]
+            location_index = record_fields[9]
+            if reserved_count or reserved_short:
+                raise PreciseStackMapError("non-zero reserved stack-map field")
+            total_locations += location_count
+            if total_locations > MAX_LOCATIONS:
+                raise PreciseStackMapError("too many stack-map locations")
+            if location_index + location_count > table_count:
+                raise PreciseStackMapError(
+                    "stack-map record names locations outside its table"
+                )
+    table_start = cursor
+    table_end = table_start + table_count * _LOCATION.size
+    if table_end > len(payload):
+        raise PreciseStackMapError("truncated stack-map location table")
+    if table_end != len(payload):
+        raise PreciseStackMapError("trailing bytes after pcc stack-map payload")
+
+    cursor = _HEADER.size
+    previous_function_id = -1
+    seen_safepoints: set[int] = set()
+    validated_location_slices: set[tuple[int, int, int]] = set()
+    stack_registers = (29, 31) if arch == ARCH_AARCH64 else (6, 7)
+    register_limit = _register_limit(arch)
+    arch_name = ARCH_NAMES[arch]
+    table_view = memoryview(payload)
+
+    for _ in range(function_count):
+        function_fields, cursor = _take(
+            payload, cursor, _FUNCTION, "function record"
+        )
+        (
+            function_id_value,
+            function_address,
+            code_size,
+            frame_size,
+            record_count,
+            _function_flags,
+        ) = function_fields
+        if function_id_value == 0:
+            raise PreciseStackMapError("function id is outside uint64")
+        if function_id_value <= previous_function_id:
+            raise PreciseStackMapError(
+                "functions must be ordered by unique stable function id"
+            )
+        previous_function_id = function_id_value
+        if final_image and function_address == 0:
+            raise PreciseStackMapError("final-image function address is unresolved")
+        if code_size == 0:
+            raise PreciseStackMapError("function code size is outside uint32")
+        if frame_size % 16:
+            raise PreciseStackMapError(
+                "function frame size must be 16-byte aligned"
+            )
+
+        previous_pc = -1
+        for _ in range(record_count):
+            record_fields, cursor = _take(
+                payload, cursor, _RECORD, "safepoint record"
+            )
+            (
+                record_id,
+                instruction_offset,
+                exceptional_offset,
+                continuation_id,
+                location_count,
+                _reserved_count,
+                kind,
+                record_flags,
+                _reserved_short,
+                location_index,
+            ) = record_fields
+            if record_id == 0:
+                raise PreciseStackMapError("safepoint id is outside uint64")
+            if record_id in seen_safepoints:
+                raise PreciseStackMapError("duplicate safepoint id")
+            seen_safepoints.add(record_id)
+            if kind not in SAFEPOINT_KINDS:
+                raise PreciseStackMapError(f"unknown safepoint kind {kind}")
+            if not previous_pc < instruction_offset < code_size:
+                raise PreciseStackMapError(
+                    "safepoints must have ordered in-function instruction offsets"
+                )
+            previous_pc = instruction_offset
+            if record_flags & ~RECORD_FLAGS:
+                raise PreciseStackMapError("unknown stack-map record flags")
+            has_exception = exceptional_offset != NO_OFFSET
+            if has_exception and exceptional_offset >= code_size:
+                raise PreciseStackMapError("exceptional successor exceeds function")
+            if has_exception != bool(
+                record_flags & RECORD_HAS_EXCEPTION_EDGE
+            ):
+                raise PreciseStackMapError(
+                    "exception-edge flag and offset disagree"
+                )
+            is_continuation = kind == SAFEPOINT_CONTINUATION
+            if is_continuation != bool(continuation_id):
+                raise PreciseStackMapError(
+                    "continuation record needs one non-zero continuation id"
+                )
+            if bool(record_flags & RECORD_SUSPENDED) != is_continuation:
+                raise PreciseStackMapError(
+                    "suspended flag is reserved for continuation records"
+                )
+
+            slice_key = (location_index, location_count, frame_size)
+            if slice_key in validated_location_slices:
+                continue
+            start = table_start + location_index * _LOCATION.size
+            end = start + location_count * _LOCATION.size
+            prior_flags: list[int] = []
+            for index, location_fields in enumerate(
+                _LOCATION.iter_unpack(table_view[start:end])
+            ):
+                (
+                    location_kind,
+                    location_flags,
+                    size,
+                    register,
+                    base_index,
+                    location_offset,
+                    extent,
+                ) = location_fields
+                if location_kind not in LOCATION_KINDS:
+                    raise PreciseStackMapError(
+                        f"unknown location kind {location_kind}"
+                    )
+                if location_flags & ~LOCATION_FLAGS:
+                    raise PreciseStackMapError(
+                        "unknown stack-map location flags"
+                    )
+                if not location_flags & LOCATION_MANAGED:
+                    raise PreciseStackMapError(
+                        "unclassified raw pointer is not a managed "
+                        "stack-map location"
+                    )
+                if size != POINTER_SIZE or extent != POINTER_SIZE:
+                    raise PreciseStackMapError(
+                        "managed locations must be one pointer wide"
+                    )
+                if register > register_limit:
+                    raise PreciseStackMapError(
+                        f"register {register} is outside {arch_name} ABI"
+                    )
+                if location_kind in (
+                    LOCATION_STACK_INDIRECT,
+                    LOCATION_STACK_DIRECT,
+                ):
+                    if register not in stack_registers:
+                        raise PreciseStackMapError(
+                            "stack location must be relative to the target "
+                            "frame/stack register"
+                        )
+                    if location_offset >= 0 or -location_offset > frame_size:
+                        raise PreciseStackMapError(
+                            f"stack location {location_offset} exceeds frame "
+                            f"size {frame_size}"
+                        )
+                    if (-location_offset) % POINTER_SIZE:
+                        raise PreciseStackMapError(
+                            "managed stack location is not aligned"
+                        )
+                elif location_offset != 0:
+                    raise PreciseStackMapError(
+                        "register location cannot carry frame offset"
+                    )
+                is_derived = bool(location_flags & LOCATION_DERIVED)
+                if is_derived:
+                    if not 0 <= base_index < index:
+                        raise PreciseStackMapError(
+                            "derived location must name an earlier base location"
+                        )
+                    base_flags = prior_flags[base_index]
+                    if (
+                        not base_flags & LOCATION_MANAGED
+                        or base_flags & LOCATION_DERIVED
+                    ):
+                        raise PreciseStackMapError(
+                            "derived location base is not a base root"
+                        )
+                    if not location_flags & LOCATION_RELOAD_REQUIRED:
+                        raise PreciseStackMapError(
+                            "derived location must be reloaded after a "
+                            "relocating safepoint"
+                        )
+                elif base_index != NO_BASE:
+                    raise PreciseStackMapError(
+                        "non-derived location carries a base index"
+                    )
+                if (
+                    location_kind == LOCATION_REGISTER
+                    and not location_flags & LOCATION_RELOAD_REQUIRED
+                ):
+                    raise PreciseStackMapError(
+                        "managed register location must reject stale "
+                        "post-safepoint SSA use"
+                    )
+                prior_flags.append(location_flags)
+            validated_location_slices.add(slice_key)
+
+    if cursor != table_start:
+        raise PreciseStackMapError("stack-map record layout changed during validation")
+
+
 def function_address_offsets(payload: bytes) -> tuple[int, ...]:
     """Return byte offsets which must carry function-symbol relocations.
 
@@ -1062,6 +1409,9 @@ __all__ = [
     "merge_stack_maps",
     "render_stack_map_assembly",
     "safepoint_id",
+    "safepoint_id_from_prefix_limbs",
     "stable_id",
+    "stable_id_prefix_limb",
     "validate_stack_map",
+    "validate_stack_map_payload",
 ]

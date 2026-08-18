@@ -49,6 +49,11 @@ class Layer1InitMixin:
             )
         self.ir_scaffold_mode = ir_scaffold_mode
         self.module = ir.Module(name=module.name or "pcc_py_module")
+        # Opt-in No.100 differential artifact.  Ordinary codegen never builds
+        # it; explicit capture keeps the fixed-layout pcc1 object honest while
+        # the direct kernel plane is brought up beside the text oracle.
+        self._direct_indexed_module = None
+        self._di_init(getattr(module, "path", None) or module.name or "<module>")
         self.runtime: dict[str, ir.Function] = declare_runtime(self.module)
         self._codegen_trace_enabled = bool(os.environ.get("PCC_DEBUG_CODEGEN_PHASES"))
         self._codegen_trace_capacity = 64
@@ -99,6 +104,10 @@ class Layer1InitMixin:
         # Values produced by `py_obj_call` on the generic dynamic-dispatch
         # path.  Always a new reference; not inferable from the AST shape.
         self._owned_dynamic_call_values: set = set()
+        # Compile-time, one-shot provenance marker.  It never enters emitted
+        # IR: a list.append consumer clears it before lowering its argument,
+        # then accepts only the exact SSA returned by emit_instantiate.
+        self._last_fresh_direct_native_ctor_value = None
         self._funcdef_yield_sentinel_cache: dict[int, bool] = {}
         self._vthread_binding_cache: dict = {}
         self._generator_ctx_stack: list = []
@@ -118,6 +127,21 @@ class Layer1InitMixin:
         self._current_entry_block = None
         self._entry_alloca_insert_before_function = None
         self._entry_alloca_insert_index = -1
+        # First inline error edge published from a function's entry block.
+        # Entry-hoisted GC protocol code (root frame enters, slot
+        # initializers) must land before it so every exceptional path sees
+        # the same registered roots the text oracle's split block gives it.
+        self._entry_inline_edge_anchor_function = None
+        self._entry_inline_edge_anchor_record = None
+        # Direct-mode shared frame landings: one block per (function, error
+        # target) reads a payload index; the module tables below map that
+        # index to the raise site's (line, source text).
+        self._direct_frame_landings: dict[int, dict[str, tuple]] = {}
+        self._tb_index_lines: list[int] = []
+        self._tb_index_sources: list = []
+        self._tb_index_by_file: dict[str, dict[int, int]] = {}
+        self._tb_lines_global = None
+        self._tb_sources_global = None
         self.current_class = None
         self.current_method_kind = None
         self._async_body_depth = 0
@@ -157,6 +181,7 @@ class Layer1InitMixin:
         self._module_uses_raw_int_scaffold = False
         self._box_int_locals = False
         self._exact_int_env_flags: dict[str, bool] = {}
+        self._boxed_int_module_global_names: set[str] = set()
         # Immutable per-function representation plan.  `_exact_int_env_flags`
         # tracks the semantic type of the current binding and can be cleared
         # by an intervening object assignment; this set keeps a later int
@@ -169,6 +194,7 @@ class Layer1InitMixin:
         self._fmt_bool_false: Optional[ir.GlobalVariable] = None
         self._str_pool: dict[str, ir.GlobalVariable] = {}
         self._str_obj_pool: dict[str, ir.GlobalVariable] = {}
+        self._static_literal_init_fn = None
         self._attr_pool: dict[str, ir.GlobalVariable] = {}
         self._cstr_pool: dict[str, ir.GlobalVariable] = {}
         self._str_counter = 0
@@ -185,6 +211,11 @@ class Layer1InitMixin:
         self._skip_program_main: bool = False
         self._python_library: bool = False
         self._freestanding_module: bool = False
+        # Runtime ports (``__pcc_runtime_port__ = True``) keep raw pointers in
+        # the pointer lane.  Derived from the module body here so every codegen
+        # construction site (single source, multi-module, frontend workers)
+        # agrees with type inference without pipeline plumbing.
+        self._runtime_port_module: bool = _module_declares_runtime_port(module)
         self._sibling_module_inits: tuple[str, ...] = ()
         self._native_module_exports: Optional[dict] = _default_native_module_exports(
             module.name
@@ -258,3 +289,18 @@ class Layer1InitMixin:
         self._hoisted_enclosing_method_kind = {}
         self._closure_boxed_params = {}
         self._hoist_wrap_caps = {}
+
+
+def _module_declares_runtime_port(module) -> bool:
+    """Mirror of ``type_infer._InferCtx``: a module-scope
+    ``__pcc_runtime_port__ = True`` assignment marks a runtime port."""
+    for stmt in getattr(module, "body", ()) or ():
+        if type(stmt).__name__ != "Assign":
+            continue
+        value = getattr(stmt, "value", None)
+        if type(value).__name__ != "BoolLit" or not getattr(value, "value", False):
+            continue
+        for target in getattr(stmt, "targets", ()):
+            if getattr(target, "ident", None) == "__pcc_runtime_port__":
+                return True
+    return False

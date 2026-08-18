@@ -16,6 +16,8 @@ INITIAL_CAPACITY = 8 (must be power of 2). Public object layout and type tags
 come from the generated C-header-derived py_abi_constants module.
 """
 
+__pcc_runtime_port__ = True
+
 from pcc.extern import extern, c_abi_export, c_ptr, c_int32, c_int64, c_void
 from pcc.py_runtime.py.py_abi_constants import (
     DICTENTRY_HASH_OFFSET,
@@ -42,10 +44,12 @@ from pcc.unsafe import (
     load_i64,
     load_ptr,
     malloc,
+    memset,
     null,
     ptr_eq,
     ptr_is_null,
     ptr_to_int,
+    stack_alloc,
     store_i32,
     store_i64,
     store_ptr,
@@ -59,9 +63,42 @@ pcc_gc_backend4_zpage_register_owner_payload_span = extern(
     (c_ptr, c_ptr, c_int64),
     c_int64,
 )
+pcc_gc_backend = extern("pcc_gc_backend", (), c_int64)
+pcc_gc_publish_initialized = extern(
+    "pcc_gc_publish_initialized", (c_ptr,), c_void
+)
+pcc_gc_scheduler_root_register_handle = extern(
+    "pcc_gc_scheduler_root_register_handle", (c_ptr,), c_ptr
+)
+pcc_gc_scheduler_root_unregister_handle = extern(
+    "pcc_gc_scheduler_root_unregister_handle", (c_ptr,), c_void
+)
+pcc_py_gc_minor_graph_lock = extern(
+    "pcc_py_gc_minor_graph_lock", (), c_void
+)
+pcc_py_gc_minor_graph_unlock = extern(
+    "pcc_py_gc_minor_graph_unlock", (), c_void
+)
+pcc_gc_store_ptr_plan_init = extern(
+    "pcc_gc_store_ptr_plan_init", (c_ptr, c_ptr, c_int64), c_void
+)
+pcc_gc_store_ptr_plan_commit_locked = extern(
+    "pcc_gc_store_ptr_plan_commit_locked",
+    (c_ptr, c_ptr, c_ptr, c_ptr),
+    c_int64,
+)
+pcc_gc_store_ptr_plan_finish = extern(
+    "pcc_gc_store_ptr_plan_finish", (c_ptr,), c_void
+)
+pcc_gc_backend4_retarget_mutator_payload_locked = extern(
+    "pcc_gc_backend4_retarget_mutator_payload_locked",
+    (c_ptr, c_ptr, c_int64, c_ptr, c_int64, c_ptr, c_int64),
+    c_int64,
+)
 py_obj_hash = extern("py_obj_hash", (c_ptr,), c_int64)
 py_obj_eq = extern("py_obj_eq", (c_ptr, c_ptr), c_int32)
 py_str_eq = extern("py_str_eq", (c_ptr, c_ptr), c_int32)
+py_str_hash = extern("py_str_hash", (c_ptr,), c_int64)
 py_gc_track = extern("py_gc_track", (c_ptr,), c_void)
 pcc_gc_store_ptr = extern("pcc_gc_store_ptr", (c_ptr, c_ptr, c_ptr), c_void)
 pcc_gc_load_ptr = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_ptr)
@@ -74,10 +111,16 @@ pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
 
 py_list_new = extern("py_list_new", (c_int64,), c_ptr)
 py_list_append = extern("py_list_append", (c_ptr, c_ptr), c_void)
+py_list_len = extern("py_list_len", (c_ptr,), c_int64)
+py_list_get = extern("py_list_get", (c_ptr, c_int64), c_ptr)
 py_tuple_new = extern("py_tuple_new", (c_int64,), c_ptr)
 py_tuple_set_item = extern("py_tuple_set_item", (c_ptr, c_int64, c_ptr), c_void)
 py_exc_new_with_value = extern("py_exc_new_with_value", (c_int64, c_ptr), c_ptr)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs the exception it stores in TLS, so a caller that created
+# it still owns a reference.  py_raise_owned raises and releases that
+# caller reference in one step, matching the C runtime.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_obj_iter = extern("py_obj_iter", (c_ptr,), c_ptr)
 py_obj_next = extern("py_obj_next", (c_ptr,), c_ptr)
 py_err_occurred = extern("py_err_occurred", (), c_int64)
@@ -105,19 +148,39 @@ def _ptr_is_dict(o) -> bool:
     return load_i32(o, PYOBJECTHEADER_TYPE_TAG_OFFSET) == PY_TYPE_DICT
 
 
-def _keys_equal(entry_key, key) -> int:
-    if ptr_eq(entry_key, key) != 0:
-        return 1
-    if is_tagged_int(entry_key) != 0 and is_tagged_int(key) != 0:
+def _dict_read_prepare_root(slot, value, backend: int):
+    store_ptr(slot, 0, value)
+    if (
+        (backend == 3 or backend == 4)
+        and ptr_is_null(value) == 0
+        and is_tagged_int(value) == 0
+    ):
+        handle = pcc_gc_scheduler_root_register_handle(slot)
+        if ptr_is_null(handle) == 0:
+            store_ptr(slot, 0, pcc_gc_load_ptr(null(), slot))
+        return handle
+    return null()
+
+
+def _dict_read_root_failed(value, backend: int, handle) -> int:
+    if backend != 3 and backend != 4:
         return 0
-    if is_tagged_int(entry_key) == 0 and is_tagged_int(key) == 0:
-        if load_i32(entry_key, PYOBJECTHEADER_TYPE_TAG_OFFSET) == PY_TYPE_STR and load_i32(key, PYOBJECTHEADER_TYPE_TAG_OFFSET) == PY_TYPE_STR:
-            if py_str_eq(entry_key, key) != 0:
-                return 1
-            return 0
-    if py_obj_eq(entry_key, key) != 0:
-        return 1
-    return 0
+    if ptr_is_null(value) != 0 or is_tagged_int(value) != 0:
+        return 0
+    return ptr_is_null(handle)
+
+
+def _dict_read_reload_root(slot, handle):
+    value = load_ptr(slot, 0)
+    if ptr_is_null(handle) == 0:
+        value = pcc_gc_load_ptr(null(), slot)
+        store_ptr(slot, 0, value)
+    return value
+
+
+def _dict_read_finish_root(handle) -> None:
+    if ptr_is_null(handle) == 0:
+        pcc_gc_scheduler_root_unregister_handle(handle)
 
 
 def _alloc_tables(d, capacity: int) -> int:
@@ -154,70 +217,6 @@ def _perturb_shift5(perturb: int) -> int:
     return shifted
 
 
-def _lookup(d, hash_val: int, key) -> int:
-    # Pack two int64 results into i64 return: high 32 = slot, low 32 =
-    # entry_idx. Both fit because capacity is bounded. We return i64 here
-    # as (slot << 32) | (entry_idx_or_minus1 & 0xFFFFFFFF).
-    capacity: int = load_i64(d, PYDICTOBJECT_CAPACITY_OFFSET)
-    indices = load_ptr(d, PYDICTOBJECT_INDICES_OFFSET)
-    entries = load_ptr(d, PYDICTOBJECT_ENTRIES_OFFSET)
-    if capacity <= 0:
-        return 0xFFFFFFFF
-    if ptr_is_null(indices) != 0:
-        return 0xFFFFFFFF
-    if ptr_is_null(entries) != 0:
-        return 0xFFFFFFFF
-    mask: int = capacity - 1
-    read_barrier_enabled: int = load_i32(global_addr("pcc_gc_read_barrier_enabled"), 0)
-    perturb: int = hash_val
-    j: int = hash_val & mask
-    first_tombstone: int = -1
-    probes: int = 0
-    limit: int = capacity * 2
-
-    while probes < limit:
-        ix: int = load_i64(indices, j * 8)
-        if ix == -1:  # PY_DICT_EMPTY
-            slot: int = j
-            if first_tombstone >= 0:
-                slot = first_tombstone
-            return (slot << 32) | (0xFFFFFFFF)
-        if ix == -2:  # PY_DICT_TOMBSTONE
-            if first_tombstone < 0:
-                first_tombstone = j
-        else:
-            entry_off: int = ix * DICTENTRY_SIZE
-            key_slot = ptr_add(entries, entry_off + DICTENTRY_KEY_OFFSET)
-            ek = load_ptr(key_slot, 0)
-            if read_barrier_enabled != 0:
-                ek = pcc_gc_load_ptr(d, key_slot)
-            if ptr_is_null(ek) == 0:
-                eh: int = load_i64(entries, entry_off + DICTENTRY_HASH_OFFSET)
-                if eh == hash_val:
-                    if _keys_equal(ek, key) != 0:
-                        return (j << 32) | (ix & 0xFFFFFFFF)
-        perturb = _perturb_shift5(perturb)
-        j = (j * 5 + perturb + 1) & mask
-        probes = probes + 1
-
-    fallback_slot: int = 0
-    if first_tombstone >= 0:
-        fallback_slot = first_tombstone
-    return (fallback_slot << 32) | (0xFFFFFFFF)
-
-
-def _slot_of(packed: int) -> int:
-    return packed >> 32
-
-
-def _entry_idx_of(packed: int) -> int:
-    # Sign-extend low 32 bits: 0xFFFFFFFF unsigned == -1 signed.
-    low: int = packed & 0xFFFFFFFF
-    if low == 0xFFFFFFFF:
-        return -1
-    return low
-
-
 def _entry_key(d, entries, entry_off: int):
     slot = ptr_add(entries, entry_off + DICTENTRY_KEY_OFFSET)
     k = load_ptr(slot, 0)
@@ -238,74 +237,767 @@ def _entry_value(d, entries, entry_off: int):
     return pcc_gc_load_ptr(d, slot)
 
 
-def _insert_fresh(d, hash_val: int, key, value) -> None:
-    # Inlined lookup + entry move. INCREFs key and value.
-    packed: int = _lookup(d, hash_val, key)
-    slot: int = _slot_of(packed)
+def _dict_fast0_key_kind(key) -> int:
+    # 1 = tagged small int, 2 = str, 0 = everything else (rooted path).
+    if is_tagged_int(key) != 0:
+        return 1
+    if load_i32(key, PYOBJECTHEADER_TYPE_TAG_OFFSET) == PY_TYPE_STR:
+        return 2
+    return 0
+
+
+def _dict_fast0_hash(key, kind: int) -> int:
+    # Neither hash can raise or run user code.
+    if kind == 1:
+        return py_obj_hash(key)
+    return py_str_hash(key)
+
+
+def _dict_probe_fast0(d, key, kind: int, hash_val: int, insert_slot) -> int:
+    """Refcount-backend (GC0) probe for a str or tagged-int key.
+
+    Nothing here allocates, runs user code or collects, so no root, lock,
+    reload or plan is needed: the rooted operation below spent ~10x the
+    lookup itself on that protocol for a ``d[str_key]`` hit.  Returns the
+    entry index of the match; -1 when the key is absent (``insert_slot``
+    then holds the index slot an insert would take, or -1 when the probe
+    budget ran out); -3 when an equal-hash entry of another type needs
+    ``py_obj_eq`` (``True``/``1.0`` against ``1``, a user ``__eq__`` against a
+    str), which only the rooted path may run.
+    """
+    capacity: int = load_i64(d, PYDICTOBJECT_CAPACITY_OFFSET)
     indices = load_ptr(d, PYDICTOBJECT_INDICES_OFFSET)
     entries = load_ptr(d, PYDICTOBJECT_ENTRIES_OFFSET)
-    ei: int = load_i64(d, PYDICTOBJECT_ENTRIES_USED_OFFSET)  # entries_used
-    store_i64(d, PYDICTOBJECT_ENTRIES_USED_OFFSET, ei + 1)
+    entries_used: int = load_i64(d, PYDICTOBJECT_ENTRIES_USED_OFFSET)
+    store_i64(insert_slot, 0, -1)
+    if capacity <= 0 or ptr_is_null(indices) != 0 or ptr_is_null(entries) != 0:
+        return -1
+    mask: int = capacity - 1
+    perturb: int = hash_val
+    j: int = hash_val & mask
+    probes: int = 0
+    first_tombstone: int = -1
+    while probes < capacity + 16:
+        ix: int = load_i64(indices, j * 8)
+        if ix == -1:
+            if first_tombstone >= 0:
+                store_i64(insert_slot, 0, first_tombstone)
+            else:
+                store_i64(insert_slot, 0, j)
+            return -1
+        if ix == -2:
+            if first_tombstone < 0:
+                first_tombstone = j
+        elif ix >= 0 and ix < entries_used:
+            entry_off: int = ix * DICTENTRY_SIZE
+            entry_key = load_ptr(entries, entry_off + DICTENTRY_KEY_OFFSET)
+            if (
+                ptr_is_null(entry_key) == 0
+                and load_i64(entries, entry_off + DICTENTRY_HASH_OFFSET) == hash_val
+            ):
+                if ptr_eq(entry_key, key) != 0:
+                    return ix
+                entry_tagged: int = is_tagged_int(entry_key)
+                if kind == 1:
+                    if entry_tagged == 0:
+                        return -3
+                    # Two distinct tagged ints sharing a hash (-1/-2) differ.
+                elif entry_tagged == 0:
+                    if load_i32(entry_key, PYOBJECTHEADER_TYPE_TAG_OFFSET) == PY_TYPE_STR:
+                        if py_str_eq(entry_key, key) != 0:
+                            return ix
+                    else:
+                        return -3
+                # A tagged entry never equals a str key.
+        perturb = _perturb_shift5(perturb)
+        j = (j * 5 + perturb + 1) & mask
+        probes = probes + 1
+    return -1
+
+
+def _dict_insert_fast0(d, key, value, slot: int, hash_val: int) -> int:
+    # GC0 insert into a probed-free index slot; mirrors
+    # _dict_insert_rooted_slot without the plans and the lock (the barrier
+    # is the balanced pcc_gc_store_ptr).  Returns 0 when the entry table has
+    # no room, which the rooted path then handles.
+    capacity: int = load_i64(d, PYDICTOBJECT_CAPACITY_OFFSET)
+    ei: int = load_i64(d, PYDICTOBJECT_ENTRIES_USED_OFFSET)
+    if ei < 0 or ei >= capacity:
+        return 0
+    indices = load_ptr(d, PYDICTOBJECT_INDICES_OFFSET)
+    entries = load_ptr(d, PYDICTOBJECT_ENTRIES_OFFSET)
     entry_off: int = ei * DICTENTRY_SIZE
     store_i64(entries, entry_off + DICTENTRY_HASH_OFFSET, hash_val)
     store_ptr(entries, entry_off + DICTENTRY_KEY_OFFSET, null())
     store_ptr(entries, entry_off + DICTENTRY_VALUE_OFFSET, null())
     pcc_gc_store_ptr(d, ptr_add(entries, entry_off + DICTENTRY_KEY_OFFSET), key)
     pcc_gc_store_ptr(d, ptr_add(entries, entry_off + DICTENTRY_VALUE_OFFSET), value)
+    store_i64(d, PYDICTOBJECT_ENTRIES_USED_OFFSET, ei + 1)
     store_i64(indices, slot * 8, ei)
-    sz: int = load_i64(d, PYDICTOBJECT_ITEM_COUNT_OFFSET)
-    store_i64(d, PYDICTOBJECT_ITEM_COUNT_OFFSET, sz + 1)
+    size: int = load_i64(d, PYDICTOBJECT_ITEM_COUNT_OFFSET)
+    store_i64(d, PYDICTOBJECT_ITEM_COUNT_OFFSET, size + 1)
+    _maybe_grow(d)
+    return 1
 
 
-def _rehash(d, new_capacity: int) -> int:
+def _dict_insert_rooted_slot(
+    dict_slot,
+    dict_handle,
+    key_slot,
+    key_handle,
+    value_slot,
+    value_handle,
+    indices,
+    entries,
+    capacity: int,
+    entries_used: int,
+    slot: int,
+    hash_val: int,
+) -> int:
+    # Publish key, value, index and size under one graph lock.  A store plan
+    # commits exactly one slot, so key and value need one plan each; both are
+    # initialized before the lock and finished after it, keeping every
+    # incref/decref finalizer outside the locked transaction.
+    d = _dict_read_reload_root(dict_slot, dict_handle)
+    key_plan = stack_alloc(128)
+    value_plan = stack_alloc(128)
+    backend: int = pcc_gc_backend()
+    pcc_gc_store_ptr_plan_init(key_plan, d, backend)
+    pcc_gc_store_ptr_plan_init(value_plan, d, backend)
+    pcc_py_gc_minor_graph_lock()
+    d = _dict_read_reload_root(dict_slot, dict_handle)
+    key = _dict_read_reload_root(key_slot, key_handle)
+    value = _dict_read_reload_root(value_slot, value_handle)
+    committed: int = 0
+    if _ptr_is_dict(d):
+        packed: int = load_i64(indices, slot * 8)
+        if (
+            ptr_eq(load_ptr(d, PYDICTOBJECT_INDICES_OFFSET), indices) != 0
+            and ptr_eq(load_ptr(d, PYDICTOBJECT_ENTRIES_OFFSET), entries) != 0
+            and load_i64(d, PYDICTOBJECT_CAPACITY_OFFSET) == capacity
+            and load_i64(d, PYDICTOBJECT_ENTRIES_USED_OFFSET) == entries_used
+            and slot >= 0
+            and slot < capacity
+            and entries_used >= 0
+            and entries_used < capacity
+            and (packed == -1 or packed == -2)
+        ):
+            ei: int = entries_used
+            entry_off: int = ei * DICTENTRY_SIZE
+            store_i64(entries, entry_off + DICTENTRY_HASH_OFFSET, hash_val)
+            store_ptr(entries, entry_off + DICTENTRY_KEY_OFFSET, null())
+            store_ptr(entries, entry_off + DICTENTRY_VALUE_OFFSET, null())
+            key_ok: int = pcc_gc_store_ptr_plan_commit_locked(
+                key_plan,
+                d,
+                ptr_add(entries, entry_off + DICTENTRY_KEY_OFFSET),
+                key,
+            )
+            value_ok: int = pcc_gc_store_ptr_plan_commit_locked(
+                value_plan,
+                d,
+                ptr_add(entries, entry_off + DICTENTRY_VALUE_OFFSET),
+                value,
+            )
+            if key_ok != 0 and value_ok != 0:
+                store_i64(d, PYDICTOBJECT_ENTRIES_USED_OFFSET, ei + 1)
+                store_i64(indices, slot * 8, ei)
+                size: int = load_i64(d, PYDICTOBJECT_ITEM_COUNT_OFFSET)
+                store_i64(d, PYDICTOBJECT_ITEM_COUNT_OFFSET, size + 1)
+                committed = 1
+            else:
+                # The entry was never indexed, so it stays unreachable; plan
+                # finish still balances any partial store.
+                store_i64(entries, entry_off + DICTENTRY_HASH_OFFSET, 0)
+    pcc_py_gc_minor_graph_unlock()
+    pcc_gc_store_ptr_plan_finish(key_plan)
+    pcc_gc_store_ptr_plan_finish(value_plan)
+    if committed != 0:
+        d = _dict_read_reload_root(dict_slot, dict_handle)
+        if _ptr_is_dict(d):
+            _maybe_grow(d)
+    return committed
+
+
+def _dict_replace_value_rooted_slot(
+    dict_slot,
+    dict_handle,
+    value_slot,
+    value_handle,
+    indices,
+    entries,
+    capacity: int,
+    slot: int,
+    ix: int,
+    hash_val: int,
+) -> int:
+    # `d[k] = v` keeps the original stored key object, so this never writes the
+    # key slot.  The displaced value is released in plan finish, after unlock.
+    d = _dict_read_reload_root(dict_slot, dict_handle)
+    plan = stack_alloc(128)
+    pcc_gc_store_ptr_plan_init(plan, d, pcc_gc_backend())
+    pcc_py_gc_minor_graph_lock()
+    d = _dict_read_reload_root(dict_slot, dict_handle)
+    value = _dict_read_reload_root(value_slot, value_handle)
+    committed: int = 0
+    if _ptr_is_dict(d):
+        entry_off: int = ix * DICTENTRY_SIZE
+        if (
+            ptr_eq(load_ptr(d, PYDICTOBJECT_INDICES_OFFSET), indices) != 0
+            and ptr_eq(load_ptr(d, PYDICTOBJECT_ENTRIES_OFFSET), entries) != 0
+            and load_i64(d, PYDICTOBJECT_CAPACITY_OFFSET) == capacity
+            and slot >= 0
+            and slot < capacity
+            and load_i64(indices, slot * 8) == ix
+            and ix >= 0
+            and ix < load_i64(d, PYDICTOBJECT_ENTRIES_USED_OFFSET)
+            and load_i64(entries, entry_off + DICTENTRY_HASH_OFFSET) == hash_val
+            and ptr_is_null(_entry_key(d, entries, entry_off)) == 0
+        ):
+            committed = pcc_gc_store_ptr_plan_commit_locked(
+                plan,
+                d,
+                ptr_add(entries, entry_off + DICTENTRY_VALUE_OFFSET),
+                value,
+            )
+    pcc_py_gc_minor_graph_unlock()
+    pcc_gc_store_ptr_plan_finish(plan)
+    return committed
+
+
+def _dict_del_rooted_slot(
+    dict_slot,
+    dict_handle,
+    indices,
+    entries,
+    capacity: int,
+    slot: int,
+    ix: int,
+) -> int:
+    # Key, value, index tombstone and size all publish under one graph lock;
+    # both releases run in plan finish after unlock.  The legacy path decref'd
+    # key and value first, so a finalizer re-entering the dict could observe a
+    # freed key behind a still-live index.
+    d = _dict_read_reload_root(dict_slot, dict_handle)
+    key_plan = stack_alloc(128)
+    value_plan = stack_alloc(128)
+    backend: int = pcc_gc_backend()
+    pcc_gc_store_ptr_plan_init(key_plan, d, backend)
+    pcc_gc_store_ptr_plan_init(value_plan, d, backend)
+    pcc_py_gc_minor_graph_lock()
+    d = _dict_read_reload_root(dict_slot, dict_handle)
+    committed: int = 0
+    if _ptr_is_dict(d):
+        entry_off: int = ix * DICTENTRY_SIZE
+        if (
+            ptr_eq(load_ptr(d, PYDICTOBJECT_INDICES_OFFSET), indices) != 0
+            and ptr_eq(load_ptr(d, PYDICTOBJECT_ENTRIES_OFFSET), entries) != 0
+            and load_i64(d, PYDICTOBJECT_CAPACITY_OFFSET) == capacity
+            and slot >= 0
+            and slot < capacity
+            and load_i64(indices, slot * 8) == ix
+            and ix >= 0
+            and ix < load_i64(d, PYDICTOBJECT_ENTRIES_USED_OFFSET)
+            and ptr_is_null(_entry_key(d, entries, entry_off)) == 0
+        ):
+            key_ok: int = pcc_gc_store_ptr_plan_commit_locked(
+                key_plan,
+                d,
+                ptr_add(entries, entry_off + DICTENTRY_KEY_OFFSET),
+                null(),
+            )
+            value_ok: int = pcc_gc_store_ptr_plan_commit_locked(
+                value_plan,
+                d,
+                ptr_add(entries, entry_off + DICTENTRY_VALUE_OFFSET),
+                null(),
+            )
+            if key_ok != 0 and value_ok != 0:
+                store_i64(indices, slot * 8, -2)  # PY_DICT_TOMBSTONE
+                size: int = load_i64(d, PYDICTOBJECT_ITEM_COUNT_OFFSET)
+                store_i64(d, PYDICTOBJECT_ITEM_COUNT_OFFSET, size - 1)
+                committed = 1
+    pcc_py_gc_minor_graph_unlock()
+    pcc_gc_store_ptr_plan_finish(key_plan)
+    pcc_gc_store_ptr_plan_finish(value_plan)
+    return committed
+
+
+def _dict_rooted_op(d, key, value, mode: int, status_slot):
+    # mode 0: get, returning an owned value.  mode 1: delete.  mode 2: set -
+    # fresh insert or value replacement.  Modes 1 and 2 return null() and
+    # report through status_slot when it is non-null.
+    if ptr_is_null(status_slot) == 0:
+        store_i64(status_slot, 0, 0)
+    backend: int = pcc_gc_backend()
+    dict_slot = stack_alloc(8)
+    key_slot = stack_alloc(8)
+    value_slot = stack_alloc(8)
+    candidate_slot = stack_alloc(8)
+    dict_handle = _dict_read_prepare_root(dict_slot, d, backend)
+    if _dict_read_root_failed(d, backend, dict_handle) != 0:
+        return null()
+    key_handle = _dict_read_prepare_root(key_slot, key, backend)
+    if _dict_read_root_failed(key, backend, key_handle) != 0:
+        _dict_read_finish_root(dict_handle)
+        return null()
+    value_handle = _dict_read_prepare_root(value_slot, value, backend)
+    if _dict_read_root_failed(value, backend, value_handle) != 0:
+        _dict_read_finish_root(key_handle)
+        _dict_read_finish_root(dict_handle)
+        return null()
+    key = _dict_read_reload_root(key_slot, key_handle)
+    hash_val: int = py_obj_hash(key)
+    d = _dict_read_reload_root(dict_slot, dict_handle)
+    key = _dict_read_reload_root(key_slot, key_handle)
+    if py_err_occurred() != 0:
+        _dict_read_finish_root(value_handle)
+        _dict_read_finish_root(key_handle)
+        _dict_read_finish_root(dict_handle)
+        return null()
+
+    result = null()
+    done: int = 0
+    attempts: int = 0
+    while done == 0 and attempts < 16:
+        attempts = attempts + 1
+        d = _dict_read_reload_root(dict_slot, dict_handle)
+        key = _dict_read_reload_root(key_slot, key_handle)
+        if not _ptr_is_dict(d):
+            done = 1
+            continue
+        capacity: int = load_i64(d, PYDICTOBJECT_CAPACITY_OFFSET)
+        indices = load_ptr(d, PYDICTOBJECT_INDICES_OFFSET)
+        entries = load_ptr(d, PYDICTOBJECT_ENTRIES_OFFSET)
+        entries_used: int = load_i64(d, PYDICTOBJECT_ENTRIES_USED_OFFSET)
+        if capacity <= 0 or ptr_is_null(indices) != 0 or ptr_is_null(entries) != 0:
+            done = 1
+            continue
+        mask: int = capacity - 1
+        perturb: int = hash_val
+        j: int = hash_val & mask
+        probes: int = 0
+        restart: int = 0
+        first_tombstone: int = -1
+        insert_slot: int = -1
+        mutated: int = 0
+        while probes < capacity + 16 and done == 0 and restart == 0:
+            ix: int = load_i64(indices, j * 8)
+            if ix == -1:
+                if first_tombstone >= 0:
+                    insert_slot = first_tombstone
+                else:
+                    insert_slot = j
+                done = 1
+            elif ix == -2:
+                if first_tombstone < 0:
+                    first_tombstone = j
+            elif ix >= 0 and ix < entries_used:
+                entry_off: int = ix * DICTENTRY_SIZE
+                entry_key = _entry_key(d, entries, entry_off)
+                entry_hash: int = load_i64(
+                    entries, entry_off + DICTENTRY_HASH_OFFSET
+                )
+                if ptr_is_null(entry_key) == 0 and entry_hash == hash_val:
+                    equal: int = 0
+                    callback: int = 0
+                    if ptr_eq(entry_key, key) != 0:
+                        equal = 1
+                    elif is_tagged_int(entry_key) != 0 and is_tagged_int(key) != 0:
+                        equal = 0
+                    elif (
+                        is_tagged_int(entry_key) == 0
+                        and is_tagged_int(key) == 0
+                        and load_i32(
+                            entry_key, PYOBJECTHEADER_TYPE_TAG_OFFSET
+                        ) == PY_TYPE_STR
+                        and load_i32(key, PYOBJECTHEADER_TYPE_TAG_OFFSET)
+                            == PY_TYPE_STR
+                    ):
+                        equal = py_str_eq(entry_key, key)
+                    else:
+                        callback = 1
+                        py_incref(entry_key)
+                        candidate_handle = _dict_read_prepare_root(
+                            candidate_slot, entry_key, backend
+                        )
+                        if _dict_read_root_failed(
+                            entry_key, backend, candidate_handle
+                        ) != 0:
+                            py_decref(entry_key)
+                            done = 1
+                        else:
+                            before_d = d
+                            equal = py_obj_eq(entry_key, key)
+                            d = _dict_read_reload_root(dict_slot, dict_handle)
+                            key = _dict_read_reload_root(key_slot, key_handle)
+                            candidate = _dict_read_reload_root(
+                                candidate_slot, candidate_handle
+                            )
+                            _dict_read_finish_root(candidate_handle)
+                            stable: int = 0
+                            if ptr_eq(d, before_d) != 0 and _ptr_is_dict(d):
+                                if (
+                                    load_i64(d, PYDICTOBJECT_CAPACITY_OFFSET)
+                                        == capacity
+                                    and ptr_eq(
+                                        load_ptr(d, PYDICTOBJECT_INDICES_OFFSET),
+                                        indices,
+                                    ) != 0
+                                    and ptr_eq(
+                                        load_ptr(d, PYDICTOBJECT_ENTRIES_OFFSET),
+                                        entries,
+                                    ) != 0
+                                    and load_i64(indices, j * 8) == ix
+                                ):
+                                    current = _entry_key(d, entries, entry_off)
+                                    if ptr_eq(current, candidate) != 0:
+                                        stable = 1
+                            py_decref(candidate)
+                            if py_err_occurred() != 0:
+                                # A raising __eq__ leaves py_obj_eq returning
+                                # 0.  Treating that as "not equal" would keep
+                                # probing and, in set mode, insert -- mutating
+                                # the dict even though the statement raises.
+                                _dict_read_finish_root(value_handle)
+                                _dict_read_finish_root(key_handle)
+                                _dict_read_finish_root(dict_handle)
+                                return null()
+                            if stable == 0:
+                                restart = 1
+                    if callback == 0 or restart == 0:
+                        if equal != 0 and restart == 0 and done == 0:
+                            if mode == 1:
+                                removed: int = _dict_del_rooted_slot(
+                                    dict_slot,
+                                    dict_handle,
+                                    indices,
+                                    entries,
+                                    capacity,
+                                    j,
+                                    ix,
+                                )
+                                if removed == 0:
+                                    restart = 1
+                                else:
+                                    if ptr_is_null(status_slot) == 0:
+                                        store_i64(status_slot, 0, 1)
+                                    mutated = 1
+                                    done = 1
+                            elif mode == 2:
+                                replaced: int = _dict_replace_value_rooted_slot(
+                                    dict_slot,
+                                    dict_handle,
+                                    value_slot,
+                                    value_handle,
+                                    indices,
+                                    entries,
+                                    capacity,
+                                    j,
+                                    ix,
+                                    hash_val,
+                                )
+                                if replaced == 0:
+                                    restart = 1
+                                else:
+                                    if ptr_is_null(status_slot) == 0:
+                                        store_i64(status_slot, 0, 1)
+                                    mutated = 1
+                                    done = 1
+                            else:
+                                found = _entry_value(d, entries, entry_off)
+                                if ptr_is_null(found) == 0:
+                                    py_incref(found)
+                                    result = found
+                                done = 1
+            if done == 0 and restart == 0:
+                perturb = _perturb_shift5(perturb)
+                j = (j * 5 + perturb + 1) & mask
+                probes = probes + 1
+        if mode == 2 and restart == 0 and mutated == 0:
+            target: int = insert_slot
+            if target < 0:
+                target = first_tombstone
+            if target >= 0:
+                inserted: int = _dict_insert_rooted_slot(
+                    dict_slot,
+                    dict_handle,
+                    key_slot,
+                    key_handle,
+                    value_slot,
+                    value_handle,
+                    indices,
+                    entries,
+                    capacity,
+                    entries_used,
+                    target,
+                    hash_val,
+                )
+                if inserted == 0:
+                    done = 0
+                    restart = 1
+                elif ptr_is_null(status_slot) == 0:
+                    store_i64(status_slot, 0, 1)
+    _dict_read_finish_root(value_handle)
+    _dict_read_finish_root(key_handle)
+    _dict_read_finish_root(dict_handle)
+    return result
+
+
+def _rehash_find_empty_slot(indices, capacity: int, hash_val: int) -> int:
+    mask: int = capacity - 1
+    perturb: int = hash_val
+    slot: int = hash_val & mask
+    probes: int = 0
+    while probes < capacity + 16:
+        if load_i64(indices, slot * 8) == -1:
+            return slot
+        perturb = _perturb_shift5(perturb)
+        slot = (slot * 5 + perturb + 1) & mask
+        probes = probes + 1
+    return -1
+
+
+def _rehash_refcount_fast(d, new_capacity: int) -> int:
     old_entries = load_ptr(d, PYDICTOBJECT_ENTRIES_OFFSET)
     old_indices = load_ptr(d, PYDICTOBJECT_INDICES_OFFSET)
     old_entries_used: int = load_i64(d, PYDICTOBJECT_ENTRIES_USED_OFFSET)
-
     new_indices = malloc(new_capacity * 8)
-    if ptr_is_null(new_indices) != 0:
-        return -1
     new_entries = malloc(new_capacity * DICTENTRY_SIZE)
-    if ptr_is_null(new_entries) != 0:
+    if ptr_is_null(new_indices) != 0 or ptr_is_null(new_entries) != 0:
+        free(new_entries)
         free(new_indices)
         return -1
-    i: int = 0
-    while i < new_capacity:
-        store_i64(new_indices, i * 8, -1)
-        i = i + 1
-
+    memset(new_entries, 0, new_capacity * DICTENTRY_SIZE)
+    init_index: int = 0
+    while init_index < new_capacity:
+        store_i64(new_indices, init_index * 8, -1)
+        init_index = init_index + 1
+    new_entries_used: int = 0
+    old_index: int = 0
+    while old_index < old_entries_used:
+        old_off: int = old_index * DICTENTRY_SIZE
+        key = load_ptr(old_entries, old_off + DICTENTRY_KEY_OFFSET)
+        if ptr_is_null(key) == 0:
+            hash_value: int = load_i64(
+                old_entries, old_off + DICTENTRY_HASH_OFFSET
+            )
+            target_slot: int = _rehash_find_empty_slot(
+                new_indices, new_capacity, hash_value
+            )
+            if target_slot < 0:
+                free(new_entries)
+                free(new_indices)
+                return -1
+            new_off: int = new_entries_used * DICTENTRY_SIZE
+            store_i64(
+                new_entries, new_off + DICTENTRY_HASH_OFFSET, hash_value
+            )
+            store_ptr(new_entries, new_off + DICTENTRY_KEY_OFFSET, key)
+            store_ptr(
+                new_entries,
+                new_off + DICTENTRY_VALUE_OFFSET,
+                load_ptr(old_entries, old_off + DICTENTRY_VALUE_OFFSET),
+            )
+            store_i64(new_indices, target_slot * 8, new_entries_used)
+            new_entries_used = new_entries_used + 1
+        old_index = old_index + 1
     store_ptr(d, PYDICTOBJECT_INDICES_OFFSET, new_indices)
     store_ptr(d, PYDICTOBJECT_ENTRIES_OFFSET, new_entries)
     store_i64(d, PYDICTOBJECT_CAPACITY_OFFSET, new_capacity)
-    store_i64(d, PYDICTOBJECT_ITEM_COUNT_OFFSET, 0)
-    store_i64(d, PYDICTOBJECT_ENTRIES_USED_OFFSET, 0)
-    pcc_gc_backend4_zpage_register_owner_payload_span(d, new_entries, new_capacity * DICTENTRY_SIZE)
+    store_i64(d, PYDICTOBJECT_ITEM_COUNT_OFFSET, new_entries_used)
+    store_i64(d, PYDICTOBJECT_ENTRIES_USED_OFFSET, new_entries_used)
     free(old_indices)
-
-    # Walk old entries in insertion order, copying live ones over.
-    j: int = 0
-    while j < old_entries_used:
-        old_off: int = j * DICTENTRY_SIZE
-        k = _entry_key(d, old_entries, old_off)
-        if ptr_is_null(k) == 0:
-            h: int = load_i64(old_entries, old_off + DICTENTRY_HASH_OFFSET)
-            v = _entry_value(d, old_entries, old_off)
-            packed: int = _lookup(d, h, k)
-            slot: int = _slot_of(packed)
-            ei: int = load_i64(d, PYDICTOBJECT_ENTRIES_USED_OFFSET)
-            store_i64(d, PYDICTOBJECT_ENTRIES_USED_OFFSET, ei + 1)
-            new_off: int = ei * DICTENTRY_SIZE
-            store_i64(new_entries, new_off + DICTENTRY_HASH_OFFSET, h)
-            store_ptr(new_entries, new_off + DICTENTRY_KEY_OFFSET, k)
-            store_ptr(new_entries, new_off + DICTENTRY_VALUE_OFFSET, v)
-            pcc_gc_note_slot_write_barrier(d, ptr_add(new_entries, new_off + DICTENTRY_KEY_OFFSET), k)
-            pcc_gc_note_slot_write_barrier(d, ptr_add(new_entries, new_off + DICTENTRY_VALUE_OFFSET), v)
-            store_i64(new_indices, slot * 8, ei)
-            sz: int = load_i64(d, PYDICTOBJECT_ITEM_COUNT_OFFSET)
-            store_i64(d, PYDICTOBJECT_ITEM_COUNT_OFFSET, sz + 1)
-        j = j + 1
     free(old_entries)
     return 0
+
+
+def _rehash(d, new_capacity: int) -> int:
+    if ptr_is_null(d) != 0 or new_capacity <= 0:
+        return -1
+    initial_backend: int = pcc_gc_backend()
+    if initial_backend == 0:
+        return _rehash_refcount_fast(d, new_capacity)
+    owner_slot = stack_alloc(8)
+    store_ptr(owner_slot, 0, d)
+    owner_handle = null()
+    if initial_backend == 3 or initial_backend == 4:
+        owner_handle = pcc_gc_scheduler_root_register_handle(owner_slot)
+        if ptr_is_null(owner_handle) != 0:
+            return -1
+
+    attempt: int = 0
+    while attempt < 8:
+        attempt = attempt + 1
+        pcc_py_gc_minor_graph_lock()
+        if pcc_gc_backend() != initial_backend:
+            pcc_py_gc_minor_graph_unlock()
+            break
+        if ptr_is_null(owner_handle) == 0:
+            d = pcc_gc_load_ptr(null(), owner_slot)
+            store_ptr(owner_slot, 0, d)
+        old_entries = load_ptr(d, PYDICTOBJECT_ENTRIES_OFFSET)
+        old_indices = load_ptr(d, PYDICTOBJECT_INDICES_OFFSET)
+        old_capacity: int = load_i64(d, PYDICTOBJECT_CAPACITY_OFFSET)
+        old_entries_used: int = load_i64(
+            d, PYDICTOBJECT_ENTRIES_USED_OFFSET
+        )
+        old_size: int = load_i64(d, PYDICTOBJECT_ITEM_COUNT_OFFSET)
+        pcc_py_gc_minor_graph_unlock()
+        if ptr_is_null(old_entries) != 0 or ptr_is_null(old_indices) != 0:
+            break
+        if old_capacity <= 0 or new_capacity < old_capacity:
+            break
+        if old_entries_used < 0 or old_entries_used > old_capacity:
+            break
+        if old_size < 0 or old_size > new_capacity:
+            break
+
+        new_indices = malloc(new_capacity * 8)
+        new_entries = malloc(new_capacity * DICTENTRY_SIZE)
+        slot_pairs = null()
+        if old_entries_used > 0:
+            slot_pairs = malloc(old_entries_used * 4 * 8)
+        if (
+            ptr_is_null(new_indices) != 0
+            or ptr_is_null(new_entries) != 0
+            or (old_entries_used > 0 and ptr_is_null(slot_pairs) != 0)
+        ):
+            free(slot_pairs)
+            free(new_entries)
+            free(new_indices)
+            break
+        memset(new_entries, 0, new_capacity * DICTENTRY_SIZE)
+        if old_entries_used > 0:
+            memset(slot_pairs, 0, old_entries_used * 4 * 8)
+        init_index: int = 0
+        while init_index < new_capacity:
+            store_i64(new_indices, init_index * 8, -1)
+            init_index = init_index + 1
+
+        pcc_py_gc_minor_graph_lock()
+        if pcc_gc_backend() != initial_backend:
+            pcc_py_gc_minor_graph_unlock()
+            free(slot_pairs)
+            free(new_entries)
+            free(new_indices)
+            break
+        if ptr_is_null(owner_handle) == 0:
+            d = pcc_gc_load_ptr(null(), owner_slot)
+            store_ptr(owner_slot, 0, d)
+        if (
+            ptr_eq(load_ptr(d, PYDICTOBJECT_ENTRIES_OFFSET), old_entries) == 0
+            or ptr_eq(load_ptr(d, PYDICTOBJECT_INDICES_OFFSET), old_indices) == 0
+            or load_i64(d, PYDICTOBJECT_CAPACITY_OFFSET) != old_capacity
+            or load_i64(d, PYDICTOBJECT_ENTRIES_USED_OFFSET) != old_entries_used
+            or load_i64(d, PYDICTOBJECT_ITEM_COUNT_OFFSET) != old_size
+        ):
+            pcc_py_gc_minor_graph_unlock()
+            free(slot_pairs)
+            free(new_entries)
+            free(new_indices)
+            continue
+
+        new_entries_used: int = 0
+        new_size: int = 0
+        pair_count: int = 0
+        copy_valid: int = 1
+        old_index: int = 0
+        while old_index < old_entries_used:
+            old_off: int = old_index * DICTENTRY_SIZE
+            key = _entry_key(d, old_entries, old_off)
+            if ptr_is_null(key) == 0:
+                hash_value: int = load_i64(
+                    old_entries, old_off + DICTENTRY_HASH_OFFSET
+                )
+                value = _entry_value(d, old_entries, old_off)
+                target_slot: int = _rehash_find_empty_slot(
+                    new_indices, new_capacity, hash_value
+                )
+                if target_slot < 0:
+                    copy_valid = 0
+                    break
+                new_off: int = new_entries_used * DICTENTRY_SIZE
+                store_i64(
+                    new_entries,
+                    new_off + DICTENTRY_HASH_OFFSET,
+                    hash_value,
+                )
+                store_ptr(new_entries, new_off + DICTENTRY_KEY_OFFSET, key)
+                store_ptr(new_entries, new_off + DICTENTRY_VALUE_OFFSET, value)
+                store_i64(new_indices, target_slot * 8, new_entries_used)
+                store_ptr(
+                    slot_pairs,
+                    pair_count * 16,
+                    ptr_add(old_entries, old_off + DICTENTRY_KEY_OFFSET),
+                )
+                store_ptr(
+                    slot_pairs,
+                    pair_count * 16 + 8,
+                    ptr_add(new_entries, new_off + DICTENTRY_KEY_OFFSET),
+                )
+                pair_count = pair_count + 1
+                store_ptr(
+                    slot_pairs,
+                    pair_count * 16,
+                    ptr_add(old_entries, old_off + DICTENTRY_VALUE_OFFSET),
+                )
+                store_ptr(
+                    slot_pairs,
+                    pair_count * 16 + 8,
+                    ptr_add(new_entries, new_off + DICTENTRY_VALUE_OFFSET),
+                )
+                pair_count = pair_count + 1
+                new_entries_used = new_entries_used + 1
+                new_size = new_size + 1
+            old_index = old_index + 1
+
+        retargeted: int = 0
+        if copy_valid != 0:
+            retargeted = pcc_gc_backend4_retarget_mutator_payload_locked(
+                d,
+                old_entries,
+                old_capacity * DICTENTRY_SIZE,
+                new_entries,
+                new_capacity * DICTENTRY_SIZE,
+                slot_pairs,
+                pair_count,
+            )
+        if copy_valid == 0 or retargeted == 0:
+            pcc_py_gc_minor_graph_unlock()
+            free(slot_pairs)
+            free(new_entries)
+            free(new_indices)
+            break
+        pair_index: int = 0
+        while pair_index < pair_count:
+            new_slot = load_ptr(slot_pairs, pair_index * 16 + 8)
+            pcc_gc_note_slot_write_barrier(
+                d, new_slot, load_ptr(new_slot, 0)
+            )
+            pair_index = pair_index + 1
+        store_ptr(d, PYDICTOBJECT_INDICES_OFFSET, new_indices)
+        store_ptr(d, PYDICTOBJECT_ENTRIES_OFFSET, new_entries)
+        store_i64(d, PYDICTOBJECT_CAPACITY_OFFSET, new_capacity)
+        store_i64(d, PYDICTOBJECT_ITEM_COUNT_OFFSET, new_size)
+        store_i64(
+            d, PYDICTOBJECT_ENTRIES_USED_OFFSET, new_entries_used
+        )
+        if retargeted == 2:
+            pcc_gc_backend4_zpage_register_owner_payload_span(
+                d, new_entries, new_capacity * DICTENTRY_SIZE
+            )
+        pcc_py_gc_minor_graph_unlock()
+        free(old_indices)
+        free(old_entries)
+        free(slot_pairs)
+        if ptr_is_null(owner_handle) == 0:
+            pcc_gc_scheduler_root_unregister_handle(owner_handle)
+        return 0
+
+    if ptr_is_null(owner_handle) == 0:
+        pcc_gc_scheduler_root_unregister_handle(owner_handle)
+    return -1
 
 
 def _maybe_grow(d) -> int:
@@ -335,6 +1027,7 @@ def py_dict_new():
         py_decref(d)
         return null()
     py_gc_track(d)
+    pcc_gc_publish_initialized(d)
     return d
 
 
@@ -344,19 +1037,26 @@ def py_dict_set(d, key, value) -> None:
         return
     if ptr_is_null(key) != 0:
         return
-    h: int = py_obj_hash(key)
-    if py_err_occurred() != 0:
-        return
-    packed: int = _lookup(d, h, key)
-    ix: int = _entry_idx_of(packed)
-    if ix >= 0:
-        # Update existing — replace value, keep key.
-        entries = load_ptr(d, PYDICTOBJECT_ENTRIES_OFFSET)
-        entry_off: int = ix * DICTENTRY_SIZE
-        pcc_gc_store_ptr(d, ptr_add(entries, entry_off + DICTENTRY_VALUE_OFFSET), value)
-        return
-    _insert_fresh(d, h, key, value)
-    _maybe_grow(d)
+    if pcc_gc_backend() == 0:
+        kind: int = _dict_fast0_key_kind(key)
+        if kind != 0:
+            insert_slot = stack_alloc(8)
+            hash_val: int = _dict_fast0_hash(key, kind)
+            ix: int = _dict_probe_fast0(d, key, kind, hash_val, insert_slot)
+            if ix >= 0:
+                # ``d[k] = v`` keeps the stored key object; replace the value.
+                entries = load_ptr(d, PYDICTOBJECT_ENTRIES_OFFSET)
+                pcc_gc_store_ptr(
+                    d,
+                    ptr_add(entries, ix * DICTENTRY_SIZE + DICTENTRY_VALUE_OFFSET),
+                    value,
+                )
+                return
+            if ix == -1:
+                target: int = load_i64(insert_slot, 0)
+                if target >= 0 and _dict_insert_fast0(d, key, value, target, hash_val) != 0:
+                    return
+    _dict_rooted_op(d, key, value, 2, null())
 
 
 @c_abi_export("py_dict_get")
@@ -365,19 +1065,22 @@ def py_dict_get(d, key):
         return null()
     if ptr_is_null(key) != 0:
         return null()
-    h: int = py_obj_hash(key)
-    if py_err_occurred() != 0:
-        return null()
-    packed: int = _lookup(d, h, key)
-    ix: int = _entry_idx_of(packed)
-    if ix < 0:
-        return null()
-    entries = load_ptr(d, PYDICTOBJECT_ENTRIES_OFFSET)
-    v = pcc_gc_load_ptr(d, ptr_add(entries, ix * DICTENTRY_SIZE + 16))
-    if ptr_is_null(v) != 0:
-        return null()
-    py_incref(v)
-    return v
+    if pcc_gc_backend() == 0:
+        kind: int = _dict_fast0_key_kind(key)
+        if kind != 0:
+            insert_slot = stack_alloc(8)
+            ix: int = _dict_probe_fast0(
+                d, key, kind, _dict_fast0_hash(key, kind), insert_slot
+            )
+            if ix >= 0:
+                entries = load_ptr(d, PYDICTOBJECT_ENTRIES_OFFSET)
+                found = load_ptr(entries, ix * DICTENTRY_SIZE + DICTENTRY_VALUE_OFFSET)
+                if ptr_is_null(found) == 0:
+                    py_incref(found)
+                    return found
+            elif ix == -1:
+                return null()
+    return _dict_rooted_op(d, key, null(), 0, null())
 
 
 @c_abi_export("py_dict_get_default")
@@ -402,7 +1105,7 @@ def py_dict_getitem(d, key):
     if py_err_occurred() != 0:
         return null()
     exc = py_exc_new_with_value(4, key)  # PY_EXC_KEYERROR
-    py_raise(exc)
+    py_raise_owned(exc)
     return null()
 
 
@@ -468,7 +1171,7 @@ def py_dict_pop(d, key):
     if py_err_occurred() != 0:
         return null()
     exc = py_exc_new_with_value(4, key)  # PY_EXC_KEYERROR
-    py_raise(exc)
+    py_raise_owned(exc)
     return null()
 
 
@@ -497,7 +1200,7 @@ def py_dict_popitem(d):
         i = i - 1
     if found == 0:
         exc = py_exc_new_with_value(4, null())  # bare KeyError
-        py_raise(exc)
+        py_raise_owned(exc)
         return null()
     return result
 
@@ -508,14 +1211,11 @@ def py_dict_contains(d, key) -> int:
         return 0
     if ptr_is_null(key) != 0:
         return 0
-    h: int = py_obj_hash(key)
-    if py_err_occurred() != 0:
+    value = py_dict_get(d, key)
+    if ptr_is_null(value) != 0:
         return 0
-    packed: int = _lookup(d, h, key)
-    ix: int = _entry_idx_of(packed)
-    if ix >= 0:
-        return 1
-    return 0
+    py_decref(value)
+    return 1
 
 
 @c_abi_export("py_dict_del")
@@ -524,27 +1224,12 @@ def py_dict_del(d, key) -> int:
         return -1
     if ptr_is_null(key) != 0:
         return -1
-    h: int = py_obj_hash(key)
-    if py_err_occurred() != 0:
-        return -1
-    packed: int = _lookup(d, h, key)
-    ix: int = _entry_idx_of(packed)
-    if ix < 0:
-        return -1
-    slot: int = _slot_of(packed)
-    entries = load_ptr(d, PYDICTOBJECT_ENTRIES_OFFSET)
-    indices = load_ptr(d, PYDICTOBJECT_INDICES_OFFSET)
-    entry_off: int = ix * DICTENTRY_SIZE
-    ek = _entry_key(d, entries, entry_off)
-    ev = _entry_value(d, entries, entry_off)
-    py_decref(ek)
-    py_decref(ev)
-    store_ptr(entries, entry_off + DICTENTRY_KEY_OFFSET, null())
-    store_ptr(entries, entry_off + DICTENTRY_VALUE_OFFSET, null())
-    store_i64(indices, slot * 8, -2)  # PY_DICT_TOMBSTONE
-    sz: int = load_i64(d, PYDICTOBJECT_ITEM_COUNT_OFFSET)
-    store_i64(d, PYDICTOBJECT_ITEM_COUNT_OFFSET, sz - 1)
-    return 0
+    status = stack_alloc(8)
+    store_i64(status, 0, 0)
+    _dict_rooted_op(d, key, null(), 1, status)
+    if load_i64(status, 0) != 0:
+        return 0
+    return -1
 
 
 @c_abi_export("py_dict_clear")
@@ -705,17 +1390,120 @@ def py_dict_items(d):
 
 @c_abi_export("py_dict_update")
 def py_dict_update(dst, src) -> None:
+    # Snapshot the source before invoking destination hash/equality callbacks.
+    # py_dict_set runs user code, which may relocate either dict or mutate the
+    # source, so caching the source table across those calls would leave later
+    # iterations reading a stale owner/table.  Mirrors py_set_update.  The
+    # snapshot holds key and value alternately.
     if not _ptr_is_dict(dst):
         return
     if not _ptr_is_dict(src):
         return
-    entries = load_ptr(src, PYDICTOBJECT_ENTRIES_OFFSET)
-    entries_used: int = load_i64(src, PYDICTOBJECT_ENTRIES_USED_OFFSET)
+    backend: int = pcc_gc_backend()
+    dst_slot = stack_alloc(8)
+    src_slot = stack_alloc(8)
+    snap_slot = stack_alloc(8)
+    key_slot = stack_alloc(8)
+    value_slot = stack_alloc(8)
+    dst_handle = _dict_read_prepare_root(dst_slot, dst, backend)
+    if _dict_read_root_failed(dst, backend, dst_handle) != 0:
+        return
+    src_handle = _dict_read_prepare_root(src_slot, src, backend)
+    if _dict_read_root_failed(src, backend, src_handle) != 0:
+        _dict_read_finish_root(dst_handle)
+        return
+
+    src = _dict_read_reload_root(src_slot, src_handle)
+    size_hint: int = load_i64(src, PYDICTOBJECT_ITEM_COUNT_OFFSET) * 2
+    if size_hint <= 0:
+        size_hint = 4
+    snapshot = py_list_new(size_hint)
+    if ptr_is_null(snapshot) != 0:
+        _dict_read_finish_root(src_handle)
+        _dict_read_finish_root(dst_handle)
+        return
+    snap_handle = _dict_read_prepare_root(snap_slot, snapshot, backend)
+    if _dict_read_root_failed(snapshot, backend, snap_handle) != 0:
+        py_decref(snapshot)
+        _dict_read_finish_root(src_handle)
+        _dict_read_finish_root(dst_handle)
+        return
+
+    src = _dict_read_reload_root(src_slot, src_handle)
+    source_used: int = load_i64(src, PYDICTOBJECT_ENTRIES_USED_OFFSET)
     i: int = 0
-    while i < entries_used:
-        off: int = i * DICTENTRY_SIZE
-        k = _entry_key(src, entries, off)
-        if ptr_is_null(k) == 0:
-            v = _entry_value(src, entries, off)
-            py_dict_set(dst, k, v)
+    stop: int = 0
+    while i < source_used and stop == 0:
+        src = _dict_read_reload_root(src_slot, src_handle)
+        if not _ptr_is_dict(src):
+            stop = 1
+        elif i >= load_i64(src, PYDICTOBJECT_ENTRIES_USED_OFFSET):
+            stop = 1
+        else:
+            entries = load_ptr(src, PYDICTOBJECT_ENTRIES_OFFSET)
+            off: int = i * DICTENTRY_SIZE
+            k = _entry_key(src, entries, off)
+            if ptr_is_null(k) == 0:
+                v = _entry_value(src, entries, off)
+                snapshot = _dict_read_reload_root(snap_slot, snap_handle)
+                py_list_append(snapshot, k)
+                if py_err_occurred() != 0:
+                    stop = 1
+                else:
+                    snapshot = _dict_read_reload_root(snap_slot, snap_handle)
+                    py_list_append(snapshot, v)
+                    if py_err_occurred() != 0:
+                        stop = 1
         i = i + 1
+
+    snapshot = _dict_read_reload_root(snap_slot, snap_handle)
+    snap_len: int = py_list_len(snapshot)
+    j: int = 0
+    done: int = 0
+    while j + 1 < snap_len and done == 0:
+        if py_err_occurred() != 0:
+            done = 1
+        else:
+            snapshot = _dict_read_reload_root(snap_slot, snap_handle)
+            key = py_list_get(snapshot, j)
+            snapshot = _dict_read_reload_root(snap_slot, snap_handle)
+            value = py_list_get(snapshot, j + 1)
+            if ptr_is_null(key) != 0 or ptr_is_null(value) != 0:
+                done = 1
+            else:
+                key_handle = _dict_read_prepare_root(key_slot, key, backend)
+                if _dict_read_root_failed(key, backend, key_handle) != 0:
+                    # Mirrors the C path: an unregistered key must not cross a
+                    # user hash/equality callback, and the pre-move pointer
+                    # must not be decref'd afterwards.
+                    py_decref(key)
+                    py_decref(value)
+                    done = 1
+                value_handle = _dict_read_prepare_root(
+                    value_slot, value, backend
+                )
+                if done == 0 and _dict_read_root_failed(
+                    value, backend, value_handle
+                ) != 0:
+                    _dict_read_finish_root(key_handle)
+                    py_decref(key)
+                    py_decref(value)
+                    done = 1
+                dst = _dict_read_reload_root(dst_slot, dst_handle)
+                key = _dict_read_reload_root(key_slot, key_handle)
+                value = _dict_read_reload_root(value_slot, value_handle)
+                if done == 0:
+                    py_dict_set(dst, key, value)
+                    key = _dict_read_reload_root(key_slot, key_handle)
+                    value = _dict_read_reload_root(value_slot, value_handle)
+                    _dict_read_finish_root(value_handle)
+                    _dict_read_finish_root(key_handle)
+                    py_decref(key)
+                    py_decref(value)
+        j = j + 2
+
+    snapshot = _dict_read_reload_root(snap_slot, snap_handle)
+    _dict_read_finish_root(snap_handle)
+    py_decref(snapshot)
+    _dict_read_finish_root(src_handle)
+    _dict_read_finish_root(dst_handle)

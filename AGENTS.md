@@ -11,7 +11,7 @@ Startup route for active goal work and direct human task intake:
    protocol.
 3. Read `docs/current-goal-state.md` for the current audit state and the
    investigation/doc routing that should be read next.
-4. Inspect `docs/goal/task-board.yaml` through `scripts/goal_state.py next` before
+4. Inspect `docs/goal/task-board.yaml` through `scripts/goal_state.py resume` before
    choosing active goal work. This structured task board is the source for
    migrated rows and new actionable tasks; `DONE_WEAK` is still unfinished.
    This applies to directly launched agents too, not only Codex `/goal` or
@@ -44,9 +44,66 @@ agent-neutral and should not mention Codex, Claude, or any specific runner.
 For active goal work:
 
 ```bash
-env -u LC_ALL uv run python scripts/goal_state.py next
-env -u LC_ALL uv run python scripts/goal_state.py validate
+gtimeout 30s env -u LC_ALL uv run python scripts/goal_state.py resume
 ```
+
+### Ordinary-session continuation
+
+`继续任务板`, `continue the task board`, `continue active goal`, and equivalent
+ordinary requests mean: run the repository `resume` command above and follow
+its selected task. They are continuation commands, not new-task intake, and
+they do not activate or require a product-specific persistent Goal mode.
+
+When `resume` reports `CONTINUE`, finish the selected row or its next finite
+slice, add the required evidence, update and validate the task board, then run
+`resume` again immediately. Do not voluntarily end the session while `resume`
+reports `CONTINUE`; continue across task boundaries. Stop only when it reports
+`COMPLETE`, the human explicitly says stop/cancel/switch, or `BLOCKED`/
+`MILESTONE_COMPLETE` identifies a real authority transition that cannot be
+resolved from repository state. This loop is runner-neutral and applies to
+ordinary sessions with no Goal mode, loops, or persistent-agent facility.
+
+Before sending any final response while task-board work is active, run:
+
+```bash
+gtimeout 30s env -u LC_ALL uv run python scripts/goal_state.py finish-check
+```
+
+Exit 4 / `finalization: DENIED` is a hard stop on finalization: send only a
+commentary checkpoint and continue the selected task. Runners must treat this
+command as a pre-final gate, not as advisory text. Only `BLOCKED`,
+`MILESTONE_COMPLETE`, or board-wide `COMPLETE` returns an allowed receipt.
+
+### Task-board mutations
+
+No CRUD command is required. Agents make narrow structured edits to
+`docs/goal/task-board.yaml`, run `goal_state.py validate`, then run
+`goal_state.py resume`. The supported operations are:
+
+- **Add a task:** create one agent-neutral row with a unique id, requested
+  `P0`, `P1`, or `P2` priority, status, track, title, claim/open boundaries,
+  milestone, dependencies, rank, exit criteria, and required gates. Normal
+  additions use the ordinary queue. If work starts now, use `IN_PROGRESS`;
+  otherwise use the honest TODO/design status.
+- **Add an immediate task:** only an explicit human request for immediate
+  execution authorizes `dispatch: IMMEDIATE`. It outranks normal ready rows
+  regardless of rank or priority, but never bypasses dependencies: `resume`
+  selects a dependency-ready prerequisite first or reports a real blocker.
+  Keep the interrupted parent row intact; after the immediate row completes,
+  rerun `resume` to return to the authoritative unfinished queue.
+- **Update a task:** patch only the exact requested row, preserve unrelated
+  fields and linked evidence, keep status/claim language honest, validate, and
+  confirm the resulting selection with `resume`.
+- **Remove a task:** destructive removal requires an explicit exact task id.
+  Inspect reverse dependencies first. If any row depends on it, stop unless
+  the human also authorizes the exact dependency rewrite or replacement. Write
+  a small removal receipt under `docs/goal/evidence/`, remove only that YAML
+  row, retain linked evidence/investigations/docs unless they are separately
+  named for deletion, then validate and resume.
+
+Priority is not an urgency synonym: `dispatch: IMMEDIATE` is the explicit
+interrupt mechanism. For normal rows, established `rank`, then priority, then
+id ordering remains authoritative.
 
 Add new actionable work as a task row in `docs/goal/task-board.yaml`, with a
 priority, status, track, title, open boundary, and required gate commands. Add
@@ -60,7 +117,7 @@ into the task board", or describes a new actionable goal, put it in
 `docs/goal/task-board.yaml` immediately instead of leaving it only in chat,
 `docs/goal/goal-prompt.md`, or `docs/current-goal-state.md`. Once the row exists,
 every directly launched agent, Claude loop, or Codex `/goal` run must see it
-through `scripts/goal_state.py next`; no extra `/goal` prompt or loop-specific
+through `scripts/goal_state.py resume`; no extra `/goal` prompt or loop-specific
 bootstrap is required for the task to become eligible. Use
 `docs/goal/goal-prompt.md` only for protocol and long-form guardrails, not as
 the place where new executable tasks live. This is an `AGENTS.md` startup rule, so
@@ -70,7 +127,7 @@ session just to make newly added tasks visible.
 Direct human-task intake is part of startup state, not a separate loop mode. If
 the current conversation or startup prompt contains a new actionable task,
 normalize it into `docs/goal/task-board.yaml` first, run
-`env -u LC_ALL uv run python scripts/goal_state.py validate`, and then let the
+`gtimeout 30s env -u LC_ALL uv run python scripts/goal_state.py resume`, and then let the
 normal priority order choose it. Do not wait for a `/goal` command, cron loop,
 or agent-specific bootstrap before recording the task.
 
@@ -98,7 +155,7 @@ inspectable, self-hostable, package-aware, runtime-extensible, and honest about
 every fallback boundary. pcc treats performance as a **consequence of proven
 semantics, never a license to weaken Python behavior.**
 
-**What separates pcc from a Python accelerator.** Five things. Without them pcc
+**What separates pcc from a Python accelerator.** Six things. Without them pcc
 is just another speedup tool; with them it is a system rebuilding Python
 *execution ownership*. Do not let any of these decay into decoration:
 
@@ -112,6 +169,10 @@ is just another speedup tool; with them it is a system rebuilding Python
 4. self-backend as a first-class execution root (LLVM is oracle, not owner)
 5. long-running runtime efficiency (pause / RSS / throughput / fragmentation
    over time, not single-shot compile+run speed)
+6. complete Python execution ownership — implement every missing surface in
+   pcc and remove every CPython/libpython/LLVM/host/C-owner or hidden fallback;
+   until a surface is implemented, fail closed with an explicit capability
+   diagnostic rather than silently changing execution owner
 ```
 
 **The fixed point is more than a byte compare.** It is evidence that pcc's
@@ -415,6 +476,16 @@ Do not do that here.
   in-flight work that has not yet been committed. If you believe a previous
   change is wrong, leave it in place and discuss with the user, or stage a
   *new* commit that supersedes it.
+- **Do not investigate or police other sessions through Git history, commit
+  timestamps, reflogs, process-CWD inspection, or similar heuristics.** The
+  shared-working-directory warning is a preservation rule, not an exclusivity
+  requirement. Treat the current filesystem/worktree as authoritative, re-read
+  a target before applying a narrow patch, and continue unless an actual
+  overlapping edit conflict prevents safe progress. A request to work solo
+  means do not spawn or contact subagents; it does not require proving that no
+  other human or process can write to the repository. Source-stability checks
+  required before broad gates may compare relevant file identities, but must
+  not turn into author attribution or session surveillance.
 - **Do not perform file-overwrite operations via git (including revert/restore
   checkout/reset --hard/clean/stash or equivalent) unless explicitly requested
   by the user.** This applies to all working-tree files touched in this
@@ -429,6 +500,97 @@ Do not do that here.
   directories unless the user explicitly names the files/directories to
   remove.** Treat `rm`, scripted deletion, and bulk cleanup of docs as
   destructive operations, even when git could recover them.
+
+
+## Autonomous Convergence Guardrails
+
+These rules apply to long-running optimization, migration, bootstrap, and
+task-board work.  They prevent local progress from being mistaken for goal
+completion.
+
+- **A requested conceptual closure is binding.** If the human says to finish a
+  concept, remove every hot-path instance of that concept before closing the
+  row.  A remaining representation may be called cold/diagnostic/unsupported
+  only when all four facts are proven: it is unreachable on the supported
+  normal path, a counter or inventory records zero normal-path uses, its lazy
+  adapter has an exact regression test, and the task evidence names it.  Low
+  Amdahl share, construction-only lifetime, or inconvenient implementation
+  size does not turn an unfinished hot representation into completed work.
+  `DONE_WEAK` and a non-empty `open_boundary` are unfinished states.
+
+- **Match optimization scale to the goal gap.** Before selecting a performance
+  candidate, record the end-to-end gap, the candidate owner's measured share,
+  and its Amdahl ceiling.  When the goal gap is at least 1.5x and three
+  consecutive candidates each measure below 5% or have a ceiling below 10%,
+  stop selecting adjacent helpers.  Re-profile the complete path, write the
+  architectural owner and a vertical slice, and resume only with work capable
+  of changing that owner.  A structural closure task may still remove a small
+  family, but must not be presented as the performance solution.
+
+- **A gate must execute the boundary it is cited for.** `--emit-llvm` proves
+  frontend emission only; it does not prove self-backend verification,
+  assembly, linking, startup, or execution.  Before accepting a closure gate,
+  inspect the relevant generated function and reject `strict.nolib.stub`,
+  unavailable placeholders, or a smoke input that omits the changed shape.
+  A pcc1 claim needs a pcc1-compiled feature canary through `-o` and execution,
+  or an explicitly equivalent direct worker/verifier replay.
+
+- **One expensive failure must close the whole failure class before retry.**
+  After a Stage1/Stage2/bootstrap run exposes an ABI, projection, ownership,
+  or helper-shape defect, scan the complete changed subsystem for the same
+  pattern, add a source-shape or behavioral ratchet, and run the cheapest real
+  execution-boundary gate.  Do not spend another long build merely to discover
+  the next occurrence of the same pattern.  If a wrapper swallows stderr,
+  replay the failing worker directly before editing.  Do not assume a
+  repository script supports `--help`; inspect its parser/usage first.
+
+- **Acceptance thresholds are claim-specific, not a universal 1.05 rule.** A
+  speed claim needs controlled runtime evidence.  A required representation
+  migration may be retained below 1.05 only when output/diagnostics are exact,
+  deterministic CPU/instruction/memory signals show no meaningful regression,
+  and it removes a named architectural debt.  Stable regressions are denied no
+  matter how elegant the representation is.  Record structural and speed
+  claims separately.
+
+- **Patch repeated shapes with counted, enclosing context.** Before changing a
+  repeated initializer/helper pattern, use `rg` to enumerate every match and
+  inspect their enclosing functions/classes.  The patch context must identify
+  the intended owner; after applying it, re-enumerate matches and run
+  `git diff --check`.  A successful `apply_patch` response does not prove it
+  changed the intended occurrence.
+
+- **Do not explain a regression as a correctness tax without attribution.**
+  A slower stage may be called required correctness work only when a
+  same-source phase receipt identifies the added work and a correctness test
+  proves it was previously omitted.  Otherwise it is an unexplained
+  regression and remains an active investigation.
+
+- **Artifact and handoff claims require readback.** Before telling the human a
+  file, receipt, binary, report, or handoff exists, check the exact path and
+  read enough of it to verify identity/status.  Intended output paths and
+  interrupted commands are not artifacts.
+
+- **Completion requires a fresh contradiction audit.** Immediately before a
+  task is marked complete, rerun its inventory/resume command and enumerate
+  every remaining family, fallback, compatibility adapter, skipped gate, and
+  open boundary.  Any item that contradicts the title or exit criteria keeps
+  the row active.  While `goal_state.py resume` reports `CONTINUE`, neither a
+  milestone summary nor a successful finite slice authorizes stopping.
+
+- **Native-data-plane growth is fail-closed.** Every new top-level class in
+  `pcc/backend/self_backend*.py` must be classified by
+  `scripts/pcc_record_inventory.py` as a native value/arena, semantic or phase
+  shell, diagnostic projection, or target/control class.  An unclassified or
+  stale entry is a test failure, and every concrete classified class remains
+  visible to the stage graph so category choice cannot hide a reachable
+  object.  Direct diagnostic-record constructor sites are also count- and
+  owner-registered; adding a call in an existing or new function fails unless
+  its parse/diagnostic/legacy/oracle policy is named.  New diagnostic adapters
+  must increment their family counter and remain zero on the supported normal
+  path.  Run
+  `tests/python/test_pcc_record_inventory_tool.py` for every changed
+  self-backend record family; do not update the contract merely to silence the
+  gate without naming the representation and normal-path policy.
 
 
 ## Interrupting tasks
@@ -485,6 +647,104 @@ interrupting subtask, not a replacement.
 | `docs/current-goal-state.md` | Current goal audit, selected task state, and investigation routing |
 | `docs/design/pcc-gpu-next-work.md` | Durable GPU / TVM-TIRx / Metal / GPU-GC / distributed / ds4 route contract, reference pins, and GPU claim levels |
 | `docs/investigations/INDEX.md` | Index of investigation docs; keep it current when investigation docs change |
+
+
+## Dev Tools — check here before writing a probe
+
+`scripts/` already holds ~55 tools. Several were re-derived from scratch by
+successive agents because nothing indexed them, which costs a rewrite *and* the
+tokens to think it through again. **Run `ls scripts/` before writing any
+throwaway probe**, and add a row here when you add a tool worth keeping.
+
+**Prefer the repository's own toolset as the default execution path.** Before
+hand-writing an A/B harness, profiler, cache inspector, IR differ, bootstrap
+reporter, or one-off parser, inspect this table and `scripts/` and use the
+closest existing tool. If the tool is almost sufficient, extend it generically
+instead of cloning its logic into a throwaway script. If a repository tool is
+wrong, misleading, or cannot observe the required boundary, first capture the
+defect with the smallest focused regression, then fix the tool and use the
+fixed version for the investigation. Do not silently work around a tool bug and
+report ad-hoc output as durable evidence. Keep additions bounded and reusable,
+index worthwhile new tools here, and preserve the same timeout, live-progress,
+mode-label, and artifact rules that apply to compiler/test commands.
+When writing a script-shaped tool, probe, benchmark harness, evidence parser,
+or build orchestrator that can plausibly be used twice, put it under
+`scripts/`, give it a focused test, and add it to this table. Reserve `/tmp`
+for genuinely disposable one-run scratch; do not leave reusable tooling hidden
+in chat commands, build artifacts, or an agent-specific temporary directory.
+
+Performance tools do not replace source-stable coordination. All standalone
+performance measurements and heavy bootstrap builds share the advisory lock
+`build/.pcc-performance.lock`; use a repository tool that acquires it, or
+acquire the same lock before starting equivalent work. Before changing a
+performance tool or a host-helper closure (`pcc/backend`, runtime provenance,
+or another source tree imported by pcc1), inspect the lock owner and do not
+edit while a measurement is active. A unique output directory is still
+required; the lock protects machine load and mutable helper inputs, not output
+paths.
+
+| Tool | Use it for |
+|---|---|
+| `scripts/pcc_profile.py <pid> [secs]` | Sample a live pcc/pcc1 and rank **self** time by function. Reads the symbol table from the sampled process's own executable, derives the slide from the image `sample` reports, and counts only frames in that image. `--binary` is a *check*: a mismatch is an error, not an override. Follows the pid down to the busiest leaf, so passing a `gtimeout`/`sh` wrapper's pid still profiles the compiler. |
+| `scripts/pcc_flamegraph.py <mode>` | Flame graph with **caller** attribution, self-contained SVG + folded stacks. `cpu`/`heap`/`peak <pid>` profile a native pcc1/pcc2 out-of-process (`sample`, `malloc_history`; heap/peak need the target launched with `MallocStackLogging=1`). Native modes normally follow the busiest child; use `--exact-pid` to retain an explicitly selected coordinator, with the same executable-identity checks. `host --argv <pcc cmdline>` profiles host CPython by injecting a `sitecustomize.py` sampler, so the coordinator **and every worker** self-profile with the build's parallelism untouched; add `--memory` for `tracemalloc` bytes-by-traceback. Blocked frames are excluded on both sides so the two graphs share one estimator and can actually be compared. |
+| `scripts/pcc_tachyon_aggregate.py <dir>` | Aggregate CPython 3.15 `profiling.sampling` flamegraph HTML across coordinator and worker processes. Reports cross-process self samples by Python file/line/function, frame opcode counts, per-process sample quality, and an optional JSON receipt. Use after a Tachyon `--subprocesses --mode=cpu --opcodes --flamegraph` Stage1 run. |
+| `scripts/run_pcc_stage1_build.py` | Build one isolated stage1 arm and emit source-manifest/runtime/compiler receipts consumed by the A/B runner. Use it for both arms so “single variable” is machine-checked rather than asserted after the build. |
+| `scripts/run_pcc_stage_ab.py` | Run adjacent alternating source-frozen Stage1 or Stage1+Stage2 pairs under one performance lock. Each arm gets an initially empty writable private pycache; receipts treat user+sys as timed-tree CPU, wall as a paired observation, and coordinator hardware counters as diagnostic only. |
+| `scripts/run_pcc_stage2_from_receipt.py` | Run one source-frozen Stage2 from an existing successful Stage1 receipt without rebuilding A/B arms. It verifies the pcc1/runtime/source identities, reuses the Stage A/B process-tree sampler and linkage checks, holds the performance lock, and writes a terminal single-arm receipt. |
+| `scripts/run_pcc_compile_ab.py` | Darwin receipt-bound pcc1 compile A/B runner for an **optimization slice**: private compiler/input/runtime snapshots, a common frozen baseline host-helper control, balanced unmeasured warmups, alternating matched inputs, process-group watchdogs, `/usr/bin/time -lp` CPU/RSS/instruction counters, byte/output/linkage checks, and an incremental JSON manifest. Use it instead of hand-running candidate/control pairs. `ACCEPT` exits 0; a valid measured `DENY` exits 2. Its result does **not** prove host→pcc1 versus pcc1→pcc2 bootstrap parity, fixed point, or five-GC equality. |
+| `scripts/run_process_tree_sample.py` | Run one long command under the shared performance lock with a process-group watchdog, durable stdout/stderr, 250ms synchronized descendant RSS samples, live progress, optional Darwin launch preflight, and a hard aggregate-RSS circuit breaker. Safety-capped runs fail closed on a one-second process-table deadline; receipts retain full argv and worker-manifest paths for the largest process. Use it when `/usr/bin/time -lp` process-local counters are insufficient for aggregate compiler-worker memory. |
+| `scripts/run_pcc_deferred_link.py` | Run a versioned pcc-owned Mach-O link plan after a compiled pcc1 coordinator exits. Bootstrap uses it to prevent the coordinator allocator high water from overlapping the assembler/linker tree; it invokes `pcc_link_macho.py`, never a system-link fallback, and retains a result receipt without deleting plan-supplied paths. |
+| `scripts/run_pcc_link_ab.py` | Receipt-bound A/B for the owned Darwin linker. Assembles one frozen `.s` set once, reuses identical `.pco` and archives in balanced control/candidate links, holds the performance lock, records `/usr/bin/time -lp` counters incrementally, runs every output with `--help`, and requires byte-identical images plus source/archive stability. It isolates assembler/linker work; it does not measure self-backend IR-to-assembly emit or prove a bootstrap fixed point. |
+| `scripts/pcc_root_elision_sizing.py <module.ll>` | Read-only sizing for allocation-point root elision on the REAL parsed IR/CFG (`parse_self_backend_module`). Knows the three window facts that each produced a wrong number once: readers are `pcc_gc_load_ptr` calls (never plain loads), a re-store ends the window (slots are reused), one dirty path kills. Contract: `tests/python/test_root_elision_sizing_tool.py`. |
+| `scripts/pcc_record_inventory.py <module.ll>` | Read-only parse-to-emit inventory for compiler-internal record/container and indexed-kernel projections. Its fail-closed class contract AST-discovers every top-level `self_backend*.py` class, rejects unclassified/stale families, and keeps every concrete class visible to the stage graph. Acquires the performance lock and emits a source-hashed JSON receipt for before/after native-data-plane gates. |
+| `scripts/pcc_sample_aggregate.py` | Aggregate/categorize an **already captured** `sample(1)` text file by symbol name. Complements `pcc_profile.py`, which does the capture and address resolution. |
+| `scripts/pcc_emit_rank.py` | Rank a frozen Stage2 object-input manifest by fresh pcc emit-worker wall/CPU/instructions/RSS under the performance lock. Emits an incremental manifest and per-item assembly receipts; use it to identify the real medium/safe critical item instead of assuming IR byte size predicts cost. |
+| `scripts/pcc_structured_instruction_inventory.py` | Decode frozen indexed-module sidecars and count every AArch64 instruction still using the text assembler. Holds the performance lock and persists source-hashed per-module progress, so packed-instruction migrations can require zero normal-path fallback without a Stage2 run. |
+| `scripts/pcc_preload_compare.py` | Compare the current complete class-preload index against two AST-extracted baseline functions on a retained native-exports wire. Requires semantic equality and insertion-order JSON byte equality, rejects input drift or an existing output, and writes source/wire/index hashes plus counts. Host correctness evidence only; not a speed or pcc1 claim. |
+| `scripts/replay_pcc_codegen_worker.py` | Replay one retained `codegen_worker.v4` Stage2 manifest with a chosen pcc1. It rewrites only result/artifact paths, restores the receipt-bound Stage2 environment, records identities, and `exec`s through `/usr/bin/time -lp`; wrap it in `run_process_tree_sample.py` for the performance lock, timeout and tree-RSS guard. |
+| `scripts/bootstrap_profile_report.py` | Turn `PCC_BOOTSTRAP_PROFILE_DIR` per-stage JSON into phase totals. Use before profiling to learn *which phase* to profile. |
+| `scripts/pcc_explain_cache.py` | Why a cache entry missed. First stop for "it rebuilt everything again". |
+| `scripts/pcc_explain_fallback.py` | Why a module needed the libpython fallback. |
+| `scripts/pcc_ir_diff.py` | Structural IR diff — use instead of `diff` when asking "did my change alter codegen?" |
+| `scripts/pcc_passes_explain.py` | What each backend pass did to a function. |
+| `scripts/pcc_gc_viewer.py`, `scripts/pcc_trace_viewer.py` | GC state / runtime trace inspection. |
+| `scripts/probe_stage1_closure.py` | Is a module inside the no-libpython stage1 closure. |
+| `scripts/probe_stage1_closure_on_mode.py --module NAME --mode off\|on\|both --emit-ir-dir DIR` | Select exact tightened-closure modules for standalone fallback attribution. Writes source-hashed IR/error receipts with the existing action/plumbing/target classification; this is frontend IR evidence, not contextual or native execution proof. |
+| `scripts/pcc_link_macho.py`, `scripts/pcc_link_elf.py` | Assemble/link a self-backend `.s` with pcc's own toolchain. |
+| `scripts/check_layer1_ownership.py` | Enforce that `layer1.py` stays a facade. |
+| `scripts/regen_investigations_index.py` | Mandatory after editing `docs/investigations/*.md`. |
+| `scripts/pcc_per_op_cost_table.py --out-dir DIR` | Per-operation cost table, pcc-compiled runtime vs CPython: one operation per counted loop, `/usr/bin/time -lp` instructions and wall at N and 2N, `(2N-N)/N` cancels startup, outputs must match. The compass for the per-op runtime gap behind Stage2/Stage1; add a benchmark to `BENCHMARKS` rather than writing a one-off probe. |
+| `scripts/goal_state.py next` / `validate` | The task board. |
+
+**Profiling rules these tools encode — the failures they came from:**
+
+- **A symbol table must come from the binary you sampled.** Two `nm` dumps taken
+  the same day from different builds shared only their first 3 entries; the
+  resulting profile claimed `fseek` was 10% of a workload that never seeks.
+  `pcc_profile.py` re-derives symbols from the sampled binary for this reason;
+  if you resolve addresses by hand, print both mtimes first.
+- **`sample`'s counts are tree-cumulative, not self time.** Reading them as self
+  time makes every caller look like a hot leaf. Subtract immediate children
+  (`pcc_profile.py` does).
+- **Derive the slide; never hardcode `0x100000000`.** A real pcc1 sample loaded
+  at `0x104ad0000`. `slide = image load address - __TEXT vmaddr`, both read from
+  the artifacts at hand (`Binary Images` section, `otool -l`).
+- **Sampling a `gtimeout`/`sh` wrapper resolves to plausible nonsense.** Frames
+  from the wrapper against pcc1's symbol table produced `_pcc_platform_waitpid`
+  at 53% — a real 112-byte function, tight symbol spacing, no gap artifact, and
+  completely fictional. `$!` after `gtimeout X cmd &` is *gtimeout*, not `cmd`.
+- **`Physical footprint` in the sample header is the memory number to watch** —
+  RSS read 1.9 GB while the footprint was 54.4 GB.
+- **Parse only the `Call graph:` section.** `sample` also prints a FLAT
+  top-of-stack summary indented about four columns. Folding both together
+  invents shallow call paths — one run's heaviest "stack" came out as
+  `Thread;start;pcc_gc_managed_pointer_find_slot`, which cannot happen — and
+  double-counts every sample.
+- **pcc allocates through its own allocator**, so `malloc_history` sees bulk
+  `pcc_allocator_refill_small` -> `mmap` refills, not per-object allocations.
+  The heap graph therefore answers "which path drove the allocator to grow",
+  not "who allocated this object". Per-object attribution needs the runtime to
+  capture a stack per allocation.
 
 
 ## Compile Modes
@@ -756,6 +1016,98 @@ rule names the cheap check that would have caught it.
   whole dict on every miss (fixed: 1.89x, byte-identical output). Get Python-level
   attribution on a representative input before editing. A microbenchmark that
   contradicts a profile is evidence, not noise -- record the denial.
+
+- **Instrument the real path before forming a hypothesis.** This is the single
+  highest-value rule in this section, measured: locating where a value was lost
+  took **five wrong guesses over several hours** (five different constructor
+  lowering paths, each one plausible), then **one probe** that made the losing
+  site print its own call stack found it in five minutes. The same day, four
+  "obviously it must be X" hypotheses (isinstance mis-answering, dataclass slots,
+  lost exception args, `dict.get` mis-lowering) were each killed by a
+  seconds-long probe. A mechanism that explains the symptom is **not** an
+  established mechanism. Make the code say where it went; do not reason about
+  where it should have gone.
+
+- **Validate in the environment the bug lives in, and measure the thing you
+  claim.** Byte-identical output proves *semantics*, not *speed*. A callee
+  signature cache produced identical IR and was accepted on that basis; it made
+  pcc1 **11% slower** (6.87 s -> 7.61 s) because `getattr` in pcc-compiled code
+  walks an MRO and hashes a string where CPython does one C-level dict hit.
+  Likewise, five integer-lowering fixes all verified green on the host while
+  pcc1 stayed broken, because the host parses with CPython and never executes
+  the path being fixed. **A fix aimed at pcc1 requires a pcc1 number.**
+
+- **No conclusion from a measurement without a control.** "My change leaks" was
+  asserted three times from arms that differed in more than the change:
+  bignum-vs-no-bignum rather than change-vs-no-change. The real control -- the
+  same loop shape producing bignums through a path the work never touched --
+  grew identically (29 MB -> 80 MB vs 26 MB -> 76 MB), so nothing supported the
+  attribution. Either run a control arm or isolate one variable; a single
+  before/after number across two different builds is not evidence.
+
+- **Prove an old file corresponds to the current binary before using it as
+  evidence.** Four separate wrong conclusions in one session came from this:
+  a `.s` from a stale temp directory (retracted a whole line-count analysis); a
+  `git show HEAD:` baseline taken while HEAD itself had moved mid-session (so
+  "mine vs HEAD" was mine vs mine); an `nm` symbol table from an earlier pcc1
+  build, whose first **3** entries were all that still matched, which produced a
+  confident "`fseek` is 10%" for a workload that makes no seek calls; and an
+  `ls -dt` temp directory picked up *after a failed run*, reporting the previous
+  run's numbers as the new ones. Diff the symbol table, stat the file, or make
+  the script refuse to report when the run it measured did not succeed.
+
+- **"Unreachable" does not mean "removable."** Operand cleanup blocks in a pure
+  constant-table module were 63.1% of its 72100 basic blocks and provably could
+  not be entered, so the edge was dropped. The build failed:
+  `self precise stack-map analysis ... managed root state disagrees at block`.
+  Those blocks carry `pcc_gc_store_root` / `pcc_gc_frame_leave_lifo` and
+  participate in the managed-root state the precise stack-map analysis
+  reconciles at every join. Before deleting anything a static analysis can see,
+  ask what invariant it maintains -- and note the follow-up guess ("then do not
+  open the root") was also wrong, because that root exists for **GC** safety
+  during element allocation, not for exception safety.
+
+- **Never handicap the control arm to fit your tool.** Profiling host pcc with
+  a main-thread sampler shows ~95% `subprocess._try_wait`, because the work is
+  in child processes. Forcing the build serial so the main thread does the work
+  makes the sampler happy and makes the *measurement worthless*: a pcc0-vs-pcc1
+  comparison against a deliberately slowed pcc0 flatters pcc1. Fix the tool
+  (profile the processes that work) instead of slowing the subject.
+
+- **An "on-CPU" graph that counts blocked frames is not an on-CPU graph.** A
+  coordinator blocked in `waitpid` burns no CPU but exists for the whole build,
+  so summing its blocked samples with the workers' working samples adds
+  wall-clock across processes and makes every percentage meaningless — one run
+  read "65% `_try_wait`". Exclude blocking leaves on **both** the native and
+  host sides, or the two graphs use different estimators and cannot be
+  compared at all.
+
+- **Check the parallelism knob before concluding "X cannot parallelize".**
+  `jobs()` returns 1 when `n_modules <= 1`, so a single-file input serializes
+  *every* front end. Measuring one file and concluding that pcc1 lacks worker
+  support was wrong: the scheduler is the same Python source pcc1 compiles, and
+  `is_native_worker_executable` accepts a Mach-O pcc1 as its own worker.
+
+- **Your own edits invalidate the measurement environment.** Editing anything
+  under `pcc/py_runtime/py/` makes every subsequent compile rebuild the runtime
+  archive, and that `make` shows up inside the profile as a huge `waitpid`
+  block. Warm the archive before profiling, and check the child process names
+  (`ps -Ao pid=,ppid=,comm=`) before attributing a wait to compiler work.
+
+- **A compile A/B must run the produced binaries and compare their output.**
+  Checking the compiler's exit code alone once reported a false **5.9x
+  speedup**: the "fast" arm was segfaulting quickly on every input. The Amdahl
+  ceiling of the phase being optimized is itself an alarm — a reading above it
+  means the measurement is broken, not that the change is great.
+
+- **A replace-all edit needs a count assertion per intended site.** One
+  sed-style `replace()` whose pattern also matched inside the replacement's own
+  definition rewrote a helper's first line into a call to itself. The resulting
+  source-level infinite recursion then masqueraded, in order, as a GC-soundness
+  bug and as a backend miscompile (`bl <+0>` in the disassembly was pcc1
+  faithfully compiling the typo), and cost two full exoneration experiments to
+  un-attribute. Assert the expected occurrence count for every site touched,
+  and never let the pattern overlap the replacement text.
 
 - **One change per expensive verification.** Three changes landed together cost
   a full bisection when the run failed. If a batch is unavoidable, make each

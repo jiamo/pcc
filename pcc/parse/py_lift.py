@@ -1198,8 +1198,23 @@ def _lift_type(node) -> pa.Type:
                     return pa.FuncType("callable", params, _lift_type(ret_node))
         return _DYN
     if isinstance(node, pp._BinOp) and _node_op(node.op) == "|":
-        # PEP 604 union — pcc has no Union type, fall back to Dyn.
-        return _DYN
+        # PCC has no general Union type yet, but ``T | None`` is exactly the
+        # PEP 604 spelling of ``Optional[T]`` handled above.  Preserve the
+        # object projection for nullable classes and object containers so a
+        # guarded receiver retains its native schema.  Primitive numeric
+        # optionals remain Dyn because their normal representation is unboxed
+        # and therefore cannot carry None.
+        left = _lift_type(node.lhs)
+        right = _lift_type(node.rhs)
+        if isinstance(left, pa.NoneType):
+            inner = right
+        elif isinstance(right, pa.NoneType):
+            inner = left
+        else:
+            return _DYN
+        if isinstance(inner, (pa.IntType, pa.FloatType, pa.BoolType)):
+            return _DYN
+        return inner
     if isinstance(node, pp._Str):
         # PEP 484 forward-reference string annotation, e.g.
         # ``self: "L1CodeGen"``. pcc does not run host CPython's

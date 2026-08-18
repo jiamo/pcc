@@ -1,4 +1,7 @@
 """pcc-Python helpers for ``*args``, ``**kwargs``, and ``zip(*rows)``."""
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_DICT,
     PY_TYPE_INT,
@@ -28,6 +31,8 @@ py_incref = extern("py_incref", (c_ptr,), c_void)
 py_decref = extern("py_decref", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_runtime_error_if_unset = extern(
     "py_runtime_error_if_unset", (c_ptr, c_ptr), c_ptr
 )
@@ -79,7 +84,7 @@ def py_call_merge_posargs(base_tuple, star_args):
                 cstr("call splat could not allocate the base argument tuple"),
             )
     elif _type_of(base_tuple) != PY_TYPE_TUPLE:
-        py_raise(py_exc_new(3, cstr("call args base must be tuple")))
+        py_raise_owned(py_exc_new(3, cstr("call args base must be tuple")))
         return null()
     else:
         py_incref(base_tuple)
@@ -90,7 +95,7 @@ def py_call_merge_posargs(base_tuple, star_args):
     star_len: int = _sequence_len(star_args)
     if star_len < 0:
         py_decref(base_tuple)
-        py_raise(py_exc_new(3, cstr("*args must be tuple or list")))
+        py_raise_owned(py_exc_new(3, cstr("*args must be tuple or list")))
         return null()
 
     out = py_tuple_new(base_len + star_len)
@@ -146,7 +151,7 @@ def py_zip_star(rows):
         )
     nrows: int = _sequence_len(rows)
     if nrows < 0:
-        py_raise(py_exc_new(3, cstr("zip(*x): x must be a tuple or list")))
+        py_raise_owned(py_exc_new(3, cstr("zip(*x): x must be a tuple or list")))
         return null()
     if nrows == 0:
         return _require_result(
@@ -256,7 +261,7 @@ def _dict_clone(source):
     if not _is_none(source):
         if _type_of(source) != PY_TYPE_DICT:
             py_decref(out)
-            py_raise(py_exc_new(3, cstr("kwargs base must be dict")))
+            py_raise_owned(py_exc_new(3, cstr("kwargs base must be dict")))
             return null()
         py_dict_update(out, source)
     return out
@@ -275,7 +280,7 @@ def py_call_merge_kwargs(base_kwargs, star_kwargs):
         return out
     if _type_of(star_kwargs) != PY_TYPE_DICT:
         py_decref(out)
-        py_raise(py_exc_new(3, cstr("**kwargs must be dict")))
+        py_raise_owned(py_exc_new(3, cstr("**kwargs must be dict")))
         return null()
     py_dict_update(out, star_kwargs)
     return out

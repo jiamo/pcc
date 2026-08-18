@@ -17,6 +17,7 @@ from pcc.unsafe import (
     ptr_add,
     ptr_eq,
     ptr_is_null,
+    stack_alloc,
     store_i32,
     store_i64,
     store_ptr,
@@ -510,30 +511,352 @@ def _has_no_pointer_slots(o) -> i64:
     return 0
 
 
+@c_abi_export("pcc_gc_visit_object_slots_slice")
+def pcc_gc_visit_object_slots_slice(
+    o,
+    cursor: i64,
+    limit: i64,
+    visitor,
+    context,
+    state_out,
+) -> i64:
+    """Visit a bounded current-layout slice without retaining raw slots."""
+    if ptr_is_null(state_out) != 0:
+        return 0
+    store_i64(state_out, 0, -1)
+    store_i64(state_out, 8, 0)
+    if (
+        ptr_is_null(o) != 0
+        or is_tagged_int(o) != 0
+        or ptr_is_null(visitor) != 0
+        or cursor < 0
+        or limit <= 0
+    ):
+        return 0
+    tag: i64 = load_i32(o, abi_constant("object.header.type_tag_offset"))
+    if tag < 0:
+        return 0
+    if _has_no_pointer_slots(o) != 0:
+        return 1
+    if pcc_capi_is_cext_type_tag(tag) != 0:
+        return 0
+
+    total: i64 = 0
+    family: i64 = 0
+    if tag == abi_constant("object.type.list"):
+        total = load_i64(o, abi_constant("object.list.length_offset"))
+        family = 1
+    elif tag == abi_constant("object.type.tuple"):
+        total = load_i64(o, abi_constant("object.tuple.length_offset"))
+        family = 2
+    elif tag == abi_constant("object.type.dict"):
+        total = load_i64(
+            o, abi_constant("object.dict.entries_used_offset")
+        ) * 2
+        family = 3
+    elif tag == abi_constant("object.type.set"):
+        total = load_i64(o, 24)
+        family = 4
+    elif tag == abi_constant("object.type.vthread_channel"):
+        kind: i64 = load_i64(
+            o, abi_constant("object.vthread_channel.core.kind_offset")
+        )
+        if kind == 0:
+            total = load_i64(
+                o, abi_constant("object.vthread_channel.core.capacity_offset")
+            )
+            if total > 1048576:
+                total = 0
+            family = 5
+        elif kind == 1 or kind == 2:
+            total = 1
+            family = 6
+        else:
+            return 1
+    elif tag == abi_constant("object.type.func"):
+        total = 6
+        family = 7
+    elif tag == abi_constant("object.type.iter"):
+        total = 1
+        family = 8
+    elif tag == abi_constant("object.type.gen"):
+        total = 2
+        family = 9
+    elif tag == abi_constant("object.type.coroutine"):
+        total = 3
+        family = 10
+    elif tag == abi_constant("object.type.task"):
+        total = 3
+        family = 11
+    elif tag == abi_constant("object.type.virtual_thread"):
+        total = 7
+        family = 12
+    elif tag == abi_constant("object.type.exc"):
+        total = 4
+        family = 13
+    elif tag == abi_constant("object.type.property"):
+        total = 3
+        family = 14
+    elif tag == abi_constant("object.type.classmethod"):
+        total = 1
+        family = 15
+    elif tag == abi_constant("object.type.staticmethod"):
+        total = 1
+        family = 16
+    elif tag == abi_constant("object.type.memoryview"):
+        total = 1
+        family = 17
+    elif tag == abi_constant("object.type.thread"):
+        total = 3
+        family = 18
+    elif tag == abi_constant("object.type.weakref"):
+        total = 2
+        family = 19
+    elif tag == abi_constant("object.type.continuation"):
+        chunk = load_ptr(o, 24)
+        if ptr_is_null(chunk) == 0 and ptr_is_null(load_ptr(chunk, 16)) == 0:
+            total = load_i64(chunk, 8)
+        family = 20
+    elif tag == abi_constant("object.type.class"):
+        n_bases: i64 = load_i32(o, abi_constant("object.class.n_bases_offset"))
+        n_mro: i64 = load_i32(o, abi_constant("object.class.n_mro_offset"))
+        n_methods: i64 = load_i32(
+            o, abi_constant("object.class.n_methods_offset")
+        )
+        if n_bases < 0:
+            n_bases = 0
+        if n_mro < 0:
+            n_mro = 0
+        if n_methods < 0:
+            n_methods = 0
+        total = n_bases + n_mro + n_methods + 3
+        family = 21
+    elif (
+        tag == abi_constant("object.type.instance")
+        or tag == abi_constant("object.type.valuebox")
+        or tag >= abi_constant("object.type.user_class_start")
+    ):
+        cls = load_ptr(o, abi_constant("object.instance.cls_offset"))
+        if ptr_is_null(cls) != 0:
+            return 1
+        if load_i32(
+            cls, abi_constant("object.header.type_tag_offset")
+        ) != abi_constant("object.type.class"):
+            return 1
+        n_fields: i64 = load_i32(
+            cls, abi_constant("object.class.n_fields_offset")
+        )
+        if n_fields < 0:
+            n_fields = 0
+        total = 1 + n_fields
+        if (
+            load_i32(cls, abi_constant("object.header.flags_offset"))
+            & abi_constant("object.flag.gc_tracked")
+        ) == 0:
+            total = total + 1
+        family = 22
+    else:
+        return 0
+    if total < 0:
+        total = 0
+
+    examined: i64 = 0
+    while cursor < total and examined < limit:
+        slot_base = o
+        slot_offset: i64 = 0
+        role: i64 = 1
+        present: i64 = 1
+        if family == 1:
+            slot_base = load_ptr(o, abi_constant("object.list.items_offset"))
+            slot_offset = cursor * 8
+            if ptr_is_null(slot_base) != 0:
+                present = 0
+        elif family == 2:
+            slot_offset = abi_constant("object.tuple.items_offset") + cursor * 8
+        elif family == 3:
+            slot_base = load_ptr(o, abi_constant("object.dict.entries_offset"))
+            entry_index: i64 = cursor // 2
+            entry_offset: i64 = entry_index * abi_constant("object.dict_entry.size")
+            if ptr_is_null(slot_base) != 0 or ptr_is_null(
+                load_ptr(
+                    slot_base,
+                    entry_offset + abi_constant("object.dict_entry.key_offset"),
+                )
+            ) != 0:
+                present = 0
+            elif cursor % 2 == 0:
+                slot_offset = entry_offset + abi_constant(
+                    "object.dict_entry.key_offset"
+                )
+            else:
+                slot_offset = entry_offset + abi_constant(
+                    "object.dict_entry.value_offset"
+                )
+        elif family == 4:
+            slot_base = load_ptr(o, 40)
+            slot_offset = cursor * 16 + 8
+            if ptr_is_null(slot_base) != 0:
+                present = 0
+            else:
+                key = load_ptr(slot_base, slot_offset)
+                if ptr_is_null(key) != 0 or ptr_eq(
+                    key, global_load_ptr("py_set_dummy")
+                ) != 0:
+                    present = 0
+        elif family == 5:
+            slot_offset = (
+                abi_constant("object.vthread_channel.core.items_offset")
+                + cursor * abi_constant("object.pointer.size")
+            )
+        elif family == 6:
+            slot_offset = abi_constant(
+                "object.vthread_channel.endpoint.core_offset"
+            )
+        elif family == 7:
+            if cursor == 0:
+                slot_offset = 24
+            elif cursor == 1:
+                slot_offset = 32
+            elif cursor == 2:
+                slot_offset = 40
+            elif cursor == 3:
+                slot_offset = 64
+            elif cursor == 4:
+                slot_offset = 80
+            else:
+                slot_offset = 88
+        elif family == 8:
+            slot_offset = 16
+        elif family == 9:
+            if cursor == 0:
+                slot_offset = 24
+            else:
+                slot_offset = 48
+        elif family == 10:
+            slot_offset = 32 + cursor * 8
+        elif family == 11:
+            slot_offset = 16 + cursor * 8
+        elif family == 12:
+            if cursor == 0:
+                slot_offset = 16
+            elif cursor == 1:
+                slot_offset = 24
+            elif cursor == 2:
+                slot_offset = 72
+            elif cursor == 3:
+                slot_offset = 112
+            elif cursor == 4:
+                slot_offset = abi_constant(
+                    "object.virtual_thread.channel_owner_a_offset"
+                )
+            elif cursor == 5:
+                slot_offset = abi_constant(
+                    "object.virtual_thread.channel_owner_b_offset"
+                )
+            else:
+                slot_offset = abi_constant(
+                    "object.virtual_thread.channel_value_offset"
+                )
+        elif family == 13:
+            slot_offset = 16 + cursor * 8
+        elif family == 14:
+            if cursor == 0:
+                slot_offset = abi_constant("object.property.fget_offset")
+            elif cursor == 1:
+                slot_offset = abi_constant("object.property.fset_offset")
+            else:
+                slot_offset = abi_constant("object.property.fdel_offset")
+        elif family == 15:
+            slot_offset = abi_constant("object.classmethod.func_offset")
+        elif family == 16:
+            slot_offset = abi_constant("object.staticmethod.func_offset")
+        elif family == 17:
+            slot_offset = 16
+        elif family == 18:
+            slot_offset = 24 + cursor * 8
+        elif family == 19:
+            slot_offset = 16 + cursor * 8
+            if cursor == 0:
+                role = 3
+        elif family == 20:
+            chunk = load_ptr(o, 24)
+            if ptr_is_null(chunk) != 0:
+                present = 0
+            else:
+                slot_base = load_ptr(chunk, 16)
+                slot_offset = cursor * 8
+                if ptr_is_null(slot_base) != 0:
+                    present = 0
+        elif family == 21:
+            n_bases = load_i32(o, abi_constant("object.class.n_bases_offset"))
+            n_mro = load_i32(o, abi_constant("object.class.n_mro_offset"))
+            n_methods = load_i32(
+                o, abi_constant("object.class.n_methods_offset")
+            )
+            if n_bases < 0:
+                n_bases = 0
+            if n_mro < 0:
+                n_mro = 0
+            if n_methods < 0:
+                n_methods = 0
+            if cursor < n_bases:
+                slot_base = load_ptr(o, abi_constant("object.class.bases_offset"))
+                slot_offset = cursor * 8
+                role = 2
+            elif cursor < n_bases + n_mro:
+                slot_base = load_ptr(o, abi_constant("object.class.mro_offset"))
+                slot_offset = (cursor - n_bases) * 8
+                role = 2
+            elif cursor < n_bases + n_mro + n_methods:
+                slot_base = load_ptr(o, abi_constant("object.class.methods_offset"))
+                slot_offset = (
+                    (cursor - n_bases - n_mro)
+                    * abi_constant("object.class_method.size")
+                    + abi_constant("object.class_method.func_offset")
+                )
+                role = 3
+            elif cursor == n_bases + n_mro + n_methods:
+                slot_offset = abi_constant("object.class.del_method_offset")
+                role = 3
+            elif cursor == n_bases + n_mro + n_methods + 1:
+                slot_offset = abi_constant("object.class.attrs_offset")
+            else:
+                slot_offset = abi_constant("object.class.metaclass_offset")
+                role = 2
+            if ptr_is_null(slot_base) != 0:
+                present = 0
+        else:
+            if cursor == 0:
+                slot_offset = abi_constant("object.instance.cls_offset")
+                role = 2
+            else:
+                slot_offset = (
+                    abi_constant("object.instance.fields_offset")
+                    + (cursor - 1) * abi_constant("object.pointer.size")
+                )
+        if present != 0:
+            _visit_slot(slot_base, slot_offset, role, visitor, context)
+        cursor = cursor + 1
+        examined = examined + 1
+    if cursor < total:
+        store_i64(state_out, 0, cursor)
+    store_i64(state_out, 8, examined)
+    return 1
+
+
 @c_abi_export("pcc_gc_visit_object_slots")
 def pcc_gc_visit_object_slots(o, visitor, context) -> i64:
     if ptr_is_null(o) != 0 or is_tagged_int(o) != 0:
         return 0
-    if _has_no_pointer_slots(o) != 0:
-        return 1
-    core_handled: i64 = _visit_core_container_slots(o, visitor, context)
-    if core_handled != 0:
-        return core_handled
-    fixed_handled: i64 = _visit_fixed_owner_slots(o, visitor, context)
-    if fixed_handled != 0:
-        return fixed_handled
-    weakref_handled: i64 = _visit_weakref_slots(o, visitor, context)
-    if weakref_handled != 0:
-        return weakref_handled
-    continuation_handled: i64 = _visit_continuation_slots(o, visitor, context)
-    if continuation_handled != 0:
-        return continuation_handled
-    class_handled: i64 = _visit_class_slots(o, visitor, context)
-    if class_handled != 0:
-        return class_handled
+    state = stack_alloc(16)
+    handled: i64 = pcc_gc_visit_object_slots_slice(
+        o, 0, 9223372036854775807, visitor, context, state
+    )
+    if handled != 0:
+        return handled
     cext_handled: i64 = pcc_capi_visit_cext_object_slots_i64(
         o, visitor, context
     )
     if cext_handled != 0:
         return cext_handled
-    return _visit_instance_slots(o, visitor, context)
+    return 0

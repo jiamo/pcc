@@ -152,6 +152,62 @@ def test_list_reverse(tmp_path, monkeypatch):
     assert _run(exe).strip() == "4 3 2 1"
 
 
+def test_list_clear(tmp_path, monkeypatch):
+    src = tmp_path / "list_clear.py"
+    exe = tmp_path / "list_clear.out"
+    src.write_text(textwrap.dedent("""
+        def main() -> None:
+            xs = [1, 2]
+            print(xs.append(3) is None, xs[2], len(xs))
+            print(xs.extend([4, 5]) is None, xs[4], len(xs))
+            print(xs.insert(0, 0) is None, xs[0], len(xs))
+            print(xs.remove(3) is None, len(xs))
+            print(xs.reverse() is None, xs[0], len(xs))
+            print(xs.clear() is None, len(xs))
+            xs.append(6)
+            print(xs[0], len(xs))
+
+        if __name__ == "__main__":
+            main()
+        """).lstrip(), encoding="utf-8")
+    _compile(monkeypatch, src, exe)
+    assert _run(exe).strip().splitlines() == [
+        "True 3 3",
+        "True 5 5",
+        "True 0 6",
+        "True 5",
+        "True 5 5",
+        "True 0",
+        "6 1",
+    ]
+
+
+def test_typed_void_list_mutators_lower_to_none_singleton():
+    source = (
+        Path(__file__).absolute().parents[2]
+        / "pcc"
+        / "py_frontend"
+        / "codegen"
+        / "list_method_lowering.py"
+    ).read_text(encoding="utf-8")
+    typed = source.split("    def _maybe_emit_list_method(", 1)[1].split(
+        "    def _emit_list_sort_with_dunder_lt(", 1
+    )[0]
+    assert "return ir.Constant(_I1, 0)" not in typed
+    for name, next_name in (
+        ("append", "extend"),
+        ("extend", "insert"),
+        ("insert", "pop"),
+        ("remove", "clear"),
+        ("clear", "index"),
+        ("reverse", "copy"),
+    ):
+        body = typed.split(f'if name == "{name}":', 1)[1].split(
+            f'if name == "{next_name}":', 1
+        )[0]
+        assert "return self._emit_none_literal()" in body
+
+
 def test_list_slicing(tmp_path, monkeypatch):
     src = tmp_path / "list_slice.py"
     exe = tmp_path / "list_slice.out"

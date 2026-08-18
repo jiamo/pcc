@@ -20,7 +20,7 @@
 #endif
 
 static void asyncio_raise_oserror(const char *msg) {
-    py_raise(py_exc_new(PY_EXC_OSERROR, msg));
+    py_raise_owned(py_exc_new(PY_EXC_OSERROR, msg));
 }
 
 static int asyncio_tcp_raw_close(int64_t fd) {

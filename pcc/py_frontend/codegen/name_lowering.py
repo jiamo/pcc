@@ -927,6 +927,10 @@ class NameLoweringMixin:
             module_globals = self._module_globals
             if expr.ident in module_globals:
                 gv, _declared_ty = module_globals[expr.ident]
+                # Only names this module deletes somewhere can be unbound, so
+                # every other global keeps a plain load with no added branch.
+                if self._module_global_needs_bound_check(expr.ident):
+                    self._emit_module_global_bound_check(expr.ident, expr)
                 val = self.builder.load(
                     gv,
                     name=self._fresh(expr.ident),

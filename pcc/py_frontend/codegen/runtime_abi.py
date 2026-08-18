@@ -45,7 +45,8 @@ _PYOBJ = _PTR
 # Table of (return_type, [param_types], var_arg). The names and
 # signatures mirror py_runtime.h line-for-line. Whenever adding a new
 # runtime function, add the C prototype there first, then mirror here.
-RUNTIME_SIGNATURES: dict[str, tuple[ir.Type, list[ir.Type], bool]] = {
+def _runtime_signatures_part_0():
+    return {
     # ---- GC interface ----------------------------------------------
     "pcc_gc_alloc": (_PYOBJ, [_I64, _I32, _I32], False),
     "pcc_gc_pointer_is_managed": (_I64, [_PYOBJ], False),
@@ -91,14 +92,47 @@ RUNTIME_SIGNATURES: dict[str, tuple[ir.Type, list[ir.Type], bool]] = {
     "pcc_gc_select_relocation_set": (_I64, [_I64], False),
     "pcc_gc_backend4_evacuation_drain": (_I64, [_I64], False),
     "pcc_gc_backend4_evacuation_page_drain": (_I64, [_I64], False),
-    "pcc_gc_backend4_remap_and_retire_unlocked": (_VOID, [], False),
+    "pcc_gc_backend4_reseed_plan_probe_config": (
+        _VOID,
+        [_I64, _I64],
+        False,
+    ),
+    "pcc_gc_backend4_reseed_plan_probe_state": (_I64, [], False),
+    "pcc_gc_backend3_remembered_scan_probe_config": (
+        _VOID,
+        [_I64],
+        False,
+    ),
+    "pcc_gc_backend4_remap_and_retire_unlocked": (_VOID, [_PTR], False),
+    "pcc_gc_backend4_remap_and_retire_stopped_world": (_I64, [], False),
+    "pcc_gc_backend4_finish_retained_page_releases": (_VOID, [_PTR], False),
+    "pcc_gc_backend4_finish_remap_retirement": (_VOID, [_PTR], False),
     "pcc_gc_relocation_set_contains": (_I64, [_PYOBJ], False),
+    }
+
+
+def _runtime_signatures_part_1():
+    return {
     "pcc_gc_relocation_set_size": (_I64, [], False),
     "pcc_gc_install_forwarding": (_I64, [_PYOBJ, _PYOBJ], False),
     "pcc_gc_relocate_copy": (_PYOBJ, [_PYOBJ, _I64], False),
     "pcc_gc_backend": (_I64, [], False),
     "pcc_py_gc_minor_graph_lock": (_VOID, [], False),
     "pcc_py_gc_minor_graph_unlock": (_VOID, [], False),
+    "py_obj_truthy": (_I64, [_PYOBJ], False),
+    "py_obj_type_tag": (_I64, [_PYOBJ], False),
+    "py_obj_eq": (_I64, [_PYOBJ, _PYOBJ], False),
+    "py_obj_lt": (_I64, [_PYOBJ, _PYOBJ], False),
+    "py_obj_le": (_I64, [_PYOBJ, _PYOBJ], False),
+    "py_obj_gt": (_I64, [_PYOBJ, _PYOBJ], False),
+    "py_obj_ge": (_I64, [_PYOBJ, _PYOBJ], False),
+    "py_obj_hash": (_I64, [_PYOBJ], False),
+    "py_instance_set_field": (_VOID, [_PYOBJ, _I32, _PYOBJ], False),
+    }
+
+
+def _runtime_signatures_part_2():
+    return {
     "pcc_gc_set_backend": (_I64, [_I64], False),
     "pcc_gc_backend_name": (_CSTR, [_I64], False),
     "pcc_gc_telemetry": (_I64, [_I64], False),
@@ -153,6 +187,11 @@ RUNTIME_SIGNATURES: dict[str, tuple[ir.Type, list[ir.Type], bool]] = {
     "pcc_gc_backend4_remembered_set_entries": (_I64, [], False),
     "pcc_gc_backend4_remembered_set_duplicate_skips": (_I64, [], False),
     "pcc_gc_backend4_remembered_set_high_water": (_I64, [], False),
+    }
+
+
+def _runtime_signatures_part_3():
+    return {
     "pcc_gc_backend4_remembered_page_entries": (_I64, [], False),
     "pcc_gc_backend4_remembered_page_slot_entries": (_I64, [], False),
     "pcc_gc_backend4_remembered_page_high_water": (_I64, [], False),
@@ -215,6 +254,11 @@ RUNTIME_SIGNATURES: dict[str, tuple[ir.Type, list[ir.Type], bool]] = {
     "pcc_gc_backend4_large_page_object_count": (_I64, [], False),
     "pcc_gc_backend4_small_page_live_bytes": (_I64, [], False),
     "pcc_gc_backend4_medium_page_live_bytes": (_I64, [], False),
+    }
+
+
+def _runtime_signatures_part_4():
+    return {
     "pcc_gc_backend4_large_page_live_bytes": (_I64, [], False),
     "pcc_gc_backend2_production_score": (_I64, [], False),
     "pcc_gc_backend2_worker_buffer_score": (_I64, [], False),
@@ -225,6 +269,8 @@ RUNTIME_SIGNATURES: dict[str, tuple[ir.Type, list[ir.Type], bool]] = {
     "pcc_gc_continuation_root_slot_count": (_I64, [], False),
     "pcc_gc_coroutine_root_score": (_I64, [], False),
     "pcc_gc_default_unlink_tracked_node": (_VOID, [_PTR], False),
+    "pcc_gc_tracked_node_pool_cached_count": (_I64, [], False),
+    "pcc_gc_tracked_node_pool_drain": (_VOID, [], False),
     "py_gc_index_insert": (_I64, [_PTR, _PTR], False),
     "py_gc_index_remove": (_PTR, [_PTR], False),
     "py_gc_callbacks_list": (_PYOBJ, [], False),
@@ -236,6 +282,13 @@ RUNTIME_SIGNATURES: dict[str, tuple[ir.Type, list[ir.Type], bool]] = {
     "pcc_current_native_thread_token": (_PTR, [], False),
     "pcc_refcount_strategy": (_I64, [], False),
     "pcc_thread_safepoint": (_VOID, [], False),
+    "pcc_thread_stop_requested_acquire": (_I64, [], False),
+    "pcc_thread_no_park_enter": (_VOID, [], False),
+    "pcc_thread_no_park_exit": (_VOID, [], False),
+    "pcc_thread_no_park_depth": (_I64, [], False),
+    "pcc_thread_owns_stopped_world": (_I64, [], False),
+    "pcc_thread_registration_waiter_count": (_I64, [], False),
+    "pcc_thread_unregister_current": (_VOID, [], False),
     "pcc_stop_the_world": (_I64, [], False),
     "pcc_resume_world": (_I64, [], False),
     # ---- Native threading module ---------------------------------
@@ -260,6 +313,11 @@ RUNTIME_SIGNATURES: dict[str, tuple[ir.Type, list[ir.Type], bool]] = {
     "py_threading_condition_wait": (_I64, [_PYOBJ], False),
     "py_threading_condition_wait_vthread": (_I64, [_PYOBJ], False),
     "py_threading_condition_notify": (_I64, [_PYOBJ], False),
+    }
+
+
+def _runtime_signatures_part_5():
+    return {
     "py_threading_semaphore_new": (_PYOBJ, [_I64], False),
     "py_threading_semaphore_acquire": (_I64, [_PYOBJ], False),
     "py_threading_semaphore_acquire_vthread": (_I64, [_PYOBJ], False),
@@ -267,6 +325,13 @@ RUNTIME_SIGNATURES: dict[str, tuple[ir.Type, list[ir.Type], bool]] = {
     "py_threading_thread_new": (_PYOBJ, [_PYOBJ, _PYOBJ], False),
     "py_threading_thread_start": (_I64, [_PYOBJ], False),
     "py_threading_thread_join": (_I64, [_PYOBJ], False),
+    "py_bytes_join": (_PYOBJ, [_PYOBJ, _PYOBJ], False),
+    "pcc_gc_store_root_take": (_VOID, [_PTR, _PYOBJ], False),
+    }
+
+
+def _runtime_signatures_part_6():
+    return {
     "py_threading_thread_is_alive": (_I64, [_PYOBJ], False),
     # ---- refcount --------------------------------------------------
     "py_incref": (_VOID, [_PYOBJ], False),
@@ -323,6 +388,11 @@ RUNTIME_SIGNATURES: dict[str, tuple[ir.Type, list[ir.Type], bool]] = {
     # ---- Complex ---------------------------------------------------
     "py_complex_new": (_PYOBJ, [_DOUBLE, _DOUBLE], False),
     "py_complex_real": (_PYOBJ, [_PYOBJ], False),
+    }
+
+
+def _runtime_signatures_part_7():
+    return {
     "py_complex_imag": (_PYOBJ, [_PYOBJ], False),
     "py_complex_add": (_PYOBJ, [_PYOBJ, _PYOBJ], False),
     "py_complex_sub": (_PYOBJ, [_PYOBJ, _PYOBJ], False),
@@ -380,6 +450,11 @@ RUNTIME_SIGNATURES: dict[str, tuple[ir.Type, list[ir.Type], bool]] = {
     "py_bytearray_del_slice": (_I64, [_PYOBJ, _PYOBJ, _PYOBJ, _PYOBJ], False),
     # ---- Str -------------------------------------------------------
     "py_str_new": (_PYOBJ, [_CSTR, _I64], False),
+    }
+
+
+def _runtime_signatures_part_8():
+    return {
     "py_str_len": (_I64, [_PYOBJ], False),
     "py_str_byte_len": (_I64, [_PYOBJ], False),
     "py_str_utf8": (_CSTR, [_PYOBJ], False),
@@ -430,6 +505,11 @@ RUNTIME_SIGNATURES: dict[str, tuple[ir.Type, list[ir.Type], bool]] = {
     "py_str_lstrip_chars": (_PYOBJ, [_PYOBJ, _PYOBJ], False),
     "py_str_rstrip_chars": (_PYOBJ, [_PYOBJ, _PYOBJ], False),
     "py_str_count": (_I64, [_PYOBJ, _PYOBJ], False),
+    }
+
+
+def _runtime_signatures_part_9():
+    return {
     "py_str_count_range": (_I64, [_PYOBJ, _PYOBJ, _PYOBJ, _PYOBJ], False),
     "py_str_isdigit": (_I64, [_PYOBJ], False),
     "py_str_isalpha": (_I64, [_PYOBJ], False),
@@ -485,6 +565,11 @@ RUNTIME_SIGNATURES: dict[str, tuple[ir.Type, list[ir.Type], bool]] = {
     "py_list_insert": (_VOID, [_PYOBJ, _I64, _PYOBJ], False),
     "py_list_pop": (_PYOBJ, [_PYOBJ, _I64], False),
     "py_list_remove": (_VOID, [_PYOBJ, _PYOBJ], False),
+    }
+
+
+def _runtime_signatures_part_10():
+    return {
     "py_list_clear": (_VOID, [_PYOBJ], False),
     "py_obj_clear": (_VOID, [_PYOBJ], False),
     "py_list_contains": (_I64, [_PYOBJ, _PYOBJ], False),
@@ -539,6 +624,11 @@ RUNTIME_SIGNATURES: dict[str, tuple[ir.Type, list[ir.Type], bool]] = {
     "py_set_difference_update": (_VOID, [_PYOBJ, _PYOBJ], False),
     "py_set_symmetric_difference_update": (_VOID, [_PYOBJ, _PYOBJ], False),
     "py_set_issubset": (_I64, [_PYOBJ, _PYOBJ], False),
+    }
+
+
+def _runtime_signatures_part_11():
+    return {
     "py_set_issuperset": (_I64, [_PYOBJ, _PYOBJ], False),
     "py_set_pop": (_PYOBJ, [_PYOBJ], False),
     "py_set_contains": (_I64, [_PYOBJ, _PYOBJ], False),
@@ -550,6 +640,11 @@ RUNTIME_SIGNATURES: dict[str, tuple[ir.Type, list[ir.Type], bool]] = {
     "py_obj_add": (_PYOBJ, [_PYOBJ, _PYOBJ], False),
     "py_obj_sub": (_PYOBJ, [_PYOBJ, _PYOBJ], False),
     "py_obj_mul": (_PYOBJ, [_PYOBJ, _PYOBJ], False),
+    "py_obj_and": (_PYOBJ, [_PYOBJ, _PYOBJ], False),
+    "py_obj_or": (_PYOBJ, [_PYOBJ, _PYOBJ], False),
+    "py_obj_xor": (_PYOBJ, [_PYOBJ, _PYOBJ], False),
+    "py_obj_lshift": (_PYOBJ, [_PYOBJ, _PYOBJ], False),
+    "py_obj_rshift": (_PYOBJ, [_PYOBJ, _PYOBJ], False),
     "py_obj_truediv": (_PYOBJ, [_PYOBJ, _PYOBJ], False),
     "py_obj_mod": (_PYOBJ, [_PYOBJ, _PYOBJ], False),
     "py_str_mod": (_PYOBJ, [_PYOBJ, _PYOBJ], False),
@@ -565,6 +660,7 @@ RUNTIME_SIGNATURES: dict[str, tuple[ir.Type, list[ir.Type], bool]] = {
     "py_weak_key_dict_len": (_I64, [_PYOBJ], False),
     "py_obj_getattr": (_PYOBJ, [_PYOBJ, _CSTR], False),
     "py_obj_getattr_default": (_PYOBJ, [_PYOBJ, _CSTR], False),
+    "py_obj_getattr_maybe": (_PYOBJ, [_PYOBJ, _CSTR], False),
     "py_obj_vars": (_PYOBJ, [_PYOBJ], False),
     "py_obj_setattr": (_I64, [_PYOBJ, _CSTR, _PYOBJ], False),
     "py_obj_delattr": (_I64, [_PYOBJ, _CSTR], False),
@@ -573,6 +669,8 @@ RUNTIME_SIGNATURES: dict[str, tuple[ir.Type, list[ir.Type], bool]] = {
     "py_builtin_type_for_tag": (_PYOBJ, [_I64], False),
     "py_obj_getitem": (_PYOBJ, [_PYOBJ, _PYOBJ], False),
     "py_obj_getitem_i64": (_PYOBJ, [_PYOBJ, _I64], False),
+    "py_obj_subscript": (_PYOBJ, [_PYOBJ, _PYOBJ], False),
+    "py_obj_subscript_i64": (_PYOBJ, [_PYOBJ, _I64], False),
     "py_obj_slice": (_PYOBJ, [_PYOBJ, _PYOBJ, _PYOBJ, _PYOBJ], False),
     "py_obj_set_slice": (
         _I64,
@@ -586,14 +684,11 @@ RUNTIME_SIGNATURES: dict[str, tuple[ir.Type, list[ir.Type], bool]] = {
     "py_obj_len": (_I64, [_PYOBJ], False),
     "py_obj_contains": (_I64, [_PYOBJ, _PYOBJ], False),
     "py_obj_sorted": (_PYOBJ, [_PYOBJ], False),
-    "py_obj_truthy": (_I64, [_PYOBJ], False),
-    "py_obj_type_tag": (_I64, [_PYOBJ], False),
-    "py_obj_eq": (_I64, [_PYOBJ, _PYOBJ], False),
-    "py_obj_lt": (_I64, [_PYOBJ, _PYOBJ], False),
-    "py_obj_le": (_I64, [_PYOBJ, _PYOBJ], False),
-    "py_obj_gt": (_I64, [_PYOBJ, _PYOBJ], False),
-    "py_obj_ge": (_I64, [_PYOBJ, _PYOBJ], False),
-    "py_obj_hash": (_I64, [_PYOBJ], False),
+    }
+
+
+def _runtime_signatures_part_12():
+    return {
     "py_obj_index_i64": (_I64, [_PYOBJ], False),
     "py_obj_repr": (_PYOBJ, [_PYOBJ], False),
     "py_obj_ascii": (_PYOBJ, [_PYOBJ], False),
@@ -650,6 +745,11 @@ RUNTIME_SIGNATURES: dict[str, tuple[ir.Type, list[ir.Type], bool]] = {
     "py_gen_close_preserving_exception": (_I64, [_PYOBJ], False),
     "py_gen_take_send": (_PYOBJ, [_PYOBJ], False),
     "py_gen_state": (_I64, [_PYOBJ], False),
+    }
+
+
+def _runtime_signatures_part_13():
+    return {
     "py_gen_set_state": (_VOID, [_PYOBJ, _I64], False),
     "py_gen_set_done": (_VOID, [_PYOBJ], False),
     "py_gen_is_done": (_I64, [_PYOBJ], False),
@@ -713,6 +813,11 @@ RUNTIME_SIGNATURES: dict[str, tuple[ir.Type, list[ir.Type], bool]] = {
         False,
     ),
     "py_virtual_thread_tcp_register_accepted": (_I64, [_I64], False),
+    }
+
+
+def _runtime_signatures_part_14():
+    return {
     "py_virtual_thread_tcp_connect_start": (
         _I64,
         [_PYOBJ, _PYOBJ, _PTR],
@@ -783,6 +888,11 @@ RUNTIME_SIGNATURES: dict[str, tuple[ir.Type, list[ir.Type], bool]] = {
     "py_virtual_thread_channel_select2_result": (_PYOBJ, [_PYOBJ], False),
     "py_virtual_thread_result": (_PYOBJ, [_PYOBJ], False),
     "py_virtual_thread_exception": (_PYOBJ, [_PYOBJ], False),
+    }
+
+
+def _runtime_signatures_part_15():
+    return {
     "py_virtual_thread_outcome": (_I64, [_PYOBJ], False),
     "py_task_new": (_PYOBJ, [_PYOBJ], False),
     "py_task_step": (_PYOBJ, [_PYOBJ], False),
@@ -836,6 +946,11 @@ RUNTIME_SIGNATURES: dict[str, tuple[ir.Type, list[ir.Type], bool]] = {
     "py_shlex_split": (_PYOBJ, [_PYOBJ], False),
     "py_shutil_which": (_PYOBJ, [_PYOBJ], False),
     "py_tempdir_new": (_PYOBJ, [_PYOBJ], False),
+    }
+
+
+def _runtime_signatures_part_16():
+    return {
     "py_tempdir_cleanup": (_VOID, [_PYOBJ], False),
     "py_re_escape": (_PYOBJ, [_PYOBJ], False),
     "py_re_match": (_PYOBJ, [_PYOBJ, _PYOBJ], False),
@@ -887,6 +1002,11 @@ RUNTIME_SIGNATURES: dict[str, tuple[ir.Type, list[ir.Type], bool]] = {
     "py_os_replace": (_PYOBJ, [_PYOBJ, _PYOBJ], False),
     "py_os_chmod": (_PYOBJ, [_PYOBJ, _I64], False),
     "py_os_fsync": (_PYOBJ, [_I64], False),
+    }
+
+
+def _runtime_signatures_part_17():
+    return {
     "py_os_access": (_I32, [_PYOBJ, _I32], False),
     "py_os_write": (_I32, [_I32, _PYOBJ], False),
     "py_http_download_to_file": (_I64, [_PYOBJ, _PYOBJ], False),
@@ -917,6 +1037,11 @@ RUNTIME_SIGNATURES: dict[str, tuple[ir.Type, list[ir.Type], bool]] = {
     "py_exc_append_frame_source": (
         _VOID,
         [_PYOBJ, _CSTR, _CSTR, _CSTR, _I32],
+        False,
+    ),
+    "py_exc_append_frame_indexed": (
+        _VOID,
+        [_PYOBJ, _CSTR, _CSTR, _CSTR, _CSTR, _I32],
         False,
     ),
     "py_runtime_error_if_unset": (_PYOBJ, [_CSTR, _CSTR], False),
@@ -955,7 +1080,11 @@ RUNTIME_SIGNATURES: dict[str, tuple[ir.Type, list[ir.Type], bool]] = {
     "py_valuebox_set_field": (_VOID, [_PYOBJ, _I32, _PYOBJ], False),
     "py_instance_new": (_PYOBJ, [_PYOBJ], False),
     "py_instance_get_field": (_PYOBJ, [_PYOBJ, _I32], False),
-    "py_instance_set_field": (_VOID, [_PYOBJ, _I32, _PYOBJ], False),
+    }
+
+
+def _runtime_signatures_part_18():
+    return {
     "py_instance_getattr": (_PYOBJ, [_PYOBJ, _CSTR], False),
     "py_instance_getattr_default": (_PYOBJ, [_PYOBJ, _CSTR], False),
     "py_instance_setattr": (_I64, [_PYOBJ, _CSTR, _PYOBJ], False),
@@ -1033,6 +1162,12 @@ RUNTIME_SIGNATURES: dict[str, tuple[ir.Type, list[ir.Type], bool]] = {
     "py_cpy_wrap_pcc_7arg": (_PTR, [_PTR], False),
     "py_cpy_wrap_pcc_8arg": (_PTR, [_PTR], False),
     "py_cpy_wrap_pcc_9arg": (_PTR, [_PTR], False),
+    }
+
+
+def _runtime_signatures_part_19():
+    return {
+    "pcc_capi_str_utf8_pinned": (_CSTR, [_PYOBJ], False),
     "py_cpy_len": (_I64, [_PTR], False),
     "py_cpy_getitem": (_PTR, [_PTR, _PTR], False),
     "py_cpy_setitem": (_I32, [_PTR, _PTR, _PTR], False),
@@ -1060,7 +1195,32 @@ RUNTIME_SIGNATURES: dict[str, tuple[ir.Type, list[ir.Type], bool]] = {
     "py_cpy_to_f64": (_DOUBLE, [_PTR], False),
     "py_cpy_from_pccstr": (_PTR, [_PYOBJ], False),
     "py_cpy_from_pcc_obj": (_PTR, [_PYOBJ], False),
-}
+    "py_list_append_fresh_native_instance": (_VOID, [_PYOBJ, _PYOBJ], False),
+    }
+
+
+RUNTIME_SIGNATURES: dict[str, tuple[ir.Type, list[ir.Type], bool]] = (
+    _runtime_signatures_part_0()
+)
+RUNTIME_SIGNATURES.update(_runtime_signatures_part_1())
+RUNTIME_SIGNATURES.update(_runtime_signatures_part_2())
+RUNTIME_SIGNATURES.update(_runtime_signatures_part_3())
+RUNTIME_SIGNATURES.update(_runtime_signatures_part_4())
+RUNTIME_SIGNATURES.update(_runtime_signatures_part_5())
+RUNTIME_SIGNATURES.update(_runtime_signatures_part_6())
+RUNTIME_SIGNATURES.update(_runtime_signatures_part_7())
+RUNTIME_SIGNATURES.update(_runtime_signatures_part_8())
+RUNTIME_SIGNATURES.update(_runtime_signatures_part_9())
+RUNTIME_SIGNATURES.update(_runtime_signatures_part_10())
+RUNTIME_SIGNATURES.update(_runtime_signatures_part_11())
+RUNTIME_SIGNATURES.update(_runtime_signatures_part_12())
+RUNTIME_SIGNATURES.update(_runtime_signatures_part_13())
+RUNTIME_SIGNATURES.update(_runtime_signatures_part_14())
+RUNTIME_SIGNATURES.update(_runtime_signatures_part_15())
+RUNTIME_SIGNATURES.update(_runtime_signatures_part_16())
+RUNTIME_SIGNATURES.update(_runtime_signatures_part_17())
+RUNTIME_SIGNATURES.update(_runtime_signatures_part_18())
+RUNTIME_SIGNATURES.update(_runtime_signatures_part_19())
 
 _PURE_RUNTIME_ATTRS = frozenset({"readnone", "willreturn", "nounwind"})
 _READONLY_RUNTIME_ATTRS = frozenset({"readonly", "willreturn", "nounwind"})
@@ -1108,7 +1268,9 @@ RUNTIME_GLOBALS: dict[str, ir.Type] = {
 FREESTANDING_GC_I32_GLOBALS: frozenset[str] = frozenset(
     {
         'pcc_gc_backend0_frame_roots_enabled',
+        'pcc_gc_backend3_frame_root_scan_phase',
         'pcc_gc_backend3_remembered_overflow',
+        'pcc_gc_backend3_scheduler_root_scan_phase',
         'pcc_gc_backend4_evacuated_bytes_count',
         'pcc_gc_backend4_evacuation_candidate_bytes_count',
         'pcc_gc_backend4_evacuation_candidate_zpage_bytes_count',
@@ -1121,6 +1283,12 @@ FREESTANDING_GC_I32_GLOBALS: frozenset[str] = frozenset(
         'pcc_gc_backend4_medium_page_candidate_bytes_count',
         'pcc_gc_backend4_medium_page_candidate_zpage_bytes_count',
         'pcc_gc_backend4_medium_page_candidates',
+        'pcc_gc_backend4_remap_active',
+        'pcc_gc_backend4_selector_page_allow_large',
+        'pcc_gc_backend4_selector_page_seed_pending',
+        'pcc_gc_backend4_selector_scan_allow_large',
+        'pcc_gc_backend4_selector_scan_require_unselected',
+        'pcc_gc_backend4_selector_scan_restart',
         'pcc_gc_backend4_remembered_set_duplicate_skips_count',
         'pcc_gc_backend4_remembered_set_entries_count',
         'pcc_gc_backend4_remembered_set_high_water_count',
@@ -1194,6 +1362,9 @@ FREESTANDING_GC_I32_GLOBALS: frozenset[str] = frozenset(
         'pcc_gc_relocation_pin_rejects',
         'pcc_gc_root_count',
         'pcc_gc_stepmul',
+        'pcc_gc_trace_extension_roots_pending',
+        'pcc_gc_tracked_node_pool_count',
+        'py_class_attr_cache_epoch',
         'py_gc_callbacks_firing',
         'py_gc_collecting',
         'py_gc_enabled',
@@ -1207,8 +1378,39 @@ FREESTANDING_GC_I32_GLOBALS: frozenset[str] = frozenset(
 
 FREESTANDING_GC_I64_GLOBALS: frozenset[str] = frozenset(
     {
+        'pcc_gc_backend3_remembered_owner_allocation_limit',
+        'pcc_gc_backend3_frame_root_scan_slot',
+        'pcc_gc_backend3_promotion_revision',
+        'pcc_gc_backend3_promotion_probe_pause',
+        'pcc_gc_backend3_promotion_probe_state_value',
+        'pcc_gc_backend3_remembered_scan_revision',
+        'pcc_gc_backend3_scheduler_root_scan_slot',
         'pcc_gc_backend4_deferred_recycle_pages',
+        'pcc_gc_backend4_candidate_fresh_skips_g',
+        'pcc_gc_backend4_relocation_add_refusals_g',
+        'pcc_gc_backend4_remap_epoch',
+        'pcc_gc_backend4_relocation_reset_owner',
+        'pcc_gc_backend4_reseed_plan_probe_allocation_limit',
+        'pcc_gc_backend4_reseed_plan_probe_pause',
+        'pcc_gc_backend4_reseed_plan_probe_state_value',
+        'pcc_gc_backend4_reseed_page_count_owner',
+        'pcc_gc_backend4_reseed_commit_owner',
+        'pcc_gc_backend4_reseed_page_revision',
+        'pcc_gc_backend4_reseed_relocation_revision',
+        'pcc_gc_backend4_selector_page_owner',
+        'pcc_gc_backend4_selector_scan_best_score',
+        'pcc_gc_backend4_selector_scan_owner',
         'pcc_gc_table_lock_owner_token',
+        'pcc_gc_tracing_cycle_epoch',
+        'pcc_gc_trace_extension_roots_backend',
+        'pcc_gc_trace_extension_roots_epoch',
+        'pcc_gc_trace_cext_pending_backend',
+        'pcc_gc_trace_cext_pending_epoch',
+        'pcc_gc_tracing_finish_claim_backend',
+        'pcc_gc_tracing_finish_claim_epoch',
+        'pcc_gc_tracing_finish_commits',
+        'pcc_gc_object_list_revision',
+        'pcc_gc_root_registry_revision',
     }
 )
 
@@ -1216,6 +1418,12 @@ FREESTANDING_GC_PTR_GLOBALS: frozenset[str] = frozenset(
     {
         'pcc_dealloc_trash_head',
         'pcc_gc_backend3_remembered_owner_head',
+        'pcc_gc_backend3_continuation_root_scan_cursor',
+        'pcc_gc_backend3_frame_root_scan_cursor',
+        'pcc_gc_backend3_promotion_head',
+        'pcc_gc_backend3_promotion_tail',
+        'pcc_gc_backend3_remembered_scan_cursor',
+        'pcc_gc_backend3_scheduler_root_scan_cursor',
         'pcc_gc_backend3_young_head',
         'pcc_gc_backend4_active_medium_old_page',
         'pcc_gc_backend4_active_medium_young_page',
@@ -1224,8 +1432,18 @@ FREESTANDING_GC_PTR_GLOBALS: frozenset[str] = frozenset(
         'pcc_gc_backend4_evacuation_page_head',
         'pcc_gc_backend4_free_page_head',
         'pcc_gc_backend4_page_head',
+        'pcc_gc_backend4_remap_pending_obj',
         'pcc_gc_backend4_parked_head',
+        'pcc_gc_backend4_reset_object_cursor',
+        'pcc_gc_backend4_reseed_page_count_cursor',
+        'pcc_gc_backend4_reseed_relocation_cursor',
         'pcc_gc_backend4_remembered_slots_head',
+        'pcc_gc_backend4_selector_page',
+        'pcc_gc_backend4_selector_page_cursor',
+        'pcc_gc_backend4_selector_page_seed',
+        'pcc_gc_backend4_selector_scan_best',
+        'pcc_gc_backend4_selector_scan_cursor',
+        'pcc_gc_backend4_selector_scan_page',
         'pcc_gc_backend4_retained_page_head',
         'pcc_gc_backend4_store_buffer_head',
         'pcc_gc_backend4_store_buffer_medium_head',
@@ -1243,12 +1461,14 @@ FREESTANDING_GC_PTR_GLOBALS: frozenset[str] = frozenset(
         'pcc_gc_minor_current',
         'pcc_gc_object_head',
         'pcc_gc_object_node_free_head',
+        'pcc_gc_tracked_node_pool',
         'pcc_gc_pending_minor_block',
         'pcc_gc_relocate_slot_pairs_ctx',
         'pcc_gc_relocation_set_head',
         'pcc_gc_root_slots',
         'pcc_gc_scheduler_root_head',
         'pcc_gc_trace_cursor',
+        'pcc_gc_trace_cext_pending_obj',
         'py_gc_callbacks',
         'py_gc_head',
         'py_set_dummy',
@@ -1381,10 +1601,17 @@ def is_freestanding_gc_readonly_runtime_import(symbol: str) -> bool:
 # freestanding escape.  Keeping raw-only object seams out of
 # ``RUNTIME_SIGNATURES`` also prevents their declarations from perturbing the
 # IR and self-object cache key of every unrelated Python module.
-FREESTANDING_GC_CROSS_OBJECT_SIGNATURES: dict[
-    str, tuple[tuple[str, ...], str]
-] = {
+def _cross_object_signatures_part_0():
+    return {
+    "pcc_current_thread_id": ((), "c_int64"),
     "pcc_thread_safepoint": ((), "c_void"),
+    "pcc_thread_stop_requested_acquire": ((), "c_int64"),
+    "pcc_thread_no_park_enter": ((), "c_void"),
+    "pcc_thread_no_park_exit": ((), "c_void"),
+    "pcc_thread_no_park_depth": ((), "c_int64"),
+    "pcc_thread_owns_stopped_world": ((), "c_int64"),
+    "pcc_thread_registration_waiter_count": ((), "c_int64"),
+    "pcc_thread_unregister_current": ((), "c_void"),
     "pcc_thread_start": (("c_ptr", "c_ptr", "c_ptr"), "c_int64"),
     "pcc_thread_join": (("c_ptr", "c_ptr"), "c_int64"),
     "pcc_platform_sleep_ns": (("c_int64",), "c_int64"),
@@ -1399,13 +1626,43 @@ FREESTANDING_GC_CROSS_OBJECT_SIGNATURES: dict[
     "pcc_dealloc_cascade_active": ((), "c_int64"),
     "pcc_gc_root_slot_count_from_map": (("c_ptr",), "c_int64"),
     "pcc_gc_root_map_is_borrowed": (("c_ptr",), "c_int64"),
+    "pcc_gc_store_root_plan_init": (
+        ("c_ptr", "c_int64"),
+        "c_void",
+    ),
+    "pcc_gc_store_root_plan_commit_locked": (
+        ("c_ptr", "c_ptr", "c_ptr"),
+        "c_int64",
+    ),
+    "pcc_gc_store_root_plan_finish": (("c_ptr",), "c_void"),
+    "pcc_gc_store_ptr_plan_commit_locked": (
+        ("c_ptr", "c_ptr", "c_ptr", "c_ptr"),
+        "c_int64",
+    ),
+    "pcc_gc_store_ptr_plan_finish": (("c_ptr",), "c_void"),
+    "pcc_gc_retain_plan_prepare_locked": (
+        ("c_ptr", "c_ptr"),
+        "c_ptr",
+    ),
+    "pcc_gc_retain_plan_finish": (("c_ptr",), "c_void"),
+    "pcc_gc_scheduler_root_link_locked": (("c_ptr",), "c_void"),
+    "pcc_gc_scheduler_root_unlink_locked": (("c_ptr",), "c_int64"),
     "pcc_gc_scheduler_root_count": ((), "c_int64"),
     "pcc_gc_frame_root_slot_count": ((), "c_int64"),
     "pcc_gc_coroutine_root_score": ((), "c_int64"),
     "pcc_gc_cycle_requested_store_release": (("c_int64",), "c_void"),
     "pcc_gc_frame_index_find": (("c_ptr",), "c_ptr"),
     "pcc_gc_frame_index_insert": (("c_ptr", "c_ptr"), "c_int64"),
+    "pcc_gc_frame_index_plan_capacity": (("c_int64",), "c_int64"),
+    "pcc_gc_frame_index_plan_commit": (
+        ("c_ptr", "c_int64", "c_int64"),
+        "c_int64",
+    ),
     "pcc_gc_frame_index_replace": (("c_ptr", "c_ptr"), "c_ptr"),
+    "pcc_gc_frame_index_replace_preallocated": (
+        ("c_ptr", "c_ptr"),
+        "c_ptr",
+    ),
     "pcc_gc_frame_index_remove": (("c_ptr",), "c_ptr"),
     "pcc_gc_frame_node_tls_pool_drain": ((), "c_void"),
     "pcc_gc_forwarding_index_find": (("c_ptr",), "c_ptr"),
@@ -1414,6 +1671,29 @@ FREESTANDING_GC_CROSS_OBJECT_SIGNATURES: dict[
     "pcc_gc_forwarding_index_clear": ((), "c_void"),
     "pcc_gc_forwarding_target_index_find": (("c_ptr",), "c_ptr"),
     "pcc_gc_forwarding_target_index_insert": (("c_ptr", "c_ptr"), "c_int64"),
+    }
+
+
+def _cross_object_signatures_part_1():
+    return {
+    "pcc_list_grow_for_mutation": (("c_ptr", "c_int64"), "c_ptr"),
+    "pcc_gc_publish_initialized": (("c_ptr",), "c_void"),
+    "pcc_gc_store_ptr_plan_init": (
+        ("c_ptr", "c_ptr", "c_int64"),
+        "c_void",
+    ),
+    "pcc_gc_backend4_retarget_mutator_payload_locked": (
+        (
+            "c_ptr",
+            "c_ptr",
+            "c_int64",
+            "c_ptr",
+            "c_int64",
+            "c_ptr",
+            "c_int64",
+        ),
+        "c_int64",
+    ),
     "pcc_gc_forwarding_target_index_upsert": (("c_ptr", "c_ptr"), "c_int64"),
     "pcc_gc_forwarding_target_index_remove": (("c_ptr",), "c_ptr"),
     "pcc_gc_forwarding_target_index_clear": ((), "c_void"),
@@ -1423,6 +1703,15 @@ FREESTANDING_GC_CROSS_OBJECT_SIGNATURES: dict[
     "pcc_gc_identity_index_clear": ((), "c_void"),
     "pcc_gc_zpage_owner_index_find": (("c_ptr",), "c_ptr"),
     "pcc_gc_zpage_owner_index_upsert": (("c_ptr", "c_ptr"), "c_int64"),
+    "pcc_gc_zpage_owner_index_plan_capacity": (("c_int64",), "c_int64"),
+    "pcc_gc_zpage_owner_index_plan_commit": (
+        ("c_ptr", "c_int64", "c_int64"),
+        "c_int64",
+    ),
+    "pcc_gc_zpage_owner_index_upsert_preallocated": (
+        ("c_ptr", "c_ptr"),
+        "c_int64",
+    ),
     "pcc_gc_zpage_owner_index_remove": (("c_ptr",), "c_ptr"),
     "pcc_gc_config_ensure": ((), "c_int64"),
     "pcc_gc_backend": ((), "c_int64"),
@@ -1434,6 +1723,11 @@ FREESTANDING_GC_CROSS_OBJECT_SIGNATURES: dict[
     "py_incref": (("c_ptr",), "c_void"),
     "py_decref": (("c_ptr",), "c_void"),
     "pcc_gc_object_list_head": ((), "c_ptr"),
+    }
+
+
+def _cross_object_signatures_part_2():
+    return {
     "pcc_gc_object_set_list_head": (("c_ptr",), "c_void"),
     "pcc_gc_trace_cursor_load": ((), "c_ptr"),
     "pcc_gc_trace_cursor_store": (("c_ptr",), "c_void"),
@@ -1455,8 +1749,14 @@ FREESTANDING_GC_CROSS_OBJECT_SIGNATURES: dict[
     "pcc_gc_object_node_set_young_next": (("c_ptr", "c_ptr"), "c_void"),
     "pcc_gc_object_node_young_prev": (("c_ptr",), "c_ptr"),
     "pcc_gc_object_node_set_young_prev": (("c_ptr", "c_ptr"), "c_void"),
+    "pcc_gc_object_node_clear_promotion_state": (("c_ptr",), "c_void"),
+    "pcc_gc_backend3_promotion_unlink": (("c_ptr",), "c_void"),
     "pcc_gc_object_node_alloc": ((), "c_ptr"),
+    "pcc_gc_object_node_prepare": ((), "c_ptr"),
+    "pcc_gc_object_node_plan_requires_prepare": ((), "c_int64"),
+    "pcc_gc_object_node_take_prepared": (("c_ptr",), "c_ptr"),
     "pcc_gc_object_node_release": (("c_ptr",), "c_void"),
+    "pcc_gc_object_node_finish_detached": (("c_ptr",), "c_void"),
     "pcc_gc_object_node_unlink": (("c_ptr",), "c_void"),
     "pcc_gc_backend3_young_link_head": (("c_ptr",), "c_void"),
     "pcc_gc_backend3_young_unlink": (("c_ptr",), "c_void"),
@@ -1464,12 +1764,75 @@ FREESTANDING_GC_CROSS_OBJECT_SIGNATURES: dict[
     "pcc_gc_object_known_size": (("c_ptr",), "c_int64"),
     "pcc_gc_live_bytes_subtract": (("c_int64",), "c_void"),
     "pcc_gc_forwarding_find": (("c_ptr",), "c_ptr"),
+    "pcc_gc_forwarding_target_exists": (("c_ptr",), "c_int64"),
     "pcc_gc_install_forwarding_unlocked": (("c_ptr", "c_ptr"), "c_int64"),
+    "pcc_gc_forwarding_install_plan_prepare": (
+        ("c_ptr", "c_ptr"),
+        "c_ptr",
+    ),
+    "pcc_gc_install_forwarding_preallocated_unlocked": (
+        ("c_ptr", "c_ptr", "c_ptr"),
+        "c_int64",
+    ),
+    "pcc_gc_forwarding_install_plan_finish": (("c_ptr",), "c_void"),
+    "pcc_gc_forwarding_plan_index_capacity": (
+        ("c_int64", "c_int64"),
+        "c_int64",
+    ),
+    "pcc_gc_forwarding_plan_index_commit": (
+        ("c_int64", "c_ptr", "c_int64", "c_int64"),
+        "c_int64",
+    ),
+    "pcc_gc_forwarding_plan_index_insert": (
+        ("c_int64", "c_ptr", "c_ptr"),
+        "c_int64",
+    ),
+    "pcc_gc_identity_detach": (("c_ptr",), "c_ptr"),
+    "pcc_gc_identity_finish_detached": (("c_ptr",), "c_void"),
     "pcc_gc_identity_remove": (("c_ptr",), "c_void"),
     "pcc_gc_relocate_copy_payload": (
         ("c_ptr", "c_ptr", "c_int64", "c_int64"),
         "c_int64",
     ),
+    "pcc_gc_relocate_copy_payload_prepared_locked": (
+        ("c_ptr", "c_ptr", "c_int64", "c_int64", "c_ptr"),
+        "c_int64",
+    ),
+    "pcc_gc_relocation_payload_slot_count_locked": (
+        ("c_ptr",),
+        "c_int64",
+    ),
+    }
+
+
+def _cross_object_signatures_part_3():
+    return {
+    "pcc_gc_relocation_payload_plan_prepare": (
+        ("c_int64",),
+        "c_ptr",
+    ),
+    "pcc_gc_relocation_payload_plan_validate_locked": (
+        ("c_ptr", "c_ptr", "c_int64", "c_ptr"),
+        "c_int64",
+    ),
+    "pcc_gc_relocation_payload_raw_snapshot_locked": (
+        ("c_ptr", "c_int64", "c_int64", "c_ptr"),
+        "c_int64",
+    ),
+    "pcc_gc_relocation_payload_raw_prepare": (
+        ("c_ptr",),
+        "c_int64",
+    ),
+    "pcc_gc_relocation_payload_raw_validate_locked": (
+        ("c_ptr", "c_ptr", "c_int64", "c_int64", "c_ptr"),
+        "c_int64",
+    ),
+    "pcc_gc_relocation_payload_plan_finish": (("c_ptr",), "c_void"),
+    "pcc_capi_visit_extension_module_state_roots": (
+        ("c_ptr", "c_ptr"),
+        "c_void",
+    ),
+    "pcc_cpy_handle_move_owned_ref": (("c_ptr", "c_ptr"), "c_void"),
     "pcc_gc_generational_oldify_supported_tag": (("c_int64",), "c_int64"),
     "pcc_gc_generational_mark_forwarded_source_inactive": (
         ("c_ptr",),
@@ -1479,10 +1842,36 @@ FREESTANDING_GC_CROSS_OBJECT_SIGNATURES: dict[
     "pcc_gc_backend3_remembered_owner_list_head": ((), "c_ptr"),
     "pcc_gc_backend3_remembered_owner_list_set_head": (("c_ptr",), "c_void"),
     "pcc_gc_backend3_remember_owner": (("c_ptr", "c_int64"), "c_void"),
-    "pcc_gc_backend3_clear_remembered_owners": ((), "c_void"),
+    "pcc_gc_backend3_clear_remembered_owners": ((), "c_ptr"),
+    "pcc_gc_backend3_finish_detached_remembered_owners": (
+        ("c_ptr",),
+        "c_void",
+    ),
     "pcc_gc_backend3_scan_remembered_owners": (("c_int64",), "c_int64"),
-    "pcc_gc_backend3_drain_remembered_owners": (("c_int64",), "c_int64"),
+    "pcc_gc_backend3_drain_remembered_owners": (
+        ("c_int64", "c_ptr"),
+        "c_int64",
+    ),
     "pcc_gc_trace_referents_for_promotion": (("c_ptr",), "c_void"),
+    "pcc_gc_backend3_promotion_worklist_unlink": (("c_ptr",), "c_void"),
+    "pcc_gc_backend3_enqueue_promotion_owner": (("c_ptr",), "c_void"),
+    "pcc_gc_backend3_promote_cext_owner_referents": (
+        ("c_ptr",),
+        "c_void",
+    ),
+    "pcc_gc_visit_object_slots_slice": (
+        ("c_ptr", "c_int64", "c_int64", "c_ptr", "c_ptr", "c_ptr"),
+        "c_int64",
+    ),
+    "pcc_gc_backend3_drain_promotion_worklist": (
+        ("c_int64",),
+        "c_int64",
+    ),
+    "pcc_gc_backend3_promotion_probe_config": (
+        ("c_int64",),
+        "c_void",
+    ),
+    "pcc_gc_backend3_promotion_probe_state": ((), "c_int64"),
     "pcc_gc_generational_promote_young_if_known": (("c_ptr",), "c_void"),
     "pcc_gc_generational_promote_owned_slot_mode": (
         ("c_ptr", "c_int64", "c_int64"),
@@ -1496,9 +1885,26 @@ FREESTANDING_GC_CROSS_OBJECT_SIGNATURES: dict[
         ("c_ptr", "c_int64"),
         "c_void",
     ),
+    "pcc_gc_trace_mark_gray_if_known": (("c_ptr",), "c_void"),
+    "pcc_gc_trace_cext_referents_unlocked": (
+        ("c_ptr", "c_ptr"),
+        "c_void",
+    ),
     "pcc_gc_backend4_zpage_note_owner_promoted": (("c_ptr",), "c_void"),
     "pcc_gc_generational_promote_frame_roots": (("c_int64",), "c_void"),
-    "pcc_gc_generational_promote_tls_exception_root": ((), "c_void"),
+    "pcc_gc_generational_promote_scheduler_roots": (
+        ("c_int64",),
+        "c_void",
+    ),
+    "pcc_gc_generational_promote_tls_exception_root": (
+        ("c_ptr",),
+        "c_void",
+    ),
+    }
+
+
+def _cross_object_signatures_part_4():
+    return {
     "pcc_gc_generational_step": (
         ("c_int64", "c_int64"),
         "c_int64",
@@ -1539,12 +1945,25 @@ FREESTANDING_GC_CROSS_OBJECT_SIGNATURES: dict[
         "c_void",
     ),
     "pcc_gc_backend4_remap_referents": (("c_ptr",), "c_void"),
+    "pcc_gc_backend4_remap_cext_ctx_valid": (("c_ptr",), "c_int64"),
+    "pcc_gc_backend4_remap_cext_referents_unlocked": (
+        ("c_ptr", "c_ptr"),
+        "c_void",
+    ),
     "pcc_gc_backend4_remembered_set_retarget_slot": (
         ("c_ptr", "c_ptr", "c_ptr", "c_ptr"),
         "c_void",
     ),
     "pcc_gc_backend4_zpage_register_owner_payload_span": (
         ("c_ptr", "c_ptr", "c_int64"),
+        "c_int64",
+    ),
+    "pcc_gc_backend4_zpage_payload_span_preflight_locked": (
+        ("c_ptr", "c_int64"),
+        "c_int64",
+    ),
+    "pcc_gc_backend4_zpage_publish_relocation_payload_spans_locked": (
+        ("c_ptr", "c_ptr", "c_int64", "c_int64"),
         "c_int64",
     ),
     "pcc_gc_backend4_relocation_set_find": (("c_ptr",), "c_ptr"),
@@ -1583,12 +2002,40 @@ FREESTANDING_GC_CROSS_OBJECT_SIGNATURES: dict[
         "c_int64",
     ),
     "pcc_gc_backend4_zpage_remove": (("c_ptr",), "c_void"),
-    "pcc_gc_backend4_relocate_copy_unlocked": (
-        ("c_ptr", "c_int64"),
+    "pcc_gc_backend4_zpage_detach_for_relocation": (
+        ("c_ptr",),
+        "c_ptr",
+    ),
+    "pcc_gc_backend4_zpage_finish_relocation_detach": (
+        ("c_ptr",),
+        "c_void",
+    ),
+    "pcc_gc_backend4_source_side_table_plan_prepare": (
+        ("c_ptr",),
+        "c_ptr",
+    ),
+    "pcc_gc_backend4_source_side_table_plan_commit": (
+        ("c_ptr",),
+        "c_int64",
+    ),
+    "pcc_gc_backend4_source_side_table_plan_finish": (
+        ("c_ptr", "c_ptr"),
+        "c_void",
+    ),
+    "pcc_gc_backend4_relocate_copy_preallocated_unlocked": (
+        ("c_ptr", "c_int64", "c_ptr", "c_ptr", "c_ptr", "c_ptr"),
         "c_ptr",
     ),
     "pcc_gc_relocate_copy": (("c_ptr", "c_int64"), "c_ptr"),
-    "pcc_gc_backend4_remap_and_retire_unlocked": ((), "c_void"),
+    }
+
+
+def _cross_object_signatures_part_5():
+    return {
+    "pcc_gc_backend4_remap_and_retire_unlocked": (("c_ptr",), "c_void"),
+    "pcc_gc_backend4_remap_and_retire_stopped_world": ((), "c_int64"),
+    "pcc_gc_backend4_finish_retained_page_releases": (("c_ptr",), "c_void"),
+    "pcc_gc_backend4_finish_remap_retirement": (("c_ptr",), "c_void"),
     "pcc_gc_backend4_park_page": (("c_ptr",), "c_void"),
     "pcc_gc_backend4_drain_parked_pages": ((), "c_void"),
     "pcc_gc_backend4_note_forwarding_removed_on_page": (
@@ -1603,7 +2050,17 @@ FREESTANDING_GC_CROSS_OBJECT_SIGNATURES: dict[
     "pcc_gc_forwarding_target_unlink": (("c_ptr",), "c_void"),
     "pcc_gc_forwarding_unlink_main": (("c_ptr",), "c_void"),
     "pcc_gc_forwarding_remove": (("c_ptr",), "c_void"),
-    "pcc_gc_forwarding_remove_target": (("c_ptr",), "c_void"),
+    "pcc_gc_forwarding_detach_into_finish": (("c_ptr", "c_ptr"), "c_void"),
+    }
+
+
+def _cross_object_signatures_part_6():
+    return {
+    "pcc_gc_forwarding_remove_target": (("c_ptr", "c_ptr"), "c_void"),
+    "pcc_gc_relocation_retire_source_payload_for_target_death_into_finish": (
+        ("c_ptr", "c_ptr", "c_ptr"),
+        "c_int64",
+    ),
     "pcc_gc_backend4_select_relocation_pages": (("c_int64",), "c_int64"),
     "pcc_gc_backend4_zpage_active_page": (
         ("c_int64", "c_int64"),
@@ -1625,7 +2082,22 @@ FREESTANDING_GC_CROSS_OBJECT_SIGNATURES: dict[
         "c_void",
     ),
     "pcc_gc_backend4_zpage_node_alloc": ((), "c_ptr"),
+    "pcc_gc_backend4_zpage_node_prepare": ((), "c_ptr"),
+    "pcc_gc_backend4_zpage_node_plan_requires_prepare": ((), "c_int64"),
+    "pcc_gc_backend4_zpage_node_take_prepared": (("c_ptr",), "c_ptr"),
     "pcc_gc_backend4_zpage_node_release": (("c_ptr",), "c_void"),
+    "pcc_gc_backend4_zpage_link_node_preallocated": (
+        ("c_ptr",),
+        "c_int64",
+    ),
+    "pcc_gc_backend4_zpage_track_page_prepare": (
+        ("c_ptr", "c_ptr", "c_int64"),
+        "c_ptr",
+    ),
+    "pcc_gc_backend4_zpage_track_alloc_preallocated": (
+        ("c_ptr", "c_int64", "c_ptr", "c_ptr", "c_int64"),
+        "c_ptr",
+    ),
     "pcc_gc_backend4_zpage_link_node": (("c_ptr",), "c_void"),
     "pcc_gc_backend4_zpage_find_page_for_addr": (
         ("c_ptr", "c_int64"),
@@ -1644,6 +2116,24 @@ FREESTANDING_GC_CROSS_OBJECT_SIGNATURES: dict[
         ("c_ptr", "c_int64", "c_ptr"),
         "c_void",
     ),
+    "pcc_gc_relocation_payload_retire_count_slot": (
+        ("c_ptr", "c_int64", "c_ptr"),
+        "c_void",
+    ),
+    "pcc_gc_relocation_payload_retire_collect_slot": (
+        ("c_ptr", "c_int64", "c_ptr"),
+        "c_void",
+    ),
+    "pcc_gc_relocation_retire_source_payload": (
+        ("c_ptr",),
+        "c_int64",
+    ),
+    "pcc_gc_relocation_retire_source_payload_into_finish": (
+        ("c_ptr", "c_ptr"),
+        "c_int64",
+    ),
+    "pcc_gc_relocation_finish_source_payloads": (("c_ptr",), "c_void"),
+    "py_mem_free": (("c_ptr",), "c_void"),
     "pcc_gc_relocation_payload_slot_pairs_prepare": (
         ("c_ptr", "c_ptr", "c_int64"),
         "c_ptr",
@@ -1665,10 +2155,38 @@ FREESTANDING_GC_CROSS_OBJECT_SIGNATURES: dict[
     "py_tls_exc_set": (("c_ptr",), "c_void"),
     "pcc_gc_object_index_find": (("c_ptr",), "c_ptr"),
     "pcc_gc_object_index_insert": (("c_ptr", "c_ptr"), "c_int64"),
+    "pcc_gc_object_index_plan_capacity": (("c_int64",), "c_int64"),
+    "pcc_gc_object_index_plan_commit": (
+        ("c_ptr", "c_int64", "c_int64"),
+        "c_int64",
+    ),
+    "pcc_gc_object_index_insert_preallocated": (
+        ("c_ptr", "c_ptr"),
+        "c_int64",
+    ),
     "pcc_gc_object_index_remove": (("c_ptr",), "c_ptr"),
     "pcc_gc_managed_pointer_index_contains": (("c_ptr",), "c_int64"),
     "pcc_gc_managed_pointer_index_insert": (("c_ptr",), "c_int64"),
     "pcc_gc_managed_pointer_index_remove": (("c_ptr",), "c_int64"),
+    "pcc_gc_granule_is_object_start": (("c_ptr",), "c_int64"),
+    "pcc_gc_granule_object_retire": (("c_ptr",), "c_int64"),
+    "pcc_runtime_tripwire_fail": (
+        ("c_ptr", "c_ptr", "c_int32"),
+        "c_void",
+    ),
+    "pcc_py_gc_defer_tripwire": (
+        ("c_ptr", "c_ptr", "c_int32"),
+        "c_void",
+    ),
+    }
+
+
+def _cross_object_signatures_part_7():
+    return {
+    "pcc_gc_tripwire_defer_or_fail": (
+        ("c_ptr", "c_ptr", "c_int32"),
+        "c_int32",
+    ),
     "pcc_gc_object_is_known_no_lock": (("c_ptr",), "c_int64"),
     "pcc_gc_object_node_is_active": (("c_ptr",), "c_int64"),
     "pcc_gc_mark_root_gray_if_known": (("c_ptr",), "c_void"),
@@ -1698,6 +2216,11 @@ FREESTANDING_GC_CROSS_OBJECT_SIGNATURES: dict[
     "pcc_gc_note_object_freeing": (("c_ptr",), "c_void"),
     "pcc_gc_trace_continuation_roots": ((), "c_int64"),
     "pcc_stop_the_world": ((), "c_int64"),
+    }
+
+
+def _cross_object_signatures_part_8():
+    return {
     "pcc_resume_world": ((), "c_int64"),
     "pcc_capi_is_cext_type_tag": (("c_int64",), "c_int64"),
     "pcc_capi_dealloc_cext_object": (
@@ -1716,10 +2239,22 @@ FREESTANDING_GC_CROSS_OBJECT_SIGNATURES: dict[
         ("c_ptr", "c_int64"),
         "c_ptr",
     ),
+    "pcc_gc_visit_mapped_root_slot": (
+        (
+            "c_ptr",
+            "c_int64",
+            "c_ptr",
+            "c_int64",
+            "c_int64",
+            "c_int64",
+        ),
+        "c_int64",
+    ),
     "pcc_gc_visit_registered_root_slots": (
         ("c_int64", "c_int64"),
         "c_int64",
     ),
+    "pcc_gc_root_registry_note_mutation_locked": ((), "c_void"),
     "py_decref": (("c_ptr",), "c_void"),
     "py_incref": (("c_ptr",), "c_void"),
     "py_subs_exc_cache_slot": (("c_int64",), "c_ptr"),
@@ -1730,6 +2265,8 @@ FREESTANDING_GC_CROSS_OBJECT_SIGNATURES: dict[
     "pcc_gc_default_drain_deferred_nodes": ((), "c_void"),
     "pcc_gc_default_table_lock": ((), "c_void"),
     "pcc_gc_default_table_unlock": ((), "c_void"),
+    "pcc_gc_tracked_node_pool_cached_count": ((), "c_int64"),
+    "pcc_gc_tracked_node_pool_drain": ((), "c_void"),
     "pcc_gc_backend0_visit_subtract": (("c_ptr",), "c_void"),
     "pcc_gc_backend0_is_unreachable": (("c_ptr",), "c_int64"),
     "pcc_gc_backend0_mark_reachable": (("c_ptr",), "c_void"),
@@ -1738,7 +2275,19 @@ FREESTANDING_GC_CROSS_OBJECT_SIGNATURES: dict[
     "pcc_gc_tracing_sweep_unreachable": (("c_int64",), "c_int64"),
     "pcc_gc_trace_referents": (("c_ptr",), "c_void"),
     "pcc_gc_begin_mark_cycle": ((), "c_void"),
-    "pcc_gc_finish_tracing_cycle": ((), "c_int64"),
+    "pcc_gc_finish_tracing_cycle": (
+        ("c_int64", "c_int64"),
+        "c_int64",
+    ),
+    "pcc_gc_complete_claimed_tracing_cycle": (
+        ("c_int64", "c_int64"),
+        "c_int64",
+    ),
+    "pcc_gc_tracing_cycle_epoch_advance_unlocked": ((), "c_int64"),
+    "pcc_gc_tracing_finish_claim_clear_unlocked": (
+        ("c_int64", "c_int64"),
+        "c_void",
+    ),
     "pcc_gc_config_ensure": ((), "c_int64"),
     "pcc_gc_maybe_start_cms_worker": ((), "c_void"),
     "pcc_gc_tracing_clear_unreachable": (("c_ptr",), "c_void"),
@@ -1746,6 +2295,7 @@ FREESTANDING_GC_CROSS_OBJECT_SIGNATURES: dict[
     "pcc_gc_tracing_recheck_reachability_after_finalizers": ((), "c_void"),
     "pcc_gc_seed_roots": ((), "c_void"),
     "pcc_gc_drain_all_gray_unlocked": ((), "c_int64"),
+    "pcc_gc_drain_all_gray_locked_slice": ((), "c_int64"),
     "pcc_refcount_forget": (("c_ptr",), "c_void"),
     "py_gc_untrack": (("c_ptr",), "c_void"),
     "py_user_del_dispatch": (("c_ptr",), "c_void"),
@@ -1757,12 +2307,22 @@ FREESTANDING_GC_CROSS_OBJECT_SIGNATURES: dict[
     "py_dealloc_tuple": (("c_ptr",), "c_void"),
     "py_dealloc_dict": (("c_ptr",), "c_void"),
     "py_dealloc_set": (("c_ptr",), "c_void"),
+    }
+
+
+def _cross_object_signatures_part_9():
+    return {
     "py_dealloc_func": (("c_ptr",), "c_void"),
     "py_class_dealloc": (("c_ptr",), "c_void"),
     "py_instance_dealloc": (("c_ptr",), "c_void"),
     "py_descriptor_dealloc": (("c_ptr",), "c_void"),
     "py_dealloc_exc": (("c_ptr",), "c_void"),
     "py_dealloc_file": (("c_ptr",), "c_void"),
+    }
+
+
+def _cross_object_signatures_part_10():
+    return {
     "py_dealloc_iter": (("c_ptr",), "c_void"),
     "py_dealloc_gen": (("c_ptr",), "c_void"),
     "py_dealloc_coroutine": (("c_ptr",), "c_void"),
@@ -1779,7 +2339,22 @@ FREESTANDING_GC_CROSS_OBJECT_SIGNATURES: dict[
     "py_dealloc_thread_semaphore": (("c_ptr",), "c_void"),
     "py_dealloc_thread_thread": (("c_ptr",), "c_void"),
     "py_dealloc_generic": (("c_ptr",), "c_void"),
-}
+    }
+
+
+FREESTANDING_GC_CROSS_OBJECT_SIGNATURES: dict[
+    str, tuple[tuple[str, ...], str]
+] = _cross_object_signatures_part_0()
+FREESTANDING_GC_CROSS_OBJECT_SIGNATURES.update(_cross_object_signatures_part_1())
+FREESTANDING_GC_CROSS_OBJECT_SIGNATURES.update(_cross_object_signatures_part_2())
+FREESTANDING_GC_CROSS_OBJECT_SIGNATURES.update(_cross_object_signatures_part_3())
+FREESTANDING_GC_CROSS_OBJECT_SIGNATURES.update(_cross_object_signatures_part_4())
+FREESTANDING_GC_CROSS_OBJECT_SIGNATURES.update(_cross_object_signatures_part_5())
+FREESTANDING_GC_CROSS_OBJECT_SIGNATURES.update(_cross_object_signatures_part_6())
+FREESTANDING_GC_CROSS_OBJECT_SIGNATURES.update(_cross_object_signatures_part_7())
+FREESTANDING_GC_CROSS_OBJECT_SIGNATURES.update(_cross_object_signatures_part_8())
+FREESTANDING_GC_CROSS_OBJECT_SIGNATURES.update(_cross_object_signatures_part_9())
+FREESTANDING_GC_CROSS_OBJECT_SIGNATURES.update(_cross_object_signatures_part_10())
 
 
 def is_freestanding_gc_cross_object_runtime_import(

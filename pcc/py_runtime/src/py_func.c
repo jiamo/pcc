@@ -50,6 +50,7 @@ PyObject *py_func_new_bound(
         py_decref(captures);
     }
     py_gc_track((PyObject *)f);
+    pcc_gc_publish_initialized((PyObject *)f);
     return (PyObject *)f;
 }
 

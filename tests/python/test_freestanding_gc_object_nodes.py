@@ -8,7 +8,10 @@ from pathlib import Path
 import pytest
 
 from pcc.py_frontend import pipeline
-from pcc.py_frontend.codegen.runtime_abi import FREESTANDING_GC_RUNTIME_GLOBALS
+from pcc.py_frontend.codegen.runtime_abi import (
+    FREESTANDING_GC_CROSS_OBJECT_SIGNATURES,
+    FREESTANDING_GC_RUNTIME_GLOBALS,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -23,14 +26,19 @@ OWNED_SYMBOLS = {
     "pcc_gc_backend3_young_rebuild",
     "pcc_gc_backend3_young_set_head",
     "pcc_gc_backend3_young_unlink",
+    "pcc_gc_backend3_promotion_unlink",
     "pcc_gc_live_bytes_subtract",
     "pcc_gc_object_known_size",
     "pcc_gc_object_list_head",
     "pcc_gc_object_node_alloc",
+    "pcc_gc_object_node_clear_promotion_state",
     "pcc_gc_object_node_freeing",
+    "pcc_gc_object_node_finish_detached",
     "pcc_gc_object_node_gc_refs",
     "pcc_gc_object_node_minor_block",
     "pcc_gc_object_node_next",
+    "pcc_gc_object_node_plan_requires_prepare",
+    "pcc_gc_object_node_prepare",
     "pcc_gc_object_node_prev",
     "pcc_gc_object_node_release",
     "pcc_gc_object_node_set_freeing",
@@ -41,6 +49,7 @@ OWNED_SYMBOLS = {
     "pcc_gc_object_node_set_young_prev",
     "pcc_gc_object_node_set_zpage",
     "pcc_gc_object_node_size",
+    "pcc_gc_object_node_take_prepared",
     "pcc_gc_object_node_unlink",
     "pcc_gc_object_node_young_next",
     "pcc_gc_object_node_young_prev",
@@ -56,11 +65,16 @@ RAW_FUNCTION_IMPORTS = {
     "pcc_gc_object_node_is_active",
 }
 RAW_GLOBAL_IMPORTS = {
+    "pcc_gc_backend3_remembered_scan_cursor",
+    "pcc_gc_backend3_promotion_head",
+    "pcc_gc_backend3_promotion_tail",
     "pcc_gc_backend3_young_head",
     "pcc_gc_live_bytes",
     "pcc_gc_object_head",
+    "pcc_gc_object_list_revision",
     "pcc_gc_object_node_free_count",
     "pcc_gc_object_node_free_head",
+    "pcc_gc_backend4_reset_object_cursor",
     "pcc_gc_trace_cursor",
 }
 
@@ -133,8 +147,65 @@ def test_object_nodes_have_one_strict_source_owner() -> None:
         "_live_bytes_subtract",
     ):
         assert f"def {old_name}(" not in managed
-    assert '_object_node_alloc = extern("pcc_gc_object_node_alloc"' in managed
+    assert '_object_node_prepare = extern("pcc_gc_object_node_prepare"' in managed
+    assert '_object_node_plan_requires_prepare = extern(' in managed
+    assert '_object_node_take_prepared = extern(' in managed
+    assert FREESTANDING_GC_CROSS_OBJECT_SIGNATURES[
+        "pcc_gc_object_node_prepare"
+    ] == ((), "c_ptr")
+    assert FREESTANDING_GC_CROSS_OBJECT_SIGNATURES[
+        "pcc_gc_object_node_plan_requires_prepare"
+    ] == ((), "c_int64")
+    assert FREESTANDING_GC_CROSS_OBJECT_SIGNATURES[
+        "pcc_gc_object_node_take_prepared"
+    ] == (("c_ptr",), "c_ptr")
+    assert FREESTANDING_GC_CROSS_OBJECT_SIGNATURES[
+        "pcc_gc_object_index_plan_capacity"
+    ] == (("c_int64",), "c_int64")
+    assert FREESTANDING_GC_CROSS_OBJECT_SIGNATURES[
+        "pcc_gc_object_index_plan_commit"
+    ] == (("c_ptr", "c_int64", "c_int64"), "c_int64")
+    assert FREESTANDING_GC_CROSS_OBJECT_SIGNATURES[
+        "pcc_gc_object_index_insert_preallocated"
+    ] == (("c_ptr", "c_ptr"), "c_int64")
     assert '_backend3_young_unlink = extern(' in managed
+
+
+def test_object_registration_prepares_node_and_index_before_graph_lock() -> None:
+    managed = MANAGED_SOURCE.read_text(encoding="utf-8")
+    strict_registration = managed.split(
+        "def pcc_gc_note_object_allocated_sized", 1
+    )[1].split('@c_abi_export("pcc_gc_note_object_allocated")', 1)[0]
+    c_oracle = (RUNTIME_DIR / "src" / "py_gc_backend.c").read_text(
+        encoding="utf-8"
+    )
+    c_registration = c_oracle.split(
+        "void pcc_gc_note_object_allocated_sized", 1
+    )[1].split("void pcc_gc_note_object_allocated(", 1)[0]
+
+    for registration, prepare, lock, unlock in (
+        (
+            strict_registration,
+            "_object_node_prepare()",
+            "_object_graph_lock()",
+            "_object_graph_unlock()",
+        ),
+        (
+            c_registration,
+            "pcc_gc_object_node_prepare()",
+            "pcc_gc_graph_lock();",
+            "pcc_gc_graph_unlock();",
+        ),
+    ):
+        prepare_at = registration.index(prepare)
+        assert registration[:prepare_at].rfind(unlock) > (
+            registration[:prepare_at].rfind(lock)
+        )
+        assert "object_node_plan_requires_prepare" in registration
+        assert "pcc_gc_object_index_plan_capacity" in registration
+        assert "pcc_gc_object_index_plan_commit" in registration
+        assert "pcc_gc_object_index_insert_preallocated" in registration
+        assert "pcc_gc_object_index_insert(o, n)" not in registration
 
 
 @pytest.mark.parametrize("emitter", ["llvm", "self"])

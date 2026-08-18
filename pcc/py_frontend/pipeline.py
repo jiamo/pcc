@@ -32,6 +32,9 @@ from typing import Optional
 from ..backend.self_backend_aarch64_darwin import (
     emit_aarch64_darwin_asm as _emit_aarch64_darwin_asm_native,
 )
+from ..backend.self_backend_indexed_emit import (
+    emit_indexed_module_file as _emit_indexed_module_file,
+)
 from ..backend.self_backend_parse import (
     parse_self_backend_target_triple as _parse_self_backend_target_triple_native,
 )
@@ -51,6 +54,7 @@ from .codegen.host_contract import (
     L1_CODEGEN_HOST_ATTRS,
     L1_CODEGEN_HOST_CLASS,
     L1_CODEGEN_HOST_METHODS,
+    PROBE_POLICY_CLOSED_WORLD,
     PROBE_POLICY_CONTEXTUAL_MIXIN,
     PROBE_POLICY_STANDALONE,
     contextual_host_for_module,
@@ -69,6 +73,7 @@ from . import pipeline_ir_text as _pipeline_ir_text
 from . import pipeline_packages as _pipeline_packages
 from . import pipeline_pass_config as _pipeline_pass_config
 from . import pipeline_pass_driver as _pipeline_pass_driver
+from .codegen.debug_info_lowering import debug_info_requested
 from . import pipeline_runtime_archive as _pipeline_runtime_archive
 from . import pipeline_native_link as _pipeline_native_link
 from . import pipeline_ir_split as _pipeline_ir_split
@@ -502,6 +507,9 @@ _without_type_checking_imports = (
 _source_declares_freestanding_module = (
     _pipeline_freestanding.source_declares_freestanding_module
 )
+_source_declares_runtime_port_module = (
+    _pipeline_freestanding.source_declares_runtime_port_module
+)
 _freestanding_allowed_external_symbols = (
     _pipeline_freestanding.freestanding_allowed_external_symbols
 )
@@ -604,6 +612,12 @@ _native_export_to_wire = _pipeline_exports._native_export_to_wire
 _native_export_from_wire = _pipeline_exports._native_export_from_wire
 _write_native_exports_wire = _pipeline_exports._write_native_exports_wire
 _read_native_exports_wire = _pipeline_exports._read_native_exports_wire
+_read_native_exports_wire_for_module = (
+    _pipeline_exports._read_native_exports_wire_for_module
+)
+_read_native_exports_wire_raw_modules = (
+    _pipeline_exports._read_native_exports_wire_raw_modules
+)
 _export_method_symbol = _pipeline_exports._export_method_symbol
 
 
@@ -613,7 +627,11 @@ _closed_world_module_block_assign_targets = _pipeline_closed_world._closed_world
 _closed_world_dyn_module_global_export = _pipeline_closed_world._closed_world_dyn_module_global_export
 _merge_closed_world_reexports = _pipeline_closed_world._merge_closed_world_reexports
 _closed_world_reexport_edges = _pipeline_closed_world._closed_world_reexport_edges
+_closed_world_module_dependencies = (
+    _pipeline_closed_world._closed_world_module_dependencies
+)
 _merge_closed_world_reexport_edges = _pipeline_closed_world._merge_closed_world_reexport_edges
+_flatten_closed_world_class_export_fields = _pipeline_closed_world._flatten_closed_world_class_export_fields
 _repair_closed_world_default_global_owners = _pipeline_closed_world._repair_closed_world_default_global_owners
 _mark_closed_world_function_object_exports = _pipeline_closed_world._mark_closed_world_function_object_exports
 _apply_closed_world_function_object_uses = _pipeline_closed_world._apply_closed_world_function_object_uses
@@ -631,6 +649,21 @@ build_closed_world_context = _build_context_owner.build_closed_world_context
 _annotate_closed_world_vthread_effects = (
     _build_context_owner.annotate_closed_world_vthread_effects
 )
+_annotate_closed_world_vthread_effect_summaries = (
+    _build_context_owner.annotate_closed_world_vthread_effect_summaries
+)
+_build_closed_world_vthread_effect_summary = (
+    _build_context_owner.build_closed_world_vthread_effect_summary
+)
+_closed_world_vthread_effect_export_surface = (
+    _build_context_owner.closed_world_vthread_effect_export_surface
+)
+_write_closed_world_vthread_effect_summary = (
+    _build_context_owner.write_closed_world_vthread_effect_summary
+)
+_read_closed_world_vthread_effect_summary = (
+    _build_context_owner.read_closed_world_vthread_effect_summary
+)
 _closed_world_derived_class_map = (
     _build_context_owner._closed_world_derived_class_map
 )
@@ -638,6 +671,9 @@ _merge_l1_mixin_stack_methods = (
     _build_context_owner._merge_l1_mixin_stack_methods
 )
 _merge_l1_codegen_methods = _build_context_owner._merge_l1_codegen_methods
+_contextual_host_export_surface = (
+    _build_context_owner._contextual_host_export_surface
+)
 _contextual_host_params_for_module = (
     _build_context_owner._contextual_host_params_for_module
 )
@@ -660,6 +696,7 @@ def _runtime_archive_stale(archive: str) -> bool:
         target_matches=_runtime_archive_target_matches,
         archive_requires_provenance=_runtime_archive_requires_provenance,
         archive_provenance_valid=_runtime_archive_provenance_valid,
+        archive_codegen_stale=_runtime_archive_codegen_stale,
         wheel_matches=_runtime_archive_wheel_stamp_matches,
         compiler_sources_newer=_runtime_archive_compiler_sources_newer_than,
         replaced_c_modules=_runtime_pcc_python_replaced_c_modules,
@@ -731,6 +768,14 @@ def _runtime_archive_provenance_valid(
         pcc_source_root=_pcc_source_root_for_host_subprocess,
         host_python_command=_host_python_command,
         runtime_root=runtime_root,
+    )
+
+
+def _runtime_archive_codegen_stale(archive: str) -> bool:
+    return _pipeline_runtime_archive.provenance_codegen_stale(
+        archive,
+        pcc_source_root=_pcc_source_root_for_host_subprocess,
+        host_python_command=_host_python_command,
     )
 
 
@@ -806,6 +851,7 @@ def _ensure_runtime(
             c_bundle_valid=_runtime_archive_c_bundle_valid,
             archive_requires_provenance=_runtime_archive_requires_provenance,
             archive_provenance_valid=_runtime_archive_provenance_valid,
+            archive_codegen_stale=_runtime_archive_codegen_stale,
             wheel_matches=_runtime_archive_wheel_stamp_matches,
             archive_manifest=_runtime_archive_provenance_manifest,
             archive_target_matches=_runtime_archive_target_matches,
@@ -818,6 +864,30 @@ def _ensure_runtime(
         )
     except _pipeline_runtime_archive.RuntimeArchiveError as exc:
         raise PyPipelineError(str(exc) or type(exc).__name__) from exc
+
+
+def _ensure_runtime_without_direct_indexed_env(verbose: bool) -> str:
+    """Build/load the runtime without leaking frontend-worker direct mode."""
+    direct_names = (
+        "PCC_DIRECT_INDEXED_KERNEL_CAPTURE",
+        "PCC_DIRECT_INDEXED_KERNEL_EMIT",
+        "PCC_DIRECT_INDEXED_KERNEL_REQUIRE_ZERO_FALLBACK",
+        "PCC_DIRECT_INDEXED_KERNEL_FUSE_USES",
+        "PCC_DIRECT_INDEXED_KERNEL_RELEASE_FRONTEND",
+        "PCC_DIRECT_INDEXED_KERNEL_VALIDATE",
+        "PCC_TEXT_INDEXED_KERNEL_EMIT",
+    )
+    saved = {}
+    for name in direct_names:
+        if name in os.environ:
+            saved[name] = os.environ.pop(name)
+    try:
+        return _ensure_runtime(verbose, needs_libpython=False)
+    finally:
+        for name, value in saved.items():
+            os.environ[name] = value
+
+
 def _resolve_pcc_binary() -> Optional[str]:
     """Locate the pcc CLI binary for PCC_RUNTIME_CC=pcc builds."""
     env_override = str(os.environ.get("PCC_BINARY", "") or "").strip()
@@ -870,6 +940,14 @@ def _apply_python_ir_pass_pipeline(
     default_raw: Optional[str] = None,
     strict_no_libpython: bool = False,
 ) -> str:
+    if debug_info_requested():
+        # A debug build is an unoptimized build.  Every transport in this
+        # pipeline rewrites instruction lines and drops their ``!dbg`` suffix,
+        # which would leave the line table pointing at instructions that no
+        # longer exist -- worse than no line table, because it looks right.
+        # Carrying locations through the transforms belongs with the real pass
+        # infrastructure; until then `-g` means `-O0`, as it does elsewhere.
+        return ir_text
     try:
         return _pipeline_pass_driver.apply_passes(
             ir_text,
@@ -1025,8 +1103,17 @@ _host_target_triple_for_self_backend = _pipeline_targets.host_target_triple
 
 
 def _self_backend_ir_text(ir_text: str) -> str:
+    # A concrete module target is already authoritative.  Resolve the host
+    # target only for a missing/placeholder directive: besides avoiding an
+    # unnecessary compiler subprocess, this keeps the internal-assembly worker
+    # genuinely independent of ``cc``.
+    text = str(ir_text)
+    header = text[:4096]
+    placeholder = 'target triple = "unknown-unknown-unknown"'
+    if placeholder not in header and 'target triple = "' in header:
+        return text
     return _pipeline_targets.self_backend_ir_text(
-        ir_text,
+        text,
         host_target_triple=_host_target_triple_for_self_backend(),
     )
 
@@ -1133,6 +1220,25 @@ def run_self_backend_emit_worker(
         normalize_ir=_self_backend_ir_text,
         emit_native=_emit_self_asm_in_process,
     )
+
+
+def run_self_backend_indexed_emit_worker(
+    sidecar_path: str,
+    output_path: str,
+    artifact_kind: str,
+) -> int:
+    try:
+        _emit_indexed_module_file(sidecar_path, output_path, artifact_kind)
+        return 0
+    except Exception as exc:
+        sys.stderr.write(
+            "self backend indexed emit worker failed: "
+            + (str(exc) or type(exc).__name__)
+            + "\n"
+        )
+        return 1
+
+
 def run_self_backend_emit_batch_worker(manifest_path: str) -> int:
     return _pipeline_self_backend_emit.run_emit_batch_worker(
         manifest_path,
@@ -1146,7 +1252,9 @@ def _run_self_backend_emit_worker_pool(
     tmp_dir: str,
     batch_label: str,
     max_parallel: int,
+    fresh_process_per_item: bool,
     item_bytes=None,
+    admission_byte_cap: int = 0,
 ) -> int:
     try:
         return _pipeline_self_backend_emit.run_emit_worker_pool(
@@ -1157,7 +1265,12 @@ def _run_self_backend_emit_worker_pool(
             batch_label,
             max_parallel,
             item_bytes=item_bytes,
-            batch_max_items=_SELF_BACKEND_EMIT_BATCH_MAX_ITEMS,
+            admission_byte_cap=admission_byte_cap,
+            batch_max_items=(
+                1
+                if fresh_process_per_item
+                else _SELF_BACKEND_EMIT_BATCH_MAX_ITEMS
+            ),
             manifest_version=_SELF_BACKEND_EMIT_BATCH_MANIFEST_V1,
             worker_arg=_SELF_BACKEND_EMIT_BATCH_WORKER_ARG,
             small_int_decimal=_small_int_decimal,
@@ -1408,7 +1521,15 @@ def _link_self_backend_ir_texts_run(
 
 
 def _repo_root_for_link() -> str:
-    """Repo root, found by walking up from this file (no pcc.backend import)."""
+    """Resolve the explicitly owned repo root before consulting ``__file__``."""
+    explicit = str(os.environ.get("PCC_REPO_ROOT", "") or "").strip()
+    if explicit:
+        root = os.path.abspath(os.path.expanduser(explicit))
+        if not os.path.isfile(os.path.join(root, "AGENTS.md")):
+            raise PyPipelineError(
+                "PCC_REPO_ROOT does not name a complete pcc source root"
+            )
+        return root
     cur = os.path.dirname(os.path.abspath(__file__))
     while True:
         if os.path.isfile(os.path.join(cur, "AGENTS.md")):
@@ -1526,7 +1647,10 @@ def _run_self_link_command(
     needs_libpython: bool = False,
     needs_native_extension_exports: bool = False,
     pcc_asm_inputs: tuple[str, ...] = (),
+    pcc_native_object_inputs: tuple[str, ...] = (),
+    pcc_internal_input_manifest: Optional[str] = None,
     semantic_layout_policy: Optional[str] = None,
+    link_profile_path: Optional[str] = None,
 ) -> None:
     try:
         _pipeline_self_backend_link.run_link_command(
@@ -1540,7 +1664,10 @@ def _run_self_link_command(
             needs_libpython=needs_libpython,
             needs_native_extension_exports=needs_native_extension_exports,
             pcc_asm_inputs=pcc_asm_inputs,
+            pcc_native_object_inputs=pcc_native_object_inputs,
+            pcc_internal_input_manifest=pcc_internal_input_manifest,
             semantic_layout_policy=semantic_layout_policy,
+            link_profile_path=link_profile_path,
             resolve_self_link_mode=_resolve_self_link_mode,
             validate_pcc_self_link_surface=_validate_pcc_self_link_surface,
             repo_root_for_link=_repo_root_for_link,
@@ -1578,6 +1705,320 @@ def _link_with_self_backend_ir_texts(
         tmp_dir=tmp_dir,
         profile=profile,
         link_run=_link_self_backend_ir_texts_run,
+    )
+
+
+def _record_macho_link_profile(profile, path: str) -> None:
+    if profile is None:
+        return
+    try:
+        with open(path, "r", encoding="utf-8") as stream:
+            payload = json.load(stream)
+    except (OSError, ValueError) as exc:
+        raise PyPipelineError("pcc Mach-O linker produced no valid phase profile") from exc
+    if payload.get("schema") != "pcc.macho-link-profile.v1":
+        raise PyPipelineError("pcc Mach-O linker phase profile schema mismatch")
+    phases = payload.get("phases_ms")
+    if not isinstance(phases, dict):
+        raise PyPipelineError("pcc Mach-O linker phase profile has no phases")
+    for name in (
+        "assemble_pool",
+        "decode_pco",
+        "prepare_link",
+        "sign",
+        "write",
+        "validate",
+    ):
+        value = phases.get(name)
+        if not isinstance(value, (int, float)):
+            raise PyPipelineError(
+                "pcc Mach-O linker phase profile is missing " + name
+            )
+        _profile_counter(profile, "link_macho_" + name + "_ms", int(value))
+
+
+def _prepare_direct_native_object_dir(out_path: str) -> str:
+    path = os.path.abspath(str(out_path)) + ".pcc-pco." + str(os.getpid())
+    subprocess.run(["/bin/rm", "-rf", path], check=True)
+    subprocess.run(["mkdir", "-p", path], check=True)
+    return path
+
+
+def _remove_direct_native_object_dir(path: str) -> None:
+    if path:
+        subprocess.run(["/bin/rm", "-rf", path], check=True)
+
+
+def _link_with_self_backend_assembly_texts(
+    assembly_texts: list[tuple[str, str]],
+    out_path: str,
+    runtime_archive: Optional[str],
+    verbose: bool,
+    *,
+    needs_libpython: bool = False,
+    needs_native_extension_exports: bool = False,
+    extra_link_inputs: tuple[str, ...] = (),
+    extra_link_args: tuple[str, ...] = (),
+    profile: Optional[dict] = None,
+) -> None:
+    """Link deterministically ordered assembly already emitted by workers."""
+    if _macho_semantic_layout_enabled():
+        raise PyPipelineError(
+            "direct indexed assembly publication does not yet own semantic layout"
+        )
+    _validate_pcc_self_link_surface(
+        extra_link_args=extra_link_args,
+        needs_libpython=needs_libpython,
+        needs_native_extension_exports=needs_native_extension_exports,
+    )
+    signature_owned_by_pcc = _resolve_self_link_mode() == "pcc"
+    export_pcc_capi = needs_native_extension_exports and not needs_libpython
+    with tempfile.TemporaryDirectory(prefix="pcc_py_direct_asm_") as tmp:
+        asm_paths = []
+        needs_subsections_via_symbols = False
+        started = _profile_begin(profile)
+        for index, item in enumerate(assembly_texts):
+            module_name, asm_text = item
+            safe_name = module_name.replace(".", "_").replace("-", "_")
+            asm_path = os.path.join(
+                tmp,
+                str(index) + "_" + safe_name + ".s",
+            )
+            with open(asm_path, "w", encoding="utf-8") as stream:
+                stream.write(asm_text)
+            asm_paths.append(asm_path)
+            if ".subsections_via_symbols" in asm_text:
+                needs_subsections_via_symbols = True
+        _profile_end(profile, "link_self_direct_asm_write", started)
+
+        cc = str(os.environ.get("CC", "") or "").strip() or "cc"
+        tmp_out_path = str(out_path) + ".tmp"
+        link_profile_path = (
+            os.path.join(tmp, "pcc-link-profile.json")
+            if signature_owned_by_pcc and profile is not None
+            else None
+        )
+        cmd = [cc] + asm_paths + list(extra_link_inputs)
+        if runtime_archive is not None:
+            cmd.extend(
+                _runtime_archive_link_args_for_native_extensions(
+                    runtime_archive,
+                    export_pcc_capi,
+                )
+            )
+        cmd.extend(["-o", tmp_out_path, "-lm"])
+        cmd.extend(extra_link_args)
+        cmd.extend(_native_extension_export_link_flags(export_pcc_capi))
+        cmd.extend(
+            _libpython_capi_isolation_link_flags(
+                runtime_archive,
+                needs_libpython,
+            )
+        )
+        if sys.platform == "darwin" and needs_subsections_via_symbols:
+            cmd.append("-Wl,-dead_strip")
+        cmd.extend(_platform_link_flags())
+        if needs_libpython:
+            _append_libpython_link_flags(cmd)
+        _log(verbose, "direct self link: " + _join_strings(cmd, " "))
+        started = _profile_begin(profile)
+        _run_self_link_command(
+            cmd,
+            None,
+            tmp_out_path,
+            runtime_archive,
+            extra_link_inputs,
+            verbose,
+            extra_link_args=extra_link_args,
+            needs_libpython=needs_libpython,
+            needs_native_extension_exports=export_pcc_capi,
+            pcc_asm_inputs=(
+                tuple(asm_paths) if signature_owned_by_pcc else ()
+            ),
+            link_profile_path=link_profile_path,
+        )
+        _profile_end(profile, "link_self_direct_asm_driver", started)
+        if link_profile_path is not None:
+            _record_macho_link_profile(profile, link_profile_path)
+        _finish_self_backend_executable(
+            tmp_out_path,
+            out_path,
+            profile,
+            signature_owned_by_pcc=signature_owned_by_pcc,
+        )
+
+
+def _write_direct_input_manifest(
+    path: str,
+    ordered: list[tuple[str, str]],
+) -> None:
+    with open(path, "w", encoding="utf-8") as stream:
+        stream.write("pcc.macho-internal-inputs.v1\n")
+        stream.write(str(len(ordered)) + "\n")
+        for kind, artifact_path in ordered:
+            stream.write(kind + "\t" + artifact_path + "\n")
+
+
+def _write_deferred_self_link_plan(
+    plan_path: str,
+    *,
+    out_path: str,
+    runtime_archive: Optional[str],
+    input_manifest: str,
+    profile_path: str,
+    cleanup_root: str,
+    extra_link_inputs: tuple[str, ...],
+) -> None:
+    with open(plan_path, "w", encoding="utf-8") as stream:
+        stream.write("pcc.deferred-self-link.v1\n")
+        stream.write(os.path.abspath(str(out_path)) + "\n")
+        stream.write(
+            ""
+            if runtime_archive is None
+            else os.path.abspath(str(runtime_archive))
+        )
+        stream.write("\n")
+        stream.write(os.path.abspath(str(input_manifest)) + "\n")
+        stream.write(os.path.abspath(str(profile_path)) + "\n")
+        stream.write(
+            "" if not cleanup_root else os.path.abspath(str(cleanup_root))
+        )
+        stream.write("\n")
+        stream.write(str(len(extra_link_inputs)) + "\n")
+        for extra in extra_link_inputs:
+            stream.write(os.path.abspath(str(extra)) + "\n")
+
+
+def _link_with_self_backend_direct_artifacts(
+    artifacts: list[tuple[str, str, str]],
+    out_path: str,
+    runtime_archive: Optional[str],
+    verbose: bool,
+    *,
+    needs_libpython: bool = False,
+    needs_native_extension_exports: bool = False,
+    extra_link_inputs: tuple[str, ...] = (),
+    extra_link_args: tuple[str, ...] = (),
+    profile: Optional[dict] = None,
+) -> None:
+    """Link ordered worker-owned ASM/PCO paths without coordinator copies."""
+    if _macho_semantic_layout_enabled():
+        raise PyPipelineError(
+            "direct indexed artifact publication does not yet own semantic layout"
+        )
+    _validate_pcc_self_link_surface(
+        extra_link_args=extra_link_args,
+        needs_libpython=needs_libpython,
+        needs_native_extension_exports=needs_native_extension_exports,
+    )
+    if _resolve_self_link_mode() != "pcc" or sys.platform != "darwin":
+        raise PyPipelineError(
+            "direct indexed artifacts require the pcc-owned Darwin linker"
+        )
+    ordered: list[tuple[str, str]] = []
+    for _module_name, raw_kind, raw_path in artifacts:
+        kind = str(raw_kind)
+        if kind not in ("ASM", "PCO"):
+            raise PyPipelineError("unknown direct indexed artifact kind: " + kind)
+        path = os.path.abspath(str(raw_path))
+        if not os.path.isfile(path):
+            raise PyPipelineError("direct indexed artifact not found: " + path)
+        if "\t" in path or "\n" in path or "\r" in path:
+            raise PyPipelineError("direct indexed artifact path is not line-safe")
+        ordered.append((kind, path))
+    if not ordered:
+        raise PyPipelineError("direct indexed artifact set is empty")
+    deferred_plan = str(
+        os.environ.get("PCC_DEFER_SELF_LINK_PLAN", "") or ""
+    ).strip()
+    if deferred_plan:
+        deferred_plan = os.path.abspath(deferred_plan)
+        input_manifest = deferred_plan + ".inputs"
+        profile_path = deferred_plan + ".profile.json"
+        _write_direct_input_manifest(input_manifest, ordered)
+        cleanup_root = os.path.dirname(ordered[0][1])
+        for _kind, path in ordered:
+            if os.path.dirname(path) != cleanup_root:
+                cleanup_root = ""
+                break
+        _write_deferred_self_link_plan(
+            deferred_plan,
+            out_path=out_path,
+            runtime_archive=runtime_archive,
+            input_manifest=input_manifest,
+            profile_path=profile_path,
+            cleanup_root=cleanup_root,
+            extra_link_inputs=extra_link_inputs,
+        )
+        return
+    with tempfile.TemporaryDirectory(prefix="pcc_py_direct_artifacts_") as tmp:
+        tmp_out_path = str(out_path) + ".tmp"
+        input_manifest = os.path.join(tmp, "internal-inputs.txt")
+        _write_direct_input_manifest(input_manifest, ordered)
+        link_profile_path = (
+            os.path.join(tmp, "pcc-link-profile.json")
+            if profile is not None
+            else None
+        )
+        cc = str(os.environ.get("CC", "") or "").strip() or "cc"
+        cmd = [cc] + [path for _kind, path in ordered]
+        cmd += list(extra_link_inputs) + ["-o", tmp_out_path]
+        started = _profile_begin(profile)
+        _run_self_link_command(
+            cmd,
+            None,
+            tmp_out_path,
+            runtime_archive,
+            extra_link_inputs,
+            verbose,
+            extra_link_args=extra_link_args,
+            needs_libpython=needs_libpython,
+            needs_native_extension_exports=needs_native_extension_exports,
+            pcc_internal_input_manifest=input_manifest,
+            link_profile_path=link_profile_path,
+        )
+        all_native = all(kind == "PCO" for kind, _path in ordered)
+        _profile_end(
+            profile,
+            (
+                "link_self_direct_native_object_driver"
+                if all_native
+                else "link_self_direct_mixed_artifact_driver"
+            ),
+            started,
+        )
+        if link_profile_path is not None:
+            _record_macho_link_profile(profile, link_profile_path)
+        _finish_self_backend_executable(
+            tmp_out_path,
+            out_path,
+            profile,
+            signature_owned_by_pcc=True,
+        )
+
+
+def _link_with_self_backend_native_objects(
+    native_objects: list[tuple[str, str]],
+    out_path: str,
+    runtime_archive: Optional[str],
+    verbose: bool,
+    *,
+    needs_libpython: bool = False,
+    needs_native_extension_exports: bool = False,
+    extra_link_inputs: tuple[str, ...] = (),
+    extra_link_args: tuple[str, ...] = (),
+    profile: Optional[dict] = None,
+) -> None:
+    _link_with_self_backend_direct_artifacts(
+        [(module_name, "PCO", path) for module_name, path in native_objects],
+        out_path,
+        runtime_archive,
+        verbose,
+        needs_libpython=needs_libpython,
+        needs_native_extension_exports=needs_native_extension_exports,
+        extra_link_inputs=extra_link_inputs,
+        extra_link_args=extra_link_args,
+        profile=profile,
     )
 
 
@@ -1826,6 +2267,37 @@ def compile_python(
             "--gpu-backend=metal currently supports @gpu.kernel only in "
             "single-file Python compiles"
         )
+    direct_indexed_assembly = str(
+        os.environ.get("PCC_DIRECT_INDEXED_KERNEL_EMIT", "") or ""
+    ).strip().lower() in ("1", "true", "yes", "on")
+    if direct_indexed_assembly and len(auto_srcs) == 1:
+        if emit_llvm_only or python_library:
+            raise PyPipelineError(
+                "direct indexed assembly mode cannot satisfy an LLVM/library output"
+            )
+        if gpu_source_has_kernels:
+            raise PyPipelineError(
+                "direct indexed assembly mode does not yet own GPU host lowering"
+            )
+        entry = _first_string(auto_mods)
+        compile_python_multi(
+            auto_srcs,
+            out_path,
+            verbose=verbose,
+            emit_llvm_only=False,
+            entry_module=entry,
+            module_names=auto_mods,
+            libpython_mode=libpython_mode,
+            ir_scaffold_mode=ir_scaffold_mode,
+            backend=backend,
+            target_triple=target_triple,
+            recursive_stdlib=effective_recursive_stdlib,
+            runtime_archive=runtime_archive,
+            link_args=link_args,
+            profile=profile,
+        )
+        _profile_end(profile, "compile_python_total", total_start)
+        return
     # Issue 11.B.1.2: when recursive_stdlib is on, force the multi-file
     # path so _expand_recursive_stdlib has a chance to pull pure-Python
     # stdlib into the native compile. The multi-file path also
@@ -1896,6 +2368,7 @@ def compile_python(
         source = gpu_source
     _profile_end(profile, "read_source", t)
     freestanding_module = _source_declares_freestanding_module(source)
+    runtime_port_module = _source_declares_runtime_port_module(source)
     freestanding_external_symbols = (
         _freestanding_allowed_external_symbols(source)
         if freestanding_module
@@ -1991,6 +2464,7 @@ def compile_python(
     codegen._module_source_path = os.path.abspath(src_path)
     codegen._target_triple = target_triple or ""
     codegen._freestanding_module = freestanding_module
+    codegen._runtime_port_module = runtime_port_module
     if runtime_port_abi_exports is not None:
         codegen._native_module_exports = runtime_port_abi_exports
     if freestanding_module:
@@ -2369,9 +2843,20 @@ def _run_python_multi_export_worker(manifest) -> int:
         build_closed_world_context=build_closed_world_context,
         write_ast_wire=_write_py_ast_wire,
         closed_world_reexport_edges=_closed_world_reexport_edges,
+        closed_world_module_dependencies=_closed_world_module_dependencies,
         mark_function_object_exports=_mark_closed_world_function_object_exports,
         write_native_exports_wire=_write_native_exports_wire,
         write_reexport_edges_wire=_write_reexport_edges_wire,
+    )
+
+
+def _run_python_multi_summary_worker(manifest) -> int:
+    return _pipeline_frontend_worker_execution.run_summary_worker(
+        manifest,
+        read_native_exports_wire=_read_native_exports_wire,
+        read_ast_wire=_read_py_ast_wire,
+        build_effect_summary=_build_closed_world_vthread_effect_summary,
+        write_effect_summary=_write_closed_world_vthread_effect_summary,
     )
 
 
@@ -2380,8 +2865,13 @@ def run_python_multi_codegen_worker(manifest_path: str) -> int:
         manifest_path,
         read_manifest=_read_python_frontend_worker_manifest,
         run_export_worker_callback=_run_python_multi_export_worker,
+        run_summary_worker_callback=_run_python_multi_summary_worker,
         worker_timing_enabled=_python_frontend_worker_timing_enabled,
+        native_worker_executable=_python_frontend_worker_executable,
         read_native_exports_wire=_read_native_exports_wire,
+        read_native_exports_wire_for_module=(
+            _read_native_exports_wire_for_module
+        ),
         read_ast_wire=_read_py_ast_wire,
         build_closed_world_context=build_closed_world_context,
         module_imports_native_extension=_module_imports_pcc_native_extension,
@@ -2404,6 +2894,12 @@ _run_python_frontend_worker_commands = (
 )
 
 
+def _build_unique_external_class_preload_index(native_exports):
+    from .type_infer import build_unique_external_class_preload_index
+
+    return build_unique_external_class_preload_index(native_exports)
+
+
 def _build_python_frontend_shared_exports_parallel(
     tmp: str,
     src_paths,
@@ -2417,8 +2913,11 @@ def _build_python_frontend_shared_exports_parallel(
     ir_scaffold_mode: str,
     verbose: bool,
     max_parallel: int,
+    oversized_chunk_count: int,
+    safe_parallel: int,
     ast_dir: str = "",
     profile: Optional[dict] = None,
+    module_dependency_map=None,
 ) -> str:
     return _pipeline_frontend_parallel.build_shared_exports(
         tmp,
@@ -2432,8 +2931,18 @@ def _build_python_frontend_shared_exports_parallel(
         ir_scaffold_mode=ir_scaffold_mode,
         verbose=verbose,
         max_parallel=max_parallel,
+        oversized_chunk_count=oversized_chunk_count,
+        safe_parallel=safe_parallel,
         ast_dir=ast_dir,
         profile=profile,
+        module_dependency_map=module_dependency_map,
+        build_unique_class_preload_index=(
+            _build_unique_external_class_preload_index
+        ),
+        contextual_host_for_module=contextual_host_for_module,
+        build_contextual_host_export_surface=(
+            _contextual_host_export_surface
+        ),
         write_manifest=_write_python_frontend_worker_manifest,
         shell_quote_arg=_shell_quote_arg,
         worker_arg=_PY_FRONTEND_WORKER_ARG,
@@ -2444,12 +2953,22 @@ def _build_python_frontend_shared_exports_parallel(
         read_native_exports_wire=_read_native_exports_wire,
         read_reexport_edges_wire=_read_reexport_edges_wire,
         merge_reexport_edges=_merge_closed_world_reexport_edges,
+        flatten_class_export_fields=_flatten_closed_world_class_export_fields,
         repair_default_global_owners=_repair_closed_world_default_global_owners,
         merge_mixin_stack_methods=_merge_l1_mixin_stack_methods,
         merge_codegen_methods=_merge_l1_codegen_methods,
+        expand_valueclass_export_refs=(
+            _pipeline_exports._expand_local_valueclass_export_refs
+        ),
         apply_function_object_uses=_apply_closed_world_function_object_uses,
         read_ast_wire=_read_py_ast_wire,
         annotate_vthread_effects=_annotate_closed_world_vthread_effects,
+        annotate_vthread_effect_summaries=(
+            _annotate_closed_world_vthread_effect_summaries
+        ),
+        vthread_effect_export_surface=(
+            _closed_world_vthread_effect_export_surface
+        ),
         derived_class_map=_closed_world_derived_class_map,
         write_native_exports_wire=_write_native_exports_wire,
         profile_counter=_profile_counter,
@@ -2468,7 +2987,17 @@ def _compile_python_multi_codegen_parallel(
     ir_scaffold_mode: str,
     verbose: bool,
     profile: Optional[dict] = None,
-) -> Optional[tuple[list[tuple[str, str]], bool, bool, int, list[str]]]:
+    artifact_dir: str = "",
+) -> Optional[
+    tuple[
+        list[tuple[str, str]],
+        bool,
+        bool,
+        int,
+        list[str],
+        Optional[list[tuple[str, str]]],
+    ]
+]:
     return _pipeline_frontend_parallel.compile_parallel(
         src_paths,
         module_names,
@@ -2479,6 +3008,7 @@ def _compile_python_multi_codegen_parallel(
         ir_scaffold_mode=ir_scaffold_mode,
         verbose=verbose,
         profile=profile,
+        artifact_dir=artifact_dir,
         can_spawn_worker=_can_spawn_python_frontend_worker,
         worker_command_prefix=_python_frontend_worker_command_prefix,
         compile_uncached=_compile_python_multi_codegen_parallel_uncached,
@@ -2503,8 +3033,16 @@ def _python_frontend_action_dependencies(
 ) -> tuple[str, ...]:
     """Return the finite in-bundle import graph used by action invalidation."""
 
-    known = set(str(name) for name in known_module_names)
-    dependencies: set[str] = set()
+    # pcc1's current set projection can lose string members across this
+    # compiled-module boundary (the same invariant is documented by
+    # _mark_closed_world_function_object_exports).  Dependency metadata is a
+    # correctness input, so keep this small closed-world table list-backed.
+    known: list[str] = []
+    for name in known_module_names:
+        clean_name = str(name)
+        if clean_name not in known:
+            known.append(clean_name)
+    dependencies: list[str] = []
     root_dir = _module_root_from_src(src_path, module_name)
     with open(src_path, "r", encoding="utf-8") as stream:
         source = stream.read()
@@ -2523,8 +3061,15 @@ def _python_frontend_action_dependencies(
     )
     for _target_path, target_name in targets:
         clean_name = str(target_name)
+        if (
+            clean_name == "pcc.llvm_capi.compat"
+            and clean_name not in known
+            and "pcc.llvm_capi.ir" in known
+        ):
+            clean_name = "pcc.llvm_capi.ir"
         if clean_name in known and clean_name != module_name:
-            dependencies.add(clean_name)
+            if clean_name not in dependencies:
+                dependencies.append(clean_name)
     return tuple(sorted(dependencies))
 
 
@@ -2533,6 +3078,7 @@ def _build_python_frontend_action_state(
     module_names,
     exports_path: str,
     action_cache_plan,
+    module_dependency_map=None,
 ):
     """Build action state from the exact merged export wire consumed by codegen."""
 
@@ -2548,13 +3094,7 @@ def _build_python_frontend_action_state(
     for field in required:
         if not str(action_cache_plan.get(field, "")):
             return None
-    with open(exports_path, "r", encoding="utf-8") as stream:
-        wire = json.load(stream)
-    if wire.get("schema") != "pcc.py_frontend.native_exports.v1":
-        return None
-    native_exports = wire.get("native_exports")
-    if not isinstance(native_exports, dict):
-        return None
+    native_exports = _read_native_exports_wire_raw_modules(exports_path)
     modules = []
     for src_path, module_name in zip(src_paths, module_names):
         module_wire = native_exports.get(str(module_name), {})
@@ -2571,10 +3111,14 @@ def _build_python_frontend_action_state(
             _module_action_dag.ModuleState.create(
                 str(module_name),
                 _module_action_dag.source_digest(str(src_path)),
-                _python_frontend_action_dependencies(
-                    str(src_path),
-                    str(module_name),
-                    module_names,
+                (
+                    tuple(module_dependency_map.get(module_name, ()))
+                    if module_dependency_map is not None
+                    else _python_frontend_action_dependencies(
+                        str(src_path),
+                        str(module_name),
+                        module_names,
+                    )
                 ),
                 summary,
             )
@@ -2600,7 +3144,31 @@ def _compile_python_multi_codegen_parallel_uncached(
     verbose: bool,
     profile: Optional[dict] = None,
     action_cache_plan=None,
-) -> Optional[tuple[list[tuple[str, str]], bool, bool, int, list[str]]]:
+    artifact_dir: str = "",
+) -> Optional[
+    tuple[
+        list[tuple[str, str]],
+        bool,
+        bool,
+        int,
+        list[str],
+        Optional[list[tuple[str, str]]],
+    ]
+]:
+    auto_source_lanes = not _pipeline_frontend_workers.numeric_jobs_override(
+        str(os.environ.get(_PY_FRONTEND_JOBS_ENV, "") or "")
+    )
+    worker_prefix = _python_frontend_worker_command_prefix()
+    module_dependency_map = None
+    if (
+        auto_source_lanes
+        and len(worker_prefix) == 1
+        and _is_native_worker_executable(worker_prefix[0])
+    ):
+        # The export workers already own one complete lifted AST each. They
+        # populate this shared map from those ASTs inside build_shared_exports;
+        # avoid a second textual import scan in the pcc1 coordinator.
+        module_dependency_map = {}
     return _pipeline_frontend_parallel.compile_parallel_uncached(
         src_paths,
         module_names,
@@ -2612,6 +3180,7 @@ def _compile_python_multi_codegen_parallel_uncached(
         verbose=verbose,
         profile=profile,
         action_cache_plan=action_cache_plan,
+        artifact_dir=artifact_dir,
         can_spawn_worker=_can_spawn_python_frontend_worker,
         worker_command_prefix=_python_frontend_worker_command_prefix,
         chunk_count_for_workers=_python_frontend_codegen_chunk_count,
@@ -2632,10 +3201,10 @@ def _compile_python_multi_codegen_parallel_uncached(
         profile_end=_profile_end,
         profile_counter=_profile_counter,
         build_action_state=_build_python_frontend_action_state,
+        module_dependency_map=module_dependency_map,
         pipeline_error=PyPipelineError,
-        auto_source_lanes=not _pipeline_frontend_workers.numeric_jobs_override(
-            str(os.environ.get(_PY_FRONTEND_JOBS_ENV, "") or "")
-        ),
+        auto_source_lanes=auto_source_lanes,
+        run_worker_manifest_in_process=run_python_multi_codegen_worker,
     )
 
 
@@ -2739,6 +3308,10 @@ def compile_python_multi(
     any_needs_native_extension_exports = False
     libpython_modules = []
     module_ir_texts = []
+    module_assembly_texts = None
+    module_assembly_paths = None
+    module_native_object_paths = None
+    module_direct_artifacts = None
     native_backend = None
     if not emit_llvm_only:
         native_backend = _resolve_native_backend(backend)
@@ -2765,6 +3338,7 @@ def compile_python_multi(
 
     total_ir_bytes_before_passes = 0
     parallel_codegen_result = None
+    direct_native_object_dir = ""
     frontend_jobs = _python_frontend_jobs_for_sources(src_paths)
     _profile_counter(profile, "multi_frontend_jobs", frontend_jobs)
     _profile_counter(
@@ -2778,28 +3352,81 @@ def compile_python_multi(
         ),
     )
     if native_backend == "self" or emit_only_self_backend:
+        direct_emit = str(
+            os.environ.get("PCC_DIRECT_INDEXED_KERNEL_EMIT", "") or ""
+        ).strip().lower() in ("1", "true", "yes", "on")
+        direct_native_object = str(
+            os.environ.get("PCC_DIRECT_INDEXED_NATIVE_OBJECT", "1") or "1"
+        ).strip().lower() not in ("0", "false", "no", "off")
+        if direct_emit:
+            direct_native_object_dir = _prepare_direct_native_object_dir(
+                out_path
+            )
         t = _profile_begin(profile)
-        parallel_codegen_result = _compile_python_multi_codegen_parallel(
-            src_paths,
-            module_names,
-            jobs=frontend_jobs,
-            entry_module=entry_module,
-            sibling_inits=sibling_inits,
-            libpython_mode=libpython_mode,
-            ir_scaffold_mode=ir_scaffold_mode,
-            verbose=verbose,
-            profile=profile,
-        )
+        try:
+            parallel_codegen_result = _compile_python_multi_codegen_parallel(
+                src_paths,
+                module_names,
+                jobs=frontend_jobs,
+                entry_module=entry_module,
+                sibling_inits=sibling_inits,
+                libpython_mode=libpython_mode,
+                ir_scaffold_mode=ir_scaffold_mode,
+                verbose=verbose,
+                profile=profile,
+                artifact_dir=direct_native_object_dir,
+            )
+        except Exception:
+            _remove_direct_native_object_dir(direct_native_object_dir)
+            raise
         _profile_end(profile, "multi_frontend_codegen_parallel", t)
 
     if parallel_codegen_result is not None:
-        (
-            module_ir_texts,
-            any_needs_libpython,
-            any_needs_native_extension_exports,
-            total_ir_bytes_before_passes,
-            libpython_modules,
-        ) = parallel_codegen_result
+        if (
+            len(parallel_codegen_result) == 1
+            and parallel_codegen_result[0] == "PCC_DEFERRED_FRONTEND_CODEGEN"
+        ):
+            _profile_counter(profile, "multi_frontend_codegen_deferred", 1)
+            _profile_end(profile, "compile_python_multi_total", total_start)
+            return
+        if len(parallel_codegen_result) == 8:
+            (
+                module_ir_texts,
+                any_needs_libpython,
+                any_needs_native_extension_exports,
+                total_ir_bytes_before_passes,
+                libpython_modules,
+                module_assembly_paths,
+                module_native_object_paths,
+                module_direct_artifacts,
+            ) = parallel_codegen_result
+        elif len(parallel_codegen_result) == 7:
+            (
+                module_ir_texts,
+                any_needs_libpython,
+                any_needs_native_extension_exports,
+                total_ir_bytes_before_passes,
+                libpython_modules,
+                module_assembly_texts,
+                module_native_object_paths,
+            ) = parallel_codegen_result
+        elif len(parallel_codegen_result) == 6:
+            (
+                module_ir_texts,
+                any_needs_libpython,
+                any_needs_native_extension_exports,
+                total_ir_bytes_before_passes,
+                libpython_modules,
+                module_assembly_texts,
+            ) = parallel_codegen_result
+        else:
+            (
+                module_ir_texts,
+                any_needs_libpython,
+                any_needs_native_extension_exports,
+                total_ir_bytes_before_passes,
+                libpython_modules,
+            ) = parallel_codegen_result
     else:
         # Pre-pass: build the closed-world context shared by real multi-file
         # compiles and contextual per-module probes.
@@ -2934,6 +3561,208 @@ def compile_python_multi(
                     libpython_modules.append(mod_name)
             total_ir_bytes_before_passes += len(ir_text)
             module_ir_texts.append((mod_name, ir_text))
+    if module_direct_artifacts is None and module_native_object_paths is None:
+        _remove_direct_native_object_dir(direct_native_object_dir)
+        direct_native_object_dir = ""
+    if module_direct_artifacts is not None:
+        if emit_llvm_only:
+            raise PyPipelineError(
+                "direct indexed artifact mode cannot satisfy emit_llvm_only"
+            )
+        if native_backend != "self":
+            raise PyPipelineError(
+                "direct indexed artifact mode requires the self backend"
+            )
+        if libpython_mode != "off" or any_needs_libpython:
+            raise PyPipelineError(
+                "direct indexed artifact mode requires no-libpython"
+            )
+        _reject_mixed_extension_object_models(
+            needs_libpython=False,
+            needs_native_extension_exports=any_needs_native_extension_exports,
+        )
+        if runtime_archive is not None:
+            runtime = os.path.abspath(str(runtime_archive))
+            if not os.path.isfile(runtime):
+                raise PyPipelineError(
+                    "explicit runtime archive not found: " + runtime
+                )
+        elif str(os.environ.get(_PY_RUNTIME_ARCHIVE_ENV, "") or "").strip():
+            runtime = _ensure_runtime(verbose, needs_libpython=False)
+        else:
+            runtime = _ensure_runtime_without_direct_indexed_env(verbose)
+        assembly_count = 0
+        native_count = 0
+        assembly_bytes = 0
+        native_bytes = 0
+        for _module_name, kind, artifact_path in module_direct_artifacts:
+            if kind == "ASM":
+                assembly_count += 1
+                assembly_bytes += os.path.getsize(artifact_path)
+            elif kind == "PCO":
+                native_count += 1
+                native_bytes += os.path.getsize(artifact_path)
+            else:
+                raise PyPipelineError(
+                    "unknown direct indexed artifact kind: " + str(kind)
+                )
+        _profile_counter(profile, "multi_direct_assembly_modules", assembly_count)
+        _profile_counter(profile, "multi_direct_assembly_bytes", assembly_bytes)
+        _profile_counter(profile, "multi_direct_native_object_modules", native_count)
+        _profile_counter(profile, "multi_direct_native_object_bytes", native_bytes)
+        _profile_counter(
+            profile,
+            "multi_direct_ir_text_bytes",
+            sum(len(ir_text) for _module_name, ir_text in module_ir_texts),
+        )
+        try:
+            _link_with_self_backend_direct_artifacts(
+                module_direct_artifacts,
+                out_path,
+                runtime,
+                verbose,
+                needs_libpython=False,
+                needs_native_extension_exports=(
+                    any_needs_native_extension_exports
+                ),
+                extra_link_args=tuple(link_args),
+                profile=profile,
+            )
+        finally:
+            if not str(
+                os.environ.get("PCC_DEFER_SELF_LINK_PLAN", "") or ""
+            ).strip():
+                _remove_direct_native_object_dir(direct_native_object_dir)
+        _profile_end(profile, "compile_python_multi_total", total_start)
+        return
+    if module_native_object_paths is not None:
+        if emit_llvm_only:
+            raise PyPipelineError(
+                "direct indexed native-object mode cannot satisfy emit_llvm_only"
+            )
+        if native_backend != "self":
+            raise PyPipelineError(
+                "direct indexed native-object mode requires the self backend"
+            )
+        if libpython_mode != "off" or any_needs_libpython:
+            raise PyPipelineError(
+                "direct indexed native-object mode requires no-libpython"
+            )
+        _reject_mixed_extension_object_models(
+            needs_libpython=False,
+            needs_native_extension_exports=any_needs_native_extension_exports,
+        )
+        if runtime_archive is not None:
+            runtime = os.path.abspath(str(runtime_archive))
+            if not os.path.isfile(runtime):
+                raise PyPipelineError(
+                    "explicit runtime archive not found: " + runtime
+                )
+        elif str(os.environ.get(_PY_RUNTIME_ARCHIVE_ENV, "") or "").strip():
+            runtime = _ensure_runtime(verbose, needs_libpython=False)
+        else:
+            runtime = _ensure_runtime_without_direct_indexed_env(verbose)
+        _profile_counter(
+            profile,
+            "multi_direct_native_object_modules",
+            len(module_native_object_paths),
+        )
+        _profile_counter(
+            profile,
+            "multi_direct_ir_text_bytes",
+            sum(len(ir_text) for _module_name, ir_text in module_ir_texts),
+        )
+        native_object_bytes = 0
+        for _module_name, native_object_path in module_native_object_paths:
+            native_object_bytes += os.path.getsize(native_object_path)
+        _profile_counter(
+            profile,
+            "multi_direct_native_object_bytes",
+            native_object_bytes,
+        )
+        try:
+            _link_with_self_backend_native_objects(
+                module_native_object_paths,
+                out_path,
+                runtime,
+                verbose,
+                needs_libpython=False,
+                needs_native_extension_exports=(
+                    any_needs_native_extension_exports
+                ),
+                extra_link_args=tuple(link_args),
+                profile=profile,
+            )
+        finally:
+            _remove_direct_native_object_dir(direct_native_object_dir)
+        _profile_end(profile, "compile_python_multi_total", total_start)
+        return
+    if module_assembly_texts is not None:
+        if emit_llvm_only:
+            raise PyPipelineError(
+                "direct indexed assembly mode cannot satisfy emit_llvm_only"
+            )
+        if native_backend != "self":
+            raise PyPipelineError(
+                "direct indexed assembly mode requires the self backend"
+            )
+        if libpython_mode != "off":
+            raise PyPipelineError(
+                "direct indexed assembly mode currently requires no-libpython"
+            )
+        if any_needs_libpython:
+            raise PyPipelineError(
+                "direct indexed assembly worker reported a libpython dependency"
+            )
+        _reject_mixed_extension_object_models(
+            needs_libpython=False,
+            needs_native_extension_exports=(
+                any_needs_native_extension_exports
+            ),
+        )
+        if runtime_archive is not None:
+            runtime = os.path.abspath(str(runtime_archive))
+            if not os.path.isfile(runtime):
+                raise PyPipelineError(
+                    "explicit runtime archive not found: " + runtime
+                )
+        elif str(
+            os.environ.get(_PY_RUNTIME_ARCHIVE_ENV, "") or ""
+        ).strip():
+            # A receipt-bound bootstrap supplies the validated archive through
+            # PCC_RUNTIME_ARCHIVE.  Preserve the ordinary bundle/provenance
+            # checks without entering the auto-build path whose nested compiler
+            # must have direct-worker flags stripped.
+            runtime = _ensure_runtime(verbose, needs_libpython=False)
+        else:
+            runtime = _ensure_runtime_without_direct_indexed_env(verbose)
+        _profile_counter(
+            profile,
+            "multi_direct_assembly_modules",
+            len(module_assembly_texts),
+        )
+        direct_assembly_bytes = 0
+        for _module_name, assembly_text in module_assembly_texts:
+            direct_assembly_bytes += len(assembly_text)
+        _profile_counter(
+            profile,
+            "multi_direct_assembly_bytes",
+            direct_assembly_bytes,
+        )
+        _link_with_self_backend_assembly_texts(
+            module_assembly_texts,
+            out_path,
+            runtime,
+            verbose,
+            needs_libpython=False,
+            needs_native_extension_exports=(
+                any_needs_native_extension_exports
+            ),
+            extra_link_args=tuple(link_args),
+            profile=profile,
+        )
+        _profile_end(profile, "compile_python_multi_total", total_start)
+        return
     if target_triple is not None:
         module_ir_texts = [
             (name, _ir_text_with_target_triple(text, target_triple))

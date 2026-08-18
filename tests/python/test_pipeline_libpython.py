@@ -41,6 +41,84 @@ def test_libpython_link_flags_honor_explicit_environment(monkeypatch):
     ]
 
 
+def test_libpython_link_flags_add_interpreter_libdir_when_config_omits_it(
+    monkeypatch,
+    tmp_path,
+):
+    import sysconfig
+
+    from pcc.py_frontend import pipeline_libpython
+
+    libdir = tmp_path / "lib"
+    libdir.mkdir()
+    (libdir / "libpython3.15.dylib").write_bytes(b"")
+    values = {
+        "LIBDIR": str(libdir),
+        "LDLIBRARY": "libpython3.15.dylib",
+    }
+    monkeypatch.delenv("PCC_PYTHON_LDFLAGS", raising=False)
+    monkeypatch.setattr(
+        pipeline_libpython,
+        "resolve_python_config_command",
+        lambda: "/fake/python3.15-config",
+    )
+    monkeypatch.setattr(
+        pipeline_libpython.subprocess,
+        "check_output",
+        lambda *_args, **_kwargs: "-lpython3.15 -ldl -framework CoreFoundation",
+    )
+    monkeypatch.setattr(
+        sysconfig,
+        "get_config_var",
+        lambda name: values.get(name),
+    )
+
+    assert pipeline_libpython.link_flags() == [
+        "-L" + str(libdir),
+        "-lpython3.15",
+        "-ldl",
+        "-framework",
+        "CoreFoundation",
+    ]
+
+
+def test_libpython_link_flags_keep_existing_interpreter_libdir_once(
+    monkeypatch,
+    tmp_path,
+):
+    import sysconfig
+
+    from pcc.py_frontend import pipeline_libpython
+
+    libdir = tmp_path / "lib"
+    libdir.mkdir()
+    (libdir / "libpython3.15.dylib").write_bytes(b"")
+    values = {
+        "LIBDIR": str(libdir),
+        "LDLIBRARY": "libpython3.15.dylib",
+    }
+    monkeypatch.delenv("PCC_PYTHON_LDFLAGS", raising=False)
+    monkeypatch.setattr(
+        pipeline_libpython,
+        "resolve_python_config_command",
+        lambda: "/fake/python3.15-config",
+    )
+    monkeypatch.setattr(
+        pipeline_libpython.subprocess,
+        "check_output",
+        lambda *_args, **_kwargs: "-L" + str(libdir) + " -lpython3.15",
+    )
+    monkeypatch.setattr(
+        sysconfig,
+        "get_config_var",
+        lambda name: values.get(name),
+    )
+
+    flags = pipeline_libpython.link_flags()
+    assert flags == ["-L" + str(libdir), "-lpython3.15"]
+    assert flags.count("-L" + str(libdir)) == 1
+
+
 def test_libpython_ir_scan_ignores_declarations_and_finds_calls():
     from pcc.py_frontend.pipeline_libpython import ir_needs_libpython
 

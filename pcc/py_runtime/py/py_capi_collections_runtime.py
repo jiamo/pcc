@@ -5,6 +5,8 @@ This module only adapts their owned-reference ABI to CPython's borrowed/stolen
 reference contracts and exposes the exact scalar C signatures extensions use.
 """
 
+__pcc_runtime_port__ = True
+
 from pcc.extern import (
     c_abi_typed_export,
     c_abi_variadic_export,
@@ -35,8 +37,11 @@ from pcc.unsafe import (
 
 py_incref = extern("py_incref", (c_ptr,), c_void)
 py_decref = extern("py_decref", (c_ptr,), c_void)
+pcc_gc_pin = extern("pcc_gc_pin", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_err_occurred = extern("py_err_occurred", (), c_int64)
 py_tuple_new = extern("py_tuple_new", (c_int64,), c_ptr)
 py_tuple_get = extern("py_tuple_get", (c_ptr, c_int64), c_ptr)
@@ -55,7 +60,7 @@ pcc_gc_store_ptr = extern(
 
 
 def _raise_collection(kind: int, message) -> None:
-    py_raise(py_exc_new(kind, message))
+    py_raise_owned(py_exc_new(kind, message))
 
 
 def _is_exact_type(obj, expected_tag: int) -> int:
@@ -84,6 +89,7 @@ def PyTuple_GetItem(obj, index: int):
         _raise_collection(7, cstr("tuple index out of range"))
         return null()
     # py_tuple_get returns owned; PyTuple_GetItem returns borrowed.
+    pcc_gc_pin(item)
     py_decref(item)
     return item
 
@@ -189,15 +195,19 @@ def PyList_GetItem(obj, index: int):
         _raise_collection(7, cstr("list index out of range"))
         return null()
     # py_list_get returns owned; PyList_GetItem returns borrowed.
+    pcc_gc_pin(item)
     py_decref(item)
     return item
 
 
 @c_abi_typed_export("PyList_GetItemRef", "ptr", ("ptr", "i64"))
 def PyList_GetItemRef(obj, index: int):
-    item = PyList_GetItem(obj, index)
-    if not ptr_is_null(item):
-        py_incref(item)
+    if _is_exact_type(obj, 5) == 0:
+        _raise_collection(3, cstr("expected list"))
+        return null()
+    item = py_list_get(obj, index)
+    if ptr_is_null(item):
+        _raise_collection(7, cstr("list index out of range"))
     return item
 
 
@@ -273,6 +283,7 @@ def PyBytes_AsString(obj):
     if _is_exact_type(obj, 17) == 0:
         _raise_collection(3, cstr("expected bytes"))
         return null()
+    pcc_gc_pin(obj)
     return ptr_add(obj, 24)
 
 
@@ -292,6 +303,7 @@ def PyBytes_AsStringAndSize(obj, buffer, length) -> int:
                 _raise_collection(2, cstr("embedded null byte"))
                 return -1
             index = index + 1
+    pcc_gc_pin(obj)
     store_ptr(buffer, 0, data)
     if not ptr_is_null(length):
         store_i64(length, 0, size)

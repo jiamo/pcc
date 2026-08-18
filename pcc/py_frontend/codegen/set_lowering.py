@@ -482,11 +482,23 @@ class SetLoweringMixin:
 
         - no args → empty ``py_set_new``.
         - literal list/tuple → allocate + add each element.
-        - any other iterable (ListType / TupleType / DictType /
-          DynType) → materialise as PyObject*, iterate via the
-          generic ``py_obj_len`` + ``py_obj_getitem``, and add
-          each element to the set.
+        - dict-typed arg → the mapping's KEYS, like ``list(d)``.
+        - any other iterable (ListType / TupleType / DynType) →
+          materialise as PyObject*, iterate via the generic
+          ``py_obj_len`` + ``py_obj_getitem``, and add each element
+          to the set.
         """
+        if expr.args and not isinstance(expr.args[0], (ListExpr, TupleExpr)):
+            mapping = expr.args[0]
+            if isinstance(mapping.ty, DictType):
+                # ``set(d)`` / ``frozenset(d)`` iterate the mapping's keys.
+                # The generic loop below indexes positionally, and for a dict
+                # ``py_obj_getitem(d, i)`` is a KEY lookup for 0, 1, 2 …, so a
+                # string-keyed mapping silently produced an EMPTY set.  That
+                # is a wrong answer, not a fallback: inside pcc1's own backend
+                # it made `frozenset(managed_origins)` empty and disabled
+                # every managed-value reload the host compiler emits.
+                return self._materialize_dict_keys_view_set(mapping)
         new_set = self.builder.call(
             self.runtime["py_set_new"],
             [],
@@ -580,7 +592,7 @@ class SetLoweringMixin:
             return new_set
         if isinstance(
             arg_ty,
-            (ListType, TupleType, DictType, SetType, DynType, StrType),
+            (ListType, TupleType, SetType, DynType, StrType),
         ):
             src_val = self._emit_expr(arg)
             src_obj = marshal.marshal_to_object(

@@ -37,16 +37,17 @@
 #   PCC_BOOTSTRAP_RUNTIME_HIGH=py
 #   PCC_BOOTSTRAP_PYTHON_LIBPYTHON=off
 #   PCC_BOOTSTRAP_PYTHON_IR_PASSES=${PCC_PYTHON_IR_PASSES:-off}
-#   PCC_BOOTSTRAP_PY_FRONTEND_JOBS=${PCC_PY_FRONTEND_JOBS:-<ncpu capped at 10>} for stage2+
-#   PCC_BOOTSTRAP_STAGE1_PY_FRONTEND_JOBS=${PCC_PY_FRONTEND_JOBS:-<ncpu capped at 10>}
+#   PCC_BOOTSTRAP_PY_FRONTEND_JOBS=${PCC_PY_FRONTEND_JOBS:-auto} for stage2+
+#   PCC_BOOTSTRAP_STAGE1_PY_FRONTEND_JOBS=${PCC_PY_FRONTEND_JOBS:-2}
+#   PCC_BOOTSTRAP_SELF_BACKEND_JOBS=${PCC_SELF_BACKEND_JOBS:-2}
+#   PCC_BOOTSTRAP_MACHO_LINK_JOBS=${PCC_MACHO_LINK_JOBS:-8}
+#   PCC_BOOTSTRAP_MAX_TREE_RSS_BYTES=8589934592
+#   PCC_BOOTSTRAP_STAGE_TIMEOUT=600
 #
-# The numeric default (not "auto") is deliberate: the source-lane policy
-# introduced later ("auto" mode) runs oversized modules serially and caps the
-# safe codegen pool at two workers. That memory guard targets package-graph
-# workloads; for the compiler bootstrap the documented policy is 8-10 workers.
-# A numeric override takes the authoritative path and restores that
-# parallelism. Set PCC_BOOTSTRAP_*_PY_FRONTEND_JOBS to override, or
-# PCC_PY_FRONTEND_JOBS=auto to restore the conservative lanes.
+# The Stage2+ auto default is a host-safety contract: it runs oversized modules
+# serially and caps the safe codegen pool at two workers.  A numeric override
+# above two requires PCC_BOOTSTRAP_UNSAFE_HIGH_MEMORY_JOBS=1; ordinary agents,
+# tests and performance runners must never set that escape hatch.
 
 set -euo pipefail
 
@@ -57,17 +58,71 @@ BOOTSTRAP_RUNTIME_CC="${PCC_BOOTSTRAP_RUNTIME_CC:-pcc}"
 BOOTSTRAP_RUNTIME_HIGH="${PCC_BOOTSTRAP_RUNTIME_HIGH:-py}"
 BOOTSTRAP_PYTHON_LIBPYTHON="${PCC_BOOTSTRAP_PYTHON_LIBPYTHON:-off}"
 BOOTSTRAP_PYTHON_IR_PASSES="${PCC_BOOTSTRAP_PYTHON_IR_PASSES:-${PCC_PYTHON_IR_PASSES:-off}}"
-# Numeric default restores the documented 8-10 worker bootstrap codegen
-# parallelism (see header note). Min(ncpu, 10) keeps small machines safe.
-_BOOTSTRAP_DEFAULT_JOBS=10
-_BOOTSTRAP_NCPU="$(sysctl -n hw.ncpu 2>/dev/null || nproc 2>/dev/null || echo 10)"
-if [[ "${_BOOTSTRAP_NCPU}" =~ ^[0-9]+$ ]] && (( _BOOTSTRAP_NCPU < _BOOTSTRAP_DEFAULT_JOBS )); then
-    _BOOTSTRAP_DEFAULT_JOBS="${_BOOTSTRAP_NCPU}"
-fi
-BOOTSTRAP_PY_FRONTEND_JOBS="${PCC_BOOTSTRAP_PY_FRONTEND_JOBS:-${PCC_PY_FRONTEND_JOBS:-${_BOOTSTRAP_DEFAULT_JOBS}}}"
-BOOTSTRAP_STAGE1_PY_FRONTEND_JOBS="${PCC_BOOTSTRAP_STAGE1_PY_FRONTEND_JOBS:-${PCC_PY_FRONTEND_JOBS:-${_BOOTSTRAP_DEFAULT_JOBS}}}"
+_BOOTSTRAP_SAFE_MAX_JOBS=2
+_BOOTSTRAP_SAFE_MAX_LINK_JOBS=8
+_BOOTSTRAP_SAFE_MAX_TREE_RSS_BYTES=17179869184
+BOOTSTRAP_PY_FRONTEND_JOBS="${PCC_BOOTSTRAP_PY_FRONTEND_JOBS:-${PCC_PY_FRONTEND_JOBS:-auto}}"
+BOOTSTRAP_STAGE1_PY_FRONTEND_JOBS="${PCC_BOOTSTRAP_STAGE1_PY_FRONTEND_JOBS:-${PCC_PY_FRONTEND_JOBS:-2}}"
+BOOTSTRAP_SELF_BACKEND_JOBS="${PCC_BOOTSTRAP_SELF_BACKEND_JOBS:-${PCC_SELF_BACKEND_JOBS:-2}}"
+BOOTSTRAP_MACHO_LINK_JOBS="${PCC_BOOTSTRAP_MACHO_LINK_JOBS:-${PCC_MACHO_LINK_JOBS:-8}}"
+BOOTSTRAP_MAX_TREE_RSS_BYTES="${PCC_BOOTSTRAP_MAX_TREE_RSS_BYTES:-8589934592}"
+BOOTSTRAP_STAGE_TIMEOUT="${PCC_BOOTSTRAP_STAGE_TIMEOUT:-600}"
+BOOTSTRAP_HOST_MEMORY_RESERVE_BYTES="${PCC_BOOTSTRAP_HOST_MEMORY_RESERVE_BYTES:-8589934592}"
+BOOTSTRAP_EXTERNAL_MEMORY_GUARD="${PCC_BOOTSTRAP_EXTERNAL_MEMORY_GUARD:-0}"
+BOOTSTRAP_IN_PROCESS_CODEGEN="${PCC_BOOTSTRAP_IN_PROCESS_CODEGEN:-0}"
+BOOTSTRAP_DEFER_FRONTEND_CODEGEN="${PCC_BOOTSTRAP_DEFER_FRONTEND_CODEGEN:-1}"
+BOOTSTRAP_DEFER_SELF_LINK="${PCC_BOOTSTRAP_DEFER_SELF_LINK:-1}"
 BOOTSTRAP_PROFILE_DIR="${PCC_BOOTSTRAP_PROFILE_DIR:-}"
 BOOTSTRAP_STAGE_EXEC_DELAY="${PCC_BOOTSTRAP_STAGE_EXEC_DELAY:-0.10}"
+
+if [[ "${BOOTSTRAP_SELF_BACKEND_JOBS}" == "auto" ]]; then
+    BOOTSTRAP_SELF_BACKEND_JOBS=2
+fi
+if [[ "${BOOTSTRAP_MACHO_LINK_JOBS}" == "auto" ]]; then
+    BOOTSTRAP_MACHO_LINK_JOBS=8
+fi
+
+validate_bootstrap_worker_budget() {
+    local label="$1"
+    local value="$2"
+    local safe_max="$3"
+    if [[ "${value}" =~ ^[0-9]+$ ]] && (( value > safe_max )); then
+        if [[ "${PCC_BOOTSTRAP_UNSAFE_HIGH_MEMORY_JOBS:-0}" != "1" ]]; then
+            echo "unsafe bootstrap worker budget: ${label}=${value} exceeds ${safe_max}; set PCC_BOOTSTRAP_UNSAFE_HIGH_MEMORY_JOBS=1 only for an explicitly isolated machine" >&2
+            exit 2
+        fi
+    fi
+}
+
+validate_bootstrap_worker_budget \
+    "PCC_BOOTSTRAP_PY_FRONTEND_JOBS" "${BOOTSTRAP_PY_FRONTEND_JOBS}" "${_BOOTSTRAP_SAFE_MAX_JOBS}"
+validate_bootstrap_worker_budget \
+    "PCC_BOOTSTRAP_STAGE1_PY_FRONTEND_JOBS" "${BOOTSTRAP_STAGE1_PY_FRONTEND_JOBS}" "${_BOOTSTRAP_SAFE_MAX_JOBS}"
+validate_bootstrap_worker_budget \
+    "PCC_SELF_BACKEND_JOBS" "${BOOTSTRAP_SELF_BACKEND_JOBS}" "${_BOOTSTRAP_SAFE_MAX_JOBS}"
+validate_bootstrap_worker_budget \
+    "PCC_MACHO_LINK_JOBS" "${BOOTSTRAP_MACHO_LINK_JOBS}" "${_BOOTSTRAP_SAFE_MAX_LINK_JOBS}"
+
+validate_bootstrap_resource_limit() {
+    local label="$1"
+    local value="$2"
+    local safe_max="$3"
+    if [[ ! "${value}" =~ ^[0-9]+$ ]] || (( value < 1 )); then
+        echo "invalid bootstrap resource limit: ${label}=${value}" >&2
+        exit 2
+    fi
+    if (( value > safe_max )) && [[ "${PCC_BOOTSTRAP_UNSAFE_HIGH_MEMORY_JOBS:-0}" != "1" ]]; then
+        echo "unsafe bootstrap resource limit: ${label}=${value} exceeds ${safe_max}" >&2
+        exit 2
+    fi
+}
+
+validate_bootstrap_resource_limit \
+    "PCC_BOOTSTRAP_MAX_TREE_RSS_BYTES" "${BOOTSTRAP_MAX_TREE_RSS_BYTES}" "${_BOOTSTRAP_SAFE_MAX_TREE_RSS_BYTES}"
+validate_bootstrap_resource_limit \
+    "PCC_BOOTSTRAP_STAGE_TIMEOUT" "${BOOTSTRAP_STAGE_TIMEOUT}" 600
+validate_bootstrap_resource_limit \
+    "PCC_BOOTSTRAP_HOST_MEMORY_RESERVE_BYTES" "${BOOTSTRAP_HOST_MEMORY_RESERVE_BYTES}" 8589934592
 
 STAGE_LIMIT=3
 START_STAGE=1
@@ -134,6 +189,17 @@ fi
 # Share one cache namespace with the pytest bootstrap helper so suite
 # provisioning, gate chains, and manual bootstraps reuse each other's work.
 export PCC_SELF_BACKEND_OBJECT_CACHE_DIR="${PCC_SELF_BACKEND_OBJECT_CACHE_DIR:-${REPO_ROOT}/build/bootstrap-pytest-object-cache}"
+
+# NOTE (2026-08-27): a physical-memory-derived oversized admission cap
+# (hw.memsize/2700 -> one wide wave on a 96 GB Mac) was tried here and
+# REMOVED: physical RAM is not available RAM.  The widened wave was run on
+# a machine that had drifted to 23.7/24 GB swap used and the stage died
+# with silently killed workers; a control with the conservative cap failed
+# identically, so the machine state — not the cap — decided, and the safe
+# in-compiler default (7 MB pairs, receipted at -58 s) is the one shape
+# proven green with a fixed point.  If a wider default is wanted, derive
+# it from AVAILABLE memory at launch time, not hw.memsize.
+# PCC_SELF_BACKEND_OVERSIZED_BYTE_CAP remains an explicit-user knob only.
 
 banner() {
     echo ""
@@ -219,6 +285,20 @@ payload = {
     "wall_ms": int(wall_ms),
     "returncode": int(returncode),
     "publish_barrier_returncode": int(barrier_returncode),
+    "metric_scopes": {
+        "compile_wall_ms": "end_to_end_elapsed",
+        "compile_time_real_ms": "end_to_end_elapsed",
+        "compile_user_ms": "timed_command_plus_waited_children_cpu",
+        "compile_sys_ms": "timed_command_plus_waited_children_cpu",
+        "publish_barrier_ms": "end_to_end_elapsed",
+        "wall_ms": "end_to_end_elapsed_including_publish_barrier",
+    },
+    "comparison_contract": {
+        "primary_compute_metrics": ["compile_user_ms", "compile_sys_ms"],
+        "wall_metric_role": "paired_end_to_end_observation",
+        "required_comparison": "adjacent_alternating_same_environment_pairs",
+        "single_wall_verdict_allowed": False,
+    },
 }
 if time_file:
     try:
@@ -261,6 +341,27 @@ run_stage() {
     # pcc2 from the shared pytest/bootstrap directory.
     rm -f "${out_exe}" "${out_exe}.tmp"
 
+    local deferred_plan=""
+    local codegen_plan=""
+    if [[ "${stage}" != "1" && "${BACKEND}" == "self" ]]; then
+        if [[ "${BOOTSTRAP_DEFER_FRONTEND_CODEGEN}" == "1" ]]; then
+            codegen_plan="${out_exe}.pcc-codegen-plan"
+            rm -f \
+                "${codegen_plan}" \
+                "${codegen_plan}.internal-inputs" \
+                "${codegen_plan}.link-profile.json" \
+                "${codegen_plan}.result.json"
+        fi
+        if [[ "${BOOTSTRAP_DEFER_SELF_LINK}" == "1" ]]; then
+            deferred_plan="${out_exe}.pcc-link-plan"
+            rm -f \
+                "${deferred_plan}" \
+                "${deferred_plan}.inputs" \
+                "${deferred_plan}.profile.json" \
+                "${deferred_plan}.result.json"
+        fi
+    fi
+
     local backend_label="${BACKEND}"
     local frontend_jobs="${BOOTSTRAP_PY_FRONTEND_JOBS}"
     if [[ "${stage}" == "1" ]]; then
@@ -275,8 +376,25 @@ run_stage() {
         "PCC_RUNTIME_HIGH=${BOOTSTRAP_RUNTIME_HIGH}"
         "PCC_PYTHON_IR_PASSES=${BOOTSTRAP_PYTHON_IR_PASSES}"
         "PCC_PY_FRONTEND_JOBS=${frontend_jobs}"
-        "${cmd[@]}"
+        "PCC_SELF_BACKEND_JOBS=${BOOTSTRAP_SELF_BACKEND_JOBS}"
+        "PCC_MACHO_LINK_JOBS=${BOOTSTRAP_MACHO_LINK_JOBS}"
+        "PCC_WORKER_TREE_BUDGET_BYTES=${BOOTSTRAP_MAX_TREE_RSS_BYTES}"
     )
+    if [[ "${stage}" != "1" && "${BACKEND}" == "self" ]]; then
+        if [[ "${BOOTSTRAP_IN_PROCESS_CODEGEN}" == "1" ]]; then
+            full_cmd+=("PCC_PY_FRONTEND_IN_PROCESS_CODEGEN=1")
+        fi
+        if [[ -n "${codegen_plan}" ]]; then
+            full_cmd+=(
+                "PCC_DEFER_FRONTEND_CODEGEN_PLAN=${codegen_plan}"
+                "PCC_DEFER_FRONTEND_OUTPUT=${out_exe}"
+            )
+        fi
+        if [[ -n "${deferred_plan}" ]]; then
+            full_cmd+=("PCC_DEFER_SELF_LINK_PLAN=${deferred_plan}")
+        fi
+    fi
+    full_cmd+=("${cmd[@]}")
     if [[ -n "${BOOTSTRAP_PROFILE_DIR}" ]]; then
         full_cmd+=(--profile-json "${BOOTSTRAP_PROFILE_DIR}/stage${stage}.json")
     fi
@@ -288,7 +406,7 @@ run_stage() {
     banner "stage ${stage}: backend ${backend_label}: ${cmd[*]}"
     echo "input: ${MAIN_PY}"
     echo "output: ${out_exe}"
-    echo "runtime: PCC_RUNTIME_CC=${BOOTSTRAP_RUNTIME_CC} PCC_RUNTIME_HIGH=${BOOTSTRAP_RUNTIME_HIGH} PCC_PYTHON_IR_PASSES=${BOOTSTRAP_PYTHON_IR_PASSES} PCC_PY_FRONTEND_JOBS=${frontend_jobs} --python-libpython ${BOOTSTRAP_PYTHON_LIBPYTHON}"
+    echo "runtime: PCC_RUNTIME_CC=${BOOTSTRAP_RUNTIME_CC} PCC_RUNTIME_HIGH=${BOOTSTRAP_RUNTIME_HIGH} PCC_PYTHON_IR_PASSES=${BOOTSTRAP_PYTHON_IR_PASSES} PCC_PY_FRONTEND_JOBS=${frontend_jobs} PCC_SELF_BACKEND_JOBS=${BOOTSTRAP_SELF_BACKEND_JOBS} PCC_MACHO_LINK_JOBS=${BOOTSTRAP_MACHO_LINK_JOBS} --python-libpython ${BOOTSTRAP_PYTHON_LIBPYTHON}"
     if [[ -n "${BOOTSTRAP_PROFILE_DIR}" ]]; then
         echo "profile: ${BOOTSTRAP_PROFILE_DIR}/stage${stage}.json"
     fi
@@ -304,25 +422,88 @@ run_stage() {
     local stage_returncode
     local barrier_returncode=0
     local stage_time_file=""
+    local process_guard_dir=""
+    local process_guard_stdout=""
+    local process_guard_stderr=""
+    local target_cmd=("${full_cmd[@]}")
+    if [[ -n "${deferred_plan}" ]]; then
+        local deferred_runner=()
+        if [[ -n "${PCC_HOST_PYTHON:-}" && -x "${PCC_HOST_PYTHON}" ]]; then
+            deferred_runner=("${PCC_HOST_PYTHON}")
+        elif command -v uv >/dev/null 2>&1; then
+            deferred_runner=(env -u LC_ALL uv run python)
+        else
+            deferred_runner=(python3)
+        fi
+        target_cmd=(
+            "${deferred_runner[@]}"
+            "${REPO_ROOT}/scripts/run_pcc_deferred_link.py"
+            --timeout "${BOOTSTRAP_STAGE_TIMEOUT}"
+        )
+        if [[ -n "${codegen_plan}" ]]; then
+            target_cmd+=(--codegen-plan "${codegen_plan}")
+        fi
+        target_cmd+=("${deferred_plan}" -- "${full_cmd[@]}")
+    fi
+    local execution_cmd=("${target_cmd[@]}")
     if [[ -n "${BOOTSTRAP_PROFILE_DIR}" ]]; then
         stage_time_file="${BOOTSTRAP_PROFILE_DIR}/stage${stage}.time"
+    fi
+    if [[ "${BOOTSTRAP_EXTERNAL_MEMORY_GUARD}" != "1" ]]; then
+        process_guard_dir="$(mktemp -d "${OUT_DIR}/stage${stage}.process.XXXXXX")"
+        process_guard_stdout="${process_guard_dir}/target.stdout"
+        process_guard_stderr="${process_guard_dir}/target.stderr"
+        local sampler_python=()
+        if command -v uv >/dev/null 2>&1; then
+            sampler_python=(env -u LC_ALL uv run python)
+        else
+            sampler_python=(python3)
+        fi
+        execution_cmd=(
+            "${sampler_python[@]}"
+            "${REPO_ROOT}/scripts/run_process_tree_sample.py"
+            --result "${process_guard_dir}/result.json"
+            --samples "${process_guard_dir}/samples.tsv"
+            --stdout "${process_guard_stdout}"
+            --stderr "${process_guard_stderr}"
+            --cwd "${REPO_ROOT}"
+            --timeout "${BOOTSTRAP_STAGE_TIMEOUT}"
+            --interval 0.25
+            --progress-interval 30
+            --max-tree-rss-bytes "${BOOTSTRAP_MAX_TREE_RSS_BYTES}"
+            --no-performance-lock
+        )
+        if [[ "$(uname)" == "Darwin" ]]; then
+            execution_cmd+=(
+                --darwin-preflight-reserve-bytes
+                "${BOOTSTRAP_HOST_MEMORY_RESERVE_BYTES}"
+            )
+        fi
+        execution_cmd+=(-- "${target_cmd[@]}")
+        echo "process-tree guard: ${process_guard_dir}/result.json cap=${BOOTSTRAP_MAX_TREE_RSS_BYTES} timeout=${BOOTSTRAP_STAGE_TIMEOUT}s"
     fi
     stage_start_ms="$(now_ms)"
     compile_start_ms="${stage_start_ms}"
     set +e
     if command -v time >/dev/null 2>&1; then
         if [[ -n "${stage_time_file}" ]]; then
-            { TIMEFORMAT=$'real_s=%3R\nuser_s=%3U\nsys_s=%3S'; time "${full_cmd[@]}" 2>&3; } 3>&2 2> "${stage_time_file}"
+            { TIMEFORMAT=$'real_s=%3R\nuser_s=%3U\nsys_s=%3S'; time "${execution_cmd[@]}" 2>&3; } 3>&2 2> "${stage_time_file}"
         else
-            time "${full_cmd[@]}"
+            time "${execution_cmd[@]}"
         fi
         stage_returncode=$?
     else
-        "${full_cmd[@]}"
+        "${execution_cmd[@]}"
         stage_returncode=$?
     fi
     set -e
     compile_end_ms="$(now_ms)"
+    if [[ -n "${process_guard_stdout}" && -s "${process_guard_stdout}" ]]; then
+        sed -n '1,$p' "${process_guard_stdout}"
+    fi
+    if [[ -n "${process_guard_stderr}" && -s "${process_guard_stderr}" ]]; then
+        sed -n '1,$p' "${process_guard_stderr}" >&2
+    fi
     compile_elapsed_ms=$((compile_end_ms - compile_start_ms))
     barrier_start_ms="${compile_end_ms}"
     if [[ ${stage_returncode} -eq 0 ]]; then
@@ -348,10 +529,20 @@ run_stage() {
         "${stage}" "${out_exe}" "${compile_elapsed_ms}" \
         "${barrier_elapsed_ms}" "${stage_elapsed_ms}" "${stage_returncode}" \
         "${stage_time_file}" "${barrier_returncode}"
-    echo "PCC_BOOTSTRAP_STAGE_RESULT stage=${stage} elapsed_ms=${stage_elapsed_ms} output=${out_exe}"
+    # A failed stage must not emit a success-shaped result line.  This printed
+    # `PCC_BOOTSTRAP_STAGE_RESULT stage=2 elapsed_ms=334749 output=.../pcc2`
+    # for a stage that crashed and produced no pcc2 at all; anyone grepping for
+    # that line -- which is exactly how these runs get measured -- reads a
+    # timing and an output path for work that never happened.
     if [[ ${stage_returncode} -ne 0 ]]; then
+        echo "PCC_BOOTSTRAP_STAGE_FAILED stage=${stage} elapsed_ms=${stage_elapsed_ms} rc=${stage_returncode} output=<none>"
         exit "${stage_returncode}"
     fi
+    if [[ ! -s "${out_exe}" ]]; then
+        echo "PCC_BOOTSTRAP_STAGE_FAILED stage=${stage} elapsed_ms=${stage_elapsed_ms} rc=0 output=<missing:${out_exe}>"
+        exit 1
+    fi
+    echo "PCC_BOOTSTRAP_STAGE_RESULT stage=${stage} elapsed_ms=${stage_elapsed_ms} output=${out_exe} rc=0"
 }
 
 # stage 1: CPython-hosted pcc produces pcc1.

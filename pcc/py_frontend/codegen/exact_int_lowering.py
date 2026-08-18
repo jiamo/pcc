@@ -1,6 +1,8 @@
 """Exact Python integer object-boundary lowering for L1CodeGen."""
 from __future__ import annotations
 
+import sys
+import os
 from typing import Optional
 
 from pcc.llvm_capi.compat import ir
@@ -491,6 +493,16 @@ class ExactIntLoweringMixin:
             value = self._emit_expr(expr)
             if isinstance(value.type, ir.PointerType):
                 return value
+        if isinstance(expr, Name) and expr.ident not in self.env:
+            module_global = self._module_globals.get(expr.ident)
+            if (
+                module_global is not None
+                and isinstance(module_global[1], IntType)
+                and isinstance(module_global[0].value_type, ir.PointerType)
+            ):
+                value = self._emit_expr(expr)
+                if isinstance(value.type, ir.PointerType):
+                    return value
         if isinstance(expr, IfExpr):
             return self._emit_if_expr_as_pcc_object(expr)
         if isinstance(expr, BinOp):
@@ -546,6 +558,7 @@ class ExactIntLoweringMixin:
             lhs_root_slot = None
             lhs_root_lifetimes = ()
             lhs_generator_slot = None
+            lhs_quiet_unpinned = False
             if lhs_pinned:
                 generator_stack = getattr(self, "_generator_ctx_stack", ())
                 if generator_stack:
@@ -645,6 +658,14 @@ class ExactIntLoweringMixin:
                     lhs_owned = True
                     self._gc_pin(lhs)
                     lhs_cleanup = ((lhs, True),)
+                elif self._exact_int_operand_is_gc_quiet(expr.rhs):
+                    # The rhs is a local/global load or a literal: nothing
+                    # between here and the operation can allocate, raise or
+                    # relocate, so the temporary root frame (store_root,
+                    # frame_enter_lifo, three reloads, frame_leave_lifo) was
+                    # pure protocol.  The operands are pinned only around the
+                    # slow runtime call below.
+                    lhs_quiet_unpinned = True
                 else:
                     # A pin keeps the object immobile, but later operand
                     # lowering can still relocate it on another thread.  Keep
@@ -680,6 +701,8 @@ class ExactIntLoweringMixin:
                 self._release_rooted_pcc_lifetimes(((lhs_root_slot, False),))
                 self._gc_pin(lhs)
                 lhs_cleanup = ((lhs, lhs_owned),)
+            if lhs_quiet_unpinned:
+                lhs_cleanup = ((lhs, lhs_owned),)
             rhs_owned = (
                 isinstance(rhs.type, ir.PointerType)
                 and rhs not in getattr(self, "_cpy_values", ())
@@ -689,8 +712,22 @@ class ExactIntLoweringMixin:
                 isinstance(rhs.type, ir.PointerType)
                 and rhs not in getattr(self, "_cpy_values", ())
             )
-            if rhs_pinned:
-                self._gc_pin(rhs)
+            inline_capable = self._int_exprs_are_boxed() and expr.op in (
+                "+", "-", "*", "&", "|", "^",
+            )
+            # With an inline fast path, pins are deferred into the slow block;
+            # otherwise the runtime call is unconditional and pins wrap it.
+            slow_pins: tuple[ir.Value, ...] = ()
+            if inline_capable:
+                if lhs_quiet_unpinned:
+                    slow_pins = slow_pins + (lhs,)
+                if rhs_pinned:
+                    slow_pins = slow_pins + (rhs,)
+            else:
+                if lhs_quiet_unpinned:
+                    self._gc_pin(lhs)
+                if rhs_pinned:
+                    self._gc_pin(rhs)
             operand_cleanup = lhs_cleanup
             if rhs_pinned:
                 operand_cleanup = operand_cleanup + ((rhs, rhs_owned),)
@@ -706,31 +743,28 @@ class ExactIntLoweringMixin:
                     rhs_i64,
                     pinned_release_on_error=operand_cleanup,
                 )
-            if self._int_exprs_are_boxed():
+            if inline_capable:
                 inline = self._emit_inline_tagged_int_binop_or_call(
                     expr.op,
                     lhs,
                     rhs,
                     fn_name,
+                    slow_pins=slow_pins,
+                    slow_err_check=True,
+                    slow_err_cleanup=operand_cleanup,
                 )
                 if inline is not None:
-                    self._emit_post_call_err_check(
-                        None,
-                        pinned_release_on_error=operand_cleanup,
-                    )
-                    self._guard_cpy_value_not_null(
-                        inline,
-                        pinned_pcc_on_error=operand_cleanup,
-                    )
-                    if lhs_pinned:
+                    if lhs_pinned and not lhs_quiet_unpinned:
                         self._gc_unpin(lhs)
                     if lhs_owned:
                         self._gc_release(lhs)
-                    if rhs_pinned:
-                        self._gc_unpin(rhs)
                     if rhs_owned:
                         self._gc_release(rhs)
                     return inline
+                # No inline shape after all: the unconditional call below
+                # needs the deferred pins in place.
+                for pinned in slow_pins:
+                    self._gc_pin(pinned)
             result = self.builder.call(
                 self.runtime[fn_name],
                 [lhs, rhs],
@@ -808,7 +842,10 @@ class ExactIntLoweringMixin:
         return None
 
     def _int_expr_needs_exact_object_boundary(self, expr: Expr) -> bool:
-        if not isinstance(expr.ty, IntType):
+        if not isinstance(expr.ty, IntType) or expr.ty.name in (
+            "pcc.i64",
+            "pcc.u64",
+        ):
             return False
         if (
             isinstance(expr, Call)
@@ -817,10 +854,20 @@ class ExactIntLoweringMixin:
         ):
             return True
         if isinstance(expr, Name):
-            return getattr(self, "_exact_int_env_flags", {}).get(
+            if getattr(self, "_exact_int_env_flags", {}).get(
                 expr.ident,
                 False,
-            )
+            ):
+                return True
+            if expr.ident not in self.env:
+                module_global = self._module_globals.get(expr.ident)
+                if (
+                    module_global is not None
+                    and isinstance(module_global[1], IntType)
+                    and isinstance(module_global[0].value_type, ir.PointerType)
+                ):
+                    return True
+            return False
         if isinstance(expr, Call) and self._call_is_int_builtin(expr):
             # ADMISSION DEMOTION.  `int(<str>)` and `int(<dyn>)` have an
             # UNBOUNDED result range -- the text or the object can hold any
@@ -904,6 +951,13 @@ class ExactIntLoweringMixin:
                 except (OverflowError, ValueError):
                     return True
                 return value < -(1 << 63) or value > (1 << 63) - 1
+            if expr.op == "<<":
+                # A non-constant ordinary Python left shift has no i64 range
+                # proof.  AArch64 masks a large machine shift count (1049 ->
+                # 25), which silently wraps instead of promoting to bigint.
+                # Literal/literal shifts were classified above; explicitly
+                # typed pcc.i64/pcc.u64 expressions returned at function entry.
+                return True
             return False
         if isinstance(expr, UnaryOp) and expr.op == "-":
             if isinstance(expr.operand, IntLit):
@@ -947,6 +1001,7 @@ class ExactIntLoweringMixin:
         lhs_root_slot = None
         lhs_root_lifetimes = ()
         lhs_generator_slot = None
+        lhs_quiet_unpinned = False
         if lhs_pinned:
             generator_stack = getattr(self, "_generator_ctx_stack", ())
             if generator_stack:
@@ -1048,6 +1103,8 @@ class ExactIntLoweringMixin:
                 lhs_owned = True
                 self._gc_pin(lhs)
                 lhs_cleanup = ((lhs, True),)
+            elif self._exact_int_operand_is_gc_quiet(expr.rhs):
+                lhs_quiet_unpinned = True
             else:
                 lhs_root_slot = self._enter_container_temp_root(
                     lhs,
@@ -1085,22 +1142,6 @@ class ExactIntLoweringMixin:
             isinstance(rhs.type, ir.PointerType)
             and rhs not in getattr(self, "_cpy_values", ())
         )
-        if rhs_pinned:
-            self._gc_pin(rhs)
-        cmp_i32 = self.builder.call(
-            self.runtime["py_int_cmp"],
-            [lhs, rhs],
-            name=self._fresh("exact.int.cmp"),
-        )
-        if lhs_pinned:
-            self._gc_unpin(lhs)
-        if lhs_owned:
-            self._gc_release(lhs)
-        if rhs_pinned:
-            self._gc_unpin(rhs)
-        if rhs_owned:
-            self._gc_release(rhs)
-        zero = ir.Constant(_I32, 0)
         pred = {
             "==": "==",
             "!=": "!=",
@@ -1109,12 +1150,116 @@ class ExactIntLoweringMixin:
             ">": ">",
             ">=": ">=",
         }[expr.op]
-        return self.builder.icmp_signed(
+        slow_pins: tuple[ir.Value, ...] = ()
+        if lhs_quiet_unpinned:
+            slow_pins = slow_pins + (lhs,)
+        if rhs_pinned:
+            slow_pins = slow_pins + (rhs,)
+        result_i1 = self._emit_inline_tagged_int_compare_or_call(
+            pred,
+            lhs,
+            rhs,
+            slow_pins=slow_pins,
+        )
+        if lhs_pinned and not lhs_quiet_unpinned:
+            self._gc_unpin(lhs)
+        if lhs_owned:
+            self._gc_release(lhs)
+        if rhs_owned:
+            self._gc_release(rhs)
+        return result_i1
+
+    def _exact_int_operand_is_gc_quiet(self, expr: Expr) -> bool:
+        """True when lowering *expr* cannot allocate, raise or run a collector.
+
+        A bound local or module global is a plain (rooted) load and an int or
+        bool literal is a constant.  Everything else -- calls, subscripts,
+        attribute loads, nested arithmetic -- may reach the runtime and keeps
+        the temporary-root protocol around the earlier operand.
+        """
+        if isinstance(expr, (IntLit, BoolLit)):
+            return True
+        if isinstance(expr, Name):
+            if expr.ident in getattr(self, "_cpy_env_flags", {}):
+                return False
+            return expr.ident in self.env or expr.ident in self._module_globals
+        if isinstance(expr, Attr) and isinstance(expr.obj, Name):
+            # A slot read (`py_instance_get_field`) on a class-hinted receiver
+            # retains and returns the field; it never allocates or raises.
+            hint = self._class_hint_for_expr(expr.obj)
+            if hint is None or not hasattr(self, "class_lowering"):
+                return False
+            info = self.class_lowering.classes.get(hint)
+            if info is None:
+                return False
+            return self.class_lowering.lookup_field_index(info, expr.name) is not None
+        return False
+
+    def _emit_inline_tagged_int_compare_or_call(
+        self,
+        pred: str,
+        lhs: ir.Value,
+        rhs: ir.Value,
+        *,
+        slow_pins: tuple[ir.Value, ...] = (),
+    ) -> ir.Value:
+        """``lhs <pred> rhs`` on exact ints: compare tagged bits inline, else
+        pin the operands around ``py_int_cmp`` (which cannot raise)."""
+        fn = self.current_function
+        ptr_one = ir.Constant(_I64, 1)
+        lhs_bits = self.builder.ptrtoint(lhs, _I64, name=self._fresh("cmp.l.bits"))
+        rhs_bits = self.builder.ptrtoint(rhs, _I64, name=self._fresh("cmp.r.bits"))
+        both_tagged = self.builder.and_(
+            self.builder.icmp_signed(
+                "==",
+                self.builder.and_(lhs_bits, ptr_one, name=self._fresh("cmp.l.low")),
+                ptr_one,
+                name=self._fresh("cmp.l.ok"),
+            ),
+            self.builder.icmp_signed(
+                "==",
+                self.builder.and_(rhs_bits, ptr_one, name=self._fresh("cmp.r.low")),
+                ptr_one,
+                name=self._fresh("cmp.r.ok"),
+            ),
+            name=self._fresh("cmp.both"),
+        )
+        fast_bb = fn.append_basic_block(name=self._fresh("int.cmp.fast"))
+        slow_bb = fn.append_basic_block(name=self._fresh("int.cmp.slow"))
+        join_bb = fn.append_basic_block(name=self._fresh("int.cmp.join"))
+        self.builder.cbranch(both_tagged, fast_bb, slow_bb)
+
+        self.builder.position_at_end(fast_bb)
+        # Tagged values keep their order under the shift, so compare the raw
+        # bits directly.
+        fast = self.builder.icmp_signed(pred, lhs_bits, rhs_bits, name=self._fresh("cmp.fast"))
+        fast_exit = self.builder._block
+        self.builder.branch(join_bb)
+
+        self.builder.position_at_end(slow_bb)
+        for pinned in slow_pins:
+            self._gc_pin(pinned)
+        cmp_i32 = self.builder.call(
+            self.runtime["py_int_cmp"],
+            [lhs, rhs],
+            name=self._fresh("exact.int.cmp"),
+        )
+        for pinned in reversed(slow_pins):
+            self._gc_unpin(pinned)
+        slow = self.builder.icmp_signed(
             pred,
             cmp_i32,
-            zero,
+            ir.Constant(_I32, 0),
             name=self._fresh("exact.int.cmp.i1"),
         )
+        slow_exit = self.builder._block
+        self.builder.branch(join_bb)
+
+        self.builder.position_at_end(join_bb)
+        phi = self.builder.phi(_I1, name=self._fresh("int.cmp.result"))
+        phi.add_incoming(fast, fast_exit)
+        phi.add_incoming(slow, slow_exit)
+        return phi
 
     def _emit_exact_int_operand_object(self, expr: Expr) -> ir.Value:
         exact = self._maybe_emit_exact_int_object(expr)
@@ -1197,7 +1342,8 @@ class ExactIntLoweringMixin:
             return None
         exact_container = self._emit_exact_container_subscript_load_object(expr, obj)
         if exact_container is not None:
-            return exact_container[0]
+            got, _, _root, _root_ptr = exact_container
+            return got
         if isinstance(obj_ty, DynType):
             key_obj = self._emit_subscript_key_object(expr.idx)
             got = self.builder.call(

@@ -200,7 +200,7 @@ int64_t py_user_bool_dispatch(PyObject *o, int64_t *handled) {
 
 int64_t py_obj_index_i64(PyObject *o) {
     if (o == NULL) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "object cannot be interpreted as an integer"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "object cannot be interpreted as an integer"));
         return 0;
     }
     if (PY_IS_TAGGED_INT(o)) return py_int_value_i64(o);
@@ -208,12 +208,12 @@ int64_t py_obj_index_i64(PyObject *o) {
     if (tag == PY_TYPE_INT) return py_int_value_i64(o);
     if (tag == PY_TYPE_BOOL) return o == py_True ? 1 : 0;
     if (!is_user_instance(o)) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "object cannot be interpreted as an integer"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "object cannot be interpreted as an integer"));
         return 0;
     }
     PyObject *method = lookup_dunder(o, "__index__");
     if (method == NULL) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "object cannot be interpreted as an integer"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "object cannot be interpreted as an integer"));
         return 0;
     }
     PyObject *result = call_unary(method, o);
@@ -226,7 +226,7 @@ int64_t py_obj_index_i64(PyObject *o) {
     } else {
         py_decref(result);
     }
-    py_raise(py_exc_new(PY_EXC_TYPEERROR, "__index__ returned non-int"));
+    py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "__index__ returned non-int"));
     return 0;
 }
 
@@ -265,13 +265,30 @@ int64_t py_user_eq_dispatch(PyObject *a, PyObject *b) {
      * concurrent comparisons don't clobber the counter. This is the
      * self-host-safety guard for the py_obj_eq instance dispatch. */
     static __thread int _eq_depth = 0;
-    PyObject *method = lookup_dunder(a, "__eq__");
-    if (method == NULL) return -1;
     if (_eq_depth >= 64) return -1;
+    PyObject *method = lookup_dunder(a, "__eq__");
+    if (method != NULL) {
+        _eq_depth++;
+        PyObject *result = call_binary(method, a, b);
+        _eq_depth--;
+        if (result == NULL) return 0;    /* __eq__ raised: error already set */
+        if (result != py_NotImplemented) {
+            int64_t truth = py_obj_truthy(result);
+            py_decref(result);
+            return truth ? 1 : 0;
+        }
+        py_decref(result);
+    }
+    if (py_type_of(a) == py_type_of(b)) return -1;
+    /* Equality reflection uses the same __eq__ name with reversed operands.
+     * This is required when the stored/left key returns NotImplemented but
+     * the query/right key knows how to compare itself to the left. */
+    method = lookup_dunder(b, "__eq__");
+    if (method == NULL) return -1;
     _eq_depth++;
-    PyObject *result = call_binary(method, a, b);
+    PyObject *result = call_binary(method, b, a);
     _eq_depth--;
-    if (result == NULL) return 0;        /* __eq__ raised: error already set */
+    if (result == NULL) return 0;
     if (result == py_NotImplemented) {
         py_decref(result);
         return -1;
@@ -307,7 +324,7 @@ PyObject *py_user_matmul_dispatch(PyObject *a, PyObject *b) {
         if (result != py_NotImplemented) return result;
         py_decref(result);
     }
-    py_raise(py_exc_new(PY_EXC_TYPEERROR, "unsupported operand type(s) for @"));
+    py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "unsupported operand type(s) for @"));
     return NULL;
 }
 
@@ -336,7 +353,7 @@ PyObject *py_user_binop_dispatch(
         if (result != py_NotImplemented) return result;
         py_decref(result);
     }
-    py_raise(py_exc_new(PY_EXC_TYPEERROR, type_err_msg));
+    py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, type_err_msg));
     return NULL;
 }
 
@@ -347,7 +364,7 @@ PyObject *py_user_binop_dispatch(
  * double quotient; instances dispatch __floordiv__/__rfloordiv__. */
 PyObject *py_obj_floordiv(PyObject *a, PyObject *b) {
     if (a == NULL || b == NULL) {
-        py_raise(py_exc_new(
+        py_raise_owned(py_exc_new(
             PY_EXC_TYPEERROR, "unsupported operand type(s) for //"));
         return NULL;
     }
@@ -366,7 +383,7 @@ PyObject *py_obj_floordiv(PyObject *a, PyObject *b) {
     if (a_num && b_num) {
         double bd = py_float_to_f64(b);
         if (bd == 0.0) {
-            py_raise(py_exc_new(
+            py_raise_owned(py_exc_new(
                 PY_EXC_ZERODIVISIONERROR, "float floor division by zero"));
             return NULL;
         }
@@ -378,7 +395,7 @@ PyObject *py_obj_floordiv(PyObject *a, PyObject *b) {
             a, b, "__floordiv__", "__rfloordiv__",
             "unsupported operand type(s) for //");
     }
-    py_raise(py_exc_new(
+    py_raise_owned(py_exc_new(
         PY_EXC_TYPEERROR, "unsupported operand type(s) for //"));
     return NULL;
 }
@@ -415,7 +432,7 @@ PyObject *py_obj_inplace_op(PyObject *a, PyObject *b, int64_t op_code) {
         case 4: return py_obj_floordiv(a, b);
         case 5: return py_obj_mod(a, b);
         default:
-            py_raise(py_exc_new(
+            py_raise_owned(py_exc_new(
                 PY_EXC_TYPEERROR, "unsupported in-place operand"));
             return NULL;
     }

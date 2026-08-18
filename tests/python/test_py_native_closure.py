@@ -148,6 +148,51 @@ def test_native_closure_sees_outer_rebind_after_value_capture(tmp_path):
     assert run.stdout == "2\n"
 
 
+def test_native_closure_shares_outer_captured_dict_subscript_mutation(tmp_path):
+    src = tmp_path / "closure_dict_cell.py"
+    src.write_text(
+        textwrap.dedent(
+            """
+            TARGET = "target"
+
+            def invoke(callback, key: str) -> bool:
+                return callback(key)
+
+            def outer():
+                labels = {}
+                labels[TARGET] = 1
+
+                def contains(key: str) -> bool:
+                    return key in labels
+
+                print(TARGET in labels)
+                print(contains(TARGET))
+                print(invoke(contains, TARGET))
+
+            outer()
+            """
+        ),
+        encoding="utf-8",
+    )
+    exe = tmp_path / "closure_dict_cell.out"
+
+    compile_python(
+        str(src),
+        str(exe),
+        backend="self",
+        libpython_mode="off",
+        ir_scaffold_mode="on",
+    )
+    run = subprocess.run(
+        [str(exe)],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert run.returncode == 0, run.stderr
+    assert run.stdout == "True\nTrue\nTrue\n"
+
+
 def test_native_nonlocal_counter_stays_libpython_free(tmp_path):
     src = tmp_path / "nonlocal_counter.py"
     src.write_text(

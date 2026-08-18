@@ -4,6 +4,9 @@ High-level print formatting for runtime PyObject* values. Native scalar
 float printing is still emitted directly by codegen; this module covers
 object-path print(), list/tuple repr, and print_many.
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.extern import extern, c_abi_export, c_ptr, c_int32, c_int64, c_void
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_CONTINUATION,

@@ -12,6 +12,8 @@ PyStrObject layout (from py_internal.h):
     offset 40   data[]           (UTF-8 bytes + NUL, flexible array)
 """
 
+__pcc_runtime_port__ = True
+
 from pcc.extern import extern, c_abi_export, c_ptr, c_int32, c_int64, c_void
 from pcc.py_runtime.py.py_abi_constants import (
     PYBYTESOBJECT_BYTE_LEN_OFFSET,
@@ -54,6 +56,8 @@ from pcc.unsafe import (
 
 py_str_new = extern("py_str_new", (c_ptr, c_int64), c_ptr)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 py_bytes_new = extern("py_bytes_new", (c_ptr, c_int64), c_ptr)
 py_int_value_i64 = extern("py_int_value_i64", (c_ptr,), c_int64)
@@ -76,6 +80,7 @@ py_dict_new = extern("py_dict_new", (), c_ptr)
 py_dict_set = extern("py_dict_set", (c_ptr, c_ptr, c_ptr), c_void)
 pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
 pcc_gc_backend = extern("pcc_gc_backend", (), c_int64)
+pcc_gc_pin = extern("pcc_gc_pin", (c_ptr,), c_void)
 pcc_gc_load_ptr = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_ptr)
 pcc_gc_note_relocation_read = extern(
     "pcc_gc_note_relocation_read",
@@ -203,6 +208,20 @@ def _byte_offset_to_cp_offset(s, byte_off: int) -> int:
     n: int = load_i64(s, PYSTROBJECT_BYTE_LEN_OFFSET)
     if byte_off >= n:
         byte_off = n
+    # All-ASCII fast path.  A codepoint count equal to the byte length means
+    # every byte is its own codepoint, so the byte offset IS the codepoint
+    # offset and no scan is needed.  The count itself is cached on the object
+    # by _str_cp_len, so this is O(1) after the first call.
+    #
+    # Without it, every str.find()/index()/rfind() on a long string pays a scan
+    # from the start just to convert the result -- making find O(n) beyond its
+    # own search.  Measured: replacing a character loop with repeated find()
+    # calls was 6.4x FASTER on CPython and 6.2x SLOWER under pcc1 (65 ms ->
+    # 405 ms on a 286 KB module), because N finds became O(N^2).  IR text,
+    # source text and symbol names are pure ASCII, so this path is the common
+    # case for the compiler's own workload.
+    if _str_cp_len(s) == n:
+        return byte_off
     return _utf8_codepoint_count(ptr_add(s, PYSTROBJECT_DATA_OFFSET), byte_off)
 
 
@@ -320,6 +339,12 @@ def py_str_utf8(s):
     if ptr_is_null(s) != 0:
         return null()
     return ptr_add(s, PYSTROBJECT_DATA_OFFSET)
+
+
+@c_abi_export("pcc_capi_str_utf8_pinned")
+def pcc_capi_str_utf8_pinned(s):
+    pcc_gc_pin(s)
+    return py_str_utf8(s)
 
 
 @c_abi_export("py_str_len")
@@ -1009,7 +1034,7 @@ def py_str_index_of(s, sub) -> int:
     # Named *_of to avoid the existing py_str_index (s[i] subscript helper).
     idx: int = py_str_find(s, sub)
     if idx < 0:
-        py_raise(py_exc_new(2, cstr("substring not found")))  # PY_EXC_VALUEERROR
+        py_raise_owned(py_exc_new(2, cstr("substring not found")))  # PY_EXC_VALUEERROR
         return -1
     return idx
 
@@ -1019,7 +1044,7 @@ def py_str_rindex_of(s, sub) -> int:
     # str.rindex(sub): like rfind() but raises ValueError when sub is absent.
     idx: int = py_str_rfind(s, sub)
     if idx < 0:
-        py_raise(py_exc_new(2, cstr("substring not found")))  # PY_EXC_VALUEERROR
+        py_raise_owned(py_exc_new(2, cstr("substring not found")))  # PY_EXC_VALUEERROR
         return -1
     return idx
 
@@ -1029,7 +1054,7 @@ def py_str_index_of_range(s, sub, start: int, end: int) -> int:
     # str.index(sub, start[, end]): find_range() but raises ValueError if absent.
     idx: int = py_str_find_range(s, sub, start, end)
     if idx < 0:
-        py_raise(py_exc_new(2, cstr("substring not found")))  # PY_EXC_VALUEERROR
+        py_raise_owned(py_exc_new(2, cstr("substring not found")))  # PY_EXC_VALUEERROR
         return -1
     return idx
 
@@ -1039,7 +1064,7 @@ def py_str_rindex_of_range(s, sub, start: int, end: int) -> int:
     # str.rindex(sub, start[, end]): rfind_range() but raises ValueError if absent.
     idx: int = py_str_rfind_range(s, sub, start, end)
     if idx < 0:
-        py_raise(py_exc_new(2, cstr("substring not found")))  # PY_EXC_VALUEERROR
+        py_raise_owned(py_exc_new(2, cstr("substring not found")))  # PY_EXC_VALUEERROR
         return -1
     return idx
 
@@ -1526,7 +1551,7 @@ def py_str_index(s, idx_obj):
     cp_len: int = _str_cp_len(s)
     real: int = _normalise_index(idx, cp_len)
     if real < 0:
-        py_raise(py_exc_new(5, cstr("string index out of range")))  # PY_EXC_INDEXERROR
+        py_raise_owned(py_exc_new(5, cstr("string index out of range")))  # PY_EXC_INDEXERROR
         return null()
     bo: int = _utf8_byte_offset_for_codepoint(s, real)
     w: int = _utf8_codepoint_byte_len(s, bo)
@@ -2045,7 +2070,7 @@ def py_str_maketrans(x, y):
     xlen: int = load_i64(x, PYSTROBJECT_BYTE_LEN_OFFSET)
     ylen: int = load_i64(y, PYSTROBJECT_BYTE_LEN_OFFSET)
     if xlen != ylen:
-        py_raise(
+        py_raise_owned(
             py_exc_new(
                 2, cstr("the first two maketrans arguments must have equal length")
             )

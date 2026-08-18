@@ -10,6 +10,7 @@ history, not an executable queue.
 Continue selecting and completing task-board rows until every row is
 `DONE_STRONG` or a real external blocker prevents further progress.
 `DONE_WEAK` is unfinished. No other document may own an executable task list.
+This protocol is runner-neutral and does not require a runner-specific Goal mode.
 
 ## 0. Authority and execution
 
@@ -21,11 +22,11 @@ before task selection.
 Run:
 
 ```bash
-gtimeout 30s env -u LC_ALL uv run python scripts/goal_state.py validate
-gtimeout 30s env -u LC_ALL uv run python scripts/goal_state.py next
+gtimeout 30s env -u LC_ALL uv run python scripts/goal_state.py resume
 ```
 
-Selection is milestone- and dependency-aware. `DONE_WEAK` remains unfinished.
+`resume` validates before it selects. Selection is milestone- and
+dependency-aware. `DONE_WEAK` remains unfinished.
 Use `DONE_STRONG` only when every listed exit criterion is proven, every required
 gate has a final successful result, `open_boundary` is empty, and a small
 evidence file is linked from the row.
@@ -50,6 +51,28 @@ source identity, changed behavior, exact commands, observed results, supported
 claim, and what is not proven. Logs without a final pytest summary are not green.
 Do not rewrite authoritative baselines to absorb a regression.
 
+### 0.3 Direct task-board mutations
+
+No CRUD command is required: agents directly patch the structured board and
+then run `validate` and `resume`.
+
+- **Add a task** as one complete agent-neutral row. Honor a requested `P0`,
+  `P1`, or `P2`; normal rank/priority ordering applies.
+- **Add an immediate task** only when the human explicitly requests immediate
+  execution. Persist `dispatch: IMMEDIATE`; it preempts normal ready rows but
+  must execute dependency-ready prerequisites rather than bypass dependencies.
+  Preserve the interrupted parent row and resume the queue after completion.
+- **Update a task** by exact id, changing only requested/necessary fields while
+  preserving unrelated claims and linked evidence; revalidate and reselect.
+- **Remove a task** only for an explicit exact-id request. Check reverse
+  dependencies, obtain authority for any exact rewiring, write a retained
+  removal receipt, remove only the row, and do not delete linked evidence or
+  documents unless they are separately named.
+
+`dispatch: IMMEDIATE` is distinct from P0/P1/P2 priority and must never be
+inferred from tone. `scripts/goal_state.py` enforces dispatch selection and
+schema invariants; task mutation itself remains an ordinary reviewed file edit.
+
 ### 0.10 Claim hygiene
 
 Every claim must label all relevant modes:
@@ -71,10 +94,14 @@ It is not a GitHub commit status. Release claims require a clean manifest with
 ## 1. North star
 
 PCC exists to provide Python a native, auditable, self-hostable no-libpython
-execution path. Performance is a consequence of proven semantics. The five
-non-negotiable differentiators are the three-stage fixed point, comparative
-five-GC runtime, opt-in identity-free value projection, self backend as an
-execution root, and long-running runtime efficiency.
+execution path. Performance is a consequence of proven semantics. The six
+non-negotiable differentiators are the three-stage fixed point,
+comparative five-GC runtime, opt-in identity-free value projection, self backend
+as an execution root, long-running runtime efficiency, and **complete Python
+execution ownership**: implement every missing surface in pcc and remove every
+CPython/libpython/LLVM/host/C-owner or hidden fallback. An unimplemented surface
+must fail closed with an explicit capability diagnostic; a fallback ratchet is
+migration evidence, never permission to keep that fallback as the end state.
 
 The production runtime, including allocation, headers, atomics, syscalls,
 threads, dynamic loading, safepoints, stack maps, all five GC implementations,
@@ -101,6 +128,20 @@ For one selected card:
    the changed boundary.
 8. Record evidence, update the row, validate the board, and check for leftover
    compiler/test children.
+9. Run `scripts/goal_state.py resume` again. If it reports `CONTINUE`, begin the
+   selected next row or finite slice in the same ordinary session. Do not stop
+   merely because one task finished.
+
+Before any final response, run `scripts/goal_state.py finish-check`. A
+`CONTINUE` state returns exit 4 and mechanically denies finalization; emit a
+checkpoint update and keep working. Loop/runner integrations must use this as
+a pre-final gate and may optionally persist its board-hash-bound JSON receipt.
+
+`继续任务板`, `continue the task board`, and equivalent ordinary-session
+requests enter this same loop. `COMPLETE` means every task-board row is
+`DONE_STRONG`; `BLOCKED` and `MILESTONE_COMPLETE` require the exact repository
+or authority transition printed by the command. An explicit human stop/cancel
+still takes precedence.
 
 All shell commands require explicit timeouts. Use `env -u LC_ALL uv run` for
 Python entrypoints. Never commit unless the user asks. Never discard shared
@@ -121,6 +162,39 @@ M5 deferred GPU/TIRx, distributed, ds4, and breadth research
 
 Before M1 is strong, M5 accepts regression maintenance and claim correction,
 not new P0 breadth.
+
+### 3.1 Full completion route — never shorten the goal to the active slice
+
+The selected row is only the next executable slice. The goal is complete only
+when **every actionable task-board row is `DONE_STRONG`** and the cumulative
+evidence proves all of the following without weakening Python semantics:
+
+1. failing correctness and control-plane gates are repaired on current source;
+2. same-source, same-knob, mode-labelled measurements make stage2 no slower
+   than a non-regressed stage1, with wall, CPU, process-tree RSS, output and
+   cache receipts; a slower stage1 may never be used to relax the ratio;
+3. a receipt-bound paired comparison then makes native pcc1 bootstrap robustly
+   faster than host pcc/CPython on the declared workload without handicapping
+   the host or omitting semantic work;
+4. pcc1→pcc2→pcc3 reaches the normalized fixed point through the self backend,
+   no libpython and no hidden LLVM/host owner;
+5. GC0..4 each pass correctness plus comparable CPU, RSS, pause, throughput,
+   fragmentation and long-running-efficiency budgets, and consume one shared
+   slot/root/frame/native-handle contract;
+6. the value projection preserves ordinary-class identity and arbitrary-
+   precision Python `int` semantics while proving its native hot-path claims;
+7. package/import/extension ABI support is generic, includes real package
+   canaries, and never relies on package-name compiler special cases;
+8. the production runtime layering converges on freestanding pcc-Python, with
+   C/libc retained only as attributed transition oracles until their production
+   link ownership is removed; and
+9. every CPython/libpython/LLVM/host/permanent-C or hidden fallback is either
+   implemented natively and removed or, while still missing, rejected by an
+   explicit mode-labelled capability diagnostic.
+
+GPU/TIRx, distributed and other M5 breadth retain their existing finite rows
+and claim levels, but they do not replace or delay the self-host→five-GC→value
+model→runtime-efficiency→complete-ownership spine above.
 
 ## 4. Gate ownership
 
@@ -144,6 +218,22 @@ regression. Source guards must reject package-name branches such as
 Reject incompatible artifacts with stable diagnostics. Never report a
 `cpython-*`/`abi3` artifact as pcc-native, a host-assisted build as no-host, an
 LLVM fallback as self backend, or a pcc1 smoke test as a fixed point.
+
+### 9.3 Implement missing surfaces and remove every fallback
+
+No fallback is an acceptable terminal state. Every CPython/libpython bridge,
+LLVM handoff after `--backend self`, host-Python/subprocess execution owner,
+production C-runtime owner, package-specific escape hatch, or hidden
+compatibility path must have a finite implementation/removal task and a gate
+that proves the selected pcc mode remains the execution owner. Until that
+surface exists, reject it explicitly and mode-label the diagnostic; do not
+silently run it under another owner or relabel an oracle as production.
+
+During migration, retained C, LLVM, CPython, and mature external systems may be
+used as differential oracles. Their oracle role does not satisfy the ownership
+gate, and fallback baselines may only ratchet downward. Completion requires the
+fallback edge to be absent from the reachable production artifact and behavior,
+not merely disabled by the benchmark input or hidden behind a helper process.
 
 ## 10. Self-backend rules
 

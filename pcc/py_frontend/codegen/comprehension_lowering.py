@@ -1039,19 +1039,40 @@ class ComprehensionLoweringMixin:
             and len(iter_e.args) == 1
             and not iter_e.kwargs
         ):
-            self._emit_enumerate_loop_in_comp(
-                target,
-                iter_e.args[0],
-                kind,
-                container,
-                generators,
-                tuple_unpacks,
-                idx,
-                elt_expr,
-                key_expr,
-                val_expr,
+            enumerate_source_ty = iter_e.args[0].ty
+            enumerate_indexed = isinstance(
+                enumerate_source_ty,
+                (
+                    ListType,
+                    TupleType,
+                    DictType,
+                    StrType,
+                    BytesType,
+                    ByteArrayType,
+                    MemoryViewType,
+                ),
+            ) or (
+                isinstance(enumerate_source_ty, ClassType)
+                and enumerate_source_ty.name in (
+                    "bytes",
+                    "bytearray",
+                    "memoryview",
+                )
             )
-            return
+            if enumerate_indexed:
+                self._emit_enumerate_loop_in_comp(
+                    target,
+                    iter_e.args[0],
+                    kind,
+                    container,
+                    generators,
+                    tuple_unpacks,
+                    idx,
+                    elt_expr,
+                    key_expr,
+                    val_expr,
+                )
+                return
         iter_val = self._emit_expr(iter_e)
         if iter_val in getattr(self, "_cpy_values", ()):
             self._emit_cpy_iter_loop(

@@ -114,3 +114,43 @@ def test_owned_elf_link_command_labels_internal_inputs_as_objects():
         for index, value in enumerate(command)
         if value == "--object"
     ] == ["first.o", "second.o", "extra.o"]
+
+
+def test_owned_macho_link_command_labels_packed_native_inputs_and_profile():
+    command = pipeline_self_link.build_pcc_link_command(
+        host_python="python3",
+        driver="scripts/pcc_link_macho.py",
+        output="program.tmp",
+        asm_path=None,
+        internal_asm_inputs=("first.pco", "second.pco"),
+        runtime_archive="runtime.a",
+        extra_link_inputs=(),
+        internal_input_flag="--native-object",
+        profile_json="link-profile.json",
+    )
+    assert "--asm" not in command
+    assert [
+        command[index + 1]
+        for index, value in enumerate(command)
+        if value == "--native-object"
+    ] == ["first.pco", "second.pco"]
+    assert command[command.index("--profile-json") + 1] == "link-profile.json"
+
+
+def test_owned_macho_link_command_accepts_ordered_internal_manifest():
+    command = pipeline_self_link.build_pcc_link_command(
+        host_python="python3",
+        driver="scripts/pcc_link_macho.py",
+        output="program.tmp",
+        asm_path=None,
+        internal_asm_inputs=(),
+        runtime_archive="runtime.a",
+        extra_link_inputs=(),
+        internal_input_manifest="ordered-inputs.txt",
+    )
+
+    assert command[command.index("--internal-input-manifest") + 1] == (
+        "ordered-inputs.txt"
+    )
+    assert "--asm" not in command
+    assert "--native-object" not in command

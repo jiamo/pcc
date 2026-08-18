@@ -219,107 +219,111 @@ def _dict_str_dyn_global_export():
     return _module_global_export(("dict", ("str",), ("dyn",)))
 
 
-_PY_AST_STATIC_CLASS_FIELDS = {
-    "Type": ("name",),
-    "IntType": ("name", "width", "signed"),
-    "FloatType": ("name", "width"),
-    "ComplexType": ("name",),
-    "BoolType": ("name",),
-    "NoneType": ("name",),
-    "StrType": ("name",),
-    "BytesType": ("name",),
-    "ByteArrayType": ("name",),
-    "MemoryViewType": ("name",),
-    "ListType": ("name", "elem"),
-    "SetType": ("name", "elem"),
-    "ValueArrayType": ("name", "elem", "length"),
-    "DictType": ("name", "key", "value"),
-    "TupleType": ("name", "elems"),
-    "FuncType": ("name", "params", "ret"),
-    "ClassType": (
-        "name",
-        "module",
-        "fields",
-        "bases",
-        "properties",
-        "valueclass",
-    ),
-    "ValueClassType": (
-        "name",
-        "module",
-        "fields",
-        "bases",
-        "properties",
-        "valueclass",
-        "flattened",
-        "nullable_fields",
-    ),
-    "DynType": ("name",),
-    "SourceSpan": ("file", "line", "col", "end_line", "end_col"),
-    "Expr": ("span", "ty"),
-    "IntLit": ("span", "ty", "value"),
-    "FloatLit": ("span", "ty", "value"),
-    "ComplexLit": ("span", "ty", "real", "imag"),
-    "BoolLit": ("span", "ty", "value"),
-    "NoneLit": ("span", "ty"),
-    "StrLit": ("span", "ty", "value"),
-    "BytesLit": ("span", "ty", "value"),
-    "Name": ("span", "ty", "ident"),
-    "BinOp": ("span", "ty", "op", "lhs", "rhs"),
-    "UnaryOp": ("span", "ty", "op", "operand"),
-    "Compare": ("span", "ty", "op", "lhs", "rhs"),
-    "BoolExpr": ("span", "ty", "op", "left", "right"),
-    "Call": ("span", "ty", "func", "args", "kwargs", "operand_order"),
-    "Attr": ("span", "ty", "obj", "name"),
-    "Subscript": ("span", "ty", "obj", "idx"),
-    "Slice": ("span", "ty", "lo", "hi", "step"),
-    "ListExpr": ("span", "ty", "elems"),
-    "DictExpr": ("span", "ty", "pairs"),
-    "TupleExpr": ("span", "ty", "elems"),
-    "IfExpr": ("span", "ty", "cond", "then_e", "else_e"),
-    "Lambda": ("span", "ty", "params", "body"),
-    "Assign": ("span", "targets", "value", "annotation"),
-    "AugAssign": ("span", "target", "op", "value"),
-    "ExprStmt": ("span", "expr"),
-    "If": ("span", "cond", "body", "else_body"),
-    "While": ("span", "cond", "body", "else_body"),
-    "For": ("span", "target", "iter", "body", "else_body", "is_async"),
-    "Return": ("span", "value"),
-    "Pass": ("span",),
-    "Break": ("span",),
-    "Continue": ("span",),
-    "Raise": ("span", "exc", "cause"),
-    "Try": ("span", "body", "handlers", "else_body", "finally_body"),
-    "ExceptHandler": ("exc_type", "name", "body", "span"),
-    "With": ("span", "items", "body", "is_async"),
-    "Import": ("span", "names"),
-    "ImportFrom": ("span", "module", "names", "level"),
-    "Global": ("span", "names"),
-    "Nonlocal": ("span", "names"),
-    "Delete": ("span", "targets"),
-    "Arg": ("name", "annotation", "default", "kind", "has_default"),
-    "FuncDef": (
-        "span",
-        "name",
-        "args",
-        "return_ty",
-        "body",
-        "decorators",
-        "is_method",
-        "is_async",
-    ),
-    "ClassDef": ("span", "name", "bases", "keywords", "body", "decorators"),
-    "Stmt": ("span",),
-    "Module": ("name", "body", "docstring"),
-}
+def _build_py_ast_static_class_fields():
+    return {
+        "Type": ("name",),
+        "IntType": ("name", "width", "signed"),
+        "FloatType": ("name", "width"),
+        "ComplexType": ("name",),
+        "BoolType": ("name",),
+        "NoneType": ("name",),
+        "StrType": ("name",),
+        "BytesType": ("name",),
+        "ByteArrayType": ("name",),
+        "MemoryViewType": ("name",),
+        "ListType": ("name", "elem"),
+        "SetType": ("name", "elem"),
+        "ValueArrayType": ("name", "elem", "length"),
+        "DictType": ("name", "key", "value"),
+        "TupleType": ("name", "elems"),
+        "FuncType": ("name", "params", "ret"),
+        "ClassType": (
+            "name",
+            "module",
+            "fields",
+            "bases",
+            "properties",
+            "valueclass",
+        ),
+        "ValueClassType": (
+            "name",
+            "module",
+            "fields",
+            "bases",
+            "properties",
+            "valueclass",
+            "flattened",
+            "nullable_fields",
+        ),
+        "DynType": ("name",),
+        "SourceSpan": ("file", "line", "col", "end_line", "end_col"),
+        "Expr": ("span", "ty"),
+        "IntLit": ("span", "ty", "value"),
+        "FloatLit": ("span", "ty", "value"),
+        "ComplexLit": ("span", "ty", "real", "imag"),
+        "BoolLit": ("span", "ty", "value"),
+        "NoneLit": ("span", "ty"),
+        "StrLit": ("span", "ty", "value"),
+        "BytesLit": ("span", "ty", "value"),
+        "Name": ("span", "ty", "ident"),
+        "BinOp": ("span", "ty", "op", "lhs", "rhs"),
+        "UnaryOp": ("span", "ty", "op", "operand"),
+        "Compare": ("span", "ty", "op", "lhs", "rhs"),
+        "BoolExpr": ("span", "ty", "op", "left", "right"),
+        "Call": ("span", "ty", "func", "args", "kwargs", "operand_order"),
+        "Attr": ("span", "ty", "obj", "name"),
+        "Subscript": ("span", "ty", "obj", "idx"),
+        "Slice": ("span", "ty", "lo", "hi", "step"),
+        "ListExpr": ("span", "ty", "elems"),
+        "DictExpr": ("span", "ty", "pairs"),
+        "TupleExpr": ("span", "ty", "elems"),
+        "IfExpr": ("span", "ty", "cond", "then_e", "else_e"),
+        "Lambda": ("span", "ty", "params", "body"),
+        "Assign": ("span", "targets", "value", "annotation"),
+        "AugAssign": ("span", "target", "op", "value"),
+        "ExprStmt": ("span", "expr"),
+        "If": ("span", "cond", "body", "else_body"),
+        "While": ("span", "cond", "body", "else_body"),
+        "For": ("span", "target", "iter", "body", "else_body", "is_async"),
+        "Return": ("span", "value"),
+        "Pass": ("span",),
+        "Break": ("span",),
+        "Continue": ("span",),
+        "Raise": ("span", "exc", "cause"),
+        "Try": ("span", "body", "handlers", "else_body", "finally_body"),
+        "ExceptHandler": ("exc_type", "name", "body", "span"),
+        "With": ("span", "items", "body", "is_async"),
+        "Import": ("span", "names"),
+        "ImportFrom": ("span", "module", "names", "level"),
+        "Global": ("span", "names"),
+        "Nonlocal": ("span", "names"),
+        "Delete": ("span", "targets"),
+        "Arg": ("name", "annotation", "default", "kind", "has_default"),
+        "FuncDef": (
+            "span",
+            "name",
+            "args",
+            "return_ty",
+            "body",
+            "decorators",
+            "is_method",
+            "is_async",
+        ),
+        "ClassDef": ("span", "name", "bases", "keywords", "body", "decorators"),
+        "Stmt": ("span",),
+        "Module": ("name", "body", "docstring"),
+    }
 
 
-_PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
-    "pcc.py_frontend.py_ast": {
+_PY_AST_STATIC_CLASS_FIELDS = _build_py_ast_static_class_fields()
+
+
+def _populate_static_native_exports_0(out):
+    out["pcc.py_frontend.py_ast"] = {
         name: _class_export(name, fields)
         for name, fields in _PY_AST_STATIC_CLASS_FIELDS.items()
-    },
-    "pcc.py_frontend.export_meta": {
+    }
+    out["pcc.py_frontend.export_meta"] = {
         "encode_type": _function_export(
             ("dyn",),
             (("dyn",),),
@@ -330,26 +334,26 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
             (("dyn",),),
             (_export_arg("desc"),),
         ),
-    },
-    "pcc.py_frontend.py_ast_contract": {
+    }
+    out["pcc.py_frontend.py_ast_contract"] = {
         "PY_AST_FIELD_NAME_OVERRIDES": _dict_str_dyn_global_export(),
-    },
+    }
     # ``cli_bootstrap.py`` imports the shared parser choices from this module.
     # Keep the standalone fallback probe on the same static surface as the
     # closed-world pcc1 build.
-    "pcc.cli_contract": {
+    out["pcc.cli_contract"] = {
         "BACKEND_CHOICES": _string_tuple_global_export(),
         "PYTHON_LIBPYTHON_CHOICES": _string_tuple_global_export(),
         "IR_SCAFFOLD_CHOICES": _string_tuple_global_export(),
         "DIAGNOSTIC_FORMAT_CHOICES": _string_tuple_global_export(),
         "DEFAULT_EMIT_LL": _str_constant_export("__PCC_DEFAULT_LL__"),
-    },
+    }
     # ``cli_bootstrap.py`` consumes this self-host-safe package contract in
     # standalone as well as closed-world builds.  Keep the imported constants
     # and helpers native in the raw per-module probe; otherwise every call is
     # inferred as ``Dyn`` and silently reintroduces ``py_cpy_*`` despite the
     # same two modules compiling cleanly together.
-    "pcc.package_schema": {
+    out["pcc.package_schema"] = {
         "PACKAGE_MANIFEST_SCHEMA": _str_constant_export("pcc.package-manifest.v1"),
         "PACKAGE_MANIFEST_SCHEMA_VERSION": {
             "kind": "constant",
@@ -387,13 +391,13 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
             (("str",),),
             (_export_arg("path", ("str",)),),
         ),
-    },
+    }
     # Package environment selection is shared by the host CLI, the compiled
     # bootstrap CLI, and frontend import discovery.  Standalone module probes
     # need the same signatures as the closed-world build; treating these
     # helpers as dynamic silently adds libpython calls to both cli_bootstrap
     # and pipeline.
-    "pcc.package_environment": {
+    out["pcc.package_environment"] = {
         "apply_locked_environment_resource_defaults": _function_export(
             ("list", ("str",)),
             (),
@@ -430,11 +434,14 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
                 _export_arg("target_triple", ("dyn",), has_default=True),
             ),
         ),
-    },
+    }
     # The strict AArch64 self path is linked into pcc1 and called in-process;
     # these three signatures keep pipeline.py's independent diagnostic probe
     # on the same native edge as the real closed-world compiler.
-    "pcc.backend.self_backend_aarch64_darwin": {
+
+
+def _populate_static_native_exports_1(out):
+    out["pcc.backend.self_backend_aarch64_darwin"] = {
         "emit_aarch64_darwin_asm": _function_export(
             ("str",),
             (("str",), ("bool",)),
@@ -443,19 +450,19 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
                 _export_arg("optimize", ("bool",)),
             ),
         ),
-    },
-    "pcc.backend.self_backend_parse": {
+    }
+    out["pcc.backend.self_backend_parse"] = {
         "parse_self_backend_target_triple": _function_export(
             ("str",),
             (("str",),),
             (_export_arg("ir_text", ("str",)),),
         ),
-    },
+    }
     # Self-backend lowering helpers are imported by independently compiled
     # emitter modules as well as the closed-world compiler. Keep their raw
     # per-module calls native so correctness hardening does not grow the
     # libpython fallback surface.
-    "pcc.backend.self_backend_ir": {
+    out["pcc.backend.self_backend_ir"] = {
         "_align_to": _function_export(
             ("int",),
             (("int",), ("int",)),
@@ -468,6 +475,19 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
             ("int",),
             (("str",),),
             (_export_arg("text", ("str",)),),
+        ),
+        "dot_numeric_text_key_id": _function_export(
+            ("int",),
+            (("str",),),
+            (_export_arg("text", ("str",)),),
+        ),
+        "text_key_names_equal": _function_export(
+            ("bool",),
+            (("str",), ("str",)),
+            (
+                _export_arg("left", ("str",)),
+                _export_arg("right", ("str",)),
+            ),
         ),
         "text_key_mapping_get": _function_export(
             ("dyn",),
@@ -485,25 +505,25 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
                 _export_arg("key", ("str",)),
             ),
         ),
-    },
-    "pcc.backend.self_backend_target_match": {
+    }
+    out["pcc.backend.self_backend_target_match"] = {
         "is_aarch64_darwin_triple": _function_export(
             ("bool",),
             (("str",),),
             (_export_arg("triple", ("str",)),),
         ),
-    },
+    }
     # ``class_gen._builtin_exception_tag_for_base_name`` calls the shared
     # exception-tag metadata helper; without a static export the standalone
     # per-module compile bridges it via py_cpy_import/getattr/call.
-    "pcc.py_frontend.codegen.builtin_exceptions": {
+    out["pcc.py_frontend.codegen.builtin_exceptions"] = {
         "builtin_exc_tag_or_missing": _function_export(
             ("int",),
             (("str",),),
             (_export_arg("name", ("str",)),),
         ),
-    },
-    "pcc.llvm_capi.ir": {
+    }
+    out["pcc.llvm_capi.ir"] = {
         "IRBuilder_current_instruction_count": _function_export(
             ("int",),
             (("dyn",),),
@@ -534,7 +554,33 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
                 _export_arg("typ", ("dyn",)),
             ),
         ),
-    },
+        "IRBuilder_can_inline_error_edge": _function_export(
+            ("bool",),
+            (("dyn",),),
+            (_export_arg("builder", ("dyn",)),),
+        ),
+        "IRBuilder_try_inline_error_edge": _function_export(
+            ("bool",),
+            (("dyn",), ("dyn",), ("dyn",), ("int",), ("int",), ("int",)),
+            (
+                _export_arg("builder", ("dyn",)),
+                _export_arg("condition", ("dyn",)),
+                _export_arg("error_block", ("dyn",)),
+                _export_arg("source_line", ("int",)),
+                _export_arg("cleanup_plan_id", ("int",)),
+                _export_arg("payload", ("int",), has_default=True),
+            ),
+        ),
+        "IRBuilder_declare_inline_error_landing": _function_export(
+            ("bool",),
+            (("dyn",), ("dyn",), ("dyn",)),
+            (
+                _export_arg("builder", ("dyn",)),
+                _export_arg("block", ("dyn",)),
+                _export_arg("slot", ("dyn",)),
+            ),
+        ),
+    }
     # ``pcc.parse.py_parse`` does ``from . import py_lex as pl`` and
     # invokes ``pl.Lexer(src, filename).tokenize()``. Without static
     # exports the standalone per-module compile resolves the
@@ -543,7 +589,7 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
     # the off-mode fallback ratchet flags as residual libpython
     # surface.  Mirror the actual classes / functions in
     # ``pcc/parse/py_lex.py``.
-    "pcc.parse.py_lex": {
+    out["pcc.parse.py_lex"] = {
         "Token": _class_export(
             "Token",
             ("kind", "text", "line", "col"),
@@ -590,8 +636,11 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
                 },
             ),
         ),
-    },
-    "pcc.parse.py_lift": {
+    }
+
+
+def _populate_static_native_exports_2(out):
+    out["pcc.parse.py_lift"] = {
         "parse_and_lift": _function_export(
             ("dyn",),
             (("str",), ("str",), ("str",)),
@@ -634,7 +683,10 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
             (("dyn",),),
             (_export_arg("node", ("dyn",)),),
         ),
-    },
+    }
+
+
+def _populate_static_native_exports_8(out):
     # ``pipeline.py``'s closed-world helpers
     # (``_closed_world_shallow_extract_top_level_assigns`` /
     # ``_closed_world_extract_native_table_for_module`` added in
@@ -644,7 +696,7 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
     # each, regressing the ``test_on_mode_per_module_fallbacks_under_ratchet``
     # diagnostic ratchet.  These mirror the actual classes / function
     # in ``pcc/parse/py_parse.py``.
-    "pcc.parse.py_parse": dict(
+    out["pcc.parse.py_parse"] = dict(
         [
             ("ParseError", _class_export("ParseError")),
             (
@@ -742,8 +794,21 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
                 ("_Yield", ("value", "is_from", "line")),
             )
         ]
-    ),
-    "pcc.py_frontend.type_infer": {
+    )
+
+
+def _populate_static_native_exports_3(out):
+    # The shared field walk returns native AST objects in a native list.
+    # Standalone consumers need that domain across import, iteration and
+    # subsequent statement-field reads just as the closed-world build does.
+    out["pcc.py_frontend.pipeline_exports"] = {
+        "instance_field_assignment_statements": _function_export(
+            ("list", ("dyn",)),
+            (("dyn",),),
+            (_export_arg("body", ("dyn",)),),
+        ),
+    }
+    out["pcc.py_frontend.type_infer"] = {
         "infer_module": _function_export(
             ("dyn",),
             (("dyn",), ("dyn",), ("dyn",), ("dyn",)),
@@ -755,14 +820,14 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
                 _export_arg("contextual_host_params", ("dyn",), has_default=True),
             ),
         ),
-    },
+    }
     # Pure-data module exporting L1_CODEGEN_STATIC_METHODS (literal
     # tuple of method dicts).  Bound here so the standalone compile
     # of ``layer1_support.py`` can import it natively rather than
     # falling through to ``py_cpy_import`` + ``py_cpy_getattr``.
-    "pcc.py_frontend.codegen._l1_codegen_static_methods": {
+    out["pcc.py_frontend.codegen._l1_codegen_static_methods"] = {
         "L1_CODEGEN_STATIC_METHODS": _module_global_export(("dyn",)),
-    },
+    }
     # Layer1.py's own top-level imports of ClassLowering,
     # L1CodeGenMixinStack, L1CodegenError, and the two
     # ``_low_ir_*`` helpers.  Without these the standalone compile
@@ -770,23 +835,23 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
     # ``py_cpy_getattr`` calls.  The classes only need their
     # identity (no fields needed for the import-binding fast
     # path); the functions get a permissive dyn signature.
-    "pcc.py_frontend.codegen.class_gen": {
+    out["pcc.py_frontend.codegen.class_gen"] = {
         "ClassLowering": _class_export("ClassLowering"),
-    },
-    "pcc.py_frontend.codegen.layer1_mixins": {
+    }
+    out["pcc.py_frontend.codegen.layer1_mixins"] = {
         "L1CodeGenMixinStack": _class_export("L1CodeGenMixinStack"),
-    },
-    "pcc.py_frontend.codegen.errors": {
+    }
+    out["pcc.py_frontend.codegen.errors"] = {
         "L1CodegenError": _class_export("L1CodegenError"),
         "CodegenDiagnosticError": _class_export("CodegenDiagnosticError"),
-    },
-    "pcc.diagnostics": {
+    }
+    out["pcc.diagnostics"] = {
         "DiagnosticSpan": _class_export(
             "DiagnosticSpan",
             ("file", "line", "col", "end_line", "end_col"),
         ),
-    },
-    "pcc.py_frontend.codegen.user_function_lowering": {
+    }
+    out["pcc.py_frontend.codegen.user_function_lowering"] = {
         "_low_ir_emit_function_to_llvm": _function_export(
             ("dyn",),
             (("dyn",),),
@@ -797,7 +862,7 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
             (("dyn",),),
             (_export_arg("fd", ("dyn",)),),
         ),
-    },
+    }
     # ``pcc/__main__.py`` does ``from pcc.cli_bootstrap import
     # bootstrap_cli_sys_argv_exit; bootstrap_cli_sys_argv_exit()``.
     # Without a static export the standalone per-module compile of
@@ -805,19 +870,19 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
     # ``py_cpy_getattr`` + ``py_cpy_call_noargs`` (4 residual
     # ``py_cpy_*`` calls captured by the on-mode per-module
     # ratchet). The exposed function is no-args, returns None.
-    "pcc.cli_bootstrap": {
+    out["pcc.cli_bootstrap"] = {
         "bootstrap_cli_sys_argv_exit": _function_export(
             ("none",),
             (),
             (),
         ),
-    },
+    }
     # ``cli_bootstrap.py`` keeps only the public dispatch facade; the native
     # pytest harness lives in this closure-safe sibling.  The explicit
     # signature keeps the standalone bootstrap probe from routing the import
     # through libpython while the real multi-file stage1 build supplies the
     # implementation.
-    "pcc.cli_bootstrap_pytest": {
+    out["pcc.cli_bootstrap_pytest"] = {
         "run_pcc1_pytest": _function_export(
             ("int",),
             (("dyn",), ("str",), ("int", 64, True)),
@@ -827,15 +892,15 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
                 _export_arg("timeout_seconds", ("int", 64, True)),
             ),
         ),
-    },
-    "pcc.cli_bootstrap_array_core": {
+    }
+    out["pcc.cli_bootstrap_array_core"] = {
         "_run_native_package_array_core_from_pcc1": _function_export(
             ("int",),
             (("dyn",),),
             (_export_arg("module_args", ("dyn",)),),
         ),
-    },
-    "pcc.py_frontend.compile_cache": {
+    }
+    out["pcc.py_frontend.compile_cache"] = {
         "acquire_python_frontend_ir_cache": _function_export(
             ("bool",),
             (("dyn",),),
@@ -896,7 +961,7 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
                 _export_arg("timeout_seconds", ("float",), has_default=True),
             ),
         ),
-    },
+    }
     # ``pcc/cli_bootstrap.py`` reaches into pipeline for the two
     # entry points it actually calls.  Static exports here avoid the
     # standalone per-module ``py_cpy_import + py_cpy_getattr`` for
@@ -904,7 +969,10 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
     # remaining +4 in the ratchet diagnostic).  The kw-only/default
     # signature mirrors ``pcc/py_frontend/pipeline.py:7035`` /
     # ``:7691`` so closed-world callsites still resolve.
-    "pcc.py_frontend.pipeline": {
+
+
+def _populate_static_native_exports_4(out):
+    out["pcc.py_frontend.pipeline"] = {
         "compile_python": _function_export(
             ("dyn",),
             (
@@ -938,16 +1006,36 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
             (("str",),),
             (_export_arg("manifest_path", ("str",)),),
         ),
-    },
-    "pcc.py_frontend.pipeline_frontend_workers": {
+    }
+    out["pcc.py_frontend.pipeline_frontend_workers"] = {
         "SOURCE_WORKER_AUTO_SAFE_JOBS": {
             "kind": "constant",
             "value_kind": "int",
             "value": 2,
         },
+        "SOURCE_WORKER_AST_OVERSIZED_BYTES": {
+            "kind": "constant",
+            "value_kind": "int",
+            "value": 6000000,
+        },
+        "compiled_native_auto_jobs": _function_export(
+            ("int",),
+            (("int",),),
+            (_export_arg("jobs", ("int",)),),
+        ),
+        "compiled_native_export_jobs": _function_export(
+            ("int",),
+            (("int",),),
+            (_export_arg("jobs", ("int",)),),
+        ),
+        "compiled_native_summary_jobs": _function_export(
+            ("int",),
+            (("int",),),
+            (_export_arg("jobs", ("int",)),),
+        ),
         "split_codegen_chunks_by_source_size": _function_export(
             ("dyn",),
-            (("dyn",), ("dyn",), ("int",)),
+            (("dyn",), ("dyn",), ("int",), ("str",), ("int",)),
             (
                 _export_arg("src_paths", ("dyn",)),
                 _export_arg("chunks", ("dyn",)),
@@ -956,10 +1044,17 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
                     ("int",),
                     has_default=True,
                 ),
+                _export_arg("", kind="kw_only"),
+                _export_arg("sidecar_dir", ("str",), has_default=True),
+                _export_arg(
+                    "sidecar_threshold_bytes",
+                    ("int",),
+                    has_default=True,
+                ),
             ),
         ),
-    },
-    "pcc.py_frontend.codegen.runtime_abi": {
+    }
+    out["pcc.py_frontend.codegen.runtime_abi"] = {
         "declare_runtime": _function_export(
             ("dict", ("str",), ("dyn",)),
             (("dyn",),),
@@ -992,12 +1087,12 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
                 _export_arg("return_source", ("str",)),
             ),
         ),
-    },
+    }
     # marshal.py reaches into core_helpers for two text-level
     # instruction inspectors.  Static exports close marshal.py's
     # remaining on-mode residual (7 calls) without needing core_helpers
     # in the consumer allowlist (it's CONTEXTUAL_MIXIN, not standalone).
-    "pcc.py_frontend.codegen.core_helpers": {
+    out["pcc.py_frontend.codegen.core_helpers"] = {
         "_instruction_opname_text": _function_export(
             ("str",),
             (("dyn",),),
@@ -1008,13 +1103,13 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
             (("dyn",),),
             (_export_arg("instr", ("dyn",)),),
         ),
-    },
+    }
     # type_infer.py consumes these from pcc.py_frontend.types.  Adding
     # static exports closes the residual ~80 fallbacks in type_infer.py's
     # standalone compile (the rest are dict/list traversals over AST
     # node fields).  Signatures are intentionally permissive — the
     # callers only need name binding, not strict types.
-    "pcc.py_frontend.types": {
+    out["pcc.py_frontend.types"] = {
         "PyFrontendError": _class_export("PyFrontendError"),
         "parse_annotation": _function_export(
             ("dyn",),
@@ -1036,8 +1131,8 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
             (("dyn",), ("dyn",)),
             (_export_arg("a", ("dyn",)), _export_arg("b", ("dyn",))),
         ),
-    },
-    "pcc.py_frontend.codegen.marshal": {
+    }
+    out["pcc.py_frontend.codegen.marshal"] = {
         "marshal_to_object": _function_export(
             ("dyn",),
             (("dyn",), ("dyn",), ("dyn",), ("dyn",), ("dyn",)),
@@ -1060,8 +1155,11 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
                 _export_arg("ty", ("dyn",)),
             ),
         ),
-    },
-    "pcc.py_frontend.codegen.layer1_support": {
+    }
+
+
+def _populate_static_native_exports_5(out):
+    out["pcc.py_frontend.codegen.layer1_support"] = {
         "_import_names_from_stmt": _function_export(
             ("dyn",),
             (("dyn",),),
@@ -1129,8 +1227,8 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
             (("dyn",),),
             (_export_arg("ir_ty", ("dyn",)),),
         ),
-    },
-    "pcc.py_frontend.codegen.host_contract": {
+    }
+    out["pcc.py_frontend.codegen.host_contract"] = {
         "PROBE_POLICY_STANDALONE": _str_constant_export("standalone"),
         "PROBE_POLICY_CONTEXTUAL_MIXIN": _str_constant_export("contextual-mixin"),
         "L1_CODEGEN_HOST_CLASS": _str_constant_export(
@@ -1158,8 +1256,8 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
             (("dyn",),),
             (_export_arg("module_names", ("dyn",)),),
         ),
-    },
-    "pcc.py_frontend.codegen.layer1_constants": {
+    }
+    out["pcc.py_frontend.codegen.layer1_constants"] = {
         "ANNOTATION_ONLY_IMPORT_MODULES": _string_tuple_global_export(),
         "COMPILE_TIME_ONLY_IMPORT_FROMS": _dict_str_dyn_global_export(),
         "COMPILE_TIME_ONLY_MODULES": _string_tuple_global_export(),
@@ -1167,8 +1265,8 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
         "IR_RUNTIME_COMPAT_MODULE": _str_constant_export("pcc.llvm_capi.compat"),
         "TEST_FACADE_IMPORT_MODULES": _string_tuple_global_export(),
         "UNSAFE_SCAFFOLD_MODULES": _string_tuple_global_export(),
-    },
-    "pcc.codegen.c_varargs": {
+    }
+    out["pcc.codegen.c_varargs"] = {
         "postprocess_varargs_ir": _function_export(
             ("str",),
             (("str",),),
@@ -1178,8 +1276,8 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
                 _export_arg("report", ("dyn",), has_default=True),
             ),
         ),
-    },
-    "pcc.py_frontend.codegen.self_module_contracts": {
+    }
+    out["pcc.py_frontend.codegen.self_module_contracts"] = {
         "IR_SCAFFOLD_CONTRACT": _str_constant_export("ir-scaffold-forced"),
         "PY_AST_FIELD_ORDER_CONTRACT": _str_constant_export(
             "py-ast-field-order"
@@ -1210,8 +1308,11 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
                 _export_arg("contract", ("str",)),
             ),
         ),
-    },
-    "pcc.py_frontend.codegen.layer1": {
+    }
+
+
+def _populate_static_native_exports_6(out):
+    out["pcc.py_frontend.codegen.layer1"] = {
         "L1CodeGen": _class_export(
             "L1CodeGen",
             (),
@@ -1251,164 +1352,180 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
                 },
             ),
         ),
-    },
-    "pcc.py_frontend.codegen.layer1_entrypoints": {
+    }
+
+
+def _layer1_entrypoint_methods_0():
+    return (
+        {
+            "name": "__init__",
+            "kind": "instance",
+            "return_ty": ("dyn",),
+            "param_types": (("dyn",), ("dyn",), ("bool",), ("str",)),
+            "call_sig": (
+                _export_arg("self"),
+                _export_arg("module", ("dyn",)),
+                _export_arg("emit_cpy_main_exitcode", ("bool",)),
+                _export_arg("ir_scaffold_mode", ("str",)),
+            ),
+            "box_int_abi": False,
+        },
+        {
+            "name": "generate",
+            "kind": "instance",
+            "return_ty": ("str",),
+            "param_types": (("dyn",), ("dyn",)),
+            "call_sig": (
+                _export_arg("self"),
+                _export_arg("module", ("dyn",), has_default=True),
+            ),
+            "box_int_abi": False,
+        },
+        {
+            "name": "_codegen_trace_span",
+            "kind": "instance",
+            "return_ty": ("str",),
+            "param_types": (("dyn",), ("dyn",)),
+            "call_sig": (
+                _export_arg("self"),
+                _export_arg("node", ("dyn",)),
+            ),
+            "box_int_abi": False,
+        },
+        {
+            "name": "_codegen_trace_module",
+            "kind": "instance",
+            "return_ty": ("str",),
+            "param_types": (("dyn",),),
+            "call_sig": (_export_arg("self"),),
+            "box_int_abi": False,
+        },
+        {
+            "name": "_codegen_trace_function",
+            "kind": "instance",
+            "return_ty": ("str",),
+            "param_types": (("dyn",),),
+            "call_sig": (_export_arg("self"),),
+            "box_int_abi": False,
+        },
+        {
+            "name": "_codegen_trace_is_enabled",
+            "kind": "instance",
+            "return_ty": ("bool",),
+            "param_types": (("dyn",),),
+            "call_sig": (_export_arg("self"),),
+            "box_int_abi": False,
+        },
+        {
+            "name": "_codegen_trace_set_stmt_context",
+            "kind": "instance",
+            "return_ty": ("dyn",),
+            "param_types": (("dyn",), ("int",), ("str",)),
+            "call_sig": (
+                _export_arg("self"),
+                _export_arg("stmt_index", ("int",)),
+                _export_arg("stmt_kind", ("str",)),
+            ),
+            "box_int_abi": False,
+        },
+    )
+
+
+def _layer1_entrypoint_methods_1():
+    return (
+        {
+            "name": "_codegen_trace_push",
+            "kind": "instance",
+            "return_ty": ("dyn",),
+            "param_types": (
+                ("dyn",),
+                ("str",),
+                ("int",),
+                ("str",),
+                ("str",),
+                ("str",),
+            ),
+            "call_sig": (
+                _export_arg("self"),
+                _export_arg("boundary", ("str",)),
+                _export_arg("stmt_index", ("int",)),
+                _export_arg("stmt_kind", ("str",)),
+                _export_arg("expr_kind", ("str",)),
+                _export_arg("span", ("str",)),
+            ),
+            "box_int_abi": False,
+        },
+        {
+            "name": "_codegen_trace_dump",
+            "kind": "instance",
+            "return_ty": ("dyn",),
+            "param_types": (("dyn",), ("dyn",)),
+            "call_sig": (
+                _export_arg("self"),
+                _export_arg("exc", ("dyn",)),
+            ),
+            "box_int_abi": False,
+        },
+        {
+            "name": "_codegen_trace_set_context_for_expr",
+            "kind": "instance",
+            "return_ty": ("dyn",),
+            "param_types": (("dyn",), ("dyn",)),
+            "call_sig": (
+                _export_arg("self"),
+                _export_arg("expr", ("dyn",)),
+            ),
+            "box_int_abi": False,
+        },
+        {
+            "name": "_emit_stmts",
+            "kind": "instance",
+            "return_ty": ("dyn",),
+            "param_types": (("dyn",), ("dyn",)),
+            "call_sig": (
+                _export_arg("self"),
+                _export_arg("stmts", ("dyn",)),
+            ),
+            "box_int_abi": False,
+        },
+        {
+            "name": "_emit_stmt",
+            "kind": "instance",
+            "return_ty": ("dyn",),
+            "param_types": (("dyn",), ("dyn",)),
+            "call_sig": (
+                _export_arg("self"),
+                _export_arg("stmt", ("dyn",)),
+            ),
+            "box_int_abi": False,
+        },
+        {
+            "name": "_emit_expr",
+            "kind": "instance",
+            "return_ty": ("dyn",),
+            "param_types": (("dyn",), ("dyn",)),
+            "call_sig": (
+                _export_arg("self"),
+                _export_arg("expr", ("dyn",)),
+            ),
+            "box_int_abi": False,
+        },
+    )
+
+
+
+def _populate_static_native_exports_9(out):
+    out["pcc.py_frontend.codegen.layer1_entrypoints"] = {
         "L1CodeGenEntrypointMixin": _class_export(
             "L1CodeGenEntrypointMixin",
             (),
-            (
-                {
-                    "name": "__init__",
-                    "kind": "instance",
-                    "return_ty": ("dyn",),
-                    "param_types": (("dyn",), ("dyn",), ("bool",), ("str",)),
-                    "call_sig": (
-                        _export_arg("self"),
-                        _export_arg("module", ("dyn",)),
-                        _export_arg("emit_cpy_main_exitcode", ("bool",)),
-                        _export_arg("ir_scaffold_mode", ("str",)),
-                    ),
-                    "box_int_abi": False,
-                },
-                {
-                    "name": "generate",
-                    "kind": "instance",
-                    "return_ty": ("str",),
-                    "param_types": (("dyn",), ("dyn",)),
-                    "call_sig": (
-                        _export_arg("self"),
-                        _export_arg("module", ("dyn",), has_default=True),
-                    ),
-                    "box_int_abi": False,
-                },
-                {
-                    "name": "_codegen_trace_span",
-                    "kind": "instance",
-                    "return_ty": ("str",),
-                    "param_types": (("dyn",), ("dyn",)),
-                    "call_sig": (
-                        _export_arg("self"),
-                        _export_arg("node", ("dyn",)),
-                    ),
-                    "box_int_abi": False,
-                },
-                {
-                    "name": "_codegen_trace_module",
-                    "kind": "instance",
-                    "return_ty": ("str",),
-                    "param_types": (("dyn",),),
-                    "call_sig": (_export_arg("self"),),
-                    "box_int_abi": False,
-                },
-                {
-                    "name": "_codegen_trace_function",
-                    "kind": "instance",
-                    "return_ty": ("str",),
-                    "param_types": (("dyn",),),
-                    "call_sig": (_export_arg("self"),),
-                    "box_int_abi": False,
-                },
-                {
-                    "name": "_codegen_trace_is_enabled",
-                    "kind": "instance",
-                    "return_ty": ("bool",),
-                    "param_types": (("dyn",),),
-                    "call_sig": (_export_arg("self"),),
-                    "box_int_abi": False,
-                },
-                {
-                    "name": "_codegen_trace_set_stmt_context",
-                    "kind": "instance",
-                    "return_ty": ("dyn",),
-                    "param_types": (("dyn",), ("int",), ("str",)),
-                    "call_sig": (
-                        _export_arg("self"),
-                        _export_arg("stmt_index", ("int",)),
-                        _export_arg("stmt_kind", ("str",)),
-                    ),
-                    "box_int_abi": False,
-                },
-                {
-                    "name": "_codegen_trace_push",
-                    "kind": "instance",
-                    "return_ty": ("dyn",),
-                    "param_types": (
-                        ("dyn",),
-                        ("str",),
-                        ("int",),
-                        ("str",),
-                        ("str",),
-                        ("str",),
-                    ),
-                    "call_sig": (
-                        _export_arg("self"),
-                        _export_arg("boundary", ("str",)),
-                        _export_arg("stmt_index", ("int",)),
-                        _export_arg("stmt_kind", ("str",)),
-                        _export_arg("expr_kind", ("str",)),
-                        _export_arg("span", ("str",)),
-                    ),
-                    "box_int_abi": False,
-                },
-                {
-                    "name": "_codegen_trace_dump",
-                    "kind": "instance",
-                    "return_ty": ("dyn",),
-                    "param_types": (("dyn",), ("dyn",)),
-                    "call_sig": (
-                        _export_arg("self"),
-                        _export_arg("exc", ("dyn",)),
-                    ),
-                    "box_int_abi": False,
-                },
-                {
-                    "name": "_codegen_trace_set_context_for_expr",
-                    "kind": "instance",
-                    "return_ty": ("dyn",),
-                    "param_types": (("dyn",), ("dyn",)),
-                    "call_sig": (
-                        _export_arg("self"),
-                        _export_arg("expr", ("dyn",)),
-                    ),
-                    "box_int_abi": False,
-                },
-                {
-                    "name": "_emit_stmts",
-                    "kind": "instance",
-                    "return_ty": ("dyn",),
-                    "param_types": (("dyn",), ("dyn",)),
-                    "call_sig": (
-                        _export_arg("self"),
-                        _export_arg("stmts", ("dyn",)),
-                    ),
-                    "box_int_abi": False,
-                },
-                {
-                    "name": "_emit_stmt",
-                    "kind": "instance",
-                    "return_ty": ("dyn",),
-                    "param_types": (("dyn",), ("dyn",)),
-                    "call_sig": (
-                        _export_arg("self"),
-                        _export_arg("stmt", ("dyn",)),
-                    ),
-                    "box_int_abi": False,
-                },
-                {
-                    "name": "_emit_expr",
-                    "kind": "instance",
-                    "return_ty": ("dyn",),
-                    "param_types": (("dyn",), ("dyn",)),
-                    "call_sig": (
-                        _export_arg("self"),
-                        _export_arg("expr", ("dyn",)),
-                    ),
-                    "box_int_abi": False,
-                },
-            ),
+            (_layer1_entrypoint_methods_0() + _layer1_entrypoint_methods_1()),
         ),
-    },
-    "pcc.py_frontend.codegen.layer1_init": {
+    }
+
+
+def _populate_static_native_exports_7(out):
+    out["pcc.py_frontend.codegen.layer1_init"] = {
         "Layer1InitMixin": _class_export(
             "Layer1InitMixin",
             (),
@@ -1428,8 +1545,8 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
                 },
             ),
         ),
-    },
-    "pcc.py_frontend.codegen.expr_dispatch_lowering": {
+    }
+    out["pcc.py_frontend.codegen.expr_dispatch_lowering"] = {
         "ExprDispatchLoweringMixin": _class_export(
             "ExprDispatchLoweringMixin",
             (),
@@ -1460,8 +1577,8 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
                 },
             ),
         ),
-    },
-    "pcc.py_frontend.codegen.generation_lowering": {
+    }
+    out["pcc.py_frontend.codegen.generation_lowering"] = {
         "GenerationLoweringMixin": _class_export(
             "GenerationLoweringMixin",
             (),
@@ -1479,8 +1596,8 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
                 },
             ),
         ),
-    },
-    "pcc.py_frontend.codegen.stmt_dispatch_lowering": {
+    }
+    out["pcc.py_frontend.codegen.stmt_dispatch_lowering"] = {
         "StmtDispatchLoweringMixin": _class_export(
             "StmtDispatchLoweringMixin",
             (),
@@ -1509,14 +1626,14 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
                 },
             ),
         ),
-    },
+    }
     # Raw per-module self-host diagnostics compile ``pipeline.py`` and
     # ``cli_bootstrap.py`` without assembling the recursive stdlib closure.
     # They still need the same forward declaration used by the real closure
     # when native subprocess lowering constructs a typed check=True failure.
     # The executable no-libpython path supplies the definition from
     # pcc/py_stdlib/subprocess.py; this entry is metadata only.
-    "subprocess": {
+    out["subprocess"] = {
         "CalledProcessError": {
             "kind": "class",
             "owning_module": "subprocess",
@@ -1551,13 +1668,31 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = {
             ),
             "box_int_abi": False,
         },
-    },
-}
+    }
+
+
+def _build_static_native_exports():
+    out = {}
+    _populate_static_native_exports_0(out)
+    _populate_static_native_exports_1(out)
+    _populate_static_native_exports_2(out)
+    _populate_static_native_exports_8(out)
+    _populate_static_native_exports_3(out)
+    _populate_static_native_exports_4(out)
+    _populate_static_native_exports_5(out)
+    _populate_static_native_exports_6(out)
+    _populate_static_native_exports_9(out)
+    _populate_static_native_exports_7(out)
+    return out
+
+
+_PCC_FRONTEND_STATIC_NATIVE_EXPORTS = _build_static_native_exports()
 
 
 _PCC_FRONTEND_STATIC_NATIVE_MODULES = frozenset(
     {
         "pcc.py_frontend.pipeline",
+        "pcc.py_frontend.pipeline_frontend_parallel",
         "pcc.py_frontend.pipeline_frontend_workers",
         "pcc.py_frontend.compile_cache",
         "pcc.py_frontend.codegen.layer1_support",
@@ -1580,6 +1715,7 @@ _PCC_FRONTEND_STATIC_NATIVE_MODULES = frozenset(
         "pcc.cli_bootstrap_array_core",
         "pcc.py_frontend.codegen._l1_codegen_static_methods",
         "pcc.backend.self_backend_aarch64_darwin_flow",
+        "pcc.backend.self_backend_aarch64_darwin_regalloc",
         "pcc.backend.self_backend_stackprep",
         "pcc.parse.py_lex",
         "pcc.parse.py_lift",

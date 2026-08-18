@@ -4,6 +4,7 @@ from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_BYTEARRAY,
     PY_TYPE_BYTES,
     PY_TYPE_COMPLEX,
+    PY_TYPE_CPY_HANDLE,
     PY_TYPE_FLOAT,
     PY_TYPE_INT,
     PY_TYPE_STR,
@@ -30,6 +31,9 @@ __pcc_freestanding__ = True
 
 
 py_decref = extern("py_decref", (c_ptr,), c_void)
+pcc_cpy_handle_move_owned_ref = extern(
+    "pcc_cpy_handle_move_owned_ref", (c_ptr, c_ptr), c_void
+)
 pcc_gc_object_is_known_no_lock = extern(
     "pcc_gc_object_is_known_no_lock", (c_ptr,), c_int64
 )
@@ -97,6 +101,8 @@ def pcc_gc_generational_oldify_supported_tag(tag: i64) -> i64:
         return 1
     if tag == PY_TYPE_BYTEARRAY:  # PY_TYPE_BYTEARRAY
         return 1
+    if tag == PY_TYPE_CPY_HANDLE:  # PY_TYPE_CPY_HANDLE
+        return 1
     return 0
 
 
@@ -147,10 +153,19 @@ def pcc_gc_generational_oldify_copy(from_obj: c_ptr) -> c_ptr:
     memmove(to_obj, from_obj, size)
     store_i64(to_obj, 0, 1)
     new_flags: i64 = load_i32(to_obj, 12)
+    # Same stale-verdict rule as the C oracle: the header copy inherits
+    # SWEEP_CANDIDATE (1024) from a finished cycle that predates
+    # promotion, and a pending-candidate sweep would run PASS-0 __del__
+    # on the live promoted copy. Promotion proves liveness.
     store_i32(
         to_obj,
         12,
-        (new_flags & ~(128 | 4096 | 512 | 2048 | 262144)) | 256 | 262144,
+        (
+            new_flags
+            & ~(128 | 4096 | 512 | 2048 | 262144 | 1024)
+        )
+        | 256
+        | 262144,
     )
     if pcc_gc_relocate_copy_payload(from_obj, to_obj, tag, size) == 0:
         py_decref(to_obj)
@@ -183,7 +198,14 @@ def pcc_gc_generational_oldify_copy(from_obj: c_ptr) -> c_ptr:
     live: i64 = load_i32(global_addr("pcc_gc_live_bytes"), 0)
     store_i32(global_addr("pcc_gc_live_bytes"), 0, live + size)
 
+    moved_cpy_ref: i64 = 0
+    if tag == PY_TYPE_CPY_HANDLE:
+        moved_cpy_ref = 1
+    if moved_cpy_ref != 0:
+        pcc_cpy_handle_move_owned_ref(from_obj, to_obj)
     if pcc_gc_install_forwarding_unlocked(from_obj, to_obj) != 0:
+        if moved_cpy_ref != 0:
+            pcc_cpy_handle_move_owned_ref(to_obj, from_obj)
         pcc_gc_object_index_remove(to_obj)
         pcc_gc_object_node_unlink(node)
         pcc_gc_object_node_release(node)

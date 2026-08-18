@@ -41,7 +41,7 @@ PyObject *py_weakref_new(PyObject *target, PyObject *callback) {
      * (weakref.ref(3) -> TypeError). The compile-time diagnostic
      * catches the static form; this covers Dyn-path boxes. */
     if (py_type_of(target) == PY_TYPE_VALUEBOX) {
-        py_raise(py_exc_new(
+        py_raise_owned(py_exc_new(
             PY_EXC_TYPEERROR,
             "cannot create weak reference to a valueclass payload"));
         return NULL;
@@ -64,6 +64,7 @@ PyObject *py_weakref_new(PyObject *target, PyObject *callback) {
     if (g_weakrefs != NULL) g_weakrefs->prev = wr;
     g_weakrefs = wr;
     pcc_runtime_log_event("weakref", "new", py_header(target)->type_tag, callback != NULL, target);
+    pcc_gc_publish_initialized((PyObject *)wr);
     return (PyObject *)wr;
 }
 

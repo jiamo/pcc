@@ -5,7 +5,15 @@ import sys
 import pytest
 
 from pcc.backend import BackendUnavailable
-from pcc.backend.self_backend_analysis import collect_used_values, value_has_uses
+from pcc.backend.self_backend_analysis import (
+    _instruction_defined_value_from_parts,
+    _instruction_used_values_from_parts,
+    collect_used_values,
+    instruction_defined_value,
+    instruction_used_values,
+    terminator_used_values,
+    value_has_uses,
+)
 from pcc.backend.self_backend_aarch64_darwin_abi import (
     aggregate_hfa_members,
     aggregate_reg_chunks,
@@ -84,6 +92,7 @@ from pcc.backend.self_backend_aarch64_darwin_terminators import (
     emit_switch_terminator,
     emit_unreachable_terminator,
 )
+from pcc.backend.self_backend_kernel import get_indexed_function_kernel
 from pcc.backend.self_backend_aarch64_darwin_slots import (
     copy_address_to_address,
     emit_slot_base_address,
@@ -122,6 +131,10 @@ from pcc.backend.self_backend_emit import emit_function_blocks
 from pcc.backend.self_backend_instruction_dispatch import emit_instruction_dispatch
 from pcc.backend.self_backend_ir import (
     ArgInfo,
+    CompactParsedInstrArena,
+    I1,
+    ParsedBlock,
+    ParsedFunction,
     ParsedInstr,
     SlotInfo,
     TypeDesc,
@@ -132,7 +145,7 @@ from pcc.backend.self_backend_parse import (
     aggregate_literal_to_bytes,
     decode_ssa_name,
     decode_value_token,
-    parse_self_backend_module,
+    parse_self_backend_module as _parse_dense_self_backend_module,
 )
 import pcc.backend.self_backend_parse as self_backend_parse
 from pcc.backend.self_backend_prepare import (
@@ -151,6 +164,29 @@ from pcc.backend.self_backend_targets import (
 )
 from pcc.evaluater.c_evaluator import CEvaluator
 from pcc.project import TranslationUnit
+
+
+def parse_self_backend_module(ir_text: str):
+    """Legacy parser projection used only by this compatibility test file."""
+
+    module = _parse_dense_self_backend_module(ir_text)
+    for function in module.functions:
+        get_indexed_function_kernel(function).materialize_legacy_blocks(function)
+    return module
+
+
+def _parsed_terminator(func: ParsedFunction, block: ParsedBlock) -> ParsedInstr:
+    kernel = get_indexed_function_kernel(func)
+    return kernel.diagnostic_terminator(kernel.block_id(block.name))
+
+
+def _parsed_phi(
+    func: ParsedFunction,
+    block: ParsedBlock,
+    phi_index: int = 0,
+):
+    kernel = get_indexed_function_kernel(func)
+    return kernel.diagnostic_phi(kernel.block_id(block.name), phi_index)
 
 
 def _compile_units(source: str, tmp_path):
@@ -576,6 +612,31 @@ def test_self_backend_bootstrap_parsers_avoid_unowned_regex_constructs():
         "noundef align 16 dereferenceable(16) %value"
     ) == 16
     assert self_backend_parse._parse_call_arg_alignment("noundef %value") == 0
+
+
+def test_self_backend_name_decoder_confident_ascii_paths_skip_regex(monkeypatch):
+    class RegexMustNotRun:
+        def match(self, _text):
+            raise AssertionError("confident ASCII name reached regex")
+
+    monkeypatch.setattr(self_backend_parse, "_SSA_NAME_RE", RegexMustNotRun())
+    monkeypatch.setattr(self_backend_parse, "_GLOBAL_NAME_RE", RegexMustNotRun())
+
+    assert self_backend_parse.decode_ssa_name(" %plain.name-7 ") == "plain.name-7"
+    assert self_backend_parse.decode_ssa_name("%123") == "%123"
+    assert self_backend_parse.decode_ssa_name("%.456") == "%.456"
+    assert self_backend_parse.decode_global_name(" @$global.name-7 ") == "$global.name-7"
+
+
+def test_self_backend_name_decoder_preserves_regex_fallback_semantics():
+    assert self_backend_parse.decode_ssa_name('%"quoted name"') == "quoted name"
+    assert self_backend_parse.decode_global_name('@"quoted name"') == "quoted name"
+    assert self_backend_parse.decode_ssa_name("%aé") == "aé"
+    assert self_backend_parse.decode_global_name("@aé") == "aé"
+    with pytest.raises(BackendUnavailable, match="unsupported SSA value syntax"):
+        self_backend_parse.decode_ssa_name("%a/b")
+    with pytest.raises(BackendUnavailable, match="unsupported global symbol syntax"):
+        self_backend_parse.decode_global_name("@1bad")
 
 
 def test_self_backend_bootstrap_parsers_reject_malformed_finite_attributes():
@@ -1679,7 +1740,9 @@ entry:
     assert module.triple == "arm64-apple-darwin23.6.0"
     assert [global_.name for global_ in module.globals_] == ["msg"]
     assert [func.name for func in module.functions] == ["main"]
-    assert module.functions[0].blocks[0].terminator is not None
+    function = module.functions[0]
+    assert function.blocks[0].terminator is not None
+    assert _parsed_terminator(function, function.blocks[0]).kind == "ret"
 
 
 def test_self_backend_shared_parser_strips_global_trailing_attrs():
@@ -1822,11 +1885,15 @@ f:
 
     module = parse_self_backend_module(ir_text)
     func = module.functions[0]
+    kernel = get_indexed_function_kernel(func)
+    entry_term = kernel.diagnostic_terminator(kernel.block_id("entry"))
+    true_term = kernel.diagnostic_terminator(kernel.block_id("t"))
+    false_term = kernel.diagnostic_terminator(kernel.block_id("f"))
 
     assert emit_terminator_dispatch(
         func,
         func.blocks[0],
-        func.blocks[0].terminator,
+        entry_term,
         emit_ret_void=lambda _func: ["ret_void"],
         emit_ret=lambda _func, ret_type, value: [f"ret {ret_type.describe()} {value}"],
         emit_br=lambda _func, source_block, target: [f"br {source_block}->{target}"],
@@ -1842,7 +1909,7 @@ f:
     assert emit_terminator_dispatch(
         func,
         func.blocks[1],
-        func.blocks[1].terminator,
+        true_term,
         emit_ret_void=lambda _func: ["ret_void"],
         emit_ret=lambda _func, ret_type, value: [f"ret {ret_type.describe()} {value}"],
         emit_br=lambda _func, source_block, target: [f"br {source_block}->{target}"],
@@ -1858,7 +1925,7 @@ f:
     assert emit_terminator_dispatch(
         func,
         func.blocks[2],
-        func.blocks[2].terminator,
+        false_term,
         emit_ret_void=lambda _func: ["ret_void"],
         emit_ret=lambda _func, ret_type, value: [f"ret {ret_type.describe()} {value}"],
         emit_br=lambda _func, source_block, target: [f"br {source_block}->{target}"],
@@ -1932,7 +1999,7 @@ entry:
     assert value_has_uses(func, "dead") is False
 
 
-def test_self_backend_shared_prepare_seeds_block_map_and_arg_types():
+def test_self_backend_shared_prepare_keeps_dense_blocks_and_seeds_arg_types():
     ir_text = """
 target triple = "arm64-apple-darwin23.6.0"
 
@@ -1943,7 +2010,7 @@ entry:
 }
 """.strip()
 
-    module = parse_self_backend_module(ir_text)
+    module = _parse_dense_self_backend_module(ir_text)
     func = module.functions[0]
 
     assert func.block_map == {}
@@ -1951,7 +2018,8 @@ entry:
 
     prepare_parsed_function(func)
 
-    assert tuple(func.block_map) == ("entry",)
+    assert func.block_map == {}
+    assert get_indexed_function_kernel(func).block_names == ["entry"]
     assert func.value_types["lhs"].describe() == "i32"
     assert func.value_types["rhs"].describe() == "i32"
 
@@ -1978,6 +2046,8 @@ entry:
     assert "value" in func.value_slots
     assert "loaded" in func.value_slots
     assert "slot" in func.alloca_slots
+    assert func.value_slot_buckets
+    assert func.alloca_slot_buckets
     assert func.hidden_sret_slot is None
     assert func.frame_size > 0
 
@@ -2020,6 +2090,37 @@ def test_self_backend_text_key_recovery_survives_inconsistent_native_hashes():
 
     assert mapping.get("sum") is None
     assert text_key_mapping_get(mapping, "sum") is slot
+
+    class ChangingHashText(str):
+        def __new__(cls, value):
+            instance = super().__new__(cls, value)
+            instance.hash_calls = 0
+            return instance
+
+        def __hash__(self):
+            self.hash_calls += 1
+            return super().__hash__() ^ self.hash_calls
+
+    changing_name = ChangingHashText("changed-after-insert")
+    changing_mapping = {changing_name: slot}
+    assert changing_mapping.get("changed-after-insert") is None
+    assert (
+        text_key_mapping_get(changing_mapping, "changed-after-insert")
+        is slot
+    )
+
+    class CopyingItemsMapping(dict):
+        def items(self):
+            return [
+                ((" " + key)[1:], value)
+                for key, value in super().items()
+            ]
+
+    copied_items_mapping = CopyingItemsMapping({changing_name: slot})
+    assert (
+        text_key_mapping_get(copied_items_mapping, "changed-after-insert")
+        is slot
+    )
 
     ir_text = """
 target triple = "arm64-apple-darwin23.6.0"
@@ -2104,23 +2205,320 @@ end:
   ret ptr %result
 }
 """.strip()
+    # A prior parse must not own this module's operand identities.
+    parse_self_backend_module(ir_text)
     module = parse_self_backend_module(ir_text)
     func = module.functions[0]
     prepare_parsed_function(func)
 
     dot_six_def = func.blocks[0].instructions[0].data[0]
-    dot_six_use = func.blocks[0].terminator.data[0]
+    dot_six_use = _parsed_terminator(func, func.blocks[0]).data[0]
     dot_nine_def = func.blocks[1].instructions[0].data[0]
-    dot_nine_use = func.blocks[3].phis[0].incoming[0].value
+    dot_nine_use = _parsed_phi(func, func.blocks[3]).incoming[0].value
     assert dot_six_def is dot_six_use
     assert dot_nine_def is dot_nine_use
 
     assign_stack_slots(func, aggregate_returned_indirect=lambda _ty: False)
 
-    assert "%.6" in func.used_values
-    assert "%.9" in func.used_values
+    kernel = get_indexed_function_kernel(func)
+    dot_six_id = kernel.value_id("%.6")
+    dot_nine_id = kernel.value_id("%.9")
+    assert dot_six_id >= 0 and kernel.value_is_used(dot_six_id)
+    assert dot_nine_id >= 0 and kernel.value_is_used(dot_nine_id)
+    assert func.used_values == []
     assert text_key_mapping_get(func.value_slots, "%.6") is not None
     assert text_key_mapping_get(func.value_slots, "%.9") is not None
+
+
+def test_self_backend_stackprep_dense_projection_preserves_result_types_without_public_views(
+    monkeypatch,
+):
+    i32 = TypeDesc("int", 32)
+    i64 = TypeDesc("int", 64)
+    f64 = TypeDesc("fp", 64)
+    ptr = TypeDesc("ptr", pointee=TypeDesc("void"))
+    vector = TypeDesc("array", count=4, elem=i32)
+    bool_vector = TypeDesc("array", count=4, elem=I1)
+    pair = TypeDesc("struct", fields=(i32, I1))
+    instructions = [
+        ParsedInstr("alloca", ("alloc", i32)),
+        ParsedInstr("load", ("load", i32, ptr, "null")),
+        ParsedInstr("load_atomic", ("load_atomic", i32, ptr, "null", "seq_cst")),
+        ParsedInstr("atomicrmw", ("atomic", "add", ptr, "null", i32, "1", "seq_cst")),
+        ParsedInstr(
+            "cmpxchg",
+            (
+                "cmpxchg",
+                pair,
+                ptr,
+                "null",
+                i32,
+                "0",
+                "1",
+                "seq_cst",
+                "seq_cst",
+            ),
+        ),
+        ParsedInstr("syscall6", ("syscall", ("0", "1", "2", "3", "4", "5", "6"))),
+        ParsedInstr("binop", ("add", "binop", i32, "1", "2")),
+        ParsedInstr("fbinop", ("fadd", "fbinop", f64, "1.0", "2.0")),
+        ParsedInstr("fneg", ("fneg", f64, "1.0")),
+        ParsedInstr(
+            "icmp", ("eq", "icmp", vector, "zeroinitializer", "zeroinitializer")
+        ),
+        ParsedInstr("fcmp", ("oeq", "fcmp", f64, "1.0", "2.0")),
+        ParsedInstr("cast", ("zext", "cast", i32, "1", i64)),
+        ParsedInstr("select", ("select", i32, "1", "2", "3")),
+        ParsedInstr("freeze", ("freeze", i32, "1")),
+        ParsedInstr(
+            "insertelement", ("insert_element", vector, "poison", i32, "1", "0")
+        ),
+        ParsedInstr("extractelement", ("extract_element", vector, "poison", "0", i32)),
+        ParsedInstr(
+            "shufflevector",
+            ("shuffle", vector, "poison", "poison", vector, "zeroinitializer"),
+        ),
+        ParsedInstr("extractvalue", ("extract_value", pair, "poison", (0,), i32, 0)),
+        ParsedInstr("insertvalue", ("insert_value", pair, "poison", i32, "1", (0,), 0)),
+        ParsedInstr("va_arg", ("va_arg", ptr, "null", i32)),
+        ParsedInstr("gep", ("gep", vector, ptr, "null", ((i32, "0"),))),
+        ParsedInstr("call", ("call", i32, "@callee", False, (), 0, False, ())),
+    ]
+    for instruction in instructions:
+        assert _instruction_defined_value_from_parts(
+            instruction.kind, instruction.data
+        ) == instruction_defined_value(instruction)
+    block = ParsedBlock(
+        "entry",
+        instructions=instructions,
+        terminator=ParsedInstr("ret_void", ()),
+    )
+    func = ParsedFunction("shape", TypeDesc("void"), [], True, False, [block])
+
+    def public_projection_used(*_args, **_kwargs):
+        raise AssertionError("stackprep must consume the private dense projection")
+
+    monkeypatch.setattr(CompactParsedInstrArena, "__iter__", public_projection_used)
+    monkeypatch.setattr(CompactParsedInstrArena, "__getitem__", public_projection_used)
+
+    assign_stack_slots(func, aggregate_returned_indirect=lambda _ty: False)
+
+    expected = {
+        "alloc": i32.ptr(),
+        "load": i32,
+        "load_atomic": i32,
+        "atomic": i32,
+        "cmpxchg": pair,
+        "syscall": i64,
+        "binop": i32,
+        "fbinop": f64,
+        "fneg": f64,
+        "icmp": bool_vector,
+        "fcmp": I1,
+        "cast": i64,
+        "select": i32,
+        "freeze": i32,
+        "insert_element": vector,
+        "extract_element": i32,
+        "shuffle": vector,
+        "extract_value": i32,
+        "insert_value": pair,
+        "va_arg": i32,
+        "gep": vector.ptr(),
+        "call": i32,
+    }
+    assert func.value_types == expected
+    assert func.value_slots == {}
+    assert func.alloca_slots == {}
+
+    corrupt = ParsedFunction(
+        "corrupt",
+        TypeDesc("void"),
+        [],
+        True,
+        False,
+        [
+            ParsedBlock(
+                "entry",
+                instructions=[ParsedInstr("freeze", ("dest", i32, "1"))],
+                terminator=ParsedInstr("ret_void", ()),
+            )
+        ],
+    )
+    corrupt.blocks[0].instructions._kind_ids[0] = 255
+    with pytest.raises(
+        BackendUnavailable, match="corrupt parsed-instruction kind id 255"
+    ):
+        assign_stack_slots(corrupt, aggregate_returned_indirect=lambda _ty: False)
+
+    used_call = ParsedFunction(
+        "used_call",
+        TypeDesc("void"),
+        [],
+        True,
+        False,
+        [
+            ParsedBlock(
+                "entry",
+                instructions=[
+                    ParsedInstr(
+                        "call",
+                        ("%call", pair, "@callee", False, (), 0, False, ()),
+                    ),
+                    ParsedInstr(
+                        "extractvalue",
+                        ("%element", pair, "%call", (0,), i32, 0),
+                    ),
+                ],
+                terminator=ParsedInstr("ret_void", ()),
+            )
+        ],
+    )
+    classified_types = []
+
+    def classify_aggregate(ty):
+        classified_types.append(ty)
+        if ty is pair:
+            raise AssertionError("used call results must short-circuit ABI classification")
+        return False
+
+    assign_stack_slots(used_call, aggregate_returned_indirect=classify_aggregate)
+    assert pair not in classified_types
+
+
+def test_self_backend_stackprep_sparse_used_value_projection_covers_instruction_abi():
+    i32 = TypeDesc("int", 32)
+    f64 = TypeDesc("fp", 64)
+    ptr = TypeDesc("ptr", pointee=TypeDesc("void"))
+    vector = TypeDesc("array", count=4, elem=i32)
+    pair = TypeDesc("struct", fields=(i32, I1))
+    cases = [
+        ("store", (i32, "%value", ptr, "%ptr"), ["%value", "%ptr"]),
+        ("load", ("%dest", i32, ptr, "%ptr"), ["%ptr"]),
+        ("load_atomic", ("%dest", i32, ptr, "%ptr", "seq_cst"), ["%ptr"]),
+        (
+            "store_atomic",
+            (i32, "%value", ptr, "%ptr", "seq_cst"),
+            ["%value", "%ptr"],
+        ),
+        (
+            "atomicrmw",
+            ("%dest", "add", ptr, "%ptr", i32, "%value", "seq_cst"),
+            ["%ptr", "%value"],
+        ),
+        (
+            "cmpxchg",
+            (
+                "%dest",
+                pair,
+                ptr,
+                "%ptr",
+                i32,
+                "%expected",
+                "%desired",
+                "seq_cst",
+                "seq_cst",
+            ),
+            ["%ptr", "%expected", "%desired"],
+        ),
+        (
+            "syscall6",
+            ("%dest", ("%number", "1", "%arg", "@global", "null", "%arg")),
+            ["%number", "%arg", "%arg"],
+        ),
+        ("va_arg", ("%dest", ptr, "%ap", i32), ["%ap"]),
+        ("binop", ("add", "%dest", i32, "%lhs", "%rhs"), ["%lhs", "%rhs"]),
+        (
+            "fbinop",
+            ("fadd", "%dest", f64, "%lhs", "%rhs"),
+            ["%lhs", "%rhs"],
+        ),
+        ("icmp", ("eq", "%dest", i32, "%lhs", "%rhs"), ["%lhs", "%rhs"]),
+        ("fcmp", ("oeq", "%dest", f64, "%lhs", "%rhs"), ["%lhs", "%rhs"]),
+        ("fneg", ("%dest", f64, "%value"), ["%value"]),
+        ("cast", ("zext", "%dest", i32, "%value", i32), ["%value"]),
+        (
+            "select",
+            ("%dest", i32, "%cond", "%true", "%false"),
+            ["%cond", "%true", "%false"],
+        ),
+        ("freeze", ("%dest", i32, "%value"), ["%value"]),
+        (
+            "insertelement",
+            ("%dest", vector, "%vector", i32, "%element", "%index"),
+            ["%vector", "%element", "%index"],
+        ),
+        (
+            "extractelement",
+            ("%dest", vector, "%vector", "%index", i32),
+            ["%vector", "%index"],
+        ),
+        (
+            "shufflevector",
+            ("%dest", vector, "%lhs", "%rhs", vector, "%mask"),
+            ["%lhs", "%rhs", "%mask"],
+        ),
+        (
+            "extractvalue",
+            ("%dest", pair, "%aggregate", (0,), i32, 0),
+            ["%aggregate"],
+        ),
+        (
+            "insertvalue",
+            ("%dest", pair, "%aggregate", i32, "%element", (0,), 0),
+            ["%aggregate", "%element"],
+        ),
+        (
+            "gep",
+            (
+                "%dest",
+                vector,
+                ptr,
+                "%base",
+                ((i32, "%first"), (i32, "0"), (i32, "%second")),
+            ),
+            ["%base", "%first", "%second"],
+        ),
+        (
+            "call",
+            (
+                "%dest",
+                i32,
+                "%callee",
+                True,
+                ((i32, "%arg"), (i32, "1"), (i32, "%arg")),
+                1,
+                True,
+                (0, 0, 0),
+            ),
+            ["%callee", "%arg", "%arg"],
+        ),
+        (
+            "call",
+            (
+                "%dest",
+                i32,
+                "@callee",
+                False,
+                ((i32, "%arg"),),
+                1,
+                False,
+                (0,),
+            ),
+            ["%arg"],
+        ),
+    ]
+    for kind, data, expected in cases:
+        assert _instruction_used_values_from_parts(kind, data) == expected
+        assert instruction_used_values(ParsedInstr(kind, data)) == expected
+
+    assert terminator_used_values(ParsedInstr("ret", (i32, "%ret"))) == ["%ret"]
+    assert terminator_used_values(
+        ParsedInstr("br_cond", ("%cond", "yes", "no"))
+    ) == ["%cond"]
+    assert terminator_used_values(
+        ParsedInstr("switch", (i32, "%value", "default", ()))
+    ) == ["%value"]
 
 
 def test_self_backend_shared_module_symbols_capture_defined_and_internal_sets():
@@ -2857,9 +3255,10 @@ join:
 }
 """.strip()
     module = parse_self_backend_module(ir_text)
-    phi = next(
+    join = next(
         block for block in module.functions[0].blocks if block.name == "join"
-    ).phis[0]
+    )
+    phi = _parsed_phi(module.functions[0], join)
     assert phi.incoming[0].value == "gepconst:g:4"
     assert phi.incoming[0].label == "then"
 
@@ -2930,7 +3329,7 @@ join:
 """.strip()
     module = parse_self_backend_module(ir_text)
     join = next(block for block in module.functions[0].blocks if block.name == "join")
-    phi = join.phis[0]
+    phi = _parsed_phi(module.functions[0], join)
     select_instr = join.instructions[0]
 
     assert phi.type == TypeDesc("array", count=4, elem=TypeDesc("int", 32))
@@ -2980,8 +3379,9 @@ bb0:
     assert store_instr.kind == "store"
     assert store_instr.data[1] == "%0"
     assert store_instr.data[3] == "gepconst:v:0"
-    assert func.blocks[0].terminator.kind == "br"
-    assert func.blocks[0].terminator.data == ("1",)
+    term = _parsed_terminator(func, func.blocks[0])
+    assert term.kind == "br"
+    assert term.data == ("1",)
 
 
 def test_self_backend_sparse_numeric_ssa_names_do_not_allocate_dense_tables():
@@ -3200,10 +3600,12 @@ done:
 }
 """.strip()
     module = parse_self_backend_module(ir_text)
-    entry = module.functions[0].blocks[0]
+    function = module.functions[0]
+    entry = function.blocks[0]
+    term = _parsed_terminator(function, entry)
 
-    assert entry.terminator.kind == "br_cond"
-    assert entry.terminator.data == ("cond", "done", "loop")
+    assert term.kind == "br_cond"
+    assert term.data == ("cond", "done", "loop")
 
 
 def test_self_backend_parse_quoted_dotted_branch_labels():
@@ -3222,12 +3624,15 @@ entry:
 }
 """.strip()
     module = parse_self_backend_module(ir_text)
-    blocks = {block.name: block for block in module.functions[0].blocks}
+    function = module.functions[0]
+    blocks = {block.name: block for block in function.blocks}
+    entry_term = _parsed_terminator(function, blocks["entry"])
+    raise_term = _parsed_terminator(function, blocks["raise.cont.1"])
 
-    assert blocks["entry"].terminator.kind == "br_cond"
-    assert blocks["entry"].terminator.data == ("cond", "raise.cont.1", "try.err.2")
-    assert blocks["raise.cont.1"].terminator.kind == "br"
-    assert blocks["raise.cont.1"].terminator.data == ("try.err.2",)
+    assert entry_term.kind == "br_cond"
+    assert entry_term.data == ("cond", "raise.cont.1", "try.err.2")
+    assert raise_term.kind == "br"
+    assert raise_term.data == ("try.err.2",)
 
 
 def test_self_backend_parse_folds_constant_conditional_branches():
@@ -3252,13 +3657,16 @@ done:
 }
 """.strip()
     module = parse_self_backend_module(ir_text)
-    blocks = {block.name: block for block in module.functions[0].blocks}
+    function = module.functions[0]
+    blocks = {block.name: block for block in function.blocks}
+    entry_term = _parsed_terminator(function, blocks["entry"])
+    taken_term = _parsed_terminator(function, blocks["taken"])
 
     assert set(blocks) == {"entry", "taken", "done"}
-    assert blocks["entry"].terminator.kind == "br"
-    assert blocks["entry"].terminator.data == ("taken",)
-    assert blocks["taken"].terminator.kind == "br"
-    assert blocks["taken"].terminator.data == ("done",)
+    assert entry_term.kind == "br"
+    assert entry_term.data == ("taken",)
+    assert taken_term.kind == "br"
+    assert taken_term.data == ("done",)
 
 
 def test_self_backend_parse_folds_numeric_constant_conditional_branches():
@@ -3283,12 +3691,15 @@ done:
 }
 """.strip()
     module = parse_self_backend_module(ir_text)
-    entry, taken = module.functions[0].blocks[:2]
+    function = module.functions[0]
+    entry, taken = function.blocks[:2]
+    entry_term = _parsed_terminator(function, entry)
+    taken_term = _parsed_terminator(function, taken)
 
-    assert entry.terminator.kind == "br"
-    assert entry.terminator.data == ("taken",)
-    assert taken.terminator.kind == "br"
-    assert taken.terminator.data == ("done",)
+    assert entry_term.kind == "br"
+    assert entry_term.data == ("taken",)
+    assert taken_term.kind == "br"
+    assert taken_term.data == ("done",)
 
 
 def test_constant_branch_folding_removes_only_the_discarded_phi_edge():
@@ -3310,11 +3721,13 @@ join:
     module = parse_self_backend_module(ir_text)
     function = module.functions[0]
     blocks = {block.name: block for block in function.blocks}
+    entry_term = _parsed_terminator(function, blocks["entry"])
 
-    assert blocks["entry"].terminator.kind == "br"
-    assert blocks["entry"].terminator.data == ("live",)
+    assert entry_term.kind == "br"
+    assert entry_term.data == ("live",)
     assert tuple(
-        incoming.label for incoming in blocks["join"].phis[0].incoming
+        incoming.label
+        for incoming in _parsed_phi(function, blocks["join"]).incoming
     ) == ("live",)
     prepare_module_for_target(
         ir_text,
@@ -3341,10 +3754,12 @@ entry:
 }
 """.strip()
     module = parse_self_backend_module(ir_text)
-    entry = module.functions[0].blocks[0]
+    function = module.functions[0]
+    entry = function.blocks[0]
+    term = _parsed_terminator(function, entry)
 
-    assert entry.terminator.kind == "switch"
-    assert entry.terminator.data == (
+    assert term.kind == "switch"
+    assert term.data == (
         TypeDesc("int", 8),
         "x",
         "0",
@@ -3495,7 +3910,7 @@ entry:
 """.strip()
     module = parse_self_backend_module(ir_text)
     func = module.functions[0]
-    ret_term = func.blocks[0].terminator
+    ret_term = _parsed_terminator(func, func.blocks[0])
 
     assert ret_term.kind == "ret"
     assert ret_term.data == (TypeDesc("int", 64), "ptrtointconst:gepconst:x:4")
@@ -6969,6 +7384,33 @@ bb0:
 
     assert "_strlit.1:" in asm_text
     assert "_main:" in asm_text
+
+
+def test_self_backend_rejects_invalid_direct_call_symbol_at_parse_boundary():
+    ir_text = '''
+target triple = "arm64-apple-darwin23.6.0"
+
+declare void @"bad-name"()
+
+define void @main() {
+entry:
+  call void @"bad-name"()
+  ret void
+}
+'''.strip()
+
+    with pytest.raises(BackendUnavailable, match="simple C identifier"):
+        parse_self_backend_module(ir_text)
+
+
+def test_self_backend_simple_symbol_scanner_matches_supported_alphabet():
+    from pcc.backend.self_backend_parse import check_simple_symbol_name
+
+    for name in ("a", "A0", "_", "$", ".", "a.b$c_9"):
+        check_simple_symbol_name(name)
+    for name in ("", "0a", "a-b", "a b", "é"):
+        with pytest.raises(BackendUnavailable, match="simple C identifier"):
+            check_simple_symbol_name(name)
 
 
 def test_self_backend_supports_globals_only_module_ir():

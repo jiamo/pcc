@@ -59,6 +59,7 @@ from pcc.llvm_capi.ir import (
     IRBuilder_emit_raw,
     IRBuilder_instruction_text_at,
     IRBuilder_next_value,
+    IRBuilder_publish_direct_raw_call,
 )
 
 from ..export_meta import decode_type
@@ -928,6 +929,39 @@ def _classgen_emit_dynamic_attr_value(
         obj_ident = obj.ident
     else:
         obj_ident = ""
+    if getattr(parent, "_native_module_exports", None) is not None:
+        native_export = parent._native_module_expr_export_info(obj, attr_name)
+        if native_export is not None:
+            exact_value = parent._emit_expr(expr)
+            return _classgen_maybe_unbox_recovered_arg(
+                parent,
+                exact_value,
+                expected_ir_ty,
+                annotation,
+            )
+    if obj_ident:
+        env = getattr(parent, "env", None)
+        slot = _classgen_dict_get_str(env, obj_ident)
+        storage_ir_ty = None
+        if slot is not None:
+            try:
+                storage_ir_ty = slot[1]
+            except (IndexError, TypeError):
+                storage_ir_ty = None
+        if (
+            storage_ir_ty is not None
+            and not _classgen_ir_type_is_pointer(storage_ir_ty)
+        ):
+            try:
+                exact_value = parent._emit_expr(expr)
+            except Exception:
+                exact_value = None
+            exact_ir_ty = _classgen_value_type_or_none(exact_value)
+            if (
+                exact_ir_ty is not None
+                and not _classgen_value_is_null(exact_value)
+            ):
+                return exact_value
     obj_val = None
     if obj_ident:
         obj_val = _classgen_current_name_load(parent, obj_ident, _PTR, None)
@@ -938,14 +972,25 @@ def _classgen_emit_dynamic_attr_value(
             obj_val = parent._emit_expr(obj)
     attr_ptr = _classgen_attr_name_ptr(parent, attr_name)
     raw = IRBuilder_next_value(parent.builder, "classgen.arg." + attr_name, _PTR)
-    IRBuilder_emit_raw(
+    obj_ref_text = _classgen_value_ref_text(obj_val)
+    attr_ref_text = _classgen_value_ref_text(attr_ptr)
+    record = IRBuilder_emit_raw(
         parent.builder,
         str(raw)
         + " = call ptr (ptr, ptr) @py_obj_getattr(ptr "
-        + _classgen_value_ref_text(obj_val)
+        + obj_ref_text
         + ", ptr "
-        + _classgen_value_ref_text(attr_ptr)
+        + attr_ref_text
         + ")",
+    )
+    IRBuilder_publish_direct_raw_call(
+        parent.builder,
+        record,
+        str(raw),
+        _PTR,
+        "@py_obj_getattr",
+        ("ptr", "ptr"),
+        (obj_ref_text, attr_ref_text),
     )
     parent._emit_attribute_error_if_null(
         raw,
@@ -1738,11 +1783,30 @@ def _classgen_emit_discarded_call(
     call_text = call_text + "("
     call_text = call_text + args_text
     call_text = call_text + ")"
+    callee_ref = _classgen_fn_ref(fn)
     if str(ret_ty) == "void":
-        IRBuilder_emit_raw(builder, call_text)
+        record = IRBuilder_emit_raw(builder, call_text)
+        IRBuilder_publish_direct_raw_call(
+            builder,
+            record,
+            None,
+            ret_ty,
+            callee_ref,
+            arg_type_texts,
+            arg_ref_texts,
+        )
     else:
         result = IRBuilder_next_value(builder, "", ret_ty)
-        IRBuilder_emit_raw(builder, str(result) + " = " + call_text)
+        record = IRBuilder_emit_raw(builder, str(result) + " = " + call_text)
+        IRBuilder_publish_direct_raw_call(
+            builder,
+            record,
+            str(result),
+            ret_ty,
+            callee_ref,
+            arg_type_texts,
+            arg_ref_texts,
+        )
 
 
 class ClassLoweringError(Exception):
@@ -2409,6 +2473,63 @@ class ClassLowering:
             )
         else:
             result = BoolLit(span=span, ty=bool_ty, value=(op in ("==", "<=", ">=")))
+        body = (Return(span=span, value=result),)
+        if method_name == "__eq__":
+            # CPython's generated dataclass equality first requires the same
+            # concrete class.  Without this guard, enabling runtime instance
+            # equality made unrelated compiler AST dataclasses call the left
+            # synthetic method and immediately read ``other.<field>`` (for
+            # example ``other.obj``), producing the systemic stage-2
+            # ``AttributeError: obj`` lift failure.
+            type_func = Name(
+                span=span,
+                ty=DynType(name="dyn"),
+                ident="type",
+            )
+            same_class = Compare(
+                span=span,
+                ty=bool_ty,
+                op="is",
+                lhs=Call(
+                    span=span,
+                    ty=DynType(name="dyn"),
+                    func=type_func,
+                    args=(
+                        Name(
+                            span=span,
+                            ty=DynType(name="dyn"),
+                            ident="self",
+                        ),
+                    ),
+                    kwargs=(),
+                ),
+                rhs=Call(
+                    span=span,
+                    ty=DynType(name="dyn"),
+                    func=type_func,
+                    args=(
+                        Name(
+                            span=span,
+                            ty=DynType(name="dyn"),
+                            ident="other",
+                        ),
+                    ),
+                    kwargs=(),
+                ),
+            )
+            body = (
+                If(
+                    span=span,
+                    cond=same_class,
+                    body=(Return(span=span, value=result),),
+                    else_body=(
+                        Return(
+                            span=span,
+                            value=BoolLit(span=span, ty=bool_ty, value=False),
+                        ),
+                    ),
+                ),
+            )
         return FuncDef(
             span=span,
             name=method_name,
@@ -2417,6 +2538,41 @@ class ClassLowering:
                 Arg("other", DynType(name="dyn"), None, "pos", False),
             ),
             return_ty=bool_ty,
+            body=body,
+            decorators=(),
+            is_method=True,
+            is_async=False,
+        )
+
+    def _dataclass_synthetic_hash(
+        self,
+        cd: ClassDef,
+        field_names: list[str],
+    ) -> FuncDef:
+        """CPython's @dataclass(frozen=True) with default eq synthesizes
+        ``__hash__ = hash(field tuple)``.  Without this, the generic
+        "__eq__ present and no __hash__ -> __hash__ = None" rule (correct
+        for ordinary classes and unfrozen dataclasses) made every frozen
+        dataclass unhashable: d[(Inner(1), Inner(2))] raised
+        "unhashable type" where CPython hashes it.  Hashing the field
+        tuple keeps the hash/eq contract, including for nested frozen
+        dataclasses (their synthesized __hash__ recurses through the
+        tuple hash)."""
+        span = cd.span
+        int_ty = IntType(name="int")
+        tup = self._dataclass_field_tuple(span, "self", field_names)
+        result = Call(
+            span=span,
+            ty=int_ty,
+            func=Name(span=span, ty=DynType(name="dyn"), ident="hash"),
+            args=(tup,),
+            kwargs=(),
+        )
+        return FuncDef(
+            span=span,
+            name="__hash__",
+            args=(Arg("self", None, None, "pos", False),),
+            return_ty=int_ty,
             body=(Return(span=span, value=result),),
             decorators=(),
             is_method=True,
@@ -2544,7 +2700,30 @@ class ClassLowering:
             _is_ast_node(s, FuncDef) and s.name == "__post_init__"
             for s in remaining_body
         )
-        if user_has_post_init:
+        inherited_post_init = False
+        pending_post_init_bases = list(cd.bases)
+        seen_post_init_bases = {}
+        while pending_post_init_bases and not inherited_post_init:
+            base_expr = pending_post_init_bases.pop()
+            if not _is_ast_node(base_expr, Name):
+                continue
+            base_name = base_expr.ident
+            if base_name in seen_post_init_bases:
+                continue
+            seen_post_init_bases[base_name] = True
+            base_info = self.classes.get(base_name)
+            if base_info is None or base_info.expanded_cd is None:
+                continue
+            for base_stmt in base_info.expanded_cd.body:
+                if (
+                    _is_ast_node(base_stmt, FuncDef)
+                    and base_stmt.name == "__post_init__"
+                ):
+                    inherited_post_init = True
+                    break
+            if not inherited_post_init:
+                pending_post_init_bases.extend(base_info.expanded_cd.bases)
+        if user_has_post_init or inherited_post_init:
             init_stmts.append(
                 ExprStmt(
                     span=span,
@@ -2597,6 +2776,17 @@ class ClassLowering:
             new_body.insert(
                 insert_at,
                 self._dataclass_synthetic_compare(cd, field_names, "__eq__", "=="),
+            )
+            insert_at += 1
+        if (
+            bool(options.get("frozen", False))
+            and "__hash__" not in existing_methods
+        ):
+            # frozen + (default) eq: CPython synthesizes __hash__ rather
+            # than clearing it; see _dataclass_synthetic_hash.
+            new_body.insert(
+                insert_at,
+                self._dataclass_synthetic_hash(cd, field_names),
             )
             insert_at += 1
         if bool(options.get("order", False)):
@@ -2891,6 +3081,7 @@ class ClassLowering:
         info: ClassInfo,
     ) -> None:
         """Discover ``self`` writes across control flow and unpack targets."""
+        from ..pipeline_exports import instance_field_assignment_statements
 
         def add_target(target, value_expr) -> None:
             if _is_ast_node(target, (TupleExpr, ListExpr)):
@@ -2912,29 +3103,13 @@ class ClassLowering:
             if field_ty is not None:
                 info.field_types[field_name] = field_ty
 
-        pending = list(reversed(fd.body))
-        while pending:
-            stmt = pending.pop()
+        for stmt in instance_field_assignment_statements(fd.body):
             if _is_ast_node(stmt, Assign):
                 for target in stmt.targets:
                     add_target(target, stmt.value)
                 continue
             if _is_ast_node(stmt, AugAssign):
                 add_target(stmt.target, stmt.value)
-                continue
-            if _is_ast_node(stmt, (If, While, For)):
-                pending.extend(reversed(stmt.else_body))
-                pending.extend(reversed(stmt.body))
-                continue
-            if _is_ast_node(stmt, With):
-                pending.extend(reversed(stmt.body))
-                continue
-            if _is_ast_node(stmt, Try):
-                pending.extend(reversed(stmt.finally_body))
-                pending.extend(reversed(stmt.else_body))
-                for handler in reversed(stmt.handlers):
-                    pending.extend(reversed(handler.body))
-                pending.extend(reversed(stmt.body))
 
     def _is_enum_like_class(self, cd: ClassDef) -> bool:
         for base in cd.bases:
@@ -3448,12 +3623,54 @@ class ClassLowering:
         g_name = f".class.{sanitised_mod}.{class_name}"
         qualified = f"{owning_module}.{class_name}"
 
+        # Extern declarations can be created before type-driven registration
+        # reaches ``_ensure_class_type_registered``.  Recover the base graph
+        # from the same closed-world export table here so an early declaration
+        # does not permanently look like a root class.  That graph is needed
+        # both for inherited field layout and for deciding whether a hinted
+        # receiver can dispatch directly without skipping a subclass override.
+        extern_bases_ast = ()
+        native_table = getattr(self.parent, "_native_module_exports", None)
+        if isinstance(native_table, dict):
+            module_exports = native_table.get(owning_module)
+            if isinstance(module_exports, dict):
+                class_export = module_exports.get(class_name)
+                if (
+                    isinstance(class_export, dict)
+                    and class_export.get("kind") == "class"
+                ):
+                    raw_base_names = class_export.get("base_names", ())
+                    if isinstance(raw_base_names, (tuple, list)):
+                        base_nodes = []
+                        stub_span = SourceSpan(
+                            file="<extern>",
+                            line=0,
+                            col=0,
+                            end_line=0,
+                            end_col=0,
+                        )
+                        for base_name in raw_base_names:
+                            if base_name == "object":
+                                continue
+                            base_nodes.append(
+                                Name(
+                                    span=stub_span,
+                                    ty=DynType(name="dyn"),
+                                    ident=base_name,
+                                )
+                            )
+                        extern_bases_ast = tuple(base_nodes)
+
         existing = self.classes.get(local)
         if existing is not None and existing.global_var.name == g_name:
             # Already declared correctly — return existing.
+            if not existing.bases_ast and extern_bases_ast:
+                existing.bases_ast = extern_bases_ast
             return existing
         qualified_existing = self.classes.get(qualified)
         if qualified_existing is not None:
+            if not qualified_existing.bases_ast and extern_bases_ast:
+                qualified_existing.bases_ast = extern_bases_ast
             if existing is None:
                 self.classes[local] = qualified_existing
             return qualified_existing
@@ -3474,7 +3691,10 @@ class ClassLowering:
 
         # Check if already declared under the qualified name.
         if primary_key in self.classes:
-            return self.classes[primary_key]
+            primary_existing = self.classes[primary_key]
+            if not primary_existing.bases_ast and extern_bases_ast:
+                primary_existing.bases_ast = extern_bases_ast
+            return primary_existing
 
         effective_field_names, synth_defs, method_plans = _extern_class_decl_plan(
             owning_module,
@@ -3483,7 +3703,11 @@ class ClassLowering:
             methods,
         )
 
-        info = ClassInfo(name=primary_key, global_var=gv, bases_ast=())
+        info = ClassInfo(
+            name=primary_key,
+            global_var=gv,
+            bases_ast=extern_bases_ast,
+        )
         info.owning_module = owning_module
         info.export_class_name = class_name
         info.field_names = list(effective_field_names)
@@ -3539,7 +3763,20 @@ class ClassLowering:
                     for t in decoded_param_types
                 ]
             else:
-                param_types = [_PTR] + [
+                receiver_ty = _PTR
+                if decoded_param_types:
+                    decoded_receiver_ty = decoded_param_types[0]
+                    if (
+                        _is_ast_node(decoded_receiver_ty, ClassType)
+                        and decoded_receiver_ty.valueclass
+                    ):
+                        info.valueclass = True
+                        payload_ty = _classgen_valueclass_payload_ir_type(
+                            decoded_receiver_ty
+                        )
+                        if payload_ty is not None:
+                            receiver_ty = payload_ty
+                param_types = [receiver_ty] + [
                     self.parent._abi_ir_type(
                         t,
                         box_int_abi=box_int_abi,
@@ -5850,6 +6087,25 @@ class ClassLowering:
                 return True
         return False
 
+    def method_overridden_by_subclass(
+        self, info: ClassInfo, method_name: str
+    ) -> bool:
+        """True if a possible runtime subclass overrides ``method_name``.
+
+        A type hint identifies a compatible base class, not the receiver's
+        exact runtime class.  Direct instance-method dispatch is therefore
+        sound only when the closed-world class graph has no subclass override
+        below the hinted receiver class.
+        """
+        for other in self.classes.values():
+            if other is info:
+                continue
+            if method_name not in other.methods:
+                continue
+            if self._derives_from(other, info.name):
+                return True
+        return False
+
     # Dict-inherited methods the runtime serves for classes that subclass the
     # builtin ``dict`` (PY_CLASS_FLAG_DICT_SUBCLASS): py_dict_subclass_getattr
     # in py_protocol.c binds each of these against the instance's backing dict
@@ -6275,7 +6531,12 @@ class ClassLowering:
                 if i < len(declared):
                     declared_annotation = declared[i].annotation
                 arg_start_index = IRBuilder_current_instruction_count(builder)
-                v = _classgen_emit_arg_expr(parent, arg_expr, declared_annotation)
+                # Resolve the parameter's IR type BEFORE emitting the argument.
+                # When the constructor takes the object projection for an `int`
+                # field, the argument has to be emitted as an object too --
+                # emitting it first yields an i64, and an i64 cannot carry a
+                # value above 2**63-1, so `IntLit(span, ty, int(text, 0))` stored
+                # 0.  Boxing that truncated i64 afterwards recovers nothing.
                 expected_ir_ty = None
                 param_index = i + 1
                 if param_index < len(init_param_types):
@@ -6284,6 +6545,17 @@ class ClassLowering:
                     expected_ir_ty = _classgen_arg_type_or_none(
                         init_fn_args,
                         param_index,
+                    )
+                v = None
+                if expected_ir_ty is not None and isinstance(
+                    expected_ir_ty, ir.PointerType
+                ):
+                    arg_ty = getattr(arg_expr, "ty", None)
+                    if isinstance(arg_ty, IntType):
+                        v = parent._emit_as_object(arg_expr)
+                if v is None:
+                    v = _classgen_emit_arg_expr(
+                        parent, arg_expr, declared_annotation
                     )
                 if _classgen_value_is_null(v):
                     recovered_v = None
@@ -6591,6 +6863,11 @@ class ClassLowering:
                 None,
                 release_on_error=(inst,),
             )
+        # Producer-side proof for the immediately enclosing expression only.
+        # Consumers clear the slot before emitting a candidate and compare by
+        # SSA identity, so aliases, factories, phi nodes, and imported/native
+        # construction paths cannot inherit this provenance accidentally.
+        parent._last_fresh_direct_native_ctor_value = inst
         return inst
 
     def _find_method_def(self, class_name: str, method_name: str):

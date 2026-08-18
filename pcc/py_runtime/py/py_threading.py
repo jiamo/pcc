@@ -4,6 +4,9 @@ This module keeps the no-C runtime archive linkable.  The heavy lifting stays
 in pcc_threads.c through extern wrappers; Python-level stdlib shims call these
 ABI symbols rather than embedding pthread details in layer1.
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_THREAD_CONDITION,
     PY_TYPE_THREAD_EVENT,

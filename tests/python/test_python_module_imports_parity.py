@@ -247,6 +247,32 @@ def test_import_json_loads_dumps(tmp_path, monkeypatch):
     assert out[1] == '{"x": 10}'
 
 
+def test_import_json_load_reads_native_file_object(tmp_path, monkeypatch):
+    payload = tmp_path / "payload.json"
+    payload.write_text('{"phase": "link", "elapsed": 41}', encoding="utf-8")
+    src = tmp_path / "imp_json_load.py"
+    exe = tmp_path / "imp_json_load.out"
+    src.write_text(
+        textwrap.dedent(
+            f"""
+            import json
+
+            def main() -> None:
+                with open({str(payload)!r}, "r", encoding="utf-8") as stream:
+                    value = json.load(stream)
+                print(value["phase"])
+                print(value["elapsed"])
+
+            if __name__ == "__main__":
+                main()
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    _compile(monkeypatch, src, exe)
+    assert _run(exe) == "link\n41\n"
+
+
 def test_import_json_string_escape_roundtrip(tmp_path, monkeypatch):
     src = tmp_path / "imp_json_escapes.py"
     exe = tmp_path / "imp_json_escapes.out"

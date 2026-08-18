@@ -4,6 +4,9 @@ The stat helpers delegate ABI-sensitive ``struct stat`` reads to
 pcc.unsafe intrinsics. The runtime source stays portable and does not encode
 Darwin/Linux field offsets directly.
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_BYTEARRAY,
     PY_TYPE_BYTES,

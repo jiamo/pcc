@@ -6,6 +6,8 @@ path, while the production-disabled fast path is one cached integer load.
 Fatal corruption preserves the C oracle's fail-closed abort contract.
 """
 
+__pcc_runtime_port__ = True
+
 from pcc.extern import c_abi_export, c_int64, c_ptr, c_void, extern
 from pcc.unsafe import (
     abi_constant,

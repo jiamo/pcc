@@ -326,26 +326,19 @@ def _for_prepare_owned_object_target(host, target_ident: str, target_ty: Type):
 def _for_store_owned_target(host, target_ident: str, slot, value: ir.Value) -> None:
     """Transfer one owned runtime object into a replaceable loop target."""
     alloca = slot[0]
-    host.builder.call(host.runtime["pcc_gc_pin"], [value])
-    # The target slot is either null or owns its current value.  Root-store is
-    # the single replacement operation: it retains ``value`` for the slot and
-    # releases the prior slot owner.  Calling the generic owned-local release
-    # first would leave the stale pointer in the slot, so root-store would
-    # release the old object a second time.
+    # The target slot is either null or owns its current value.  The
+    # ownership-transferring root store is the single replacement operation:
+    # the getter/iterator result arrived owned, its reference moves into the
+    # slot, and the prior slot owner is released (relocation-aware on the
+    # moving backends).  This replaces the pin / store_root / unpin / release
+    # quartet -- four runtime calls per loop iteration, two of them refcount
+    # round trips on the same object (per-op row ``for_over_list``).
     host.builder.call(
-        host.runtime["pcc_gc_store_root"],
+        host.runtime["pcc_gc_store_root_take"],
         [host._as_gc_ptr(alloca), value],
     )
     owned_flag = host._ensure_owned_local_flag(target_ident, alloca)
     host.builder.store(ir.Constant(_I1, 1), owned_flag)
-    host.builder.call(host.runtime["pcc_gc_unpin"], [value])
-    # The getter/iterator result arrived owned.  Root-store created the local
-    # slot's independent owner, so consume the transferred temporary exactly
-    # once.
-    host._gc_release(
-        value,
-        host._release_context_label("for-target-incoming:" + target_ident),
-    )
 
 
 class ForLoopLoweringMixin:

@@ -9,7 +9,11 @@ from pathlib import Path
 import pytest
 
 from pcc.py_frontend import pipeline
-from pcc.py_frontend.codegen.runtime_abi import FREESTANDING_GC_RUNTIME_GLOBALS
+from pcc.py_frontend.codegen.runtime_abi import (
+    FREESTANDING_GC_CROSS_OBJECT_SIGNATURES,
+    FREESTANDING_GC_RUNTIME_GLOBALS,
+)
+from tests.runtime_build_cache import cached_threaded_pcc_python_runtime
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -21,8 +25,11 @@ MAKEFILE = RUNTIME_DIR / "Makefile"
 OWNED_SYMBOLS = {
     "pcc_gc_backend4_try_zpage_alloc",
     "pcc_gc_backend4_zpage_track_alloc",
+    "pcc_gc_backend4_zpage_track_alloc_preallocated",
+    "pcc_gc_backend4_zpage_track_page_prepare",
 }
 RAW_FUNCTION_IMPORTS = {
+    "free",
     "malloc",
     "memset",
     "pcc_gc_backend4_evacuation_page_find",
@@ -32,8 +39,10 @@ RAW_FUNCTION_IMPORTS = {
     "pcc_gc_backend4_zpage_find_reusable_page",
     "pcc_gc_backend4_zpage_find_reusable_page_for_gen",
     "pcc_gc_backend4_zpage_link_node",
+    "pcc_gc_backend4_zpage_link_node_preallocated",
     "pcc_gc_backend4_zpage_node_alloc",
     "pcc_gc_backend4_zpage_node_release",
+    "pcc_gc_backend4_zpage_node_take_prepared",
     "pcc_gc_backend4_zpage_pop_free_page",
     "pcc_gc_backend4_zpage_reset",
     "pcc_gc_backend4_zpage_set_active_page",
@@ -43,6 +52,7 @@ RAW_FUNCTION_IMPORTS = {
 }
 RAW_GLOBAL_IMPORTS = {
     "pcc_gc_backend4_evacuation_page_head",
+    "pcc_gc_backend4_free_page_head",
     "pcc_gc_backend4_page_head",
     "pcc_gc_backend_selected",
     "pcc_gc_config_initialized",
@@ -51,6 +61,11 @@ RAW_GLOBAL_IMPORTS = {
 
 def _exported_symbols(source: str) -> set[str]:
     return set(re.findall(r'@c_abi_export\("([^"]+)"\)', source))
+
+
+@pytest.fixture(scope="session")
+def zpage_threaded_pcc_py_runtime_archive() -> Path:
+    return cached_threaded_pcc_python_runtime() / "libpy_runtime_pcc_py.a"
 
 
 def _literal_global_imports() -> set[str]:
@@ -82,6 +97,64 @@ def test_zpage_allocation_has_one_strict_source_owner() -> None:
     assert "def _backend4_zpage_track_alloc(" not in managed
     assert 'pcc_gc_backend4_try_zpage_alloc = extern(' in managed
     assert '_backend4_zpage_track_alloc = extern(' in managed
+
+
+def _assert_calls_follow_latest_unlock(
+    body: str, call: str, lock: str, unlock: str
+) -> None:
+    starts = [match.start() for match in re.finditer(re.escape(call), body)]
+    assert starts, call
+    for start in starts:
+        prefix = body[:start]
+        assert prefix.rfind(unlock) > prefix.rfind(lock), (call, body[start - 80 : start + 80])
+
+
+def test_zpage_allocation_prepares_and_clears_storage_outside_graph_lock() -> None:
+    strict = STRICT_SOURCE.read_text(encoding="utf-8")
+    strict_alloc = strict.split("def pcc_gc_backend4_try_zpage_alloc", 1)[1].split(
+        '@c_abi_export("pcc_gc_backend4_zpage_track_alloc")', 1
+    )[0]
+    c_oracle = (RUNTIME_DIR / "src" / "py_gc_backend.c").read_text(
+        encoding="utf-8"
+    )
+    c_alloc = c_oracle.split(
+        "void *pcc_gc_backend4_try_zpage_alloc", 1
+    )[1].split(
+        "static int64_t pcc_gc_backend4_free_page_count_for_class_unlocked", 1
+    )[0]
+
+    assert "prepared_page" in strict_alloc
+    assert "prepared_page" in c_alloc
+    _assert_calls_follow_latest_unlock(
+        strict_alloc,
+        "pcc_gc_backend4_zpage_reset(",
+        "pcc_py_gc_minor_graph_lock()",
+        "pcc_py_gc_minor_graph_unlock()",
+    )
+    _assert_calls_follow_latest_unlock(
+        c_alloc,
+        "pcc_gc_backend4_zpage_reset_unlocked(",
+        "pcc_gc_graph_lock();",
+        "pcc_gc_graph_unlock();",
+    )
+    _assert_calls_follow_latest_unlock(
+        strict_alloc,
+        "malloc(",
+        "pcc_py_gc_minor_graph_lock()",
+        "pcc_py_gc_minor_graph_unlock()",
+    )
+    _assert_calls_follow_latest_unlock(
+        c_alloc, "calloc(", "pcc_gc_graph_lock();", "pcc_gc_graph_unlock();"
+    )
+    _assert_calls_follow_latest_unlock(
+        strict_alloc,
+        "memset(obj",
+        "pcc_py_gc_minor_graph_lock()",
+        "pcc_py_gc_minor_graph_unlock()",
+    )
+    _assert_calls_follow_latest_unlock(
+        c_alloc, "memset(ptr", "pcc_gc_graph_lock();", "pcc_gc_graph_unlock();"
+    )
 
 
 @pytest.mark.parametrize("emitter", ["llvm", "self"])
@@ -158,6 +231,90 @@ def test_zpage_allocation_preserves_page_and_pending_handoff_contract() -> None:
     assert "pcc_gc_backend4_zpage_link_node(node)" in tracking
 
 
+def test_object_registration_prepares_zpage_tracking_before_graph_lock() -> None:
+    managed = (RUNTIME_DIR / "py" / "py_gc_backend.py").read_text(
+        encoding="utf-8"
+    )
+    strict_registration = managed.split(
+        "def pcc_gc_note_object_allocated_sized", 1
+    )[1].split('@c_abi_export("pcc_gc_note_object_allocated")', 1)[0]
+    c_oracle = (RUNTIME_DIR / "src" / "py_gc_backend.c").read_text(
+        encoding="utf-8"
+    )
+    c_registration = c_oracle.split(
+        "void pcc_gc_note_object_allocated_sized", 1
+    )[1].split("void pcc_gc_note_object_allocated(", 1)[0]
+
+    for registration, prepare, lock, unlock, preallocated in (
+        (
+            strict_registration,
+            "_backend4_zpage_node_prepare()",
+            "_object_graph_lock()",
+            "_object_graph_unlock()",
+            "_backend4_zpage_track_alloc_preallocated(",
+        ),
+        (
+            c_registration,
+            "pcc_gc_backend4_zpage_node_prepare()",
+            "pcc_gc_graph_lock();",
+            "pcc_gc_graph_unlock();",
+            "pcc_gc_backend4_zpage_track_alloc_preallocated(",
+        ),
+    ):
+        prepare_at = registration.index(prepare)
+        assert registration[:prepare_at].rfind(unlock) > (
+            registration[:prepare_at].rfind(lock)
+        )
+        assert "pcc_gc_zpage_owner_index_plan_capacity" in registration
+        assert "pcc_gc_zpage_owner_index_plan_commit" in registration
+        assert "zpage_track_page_prepare" in registration
+        assert preallocated in registration
+        assert "zpage_track_alloc_unlocked(\n                o, n->size\n" not in registration
+        assert "_backend4_zpage_track_alloc(o, size)" not in registration
+        for allocating_call in (
+            prepare,
+            "zpage_track_page_prepare(",
+            "calloc(" if "pcc_gc_graph_lock();" in registration else "malloc(",
+        ):
+            _assert_calls_follow_latest_unlock(
+                registration, allocating_call, lock, unlock
+            )
+
+    expected_signatures = {
+        "pcc_gc_backend4_zpage_node_prepare": ((), "c_ptr"),
+        "pcc_gc_backend4_zpage_node_plan_requires_prepare": (
+            (),
+            "c_int64",
+        ),
+        "pcc_gc_backend4_zpage_node_take_prepared": (
+            ("c_ptr",),
+            "c_ptr",
+        ),
+        "pcc_gc_zpage_owner_index_plan_capacity": (
+            ("c_int64",),
+            "c_int64",
+        ),
+        "pcc_gc_zpage_owner_index_plan_commit": (
+            ("c_ptr", "c_int64", "c_int64"),
+            "c_int64",
+        ),
+        "pcc_gc_zpage_owner_index_upsert_preallocated": (
+            ("c_ptr", "c_ptr"),
+            "c_int64",
+        ),
+        "pcc_gc_backend4_zpage_track_page_prepare": (
+            ("c_ptr", "c_ptr", "c_int64"),
+            "c_ptr",
+        ),
+        "pcc_gc_backend4_zpage_track_alloc_preallocated": (
+            ("c_ptr", "c_int64", "c_ptr", "c_ptr", "c_int64"),
+            "c_ptr",
+        ),
+    }
+    for symbol, signature in expected_signatures.items():
+        assert FREESTANDING_GC_CROSS_OBJECT_SIGNATURES[symbol] == signature
+
+
 def test_production_archive_has_one_zpage_allocation_owner(
     pcc_py_runtime_archive: Path,
 ) -> None:
@@ -226,6 +383,7 @@ def _link_zpage_allocation_probe(
             "-std=c11",
             f"-I{RUNTIME_DIR / 'include'}",
             f"-I{RUNTIME_DIR / 'src'}",
+            f"-I{RUNTIME_DIR / 'src'}",
             str(source),
             str(archive),
             "-pthread",
@@ -276,3 +434,247 @@ def test_zpage_allocation_matches_c_oracle_across_page_classes(
     assert result.returncode == 0, result.stdout + result.stderr
     assert oracle_result.stdout == expected
     assert result.stdout == oracle_result.stdout
+
+
+def _link_zpage_prepare_probe(
+    tmp_path: Path, name: str, archive: Path, source_text: str
+) -> Path:
+    source = tmp_path / (name + ".c")
+    executable = tmp_path / name
+    source.write_text(textwrap.dedent(source_text).lstrip(), encoding="utf-8")
+    result = subprocess.run(
+        [
+            "clang",
+            "-std=c11",
+            f"-I{RUNTIME_DIR / 'include'}",
+            str(source),
+            str(archive),
+            "-pthread",
+            "-lm",
+            "-o",
+            str(executable),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    return executable
+
+
+def test_zpage_allocation_failure_does_not_publish_partial_page(
+    tmp_path: Path,
+    c_runtime_archive: Path,
+    pcc_py_runtime_archive: Path,
+) -> None:
+    source = r'''
+        #include "py_runtime.h"
+        #include <stdint.h>
+        #include <stdio.h>
+
+        extern void *pcc_gc_backend4_try_zpage_alloc(int64_t, int32_t);
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) {
+                return 2;
+            }
+            int64_t count0 = pcc_gc_backend4_zpage_count();
+            int64_t capacity0 = pcc_gc_backend4_zpage_capacity_bytes();
+            int64_t free0 = pcc_gc_backend4_zpage_free_pages();
+            void *p = pcc_gc_backend4_try_zpage_alloc(INT64_C(1) << 62, 0);
+            printf("%d,%lld,%lld,%lld\n",
+                   p == NULL,
+                   (long long)(pcc_gc_backend4_zpage_count() - count0),
+                   (long long)(pcc_gc_backend4_zpage_capacity_bytes() - capacity0),
+                   (long long)(pcc_gc_backend4_zpage_free_pages() - free0));
+            return p == NULL ? 0 : 3;
+        }
+    '''
+    outputs = []
+    for runtime, archive in (
+        ("c", c_runtime_archive),
+        ("pcc_python", pcc_py_runtime_archive),
+    ):
+        executable = _link_zpage_prepare_probe(
+            tmp_path, "zpage_prepare_failure_" + runtime, archive, source
+        )
+        result = subprocess.run(
+            [str(executable)], capture_output=True, text=True, timeout=30
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        outputs.append(result.stdout)
+    assert outputs == ["1,0,0,0\n", "1,0,0,0\n"]
+
+
+def test_zpage_tracking_fallback_admission_and_prepare_failure_match_oracle(
+    tmp_path: Path,
+    c_runtime_archive: Path,
+    pcc_py_runtime_archive: Path,
+) -> None:
+    source = r'''
+        #include "py_runtime.h"
+        #include <stdint.h>
+        #include <stdio.h>
+        #include <stdlib.h>
+
+        typedef struct {
+            int64_t refcount;
+            int32_t type_tag;
+            int32_t flags;
+        } ProbeHeader;
+
+        extern void pcc_gc_note_object_allocated_sized(PyObject *, int64_t);
+        extern void pcc_gc_note_object_freeing(PyObject *);
+        extern void *pcc_gc_object_index_find(PyObject *);
+        extern void *pcc_gc_zpage_owner_index_find(PyObject *);
+        extern void *pcc_gc_backend4_zpage_track_page_prepare(
+            void *, PyObject *, int64_t
+        );
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) {
+                return 2;
+            }
+            PyObject *owner = (PyObject *)calloc(1, 128);
+            if (owner == NULL) return 3;
+            ProbeHeader *header = (ProbeHeader *)owner;
+            header->refcount = 1;
+            header->type_tag = PY_TYPE_LIST;
+            header->flags = 262144;
+            pcc_gc_note_object_allocated_sized(owner, 128);
+            int tracked = pcc_gc_zpage_owner_index_find(owner) != NULL;
+            int offset_ok = pcc_gc_backend4_zpage_owner_offset_bytes(owner) >= 0;
+            pcc_gc_note_object_freeing(owner);
+            int removed = pcc_gc_zpage_owner_index_find(owner) == NULL;
+            void *huge = pcc_gc_backend4_zpage_track_page_prepare(
+                NULL, owner, INT64_C(1) << 62
+            );
+            int failed_closed = huge == NULL;
+            PyObject *failed_owner = (PyObject *)calloc(1, 128);
+            if (failed_owner == NULL) return 5;
+            ProbeHeader *failed_header = (ProbeHeader *)failed_owner;
+            failed_header->refcount = 1;
+            failed_header->type_tag = PY_TYPE_LIST;
+            failed_header->flags = 262144;
+            pcc_gc_note_object_allocated_sized(
+                failed_owner, INT64_C(1) << 62
+            );
+            int registration_rolled_back =
+                pcc_gc_object_index_find(failed_owner) == NULL
+                && pcc_gc_zpage_owner_index_find(failed_owner) == NULL;
+            printf(
+                "%d,%d,%d,%d,%d\n",
+                tracked,
+                offset_ok,
+                removed,
+                failed_closed,
+                registration_rolled_back
+            );
+            free(owner);
+            free(failed_owner);
+            return tracked && offset_ok && removed && failed_closed
+                && registration_rolled_back ? 0 : 4;
+        }
+    '''
+    outputs = []
+    for runtime, archive in (
+        ("c", c_runtime_archive),
+        ("pcc_python", pcc_py_runtime_archive),
+    ):
+        executable = _link_zpage_prepare_probe(
+            tmp_path, "zpage_track_fallback_" + runtime, archive, source
+        )
+        result = subprocess.run(
+            [str(executable)], capture_output=True, text=True, timeout=30
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        outputs.append(result.stdout)
+    assert outputs == ["1,1,1,1,1\n", "1,1,1,1,1\n"]
+
+
+def test_zpage_first_page_race_publishes_one_page_in_c_and_strict_runtime(
+    tmp_path: Path,
+    threaded_c_runtime_archive: Path,
+    zpage_threaded_pcc_py_runtime_archive: Path,
+) -> None:
+    source = r'''
+        #include "py_runtime.h"
+        #include <pthread.h>
+        #include <sched.h>
+        #include <stdatomic.h>
+        #include <stdint.h>
+        #include <stdio.h>
+
+        #define THREADS 16
+        static _Atomic int ready = 0;
+        static _Atomic int go = 0;
+        static PyObject *objects[THREADS];
+
+        static void *worker(void *opaque) {
+            intptr_t index = (intptr_t)opaque;
+            atomic_fetch_add_explicit(&ready, 1, memory_order_release);
+            while (atomic_load_explicit(&go, memory_order_acquire) == 0) {
+                sched_yield();
+            }
+            objects[index] = pcc_gc_alloc(128, PY_TYPE_LIST, 0);
+            pcc_thread_unregister_current();
+            return NULL;
+        }
+
+        int main(void) {
+            if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) {
+                return 2;
+            }
+            int64_t count0 = pcc_gc_backend4_zpage_count();
+            int64_t capacity0 = pcc_gc_backend4_zpage_capacity_bytes();
+            int64_t used0 = pcc_gc_backend4_zpage_used_bytes();
+            int64_t free0 = pcc_gc_backend4_zpage_free_pages();
+            pthread_t threads[THREADS];
+            for (intptr_t i = 0; i < THREADS; i++) {
+                if (pthread_create(&threads[i], NULL, worker, (void *)i) != 0) {
+                    return 3;
+                }
+            }
+            while (atomic_load_explicit(&ready, memory_order_acquire) != THREADS) {
+                sched_yield();
+            }
+            atomic_store_explicit(&go, 1, memory_order_release);
+            for (int i = 0; i < THREADS; i++) {
+                if (pthread_join(threads[i], NULL) != 0) return 4;
+            }
+            int errors = 0;
+            for (int i = 0; i < THREADS; i++) {
+                if (objects[i] == NULL) {
+                    errors++;
+                    continue;
+                }
+                int64_t offset = pcc_gc_backend4_zpage_owner_offset_bytes(objects[i]);
+                if (offset < 0 || offset >= 4096 || (offset % 128) != 0) errors++;
+                for (int j = 0; j < i; j++) {
+                    if (objects[i] == objects[j]) errors++;
+                }
+            }
+            printf("%lld,%lld,%lld,%lld,%d\n",
+                   (long long)(pcc_gc_backend4_zpage_count() - count0),
+                   (long long)(pcc_gc_backend4_zpage_capacity_bytes() - capacity0),
+                   (long long)(pcc_gc_backend4_zpage_used_bytes() - used0),
+                   (long long)(pcc_gc_backend4_zpage_free_pages() - free0),
+                   errors);
+            for (int i = 0; i < THREADS; i++) pcc_gc_release(objects[i]);
+            return errors == 0 ? 0 : 5;
+        }
+    '''
+    outputs = []
+    for runtime, archive in (
+        ("c", threaded_c_runtime_archive),
+        ("pcc_python", zpage_threaded_pcc_py_runtime_archive),
+    ):
+        executable = _link_zpage_prepare_probe(
+            tmp_path, "zpage_prepare_race_" + runtime, archive, source
+        )
+        result = subprocess.run(
+            [str(executable)], capture_output=True, text=True, timeout=30
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        outputs.append(result.stdout)
+    assert outputs == ["1,4096,2048,0,0\n", "1,4096,2048,0,0\n"]

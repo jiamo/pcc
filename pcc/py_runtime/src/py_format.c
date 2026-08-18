@@ -467,7 +467,7 @@ double py_float_value_of(PyObject *o) {
         char *end = NULL;
         double v = strtod(s, &end);
         if (end == s) {
-            py_raise(py_exc_new(PY_EXC_VALUEERROR,
+            py_raise_owned(py_exc_new(PY_EXC_VALUEERROR,
                 "could not convert string to float"));
             return 0.0;
         }
@@ -476,7 +476,7 @@ double py_float_value_of(PyObject *o) {
             end++;
         }
         if (*end != '\0') {
-            py_raise(py_exc_new(PY_EXC_VALUEERROR,
+            py_raise_owned(py_exc_new(PY_EXC_VALUEERROR,
                 "could not convert string to float"));
             return 0.0;
         }
@@ -827,7 +827,7 @@ PyObject *py_obj_format(PyObject *o, PyObject *spec) {
         builtin = format_float_builtin(o, text);
     }
     if (builtin != NULL) return builtin;
-    py_raise(py_exc_new(PY_EXC_VALUEERROR, "unsupported format specifier"));
+    py_raise_owned(py_exc_new(PY_EXC_VALUEERROR, "unsupported format specifier"));
     return NULL;
 }
 
@@ -873,7 +873,7 @@ static PyObject *percent_get_arg(PyObject *args, int64_t *index, int *tuple_mode
         *tuple_mode = 1;
         PyTupleObject *t = (PyTupleObject *)args;
         if (*index >= t->len) {
-            py_raise(py_exc_new(PY_EXC_TYPEERROR, "not enough arguments for format string"));
+            py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "not enough arguments for format string"));
             return NULL;
         }
         PyObject *item = pcc_gc_load_ptr(args, &t->items[*index]);
@@ -882,7 +882,7 @@ static PyObject *percent_get_arg(PyObject *args, int64_t *index, int *tuple_mode
     }
     *tuple_mode = 0;
     if (*index != 0) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "not enough arguments for format string"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "not enough arguments for format string"));
         return NULL;
     }
     *index = 1;
@@ -953,7 +953,7 @@ static int percent_append_formatted_str(
     PyObject *s = repr ? py_obj_repr(arg) : py_obj_str(arg);
     if (s == NULL) s = py_obj_repr(arg);
     if (s == NULL || py_type_of(s) != PY_TYPE_STR) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "format argument cannot be converted to string"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "format argument cannot be converted to string"));
         return -1;
     }
     const char *text = py_str_utf8(s);
@@ -993,7 +993,7 @@ static int percent_append_formatted_str(
 
 PyObject *py_str_mod(PyObject *fmt_obj, PyObject *args) {
     if (fmt_obj == NULL || py_type_of(fmt_obj) != PY_TYPE_STR) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "left operand of % must be str"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "left operand of % must be str"));
         return NULL;
     }
     PyStrObject *fmt = (PyStrObject *)fmt_obj;
@@ -1024,11 +1024,11 @@ PyObject *py_str_mod(PyObject *fmt_obj, PyObject *args) {
             int64_t ke = ks;
             while (ke < fmt->byte_len && fmt->data[ke] != ')') ke++;
             if (ke >= fmt->byte_len) {
-                py_raise(py_exc_new(PY_EXC_VALUEERROR, "incomplete format key"));
+                py_raise_owned(py_exc_new(PY_EXC_VALUEERROR, "incomplete format key"));
                 goto fail;
             }
             if (py_type_of(args) != PY_TYPE_DICT) {
-                py_raise(py_exc_new(PY_EXC_TYPEERROR, "format requires a mapping"));
+                py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "format requires a mapping"));
                 goto fail;
             }
             PyObject *key = py_str_new(fmt->data + ks, ke - ks);
@@ -1036,7 +1036,7 @@ PyObject *py_str_mod(PyObject *fmt_obj, PyObject *args) {
             PyObject *val = py_dict_get(args, key);
             py_decref(key);
             if (val == NULL) {
-                py_raise(py_exc_new(PY_EXC_KEYERROR, "format key not found"));
+                py_raise_owned(py_exc_new(PY_EXC_KEYERROR, "format key not found"));
                 goto fail;
             }
             py_decref(val);            /* dict retains ownership; borrow it */
@@ -1053,7 +1053,7 @@ PyObject *py_str_mod(PyObject *fmt_obj, PyObject *args) {
         }
         while (i < fmt->byte_len && strchr("hlLzjt", fmt->data[i]) != NULL) i++;
         if (i >= fmt->byte_len) {
-            py_raise(py_exc_new(PY_EXC_VALUEERROR, "incomplete format"));
+            py_raise_owned(py_exc_new(PY_EXC_VALUEERROR, "incomplete format"));
             goto fail;
         }
         char conv = fmt->data[i];
@@ -1065,7 +1065,7 @@ PyObject *py_str_mod(PyObject *fmt_obj, PyObject *args) {
         if (has_mapping) {
             int64_t body_len = i - body_start + 1;   /* flags .. conv */
             if (body_len + 1 >= (int64_t)sizeof(specbuf)) {
-                py_raise(py_exc_new(PY_EXC_VALUEERROR, "format spec too long"));
+                py_raise_owned(py_exc_new(PY_EXC_VALUEERROR, "format spec too long"));
                 goto fail;
             }
             specbuf[0] = '%';
@@ -1087,7 +1087,7 @@ PyObject *py_str_mod(PyObject *fmt_obj, PyObject *args) {
         if (conv == 'd' || conv == 'i' || conv == 'u' || conv == 'x' || conv == 'X' || conv == 'o') {
             char cfmt[96];
             if (percent_copy_spec(cfmt, (int)sizeof(cfmt), specptr, spec_use_len, conv, "ll") != 0) {
-                py_raise(py_exc_new(PY_EXC_VALUEERROR, "unsupported format specifier"));
+                py_raise_owned(py_exc_new(PY_EXC_VALUEERROR, "unsupported format specifier"));
                 goto fail;
             }
             int64_t v = 0;
@@ -1099,7 +1099,7 @@ PyObject *py_str_mod(PyObject *fmt_obj, PyObject *args) {
                 v = py_int_to_i64(arg, &overflow);
                 if (overflow) v = py_int_value_i64(arg);
             } else {
-                py_raise(py_exc_new(PY_EXC_TYPEERROR, "integer format requires a number"));
+                py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "integer format requires a number"));
                 goto fail;
             }
             if (conv == 'u' || conv == 'x' || conv == 'X' || conv == 'o') {
@@ -1112,7 +1112,7 @@ PyObject *py_str_mod(PyObject *fmt_obj, PyObject *args) {
         if (conv == 'e' || conv == 'E' || conv == 'f' || conv == 'F' || conv == 'g' || conv == 'G') {
             char cfmt[96];
             if (percent_copy_spec(cfmt, (int)sizeof(cfmt), specptr, spec_use_len, conv, NULL) != 0) {
-                py_raise(py_exc_new(PY_EXC_VALUEERROR, "unsupported format specifier"));
+                py_raise_owned(py_exc_new(PY_EXC_VALUEERROR, "unsupported format specifier"));
                 goto fail;
             }
             double v = py_float_to_f64(arg);
@@ -1123,7 +1123,7 @@ PyObject *py_str_mod(PyObject *fmt_obj, PyObject *args) {
             int64_t v = 0;
             if (py_type_of(arg) == PY_TYPE_STR) {
                 if (py_str_byte_len(arg) != 1) {
-                    py_raise(py_exc_new(PY_EXC_TYPEERROR, "%c requires int or char"));
+                    py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "%c requires int or char"));
                     goto fail;
                 }
                 if (pfbuf_append_char(&out, py_str_utf8(arg)[0]) != 0) goto oom;
@@ -1134,21 +1134,21 @@ PyObject *py_str_mod(PyObject *fmt_obj, PyObject *args) {
             } else if (py_type_of(arg) == PY_TYPE_INT) {
                 v = py_int_value_i64(arg);
             } else {
-                py_raise(py_exc_new(PY_EXC_TYPEERROR, "%c requires int or char"));
+                py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "%c requires int or char"));
                 goto fail;
             }
             char ch = (char)v;
             if (pfbuf_append_char(&out, ch) != 0) goto oom;
             continue;
         }
-        py_raise(py_exc_new(PY_EXC_VALUEERROR, "unsupported format character"));
+        py_raise_owned(py_exc_new(PY_EXC_VALUEERROR, "unsupported format character"));
         goto fail;
     }
 
     if (tuple_mode && py_type_of(args) == PY_TYPE_TUPLE) {
         PyTupleObject *t = (PyTupleObject *)args;
         if (arg_index < t->len) {
-            py_raise(py_exc_new(PY_EXC_TYPEERROR, "not all arguments converted during string formatting"));
+            py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "not all arguments converted during string formatting"));
             goto fail;
         }
     }
@@ -1157,7 +1157,7 @@ PyObject *py_str_mod(PyObject *fmt_obj, PyObject *args) {
     return result;
 
 oom:
-    py_raise(py_exc_new(PY_EXC_RUNTIMEERROR, "out of memory"));
+    py_raise_owned(py_exc_new(PY_EXC_RUNTIMEERROR, "out of memory"));
 fail:
     free(out.data);
     return NULL;
@@ -1261,7 +1261,7 @@ static int bytes_mod_append_padded(
 PyObject *py_bytes_mod(PyObject *fmt_obj, PyObject *args) {
     int32_t fmt_tag = fmt_obj == NULL ? -1 : py_type_of(fmt_obj);
     if (fmt_tag != PY_TYPE_BYTES && fmt_tag != PY_TYPE_BYTEARRAY) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR,
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR,
                             "left operand of % must be bytes or bytearray"));
         return NULL;
     }
@@ -1297,11 +1297,11 @@ PyObject *py_bytes_mod(PyObject *fmt_obj, PyObject *args) {
             int64_t ke = ks;
             while (ke < fmt_len && fmt[ke] != ')') ke++;
             if (ke >= fmt_len) {
-                py_raise(py_exc_new(PY_EXC_VALUEERROR, "incomplete format key"));
+                py_raise_owned(py_exc_new(PY_EXC_VALUEERROR, "incomplete format key"));
                 goto fail;
             }
             if (py_type_of(args) != PY_TYPE_DICT) {
-                py_raise(py_exc_new(PY_EXC_TYPEERROR, "format requires a mapping"));
+                py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "format requires a mapping"));
                 goto fail;
             }
             PyObject *key = py_bytes_new(fmt + ks, ke - ks);
@@ -1309,7 +1309,7 @@ PyObject *py_bytes_mod(PyObject *fmt_obj, PyObject *args) {
             PyObject *val = py_dict_get(args, key);
             py_decref(key);
             if (val == NULL) {
-                py_raise(py_exc_new(PY_EXC_KEYERROR, "format key not found"));
+                py_raise_owned(py_exc_new(PY_EXC_KEYERROR, "format key not found"));
                 goto fail;
             }
             py_decref(val);            /* dict retains ownership; borrow it */
@@ -1326,7 +1326,7 @@ PyObject *py_bytes_mod(PyObject *fmt_obj, PyObject *args) {
         }
         while (i < fmt_len && strchr("hlLzjt", fmt[i]) != NULL) i++;
         if (i >= fmt_len) {
-            py_raise(py_exc_new(PY_EXC_VALUEERROR, "incomplete format"));
+            py_raise_owned(py_exc_new(PY_EXC_VALUEERROR, "incomplete format"));
             goto fail;
         }
         char conv = fmt[i];
@@ -1337,7 +1337,7 @@ PyObject *py_bytes_mod(PyObject *fmt_obj, PyObject *args) {
         if (has_mapping) {
             int64_t body_len = i - body_start + 1;   /* flags .. conv */
             if (body_len + 1 >= (int64_t)sizeof(specbuf)) {
-                py_raise(py_exc_new(PY_EXC_VALUEERROR, "format spec too long"));
+                py_raise_owned(py_exc_new(PY_EXC_VALUEERROR, "format spec too long"));
                 goto fail;
             }
             specbuf[0] = '%';
@@ -1356,7 +1356,7 @@ PyObject *py_bytes_mod(PyObject *fmt_obj, PyObject *args) {
             if (adata == NULL) {
                 /* CPython: str (and any non-bytes-like) is a TypeError for
                  * bytes %s / %b. */
-                py_raise(py_exc_new(PY_EXC_TYPEERROR,
+                py_raise_owned(py_exc_new(PY_EXC_TYPEERROR,
                     "%b requires a bytes-like object, or an object that "
                     "implements __bytes__"));
                 goto fail;
@@ -1375,7 +1375,7 @@ PyObject *py_bytes_mod(PyObject *fmt_obj, PyObject *args) {
             if (s == NULL || py_type_of(s) != PY_TYPE_STR) {
                 if (s != NULL) py_decref(s);
                 if (py_err_occurred() == 0) {
-                    py_raise(py_exc_new(PY_EXC_TYPEERROR,
+                    py_raise_owned(py_exc_new(PY_EXC_TYPEERROR,
                         "format argument cannot be converted"));
                 }
                 goto fail;
@@ -1393,7 +1393,7 @@ PyObject *py_bytes_mod(PyObject *fmt_obj, PyObject *args) {
         if (conv == 'd' || conv == 'i' || conv == 'u' || conv == 'x' || conv == 'X' || conv == 'o') {
             char cfmt[96];
             if (percent_copy_spec(cfmt, (int)sizeof(cfmt), specptr, spec_use_len, conv, "ll") != 0) {
-                py_raise(py_exc_new(PY_EXC_VALUEERROR, "unsupported format specifier"));
+                py_raise_owned(py_exc_new(PY_EXC_VALUEERROR, "unsupported format specifier"));
                 goto fail;
             }
             int64_t v = 0;
@@ -1405,7 +1405,7 @@ PyObject *py_bytes_mod(PyObject *fmt_obj, PyObject *args) {
                 v = py_int_to_i64(arg, &overflow);
                 if (overflow) v = py_int_value_i64(arg);
             } else {
-                py_raise(py_exc_new(PY_EXC_TYPEERROR,
+                py_raise_owned(py_exc_new(PY_EXC_TYPEERROR,
                     "%d format: a real number is required"));
                 goto fail;
             }
@@ -1419,7 +1419,7 @@ PyObject *py_bytes_mod(PyObject *fmt_obj, PyObject *args) {
         if (conv == 'e' || conv == 'E' || conv == 'f' || conv == 'F' || conv == 'g' || conv == 'G') {
             char cfmt[96];
             if (percent_copy_spec(cfmt, (int)sizeof(cfmt), specptr, spec_use_len, conv, NULL) != 0) {
-                py_raise(py_exc_new(PY_EXC_VALUEERROR, "unsupported format specifier"));
+                py_raise_owned(py_exc_new(PY_EXC_VALUEERROR, "unsupported format specifier"));
                 goto fail;
             }
             double v = py_float_to_f64(arg);
@@ -1431,7 +1431,7 @@ PyObject *py_bytes_mod(PyObject *fmt_obj, PyObject *args) {
             const char *adata = bytes_mod_payload(arg, &alen);
             if (adata != NULL) {
                 if (alen != 1) {
-                    py_raise(py_exc_new(PY_EXC_TYPEERROR,
+                    py_raise_owned(py_exc_new(PY_EXC_TYPEERROR,
                         "%c requires an integer in range(256) or a single byte"));
                     goto fail;
                 }
@@ -1445,12 +1445,12 @@ PyObject *py_bytes_mod(PyObject *fmt_obj, PyObject *args) {
             } else if (tag == PY_TYPE_INT) {
                 v = py_int_value_i64(arg);
             } else {
-                py_raise(py_exc_new(PY_EXC_TYPEERROR,
+                py_raise_owned(py_exc_new(PY_EXC_TYPEERROR,
                     "%c requires an integer in range(256) or a single byte"));
                 goto fail;
             }
             if (v < 0 || v > 255) {
-                py_raise(py_exc_new(PY_EXC_VALUEERROR,
+                py_raise_owned(py_exc_new(PY_EXC_VALUEERROR,
                     "%c arg not in range(256)"));
                 goto fail;
             }
@@ -1458,14 +1458,14 @@ PyObject *py_bytes_mod(PyObject *fmt_obj, PyObject *args) {
             if (pfbuf_append_char(&out, ch) != 0) goto oom;
             continue;
         }
-        py_raise(py_exc_new(PY_EXC_VALUEERROR, "unsupported format character"));
+        py_raise_owned(py_exc_new(PY_EXC_VALUEERROR, "unsupported format character"));
         goto fail;
     }
 
     if (tuple_mode && py_type_of(args) == PY_TYPE_TUPLE) {
         PyTupleObject *t = (PyTupleObject *)args;
         if (arg_index < t->len) {
-            py_raise(py_exc_new(PY_EXC_TYPEERROR, "not all arguments converted during bytes formatting"));
+            py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "not all arguments converted during bytes formatting"));
             goto fail;
         }
     }
@@ -1481,7 +1481,7 @@ PyObject *py_bytes_mod(PyObject *fmt_obj, PyObject *args) {
     return result;
 
 oom:
-    py_raise(py_exc_new(PY_EXC_RUNTIMEERROR, "out of memory"));
+    py_raise_owned(py_exc_new(PY_EXC_RUNTIMEERROR, "out of memory"));
 fail:
     free(out.data);
     return NULL;

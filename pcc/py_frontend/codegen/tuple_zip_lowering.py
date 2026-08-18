@@ -347,8 +347,18 @@ class TupleZipLoweringMixin:
         as ``list(zip(xs, ys))`` and dict construction helpers in the
         bootstrap pipeline without pulling in CPython's iterator object.
         """
-        if expr.kwargs or not expr.args:
+        if not expr.args:
             return None
+        strict_expr = None
+        for kwarg_name, kwarg_value in expr.kwargs:
+            if kwarg_name != "strict":
+                return None
+            strict_expr = kwarg_value
+        # ``strict`` is enforced below (ValueError on unequal lengths, as in
+        # CPython).  The for-loop rewrite
+        # (``for_normalization_lowering._for_iter_is_zip``) declines any
+        # kwarg'd zip and routes it here, so this is the single owner of the
+        # strict semantics.
         if self._is_starred_unpack(expr.args):
             # zip(*rows): runtime-variadic transpose. The static path below
             # fixes the tuple width at len(expr.args); a *splat needs the
@@ -366,6 +376,15 @@ class TupleZipLoweringMixin:
             )
         src_objs: list[ir.Value] = []
         lengths: list[ir.Value] = []
+        # Fail-closed edges are emitted for DynType sources only; statically
+        # known sources cannot raise from len/getitem, and the cost guard in
+        # tests/python/test_native_container_builtin_error_paths.py pins
+        # that static shapes gain no checks.
+        src_can_raise: list[bool] = []
+        # ``py_dict_keys`` returns a NEW list ref (py_runtime.h).  Every one
+        # materialised below is owned by this expression and must be released
+        # at the exit, or ``zip(mapping, ...)`` leaks one list per call.
+        owned_dict_keys: list[ir.Value] = []
         for i, arg in enumerate(expr.args):
             raw = self._emit_expr(arg)
             obj = self._emit_value_as_pcc_object_or_bridge(
@@ -373,6 +392,22 @@ class TupleZipLoweringMixin:
                 arg.ty,
                 f"zip.arg.{i}.bridge",
             )
+            src_can_raise.append(
+                isinstance(arg.ty, DynType) or _type_name(arg.ty) == "dyn"
+            )
+            if isinstance(arg.ty, DictType) or _type_name(arg.ty) == "dict":
+                # The loop below walks each source positionally with
+                # py_obj_getitem, and for a dict that is a KEY lookup for
+                # 0, 1, 2 …  Iterating a mapping yields its keys, so
+                # materialise them first — the same normalisation
+                # ``tuple(dict)`` above already does.  Without it
+                # ``zip(d, ...)`` raised KeyError on a string-keyed dict.
+                obj = self.builder.call(
+                    self.runtime["py_dict_keys"],
+                    [obj],
+                    name=self._fresh(f"zip.arg.{i}.dict.keys"),
+                )
+                owned_dict_keys.append(obj)
             src_objs.append(obj)
             lengths.append(
                 self.builder.call(
@@ -381,6 +416,68 @@ class TupleZipLoweringMixin:
                     name=self._fresh(f"zip.len.{i}"),
                 )
             )
+            if src_can_raise[-1]:
+                # A dyn source's user __len__ can raise; the keys views
+                # acquired so far are live owned references on that edge.
+                self._emit_post_call_err_check(
+                    expr.span,
+                    release_on_error=tuple(owned_dict_keys),
+                )
+                # py_obj_len returned 0 silently for a dyn-held scalar, so
+                # zip(t, 5) answered [] where CPython raises TypeError.
+                self._emit_non_iterable_scalar_guard(
+                    obj,
+                    "zip",
+                    release_first=tuple(owned_dict_keys),
+                )
+        fn = self.current_function
+        if strict_expr is not None and len(lengths) > 1:
+            strict_i1 = self._emit_condition_value(strict_expr)
+            mismatch = ir.Constant(ir.IntType(1), 0)
+            for i, n_val in enumerate(lengths[1:], start=1):
+                ne_i = self.builder.icmp_signed(
+                    "!=",
+                    n_val,
+                    lengths[0],
+                    name=self._fresh(f"zip.strict.ne.{i}"),
+                )
+                mismatch = self.builder.or_(
+                    mismatch,
+                    ne_i,
+                    name=self._fresh(f"zip.strict.any.{i}"),
+                )
+            violated = self.builder.and_(
+                strict_i1,
+                mismatch,
+                name=self._fresh("zip.strict.violated"),
+            )
+            bad_bb = fn.append_basic_block(
+                name=self._fresh("zip.strict.bad")
+            )
+            ok_bb = fn.append_basic_block(name=self._fresh("zip.strict.ok"))
+            self.builder.cbranch(violated, bad_bb, ok_bb)
+            self.builder.position_at_end(bad_bb)
+            for keys in owned_dict_keys:
+                self._gc_release(
+                    keys, self._release_context_label("zip.strict.bad")
+                )
+            message = self._ptr_to_cstr(
+                self._cstr_global(
+                    "zip() arguments have different lengths (strict=True)",
+                    ".zip.strict.valueerror",
+                )
+            )
+            exc = self.builder.call(
+                self.runtime["py_exc_new"],
+                [ir.Constant(_I64, 2), message],
+                name=self._fresh("zip.strict.exc"),
+            )
+            self.builder.call(self.runtime["py_raise"], [exc])
+            err_target = (
+                self._current_try_err_block() or self._ensure_fn_err_exit()
+            )
+            self.builder.branch(err_target)
+            self.builder.position_at_end(ok_bb)
         min_len = lengths[0]
         for i, n_val in enumerate(lengths[1:], start=1):
             take_n = self.builder.icmp_signed(
@@ -435,11 +532,82 @@ class TupleZipLoweringMixin:
                 [src_obj, idx_box],
                 name=self._fresh(f"zip.elem.{i}"),
             )
+            if src_can_raise[i]:
+                # A dyn source's getitem can raise (user __getitem__);
+                # without this check the walk kept looping, stored NULL
+                # into the result tuples, and returned a silently corrupt
+                # list.  elem is the raising call's own NULL return
+                # (pcc_gc_release is NULL-safe); the partial tuple, index
+                # box, result list under construction, and every keys view
+                # are live owned references on this edge.
+                self._emit_post_call_err_check(
+                    expr.span,
+                    release_on_error=(
+                        elem,
+                        item,
+                        idx_box,
+                        result,
+                        *owned_dict_keys,
+                    ),
+                )
+                # py_obj_getitem also returns NULL WITHOUT raising for a
+                # missing dict key (py_dict_get is the silent variant) and
+                # for unsupported tags; fail closed instead of building a
+                # NULL-slotted tuple.
+                elem_null = self.builder.icmp_unsigned(
+                    "==",
+                    elem,
+                    ir.Constant(elem.type, None),
+                    name=self._fresh(f"zip.elem.null.{i}"),
+                )
+                badelem_bb = fn.append_basic_block(
+                    name=self._fresh(f"zip.elem.bad.{i}")
+                )
+                elemok_bb = fn.append_basic_block(
+                    name=self._fresh(f"zip.elem.ok.{i}")
+                )
+                self.builder.cbranch(elem_null, badelem_bb, elemok_bb)
+                self.builder.position_at_end(badelem_bb)
+                for owned in (item, idx_box, result, *owned_dict_keys):
+                    self._gc_release(
+                        owned, self._release_context_label("zip.elem.bad")
+                    )
+                message = self._ptr_to_cstr(
+                    self._cstr_global(
+                        "zip() argument is not indexable from 0..len-1"
+                        " (mappings iterate by key in CPython; unsupported"
+                        " here for dyn sources)",
+                        ".zip.dyn.typeerror",
+                    )
+                )
+                exc = self.builder.call(
+                    self.runtime["py_exc_new"],
+                    [ir.Constant(_I64, 3), message],
+                    name=self._fresh("zip.dyn.exc"),
+                )
+                self.builder.call(self.runtime["py_raise"], [exc])
+                err_target = (
+                    self._current_try_err_block()
+                    or self._ensure_fn_err_exit()
+                )
+                self.builder.branch(err_target)
+                self.builder.position_at_end(elemok_bb)
             self.builder.call(
                 self.runtime["py_tuple_set_item"],
                 [item, ir.Constant(_I64, i), elem],
             )
+            # py_obj_getitem returns a NEW ref and py_tuple_set_item RETAINS
+            # what it stores (py_incref on the GC0 path, the balanced
+            # pcc_gc_store_ptr otherwise), so this reference is ours to drop.
+            self._gc_release(
+                elem, self._release_context_label(f"zip.elem.{i}")
+            )
         self.builder.call(self.runtime["py_list_append"], [result, item])
+        # py_list_append retains as well, so the freshly built tuple is ours.
+        self._gc_release(item, self._release_context_label("zip.item"))
+        # py_int_from_i64 also returns a NEW ref; py_obj_getitem only reads
+        # the index, it does not take it.
+        self._gc_release(idx_box, self._release_context_label("zip.idx.box"))
         self.builder.branch(step_bb)
 
         self.builder.position_at_end(step_bb)
@@ -452,4 +620,6 @@ class TupleZipLoweringMixin:
         self.builder.branch(cond_bb)
 
         self.builder.position_at_end(end_bb)
+        for keys in owned_dict_keys:
+            self._gc_release(keys, self._release_context_label("zip.dict.keys"))
         return result

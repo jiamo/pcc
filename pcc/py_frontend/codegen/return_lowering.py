@@ -59,6 +59,16 @@ class ReturnLoweringMixin:
             return False
         if value in getattr(self, "_cpy_values", ()):
             return False
+        if self._value_is_owned_object(value):
+            # The emitter registered this SSA value as carrying one owner (a
+            # py_obj_getattr / py_obj_call result on the dynamic path).  The
+            # AST-shape classifier below answers "not owned" for Attr and
+            # dynamic Call, which retained a SECOND reference and returned that
+            # copy while the original leaked (the attribute object's finalizer
+            # never ran).  The ledger is authoritative, as it already is for
+            # every borrowing consumer via _gc_release_if_owned: transfer the
+            # existing owner to the caller without a retain.
+            return False
         expr = stmt.value
         if self._expr_returns_unsafe_raw_pointer(expr):
             return False

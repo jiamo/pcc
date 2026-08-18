@@ -22,6 +22,9 @@ tagged pointers come from malloc (8-byte aligned) so low bit is 0.
 Public object type tags come from the generated ``py_abi_constants`` module.
 The runtime-error exception-table code remains owned by the exception ABI.
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_EXC,
     PY_TYPE_INSTANCE,

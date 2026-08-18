@@ -14,6 +14,7 @@ import hashlib
 import json
 import os
 import platform
+import resource
 import shutil
 import signal
 import subprocess
@@ -27,8 +28,15 @@ REPO_ROOT = Path(__file__).absolute().parents[1]
 WORKLOAD = REPO_ROOT / "benchmarks" / "python" / "longrun_churn.py"
 DEFAULT_ROUNDS = 100_000
 MANUAL_ENV = "PCC_GC_LONGRUN"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 MAX_PERSISTED_SAMPLES = 25
+MIN_THROUGHPUT_OPS_PER_SEC = 240_000
+MAX_PEAK_RSS_BYTES = 10_000_000
+MAX_STEADY_DRIFT_BYTES_PER_MILLION_OPS = 65_536
+MAX_CPU_US_PER_MILLION_OPS = 5_000_000
+MAX_ALLOCATOR_FRAGMENTATION_BYTES = 10_000_000
+MAX_PAUSE_US = 10_000
+GC4_RETAINED_ZPAGE_GAP_LIMIT = 504_992
 FIELD_NAMES = (
     "elapsed_ms",
     "rss_bytes",
@@ -246,15 +254,45 @@ def _persisted_samples(samples: list[dict[str, int]]) -> list[dict[str, int]]:
     return [samples[index] for index in indexes]
 
 
-def run_backend(executable: Path, *, backend: int, rounds: int, timeout: int) -> dict[str, Any]:
+def _child_cpu_usage_us() -> tuple[int, int]:
+    usage = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return int(usage.ru_utime * 1_000_000), int(usage.ru_stime * 1_000_000)
+
+
+def run_backend(
+    executable: Path,
+    *,
+    backend: int,
+    rounds: int,
+    timeout: int,
+    repeat_index: int = 1,
+) -> dict[str, Any]:
     env = os.environ.copy()
     env["PCC_GC_BACKEND"] = str(backend)
-    print(f"[gc-longrun] backend={backend} rounds={rounds} start", file=sys.stderr, flush=True)
+    print(
+        f"[gc-longrun] backend={backend} repeat={repeat_index} "
+        f"rounds={rounds} start",
+        file=sys.stderr,
+        flush=True,
+    )
+    user_before_us, system_before_us = _child_cpu_usage_us()
     result = _run_checked([str(executable), str(rounds)], timeout=timeout, env=env)
+    user_after_us, system_after_us = _child_cpu_usage_us()
     samples, completed_ops = parse_samples(result.stdout, backend=backend)
     summary = _summarize(samples, completed_ops)
+    user_cpu_us = max(0, user_after_us - user_before_us)
+    system_cpu_us = max(0, system_after_us - system_before_us)
+    total_cpu_us = user_cpu_us + system_cpu_us
+    summary["process_user_cpu_us"] = user_cpu_us
+    summary["process_system_cpu_us"] = system_cpu_us
+    summary["process_total_cpu_us"] = total_cpu_us
+    summary["cpu_us_per_million_ops"] = (
+        total_cpu_us * 1_000_000 // max(1, completed_ops)
+    )
     print(
-        f"[gc-longrun] backend={backend} done elapsed_ms={summary['elapsed_ms']} "
+        f"[gc-longrun] backend={backend} repeat={repeat_index} "
+        f"done elapsed_ms={summary['elapsed_ms']} "
+        f"cpu_us={summary['process_total_cpu_us']} "
         f"rss_peak={summary['rss_peak_bytes']}",
         file=sys.stderr,
         flush=True,
@@ -262,10 +300,105 @@ def run_backend(executable: Path, *, backend: int, rounds: int, timeout: int) ->
     persisted = _persisted_samples(samples)
     return {
         "backend": backend,
+        "repeat_index": repeat_index,
         "summary": summary,
         "samples_total": len(samples),
         "samples_persisted": len(persisted),
         "samples": persisted,
+    }
+
+
+def _aggregate_results(
+    results: list[dict[str, Any]],
+    backends: tuple[int, ...],
+) -> list[dict[str, int]]:
+    aggregates: list[dict[str, int]] = []
+    for backend in backends:
+        rows = [row["summary"] for row in results if row["backend"] == backend]
+        aggregates.append(
+            {
+                "backend": backend,
+                "repeats": len(rows),
+                "median_throughput_ops_per_sec": int(
+                    median(row["throughput_ops_per_sec"] for row in rows)
+                ),
+                "median_cpu_us_per_million_ops": int(
+                    median(row["cpu_us_per_million_ops"] for row in rows)
+                ),
+                "max_peak_rss_bytes": max(row["rss_peak_bytes"] for row in rows),
+                "max_positive_steady_rss_drift_bytes_per_million_ops": max(
+                    max(0, row["steady_rss_drift_bytes_per_million_ops"])
+                    for row in rows
+                ),
+                "max_pause_us": max(row["pause_max_us"] for row in rows),
+                "max_allocator_fragmentation_bytes": max(
+                    row["allocator_fragmentation_bytes"] for row in rows
+                ),
+                "max_zpage_retained_gap_bytes": max(
+                    row["zpage_retained_gap_bytes"] for row in rows
+                ),
+            }
+        )
+    return aggregates
+
+
+def evaluate_resource_budget(
+    aggregates: list[dict[str, int]],
+) -> dict[str, Any]:
+    violations: list[str] = []
+    for row in aggregates:
+        backend = row["backend"]
+        checks = (
+            (
+                "median_throughput_ops_per_sec",
+                row["median_throughput_ops_per_sec"] >= MIN_THROUGHPUT_OPS_PER_SEC,
+            ),
+            ("max_peak_rss_bytes", row["max_peak_rss_bytes"] <= MAX_PEAK_RSS_BYTES),
+            (
+                "max_positive_steady_rss_drift_bytes_per_million_ops",
+                row["max_positive_steady_rss_drift_bytes_per_million_ops"]
+                <= MAX_STEADY_DRIFT_BYTES_PER_MILLION_OPS,
+            ),
+            (
+                "median_cpu_us_per_million_ops",
+                row["median_cpu_us_per_million_ops"]
+                <= MAX_CPU_US_PER_MILLION_OPS,
+            ),
+            ("max_pause_us", row["max_pause_us"] < MAX_PAUSE_US),
+            (
+                "max_allocator_fragmentation_bytes",
+                row["max_allocator_fragmentation_bytes"]
+                <= MAX_ALLOCATOR_FRAGMENTATION_BYTES,
+            ),
+        )
+        for metric, passed in checks:
+            if not passed:
+                violations.append(f"gc{backend}:{metric}={row[metric]}")
+        if (
+            backend == 4
+            and row["max_zpage_retained_gap_bytes"]
+            > GC4_RETAINED_ZPAGE_GAP_LIMIT
+        ):
+            violations.append(
+                "gc4:max_zpage_retained_gap_bytes="
+                + str(row["max_zpage_retained_gap_bytes"])
+            )
+    return {
+        "status": "PASS" if not violations else "FAIL",
+        "violations": violations,
+        "thresholds": {
+            "min_median_throughput_ops_per_sec": MIN_THROUGHPUT_OPS_PER_SEC,
+            "max_peak_rss_bytes": MAX_PEAK_RSS_BYTES,
+            "max_positive_steady_rss_drift_bytes_per_million_ops": (
+                MAX_STEADY_DRIFT_BYTES_PER_MILLION_OPS
+            ),
+            "max_median_cpu_us_per_million_ops": MAX_CPU_US_PER_MILLION_OPS,
+            "max_allocator_fragmentation_bytes": (
+                MAX_ALLOCATOR_FRAGMENTATION_BYTES
+            ),
+            "max_pause_us_exclusive": MAX_PAUSE_US,
+            "gc4_max_zpage_retained_gap_bytes": GC4_RETAINED_ZPAGE_GAP_LIMIT,
+        },
     }
 
 
@@ -275,6 +408,7 @@ def run_gate(
     backends: tuple[int, ...],
     build_timeout: int,
     backend_timeout: int,
+    repeats: int = 1,
 ) -> dict[str, Any]:
     if rounds >= DEFAULT_ROUNDS and not manual_gate_enabled():
         raise GCLongrunGateError(
@@ -284,16 +418,22 @@ def run_gate(
         raise GCLongrunGateError("rounds must be at least 600 for three samples")
     if not backends or any(backend < 0 or backend > 4 for backend in backends):
         raise GCLongrunGateError(f"invalid backend set: {backends}")
+    if repeats < 1 or repeats > 10:
+        raise GCLongrunGateError("repeats must be between 1 and 10")
     executable, digest, binary_digest = build_workload(timeout=build_timeout)
-    results = [
-        run_backend(
-            executable,
-            backend=backend,
-            rounds=rounds,
-            timeout=backend_timeout,
-        )
-        for backend in backends
-    ]
+    results = []
+    for repeat_index in range(1, repeats + 1):
+        for backend in backends:
+            results.append(
+                run_backend(
+                    executable,
+                    backend=backend,
+                    rounds=rounds,
+                    timeout=backend_timeout,
+                    repeat_index=repeat_index,
+                )
+            )
+    aggregates = _aggregate_results(results, backends)
     return {
         "schema_version": SCHEMA_VERSION,
         "harness": "pcc-gc-longrun-churn",
@@ -306,10 +446,13 @@ def run_gate(
         "machine": platform.machine(),
         "python_driver": platform.python_version(),
         "rounds": rounds,
+        "repeats": repeats,
         "live_set": 2048,
         "sample_every_rounds": 200,
         "backends": list(backends),
         "results": results,
+        "aggregates": aggregates,
+        "resource_budget": evaluate_resource_budget(aggregates),
         "claim_boundary": (
             "Current-machine, source-bound, strict no-libpython/self-backend "
             "steady-live-set churn profile. Pause buckets are runtime telemetry; "
@@ -332,6 +475,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--backends", type=_parse_backends, default=(0, 1, 2, 3, 4))
     parser.add_argument("--build-timeout", type=int, default=240)
     parser.add_argument("--backend-timeout", type=int, default=180)
+    parser.add_argument("--repeats", type=int, default=1)
+    parser.add_argument("--enforce-resource-budget", action="store_true")
     parser.add_argument("--output", type=Path)
     parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args(argv)
@@ -341,6 +486,7 @@ def main(argv: list[str] | None = None) -> int:
             backends=args.backends,
             build_timeout=args.build_timeout,
             backend_timeout=args.backend_timeout,
+            repeats=args.repeats,
         )
     except (OSError, GCLongrunGateError) as exc:
         print(f"gc longrun gate failed: {exc}", file=sys.stderr)
@@ -351,6 +497,11 @@ def main(argv: list[str] | None = None) -> int:
         args.output.write_text(blob, encoding="utf-8")
     if not args.quiet:
         sys.stdout.write(blob)
+    if (
+        args.enforce_resource_budget
+        and manifest["resource_budget"]["status"] != "PASS"
+    ):
+        return 3
     return 0
 
 

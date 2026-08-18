@@ -5,6 +5,8 @@ They preserve CPython's non-null zero-size convention without introducing a
 second allocator or object-layout policy in the C-API layer.
 """
 
+__pcc_runtime_port__ = True
+
 from pcc.extern import c_abi_export, c_int64, c_ptr, c_void, extern
 from pcc.unsafe import (
     calloc,
@@ -23,6 +25,9 @@ pcc_gc_pointer_unregister = extern(
 )
 pcc_gc_pointer_is_managed = extern(
     "pcc_gc_pointer_is_managed", (c_ptr,), c_int64
+)
+pcc_gc_granule_object_retire = extern(
+    "pcc_gc_granule_object_retire", (c_ptr,), c_int64
 )
 pcc_gc_note_object_freeing = extern(
     "pcc_gc_note_object_freeing", (c_ptr,), c_void
@@ -103,5 +108,14 @@ def PyObject_Realloc(ptr, new_size: int) -> c_ptr:
 def PyObject_Free(ptr) -> None:
     if pcc_gc_pointer_is_managed(ptr) != 0:
         pcc_gc_note_object_freeing(ptr)
-        pcc_gc_pointer_unregister(ptr)
+        # A corrupt ordinary-slab lifecycle must stay quarantined.  Returning
+        # the same address to PyMem_Free would overwrite the invalid state and
+        # make a later reuse look like a valid allocator transition.
+        if pcc_gc_pointer_unregister(ptr) < 0:
+            return
+    elif pcc_gc_granule_object_retire(ptr) < 0:
+        # Backend 0 has no object-index/exact-set fallback for ordinary LIVE
+        # slab cells.  A corrupt marker therefore makes the pointer appear
+        # unmanaged, but it must still be quarantined rather than recycled.
+        return
     PyMem_Free(ptr)

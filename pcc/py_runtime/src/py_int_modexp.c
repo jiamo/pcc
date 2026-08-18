@@ -37,7 +37,7 @@ PyObject *py_int_pow_mod(PyObject *base, PyObject *exp, PyObject *mod) {
      * front (before the first py_int_mod, which would otherwise return a bare
      * NULL for a zero divisor with no exception set). */
     if (py_int_cmp(mod, zero) == 0) {
-        py_raise(py_exc_new(PY_EXC_VALUEERROR,
+        py_raise_owned(py_exc_new(PY_EXC_VALUEERROR,
                             "pow() 3rd argument cannot be 0"));
         py_decref(one);
         py_decref(zero);
@@ -49,7 +49,7 @@ PyObject *py_int_pow_mod(PyObject *base, PyObject *exp, PyObject *mod) {
      * matching-typed error (ValueError) instead of returning a wrong result or
      * a silent NULL. */
     if (py_int_cmp(exp, zero) < 0) {
-        py_raise(py_exc_new(PY_EXC_VALUEERROR,
+        py_raise_owned(py_exc_new(PY_EXC_VALUEERROR,
                             "pow() negative exponent with modulus not "
                             "supported"));
         py_decref(one);
@@ -145,7 +145,7 @@ PyObject *py_int_isqrt(PyObject *n) {
 
     /* Negative argument: CPython raises ValueError. */
     if (py_int_cmp(n, zero) < 0) {
-        py_raise(py_exc_new(PY_EXC_VALUEERROR,
+        py_raise_owned(py_exc_new(PY_EXC_VALUEERROR,
                             "isqrt() argument must be nonnegative"));
         py_decref(zero);
         return NULL;

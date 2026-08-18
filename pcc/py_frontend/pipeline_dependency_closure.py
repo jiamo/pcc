@@ -776,10 +776,10 @@ def _is_pcc_owned_component_module(mod_name: str) -> bool:
 def _locate_pcc_owned_component_source(mod_name: str) -> Optional[str]:
     """Resolve an allow-listed first-party component from the pcc tree.
 
-    This is intentionally separate from stdlib discovery: ``pcc.gateway`` and
-    ``pcc.web`` retain their public pcc-qualified identity and are compiled
-    into the application closure by current pcc1.  Arbitrary pcc compiler
-    internals are not admitted through this route.
+    This is intentionally separate from stdlib discovery.  The allow-list is
+    empty today (the gateway and web framework live in their own repository
+    and resolve through the package site); arbitrary pcc compiler internals
+    are never admitted through this route.
     """
     if not _is_pcc_owned_component_module(mod_name):
         return None

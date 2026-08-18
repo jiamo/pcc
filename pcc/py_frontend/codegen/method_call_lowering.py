@@ -42,8 +42,23 @@ def _method_abi_type_matches(host, actual: ir.Type, expected: ir.Type) -> bool:
     loads/stores can insert the required casts.  A call boundary, however,
     emits LLVM opaque ``ptr`` and only the address space is ABI-significant.
     """
+    if actual is expected:
+        return actual is not None
     if isinstance(actual, ir.PointerType) and isinstance(expected, ir.PointerType):
         return getattr(actual, "addrspace", 0) == getattr(expected, "addrspace", 0)
+    if isinstance(actual, ir.LiteralStructType) and isinstance(expected, ir.LiteralStructType):
+        if actual.packed != expected.packed or len(actual.elements) != len(expected.elements):
+            return False
+        index = 0
+        while index < len(actual.elements):
+            if not _method_abi_type_matches(host, actual.elements[index], expected.elements[index]):
+                return False
+            index += 1
+        return True
+    if isinstance(actual, ir.ArrayType) and isinstance(expected, ir.ArrayType):
+        return actual.count == expected.count and _method_abi_type_matches(
+            host, actual.element, expected.element,
+        )
     return host._ir_type_matches(actual, expected)
 
 

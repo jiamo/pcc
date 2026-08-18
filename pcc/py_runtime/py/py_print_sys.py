@@ -12,6 +12,9 @@ PyStrObject layout (from py_internal.h):
     the pointer rather than load_ptr + add, since the whole point
     of the runtime ABI is that py_str_utf8 is stable.
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_INT,
     PY_TYPE_STR,

@@ -18,6 +18,9 @@
 #include "../include/py_runtime.h"
 
 int32_t py_class_attr_cache_epoch = 0;
+/* Classes that ever had __del__ installed; never decremented.  Mirrors the
+ * pcc_class_del_defined_count global in the py_class.py port. */
+int32_t pcc_class_del_defined_count = 0;
 PyObject *py_inst_field_cache_cls0 = NULL;
 PyObject *py_inst_field_cache_cls1 = NULL;
 PyObject *py_inst_field_cache_cls2 = NULL;

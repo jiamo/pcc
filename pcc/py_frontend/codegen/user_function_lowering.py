@@ -406,7 +406,12 @@ def _emit_thread_safepoint_poll_llvm(builder, llvm_module, fn, runtime) -> None:
     if block is not None and getattr(block, "terminator", None) is not None:
         return
     flag_gv = declare_runtime_global(llvm_module, "pcc_thread_stop_requested")
-    flag = builder.load(flag_gv, name="low.safepoint.flag")
+    flag = builder.load_atomic(
+        flag_gv,
+        "acquire",
+        4,
+        name="low.safepoint.flag",
+    )
     need_slow = builder.icmp_unsigned(
         "!=",
         flag,
@@ -1044,15 +1049,19 @@ class UserFunctionLoweringMixin:
         if not getattr(self, "_strict_no_libpython", False):
             return False
 
-        first_cpy_call = None
-        for block in fn.blocks:
-            for instr in block.instructions:
-                text = str(instr)
-                if "call " in text and "@py_cpy_" in text:
-                    first_cpy_call = text
+        direct_callee = fn._direct_first_libpython_callee
+        first_cpy_call = (
+            None if not direct_callee else "call @" + direct_callee
+        )
+        if first_cpy_call is None:
+            for block in fn.blocks:
+                for instr in block.instructions:
+                    text = str(instr)
+                    if "call " in text and "@py_cpy_" in text:
+                        first_cpy_call = text
+                        break
+                if first_cpy_call is not None:
                     break
-            if first_cpy_call is not None:
-                break
         if first_cpy_call is None:
             return False
 
@@ -1069,6 +1078,14 @@ class UserFunctionLoweringMixin:
             )
 
         fn.blocks.clear()
+        # The strict stub replaces the complete body.  The direct builder is
+        # the structured mirror of that body, so retaining it here leaves
+        # calls from the discarded CPython-backed implementation reachable in
+        # the direct call plane even though canonical LLVM text contains only
+        # the native fail-closed stub.
+        fn._direct_indexed_builder = None
+        fn._direct_indexed_function_cache = None
+        fn._direct_first_libpython_callee = ""
         entry = fn.append_basic_block(name="strict.nolib.stub")
         self.builder = ir.IRBuilder(entry)
         self._current_entry_block = entry
@@ -1092,7 +1109,41 @@ class UserFunctionLoweringMixin:
             self.builder.ret(self._zero_of(return_ty))
         return True
 
+    def _prologue_mark(self, tag: str) -> None:
+        """Sub-function-level marker: the statement marker stayed empty while
+        the function marker was set, so the failure is inside the prologue --
+        before the first statement is lowered.  Narrow that window."""
+        path = ""
+        try:
+            path = str(os.environ.get("PCC_STMT_PROGRESS_FILE", ""))
+        except Exception:
+            path = ""
+        if not path:
+            return
+        try:
+            s = open(path + ".pro." + str(os.getpid()), "w")
+            s.write(str(tag) + "\n")
+            s.close()
+        except Exception:
+            pass
+
     def _emit_user_function(self, fd: FuncDef) -> None:
+        # Function-level progress marker, same technique that localised the
+        # failing MODULE: under pcc1 a caught exception carries no traceback
+        # (verified) so the site cannot be recovered afterwards -- it has to be
+        # written down before the work.  Last value written is where it died.
+        _marker = ""
+        try:
+            _marker = str(os.environ.get("PCC_COMPILE_PROGRESS_FILE", ""))
+        except Exception:
+            _marker = ""
+        if _marker:
+            try:
+                _s = open(_marker + ".fn." + str(os.getpid()), "w", encoding="utf-8")
+                _s.write(str(getattr(self, "_codegen_current_module_name", "")) + " :: " + str(fd.name) + "\n")
+                _s.close()
+            except Exception:
+                pass
         debug_codegen = bool(os.environ.get("PCC_DEBUG_CODEGEN_PHASES"))
 
         if self._codegen_trace_is_enabled():
@@ -1172,6 +1223,11 @@ class UserFunctionLoweringMixin:
         saved_loop_stack = self.loop_stack
         saved_class = getattr(self, "current_class", None)
         saved_kind = getattr(self, "current_method_kind", None)
+        # Locations inside this body must name this subprogram as their scope;
+        # LLVM discards the compile unit if one points at an enclosing one.
+        saved_di_scope = self._di_declare_function(
+            fn, fd.name, getattr(getattr(fd, "span", None), "line", 0)
+        )
 
         if self._codegen_trace_is_enabled():
             self._codegen_current_stmt_index = -1
@@ -1623,6 +1679,7 @@ class UserFunctionLoweringMixin:
         finally:
             self._strict_stub_user_function_with_cpy_fallback(fn, fd)
             self.builder = saved_builder
+            self._di_restore_scope(saved_di_scope)
             self.current_function = saved_fn
             self.current_func_def = saved_fd
             self._current_entry_block = saved_entry_block

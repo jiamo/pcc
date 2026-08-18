@@ -101,16 +101,17 @@ PyObject *py_coroutine_new_native(
     if (made_captures) py_decref(captures);
     if (made_args) py_decref(args);
     py_gc_track((PyObject *)c);
+    pcc_gc_publish_initialized((PyObject *)c);
     return (PyObject *)c;
 }
 
 static PyCoroutineObject *checked_coroutine(PyObject *coro) {
     if (coro == NULL || PY_IS_TAGGED_INT(coro)) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "object is not a coroutine"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "object is not a coroutine"));
         return NULL;
     }
     if (py_type_of(coro) != PY_TYPE_COROUTINE) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "object is not a coroutine"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "object is not a coroutine"));
         return NULL;
     }
     return (PyCoroutineObject *)coro;
@@ -120,11 +121,11 @@ PyObject *py_coroutine_run(PyObject *coro) {
     PyCoroutineObject *c = checked_coroutine(coro);
     if (c == NULL) return NULL;
     if (c->closed != 0) {
-        py_raise(py_exc_new(PY_EXC_RUNTIMEERROR, "cannot reuse closed coroutine"));
+        py_raise_owned(py_exc_new(PY_EXC_RUNTIMEERROR, "cannot reuse closed coroutine"));
         return NULL;
     }
     if (c->done != 0) {
-        py_raise(py_exc_new(
+        py_raise_owned(py_exc_new(
             PY_EXC_RUNTIMEERROR,
             "cannot reuse already awaited coroutine"
         ));
@@ -250,7 +251,7 @@ PyObject *py_await(PyObject *awaitable) {
         py_decref(iter);
         return result;
     }
-    py_raise(py_exc_new(PY_EXC_TYPEERROR, "object is not awaitable"));
+    py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "object is not awaitable"));
     return NULL;
 }
 
@@ -279,12 +280,12 @@ static const void *continuation_chunk_frame_map(PyContinuationObject *c) {
 
 static PyContinuationObject *checked_continuation(PyObject *cont) {
     if (cont == NULL || PY_IS_TAGGED_INT(cont)) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "object is not a continuation"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "object is not a continuation"));
         return NULL;
     }
     cont = pcc_gc_note_relocation_read(cont);
     if (py_type_of(cont) != PY_TYPE_CONTINUATION) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "object is not a continuation"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "object is not a continuation"));
         return NULL;
     }
     return (PyContinuationObject *)cont;
@@ -308,7 +309,7 @@ static PyObject *py_continuation_new_with_abi(
 ) {
     int64_t n_slots = continuation_slot_count_from_map(frame_map);
     if (n_slots > 0 && slots == NULL) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "continuation slots are null"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "continuation slots are null"));
         return NULL;
     }
 
@@ -349,6 +350,7 @@ static PyObject *py_continuation_new_with_abi(
         pcc_gc_store_ptr((PyObject *)c, &stack_chunk->slots[i], slots[i]);
     }
     py_gc_track((PyObject *)c);
+    pcc_gc_publish_initialized((PyObject *)c);
     if (py_continuation_unmount((PyObject *)c, NULL, resume_pc) != 0) {
         py_decref((PyObject *)c);
         return NULL;
@@ -449,7 +451,7 @@ PyObject *py_continuation_get_slot(PyObject *cont, int64_t index) {
     PyContinuationObject *c = checked_continuation(cont);
     if (c == NULL || c->stack_chunk == NULL) return NULL;
     if (index < 0 || index >= c->stack_chunk->slot_count) {
-        py_raise(py_exc_new(PY_EXC_INDEXERROR, "continuation slot out of range"));
+        py_raise_owned(py_exc_new(PY_EXC_INDEXERROR, "continuation slot out of range"));
         return NULL;
     }
     PyObject *value = pcc_gc_load_ptr(cont, &c->stack_chunk->slots[index]);
@@ -466,7 +468,7 @@ int64_t py_continuation_set_slot(
     PyContinuationObject *c = checked_continuation(cont);
     if (c == NULL || c->stack_chunk == NULL) return -1;
     if (index < 0 || index >= c->stack_chunk->slot_count) {
-        py_raise(py_exc_new(PY_EXC_INDEXERROR, "continuation slot out of range"));
+        py_raise_owned(py_exc_new(PY_EXC_INDEXERROR, "continuation slot out of range"));
         return -1;
     }
     pcc_gc_store_ptr((PyObject *)c, &c->stack_chunk->slots[index], value);
@@ -476,12 +478,12 @@ int64_t py_continuation_set_slot(
 static PyTaskObject *checked_task(PyObject *task) {
     PyObject *original = task;
     if (task == NULL || PY_IS_TAGGED_INT(task)) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "object is not a task"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "object is not a task"));
         return NULL;
     }
     task = pcc_gc_note_relocation_read(task);
     if (py_type_of(task) != PY_TYPE_TASK) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "object is not a task"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "object is not a task"));
         return NULL;
     }
     if (task != original && py_type_of(original) == PY_TYPE_TASK) {
@@ -504,6 +506,7 @@ PyObject *py_task_new(PyObject *coro) {
     t->done = 0;
     pcc_gc_store_ptr((PyObject *)t, &t->coro, coro == NULL ? py_None : coro);
     py_gc_track((PyObject *)t);
+    pcc_gc_publish_initialized((PyObject *)t);
     return (PyObject *)t;
 }
 

@@ -10,7 +10,9 @@ from pcc.unsafe import (
     null,
     ptr_diff,
     ptr_is_null,
+    stack_alloc,
     store_i32,
+    store_ptr,
 )
 
 
@@ -30,6 +32,7 @@ pcc_gc_generational_step = extern(
 pcc_gc_backend4_step_remembered_roots = extern(
     "pcc_gc_backend4_step_remembered_roots", (c_int64,), c_int64
 )
+pcc_gc_backend3_drain_promotion_worklist = extern("pcc_gc_backend3_drain_promotion_worklist", (c_int64,), c_int64)
 pcc_gc_backend4_step_generation_aging = extern(
     "pcc_gc_backend4_step_generation_aging", (c_int64,), c_int64
 )
@@ -48,8 +51,8 @@ pcc_gc_tracing_step_cycle = extern(
 pcc_gc_tracing_record_pause = extern(
     "pcc_gc_tracing_record_pause", (c_int64, c_int64), c_void
 )
-pcc_gc_backend4_remap_and_retire_unlocked = extern(
-    "pcc_gc_backend4_remap_and_retire_unlocked", (), c_void
+pcc_gc_backend4_remap_and_retire_stopped_world = extern(
+    "pcc_gc_backend4_remap_and_retire_stopped_world", (), c_int64
 )
 pcc_stop_the_world = extern("pcc_stop_the_world", (), c_int64)
 pcc_resume_world = extern("pcc_resume_world", (), c_int64)
@@ -94,10 +97,29 @@ def _tracing_work_pending() -> i64:
     return pcc_gc_tracing_has_sweep_candidate()
 
 
+@c_abi_export("pcc_gc_sweep_owed")
+def pcc_gc_sweep_owed() -> i64:
+    # Mirror of the C predicate: a mark cycle completed and its sweep is still
+    # owed.  pcc_gc_finish_tracing_cycle is the only writer of the candidate
+    # flag and it clears mark_active in the same commit, so checking both is a
+    # mark-complete test.  Gating a sweep on the candidate flag alone is
+    # unsound - leftovers from a previous unfinished sweep read true mid-mark.
+    if _selected_backend() == 0:
+        return 0
+    if load_i32(global_addr("pcc_gc_mark_active"), 0) != 0:
+        return 0
+    return pcc_gc_tracing_has_sweep_candidate()
+
+
 @c_abi_export("pcc_gc_step")
 def pcc_gc_step(budget: i64) -> i64:
     backend: i64 = _selected_backend()
     if budget <= 0:
+        return 0
+    if (
+        backend == 4
+        and load_i32(global_addr("pcc_gc_backend4_remap_active"), 0) != 0
+    ):
         return 0
     if backend == 1 or backend == 2:
         return pcc_gc_incremental_concurrent_step(budget)
@@ -120,58 +142,61 @@ def pcc_gc_step(budget: i64) -> i64:
             processed = processed + pcc_gc_tracing_step_cycle(budget - processed)
     elif backend == 4:
         if load_i32(global_addr("pcc_gc_explicit_collect_active"), 0) != 0:
-            processed = processed + pcc_gc_tracing_step_cycle(budget - processed)
+            processed = processed + pcc_gc_backend3_drain_promotion_worklist(
+                budget - processed
+            )
+            if processed < budget:
+                processed = processed + pcc_gc_tracing_step_cycle(
+                    budget - processed
+                )
         else:
             processed = processed + pcc_gc_backend4_step_remembered_roots(
                 budget - processed
             )
-            if processed < budget:
-                processed = processed + pcc_gc_backend4_step_generation_aging(
-                    budget - processed
+            if (
+                load_i32(
+                    global_addr("pcc_gc_backend4_store_buffer_entries_count"),
+                    0,
                 )
-            if processed < budget:
-                processed = processed + pcc_gc_backend4_evacuation_page_drain(
-                    budget - processed
-                )
-            if processed < budget:
-                selected: i64 = pcc_gc_backend4_select_relocation_pages(
-                    budget - processed
-                )
-                if selected > 0:
-                    moved: i64 = pcc_gc_backend4_evacuation_page_drain(
+                == 0
+            ):
+                if processed < budget:
+                    processed = processed + pcc_gc_backend4_step_generation_aging(
                         budget - processed
                     )
-                    if moved > 0:
-                        processed = processed + moved
-                    else:
-                        processed = processed + selected
-            if processed < budget and _tracing_work_pending() != 0:
-                stw: i64 = pcc_stop_the_world()
-                processed = processed + pcc_gc_tracing_step_cycle(
-                    budget - processed
-                )
-                if stw == 0:
-                    pcc_resume_world()
-            if (
-                processed == 0
-                and load_i32(global_addr("pcc_gc_forwarding_population"), 0) > 0
-            ):
-                pcc_py_gc_minor_graph_lock()
-                before: i64 = load_i32(
-                    global_addr("pcc_gc_forwarding_population"), 0
-                )
-                if ptr_is_null(
-                    global_load_ptr("pcc_gc_relocation_set_head")
-                ) != 0:
-                    pcc_gc_backend4_remap_and_retire_unlocked()
-                after: i64 = load_i32(
-                    global_addr("pcc_gc_forwarding_population"), 0
-                )
-                pcc_py_gc_minor_graph_unlock()
-                if before > after:
-                    processed = processed + (before - after)
-                elif before > 0:
-                    processed = processed + 1
+                if processed < budget:
+                    processed = processed + pcc_gc_backend4_evacuation_page_drain(
+                        budget - processed
+                    )
+                if processed < budget:
+                    selected: i64 = pcc_gc_backend4_select_relocation_pages(
+                        budget - processed
+                    )
+                    if selected > 0:
+                        moved: i64 = pcc_gc_backend4_evacuation_page_drain(
+                            budget - processed
+                        )
+                        if moved > 0:
+                            processed = processed + moved
+                        else:
+                            processed = processed + selected
+                if processed < budget and _tracing_work_pending() != 0:
+                    stw: i64 = pcc_stop_the_world()
+                    processed = processed + pcc_gc_tracing_step_cycle(
+                        budget - processed
+                    )
+                    if stw == 0:
+                        pcc_resume_world()
+                if (
+                    processed == 0
+                    and load_i32(
+                        global_addr("pcc_gc_forwarding_population"), 0
+                    )
+                    > 0
+                ):
+                    processed = processed + (
+                        pcc_gc_backend4_remap_and_retire_stopped_world()
+                    )
 
     pcc_gc_tracing_record_pause(start_us, pcc_platform_monotonic_us())
     return processed
@@ -220,7 +245,20 @@ def pcc_gc_note_slot_write_barrier(owner, slot, value) -> None:
             owner_flags: i64 = load_i32(owner, 12)
             value_flags = load_i32(value, 12)
             should_shade: i64 = 0
-            if backend == 1 and (owner_flags & 32) != 0:
+            # Backend 1 shades a black owner's new white referent to keep the
+            # tricolor invariant DURING a marking cycle.  Outside a cycle there
+            # is no invariant to keep, and shading there used to also store
+            # mark_active=1 below - fabricating a cycle with no epoch, no
+            # whitening pass and no seeded roots.  The next explicit collect
+            # then saw an active cycle, skipped pcc_gc_begin_mark_cycle, traced
+            # nothing, finished that phantom cycle and computed an empty
+            # candidate set, so it reclaimed nothing at all.  Require an active
+            # cycle, exactly as the backend-2 arm below already does.
+            if (
+                backend == 1
+                and load_i32(global_addr("pcc_gc_mark_active"), 0) != 0
+                and (owner_flags & 32) != 0
+            ):
                 should_shade: i64 = 1
             if (
                 backend == 2

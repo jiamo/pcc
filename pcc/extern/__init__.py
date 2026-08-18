@@ -96,6 +96,13 @@ c_double = _CType("double", "double")
 # type-inference layer.
 c_ptr = _CType("ptr", "ptr")
 c_str = _CType("cstr", "ptr")
+# Return-position markers.  In normal (non-runtime-port) compilation a bare
+# ``c_ptr``/``c_str`` return is rejected because the frontend cannot tell a
+# PyObject* from raw memory: ``c_obj`` declares a Python object result and
+# ``c_rawptr`` a raw address, which pcc types as ``int`` so it never enters the
+# object refcount protocol.  Both lower to the same IR pointer type.
+c_obj = _CType("obj", "ptr")
+c_rawptr = _CType("rawptr", "ptr")
 
 
 @dataclass(frozen=True)
@@ -213,5 +220,5 @@ __all__ = [
     "c_uint8", "c_uint16", "c_uint32", "c_uint64",
     "c_int", "c_long", "c_size_t",
     "c_float", "c_double",
-    "c_ptr", "c_str",
+    "c_ptr", "c_str", "c_obj", "c_rawptr",
 ]

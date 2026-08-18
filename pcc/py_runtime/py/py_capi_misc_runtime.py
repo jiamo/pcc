@@ -13,6 +13,9 @@ Owned surface (stable C ABI names):
 Constants (inlined per the pcc-Python runtime-module contract):
   PY_EXC_TYPEERROR = 3
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_STR,
 )
@@ -28,6 +31,8 @@ from pcc.unsafe import (
     define_global_i8,
     define_global_ptr_null,
     global_addr,
+    global_load_ptr,
+    global_store_ptr,
     is_tagged_int,
     load_i32,
     load_i64,
@@ -35,6 +40,7 @@ from pcc.unsafe import (
     load_ptr,
     memset,
     null,
+    ptr_eq,
     ptr_is_null,
     stack_alloc,
     store_i64,
@@ -47,8 +53,13 @@ py_incref = extern("py_incref", (c_ptr,), c_void)
 py_exc_set_cause = extern("py_exc_set_cause", (c_ptr, c_ptr), c_void)
 py_exc_set_context = extern("py_exc_set_context", (c_ptr, c_ptr), c_void)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 free_c = extern("free", (c_ptr,), c_void)
+pcc_gc_unpin = extern("pcc_gc_unpin", (c_ptr,), c_void)
+pcc_py_gc_minor_graph_lock = extern("pcc_py_gc_minor_graph_lock", (), c_void)
+pcc_py_gc_minor_graph_unlock = extern("pcc_py_gc_minor_graph_unlock", (), c_void)
 
 # One main interpreter + thread state (single-interpreter no-libpython path).
 # The fake-libc opaque PyThreadState / PyInterpreterState pointers are
@@ -58,7 +69,7 @@ define_global_i64_array("pcc_capi_main_tstate_storage", 0)
 
 
 def _type_error(message) -> None:
-    py_raise(py_exc_new(3, message))  # PY_EXC_TYPEERROR
+    py_raise_owned(py_exc_new(3, message))  # PY_EXC_TYPEERROR
 
 
 @c_abi_typed_export("PyException_SetCause", "void", ("ptr", "ptr"))
@@ -107,10 +118,40 @@ def PyDictProxy_New(mapping) -> c_ptr:
 def PyBuffer_Release(view) -> None:
     if ptr_is_null(view):
         return
+    internal = load_ptr(view, 72)  # Py_buffer.internal
+    if not ptr_is_null(internal):
+        lease_owner = load_ptr(internal, 16)
+        view_owner = load_ptr(internal, 24)
+        if not ptr_is_null(lease_owner):
+            pcc_py_gc_minor_graph_lock()
+            node = global_load_ptr("pcc_capi_buffer_lease_head")
+            previous = null()
+            while not ptr_is_null(node) and ptr_eq(node, internal) == 0:
+                previous = node
+                node = load_ptr(node, 32)
+            if ptr_eq(node, internal):
+                nxt = load_ptr(internal, 32)
+                if ptr_is_null(previous):
+                    global_store_ptr("pcc_capi_buffer_lease_head", nxt)
+                else:
+                    store_ptr(previous, 32, nxt)
+            scan = global_load_ptr("pcc_capi_buffer_lease_head")
+            owner_still_leased: int = 0
+            view_still_leased: int = 0
+            while not ptr_is_null(scan):
+                if ptr_eq(load_ptr(scan, 16), lease_owner) or ptr_eq(load_ptr(scan, 24), lease_owner):
+                    owner_still_leased = 1
+                if ptr_eq(load_ptr(scan, 16), view_owner) or ptr_eq(load_ptr(scan, 24), view_owner):
+                    view_still_leased = 1
+                scan = load_ptr(scan, 32)
+            if owner_still_leased == 0:
+                pcc_gc_unpin(lease_owner)
+            if ptr_eq(view_owner, lease_owner) == 0 and view_still_leased == 0:
+                pcc_gc_unpin(view_owner)
+            pcc_py_gc_minor_graph_unlock()
     obj = load_ptr(view, 8)  # Py_buffer.obj at offset 8 (buf at 0)
     if not ptr_is_null(obj):
         py_decref(obj)
-    internal = load_ptr(view, 72)  # Py_buffer.internal
     if not ptr_is_null(internal):
         free_c(internal)
     memset(view, 0, 80)
@@ -173,7 +214,7 @@ py_dict_set = extern("py_dict_set", (c_ptr, c_ptr, c_ptr), c_int64)
 @c_abi_typed_export("PyUnicode_Format", "ptr", ("ptr", "ptr"))
 def PyUnicode_Format(format_obj, args) -> c_ptr:
     if ptr_is_null(format_obj):
-        py_raise(py_exc_new(3, cstr("PyUnicode_Format requires a format")))
+        py_raise_owned(py_exc_new(3, cstr("PyUnicode_Format requires a format")))
         return null()
     return py_str_mod(format_obj, args)
 
@@ -343,7 +384,7 @@ def pcc_capi_file_flush(fp) -> int:
 @c_abi_typed_export("PyObject_Print", "i32", ("ptr", "ptr", "i32"))
 def PyObject_Print(obj, fp, flags: int) -> int:
     if ptr_is_null(fp):
-        py_raise(py_exc_new(3, cstr("NULL FILE pointer")))  # PY_EXC_TYPEERROR
+        py_raise_owned(py_exc_new(3, cstr("NULL FILE pointer")))  # PY_EXC_TYPEERROR
         return -1
     if (flags & (1)) != 0:
         text = PyObject_Str(obj)
@@ -360,7 +401,7 @@ def PyObject_Print(obj, fp, flags: int) -> int:
     written = pcc_capi_file_write(raw, load_i64(size_slot, 0), fp)
     py_decref(text)
     if written != load_i64(size_slot, 0):
-        py_raise(py_exc_new(7, cstr("failed to write object")))  # PY_EXC_OSERROR
+        py_raise_owned(py_exc_new(7, cstr("failed to write object")))  # PY_EXC_OSERROR
         return -1
     pcc_capi_file_flush(fp)
     return 0

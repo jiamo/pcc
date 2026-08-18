@@ -9,6 +9,8 @@ and typed memory primitives.
 Returned by: PyClassObject*. Recursive on parent chain.
 """
 
+__pcc_runtime_port__ = True
+
 from pcc.extern import extern, c_abi_export, c_ptr, c_int32
 from pcc.py_runtime.py.py_abi_constants import (
     C_POINTER_SIZE,

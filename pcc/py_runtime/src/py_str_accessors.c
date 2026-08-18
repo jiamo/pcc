@@ -51,9 +51,21 @@ static int64_t byte_rfind(const char *hay, int64_t hay_len,
     }
     return -1;
 }
+static int64_t str_cp_len(PyStrObject *s);
+
 static int64_t byte_offset_to_cp_offset(PyStrObject *s, int64_t byte_off) {
     if (byte_off <= 0) return 0;
     if (byte_off >= s->byte_len) byte_off = s->byte_len;
+    /* All-ASCII fast path, mirroring utf8_byte_offset_for_codepoint below,
+     * which already had one for the opposite direction.  cp_len == byte_len
+     * means every byte is its own codepoint, so the byte offset already IS the
+     * codepoint offset; str_cp_len caches the count, so this is O(1) after the
+     * first call.  Without it every find()/index()/rfind() on a long string
+     * paid a scan from the start merely to convert its result: measured 65 ms
+     * -> 405 ms under pcc1 when a character loop was replaced by repeated
+     * find() calls (the same change is 6.4x FASTER on CPython, whose find is
+     * C-level and whose indices are O(1)). */
+    if (str_cp_len(s) == s->byte_len) return byte_off;
     return utf8_codepoint_count(s->data, byte_off);
 }
 
@@ -157,6 +169,11 @@ int64_t py_str_byte_len(PyObject *s) {
 const char *py_str_utf8(PyObject *s) {
     if (s == NULL) return "";
     return ((PyStrObject *)s)->data;
+}
+
+const char *pcc_capi_str_utf8_pinned(PyObject *s) {
+    pcc_gc_pin(s);
+    return py_str_utf8(s);
 }
 
 int64_t py_str_len(PyObject *s) {
@@ -580,7 +597,7 @@ int64_t py_str_istitle(PyObject *s) {
 int64_t py_str_index_of(PyObject *s, PyObject *sub) {
     int64_t idx = py_str_find(s, sub);
     if (idx < 0) {
-        py_raise(py_exc_new(PY_EXC_VALUEERROR, "substring not found"));
+        py_raise_owned(py_exc_new(PY_EXC_VALUEERROR, "substring not found"));
         return -1;
     }
     return idx;
@@ -590,7 +607,7 @@ int64_t py_str_index_of(PyObject *s, PyObject *sub) {
 int64_t py_str_rindex_of(PyObject *s, PyObject *sub) {
     int64_t idx = py_str_rfind(s, sub);
     if (idx < 0) {
-        py_raise(py_exc_new(PY_EXC_VALUEERROR, "substring not found"));
+        py_raise_owned(py_exc_new(PY_EXC_VALUEERROR, "substring not found"));
         return -1;
     }
     return idx;
@@ -601,7 +618,7 @@ int64_t py_str_index_of_range(PyObject *s, PyObject *sub,
                               int64_t start, int64_t end) {
     int64_t idx = py_str_find_range(s, sub, start, end);
     if (idx < 0) {
-        py_raise(py_exc_new(PY_EXC_VALUEERROR, "substring not found"));
+        py_raise_owned(py_exc_new(PY_EXC_VALUEERROR, "substring not found"));
         return -1;
     }
     return idx;
@@ -612,7 +629,7 @@ int64_t py_str_rindex_of_range(PyObject *s, PyObject *sub,
                                int64_t start, int64_t end) {
     int64_t idx = py_str_rfind_range(s, sub, start, end);
     if (idx < 0) {
-        py_raise(py_exc_new(PY_EXC_VALUEERROR, "substring not found"));
+        py_raise_owned(py_exc_new(PY_EXC_VALUEERROR, "substring not found"));
         return -1;
     }
     return idx;
@@ -1079,7 +1096,7 @@ PyObject *py_str_index(PyObject *s, PyObject *i) {
     int64_t cp_len = str_cp_len(ss);
     int64_t real = normalise_index(idx, cp_len);
     if (real < 0) {
-        py_raise(py_exc_new(PY_EXC_INDEXERROR, "string index out of range"));
+        py_raise_owned(py_exc_new(PY_EXC_INDEXERROR, "string index out of range"));
         return NULL;
     }
     int64_t bo = utf8_byte_offset_for_codepoint(ss, real);
@@ -1537,7 +1554,7 @@ PyObject *py_str_maketrans(PyObject *x, PyObject *y) {
     PyStrObject *sx = (PyStrObject *)x;
     PyStrObject *sy = (PyStrObject *)y;
     if (sx->byte_len != sy->byte_len) {
-        py_raise(py_exc_new(
+        py_raise_owned(py_exc_new(
             PY_EXC_VALUEERROR,
             "the first two maketrans arguments must have equal length"));
         return NULL;

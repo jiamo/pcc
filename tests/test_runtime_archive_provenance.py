@@ -11,6 +11,7 @@ from llvmlite import binding as llvm
 import pytest
 
 import pcc.tools.ir_to_obj as ir_to_obj_module
+import pcc.tools.runtime_archive_provenance as provenance_module
 from pcc.tools.ir_to_obj import emit_object, main as ir_to_obj_main
 from pcc.tools.runtime_archive_provenance import (
     MANIFEST_SCHEMA,
@@ -19,6 +20,7 @@ from pcc.tools.runtime_archive_provenance import (
     ProvenanceError,
     assemble_runtime_archive_manifest,
     capi_inventory_path_for_archive,
+    manifest_is_stale_for_current_codegen,
     receipt_path_for_object,
     verify_runtime_archive_manifest,
     write_pcc_python_receipt,
@@ -289,6 +291,59 @@ def _build_provenanced_archive(
         runtime_root=runtime_root,
     )
     return runtime_root, archive, objects, manifest
+
+
+def test_codegen_freshness_is_fail_closed_and_aggregates_all_members(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    current = "a" * 64
+    monkeypatch.setattr(provenance_module, "codegen_checksum", lambda: current)
+
+    assert not manifest_is_stale_for_current_codegen(
+        {
+            "members": [
+                {"codegen_checksum": current},
+                {"codegen_checksum": current},
+            ]
+        }
+    )
+    assert manifest_is_stale_for_current_codegen(
+        {
+            "members": [
+                {"codegen_checksum": current},
+                {"codegen_checksum": "b" * 64},
+            ]
+        }
+    )
+    assert manifest_is_stale_for_current_codegen(
+        {"members": [{"codegen_checksum": "unknown"}]}
+    )
+    assert manifest_is_stale_for_current_codegen({"members": [{}]})
+    assert manifest_is_stale_for_current_codegen({"members": []})
+    assert manifest_is_stale_for_current_codegen(None)
+
+
+def test_codegen_freshness_is_separate_from_manifest_integrity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime_root, archive, _objects, manifest = _build_provenanced_archive(tmp_path)
+    manifest_path = Path(str(archive) + ".provenance.json")
+    monkeypatch.setattr(
+        provenance_module,
+        "codegen_checksum",
+        lambda: "a" * 64,
+    )
+
+    manifest["members"][0]["codegen_checksum"] = "b" * 64
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    verified = verify_runtime_archive_manifest(archive, runtime_root=runtime_root)
+    assert manifest_is_stale_for_current_codegen(verified)
+
+    del manifest["members"][0]["codegen_checksum"]
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    verified = verify_runtime_archive_manifest(archive, runtime_root=runtime_root)
+    assert manifest_is_stale_for_current_codegen(verified)
 
 
 @pytest.mark.parametrize("archive_header", [b"not-an-archive", b"!<thin>\n"])

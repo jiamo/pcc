@@ -11,7 +11,7 @@ is exactly the .pco payload the incremental cache stores.
 from __future__ import annotations
 
 
-def assemble_asm_path_to_encoded(path: str) -> bytes:
+def assemble_asm_text_to_encoded(assembly: str) -> bytes:
     import gc
 
     from .arm64_asm_driver import assemble_file
@@ -25,11 +25,20 @@ def assemble_asm_path_to_encoded(path: str) -> bytes:
     except Exception:
         pass
     gc.disable()
+    sections, undefined = assemble_file(assembly)
+    assembly = ""
+    native = NativeObject.from_sections(sections, undefined=undefined)
+    del sections
+    del undefined
+    encoded = encode_native_object(native)
+    del native
+    return encoded
+
+
+def assemble_asm_path_to_encoded(path: str) -> bytes:
     with open(path, "r", encoding="utf-8") as stream:
         assembly = stream.read()
-    sections, undefined = assemble_file(assembly)
-    native = NativeObject.from_sections(sections, undefined=undefined)
-    return encode_native_object(native)
+    return assemble_asm_text_to_encoded(assembly)
 
 
-__all__ = ["assemble_asm_path_to_encoded"]
+__all__ = ["assemble_asm_path_to_encoded", "assemble_asm_text_to_encoded"]

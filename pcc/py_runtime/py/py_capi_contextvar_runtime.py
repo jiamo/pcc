@@ -13,9 +13,11 @@ Owned surface (stable C ABI names):
 
 Constants:
   Py_TPFLAGS_READY = 0x1000, Py_TPFLAGS_HAVE_GC = 0x2000,
-  PCC_TPFLAGS_MANAGED_DEALLOC = 0x1000000
+  PCC_TPFLAGS_MANAGED_DEALLOC = 1 << 62
   METH_VARARGS = 0x0001, METH_O = 0x0008
 """
+
+__pcc_runtime_port__ = True
 
 from pcc.extern import c_abi_typed_export, c_int32, c_int64, c_ptr, c_void, extern
 from pcc.unsafe import (
@@ -38,6 +40,8 @@ from pcc.unsafe import (
 py_decref = extern("py_decref", (c_ptr,), c_void)
 py_incref = extern("py_incref", (c_ptr,), c_void)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 pcc_gc_load_ptr = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_ptr)
 pcc_gc_store_ptr = extern("pcc_gc_store_ptr", (c_ptr, c_ptr, c_ptr), c_void)
@@ -71,15 +75,15 @@ define_global_i64_array(
 
 
 def _type_error(message) -> None:
-    py_raise(py_exc_new(3, message))  # PY_EXC_TYPEERROR
+    py_raise_owned(py_exc_new(3, message))  # PY_EXC_TYPEERROR
 
 
 def _value_error(message) -> None:
-    py_raise(py_exc_new(2, message))  # PY_EXC_VALUEERROR
+    py_raise_owned(py_exc_new(2, message))  # PY_EXC_VALUEERROR
 
 
 def _lookup_error(message) -> None:
-    py_raise(py_exc_new(13, message))  # PY_EXC_LOOKUPERROR
+    py_raise_owned(py_exc_new(13, message))  # PY_EXC_LOOKUPERROR
 
 
 # NOTE: never wrap stack_alloc in a helper that returns it -- the allocation
@@ -176,7 +180,7 @@ def _contextvar_type() -> c_ptr:
     store_i64(t, 0, 1)  # refcount
     store_ptr(t, 32, cstr("ContextVar"))
     store_i64(t, 40, 48)  # tp_basicsize
-    store_i64(t, 176, 0x1000 | 0x2000 | 0x1000000)
+    store_i64(t, 176, 0x1000 | 0x2000 | 4611686018427387904)
     store_ptr(t, 56, function_addr("pcc_capi_contextvar_dealloc"))
     store_ptr(t, 192, function_addr("pcc_capi_contextvar_traverse"))
     tag: int = pcc_capi_cext_tag_for(t)

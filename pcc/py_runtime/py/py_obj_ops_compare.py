@@ -20,6 +20,9 @@ FNV-1a constants (verified to work in pcc-Python signed-i64):
     offset basis: 0xcbf29ce484222325 = -3750763034362895579 (signed)
     prime:        0x100000001b3      =  1099511628211
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.extern import extern, c_abi_export, c_ptr, c_int32, c_int64, c_void, c_double
 from pcc.py_runtime.py.py_abi_constants import (
     C_POINTER_SIZE,
@@ -75,10 +78,14 @@ from pcc.unsafe import (
     load_i32,
     load_i64,
     load_ptr,
+    logical_shift_right_i64,
     null,
     ptr_add,
     ptr_eq,
     ptr_is_null,
+    ptr_to_int,
+    stack_alloc,
+    store_ptr,
     store_i64,
     untag_int,
 )
@@ -127,8 +134,19 @@ py_user_contains_dispatch = extern("py_user_contains_dispatch", (c_ptr, c_ptr, c
 py_user_eq_dispatch = extern("py_user_eq_dispatch", (c_ptr, c_ptr),               c_int64)
 
 pcc_gc_load_ptr      = extern("pcc_gc_load_ptr",      (c_ptr, c_ptr),              c_ptr)
+pcc_gc_backend = extern("pcc_gc_backend", (), c_int64)
+pcc_gc_scheduler_root_register_handle = extern(
+    "pcc_gc_scheduler_root_register_handle", (c_ptr,), c_ptr
+)
+pcc_gc_scheduler_root_unregister_handle = extern(
+    "pcc_gc_scheduler_root_unregister_handle", (c_ptr,), c_void
+)
+pcc_gc_pin = extern("pcc_gc_pin", (c_ptr,), c_void)
+pcc_gc_unpin = extern("pcc_gc_unpin", (c_ptr,), c_void)
 py_exc_new           = extern("py_exc_new",           (c_int64, c_ptr),            c_ptr)
 py_raise             = extern("py_raise",             (c_ptr,),                    c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_user_abs_dispatch = extern("py_user_abs_dispatch", (c_ptr,),                    c_ptr)
 pcc_capi_is_cext_type_tag = extern("pcc_capi_is_cext_type_tag", (c_int64,),       c_int64)
 pcc_capi_cext_absolute = extern("pcc_capi_cext_absolute", (c_ptr,),               c_ptr)
@@ -304,6 +322,70 @@ def _bytes_cmp(a, b) -> int:
 
 # ---- FNV-1a ---------------------------------------------------------
 
+# CPython's numeric hash: every value is reduced modulo the Mersenne prime
+# P = 2**61 - 1 so that ``x == y`` implies ``hash(x) == hash(y)`` across int,
+# bool and float (``hash(1) == hash(1.0) == hash(True) == 1``).  Mirrors
+# ``long_hash`` / ``_Py_HashDouble`` in Objects/longobject.c and
+# Python/pyhash.c, and ``pcc_hash_i64`` / ``pcc_hash_double_bits`` in
+# py_obj_ops_compare.c.  The port used to hash a float by its raw IEEE bits,
+# so ``d[1.0]`` missed the entry stored under ``d[1]`` and ``{1: a, 1.0: b}``
+# held two keys.
+
+
+def _hash_i64(v: int) -> int:
+    if v == -9223372036854775808:
+        # |v| overflows i64; 2**63 mod P == 4.
+        return -4
+    neg: int = 0
+    mag: int = v
+    if v < 0:
+        neg = 1
+        mag = -v
+    x: int = mag % 2305843009213693951
+    if neg != 0:
+        x = -x
+    if x == -1:
+        x = -2
+    return x
+
+
+def _hash_f64_bits(bits: int, o) -> int:
+    # value = (-1)**sign * mant * 2**e with mant < 2**53, so
+    # hash = mant * 2**e mod P, and because 2**61 == 1 (mod P) the power of
+    # two is a 61-bit rotation by ``e mod 61``.
+    sign: int = 1
+    if bits < 0:
+        sign = -1
+    exp: int = logical_shift_right_i64(bits, 52) & 2047
+    frac: int = bits & 4503599627370495
+    if exp == 2047:
+        if frac == 0:
+            return 314159 * sign
+        # nan hashes by identity (CPython >= 3.10: _Py_HashPointer).
+        p: int = ptr_to_int(o)
+        h: int = logical_shift_right_i64(p, 4) | (p << 60)
+        if h == -1:
+            h = -2
+        return h
+    mant: int = frac
+    e: int = 0
+    if exp == 0:
+        if frac == 0:
+            return 0
+        e = -1074
+    else:
+        mant = frac | 4503599627370496
+        e = exp - 1075
+    k: int = ((e % 61) + 61) % 61
+    x: int = mant
+    if k != 0:
+        x = ((x << k) & 2305843009213693951) | logical_shift_right_i64(x, 61 - k)
+    x = x * sign
+    if x == -1:
+        x = -2
+    return x
+
+
 def _fnv1a(p, n: int) -> int:
     # 0xcbf29ce484222325 as signed i64.
     h: int = -3750763034362895579
@@ -473,7 +555,7 @@ def _cmp_threeway(a, b) -> int:
 @c_abi_export("py_obj_abs")
 def py_obj_abs(o):
     if ptr_is_null(o) != 0:
-        py_raise(py_exc_new(3, cstr("bad operand type for abs()")))
+        py_raise_owned(py_exc_new(3, cstr("bad operand type for abs()")))
         return null()
     if is_tagged_int(o) != 0:
         ivalue: int = py_int_value_i64(o)
@@ -501,7 +583,7 @@ def py_obj_abs(o):
             return r
         if py_err_occurred() != 0:
             return null()
-    py_raise(py_exc_new(3, cstr("bad operand type for abs()")))
+    py_raise_owned(py_exc_new(3, cstr("bad operand type for abs()")))
     return null()
 
 
@@ -707,6 +789,14 @@ def py_obj_eq(a, b) -> int:
     if tb == PY_TYPE_NONE:
         return 0
 
+    # User instances: honor __eq__ for container key lookup and ``==``.
+    # Tri-state: -1 = no user __eq__ (or NotImplemented) -> keep the
+    if (ta == PY_TYPE_INSTANCE or ta >= PY_TYPE_USER_CLASS_START
+            or tb == PY_TYPE_INSTANCE or tb >= PY_TYPE_USER_CLASS_START):
+        dispatched: int = py_user_eq_dispatch(a, b)
+        if dispatched >= 0:
+            return dispatched
+
     return 0
 
 
@@ -717,10 +807,7 @@ def py_obj_hash(o) -> int:
     if ptr_is_null(o) != 0:
         return 0
     if is_tagged_int(o) != 0:
-        v: int = untag_int(o)
-        if v == -1:
-            return -2
-        return v
+        return _hash_i64(untag_int(o))
     tag: int = load_i32(o, PYOBJECTHEADER_TYPE_TAG_OFFSET)
     if tag == PY_TYPE_NONE:                      # NONE
         return 0
@@ -751,15 +838,9 @@ def py_obj_hash(o) -> int:
             return -2
         return h
     if tag == PY_TYPE_INT:                      # INT
-        v: int = py_int_value_i64(o)
-        if v == -1:
-            return -2
-        return v
-    if tag == PY_TYPE_FLOAT:                      # FLOAT — read as i64 bits
-        v: int = load_i64(o, PYFLOATOBJECT_VALUE_OFFSET)
-        if v == -1:
-            return -2
-        return v
+        return _hash_i64(py_int_value_i64(o))
+    if tag == PY_TYPE_FLOAT:                      # FLOAT
+        return _hash_f64_bits(load_i64(o, PYFLOATOBJECT_VALUE_OFFSET), o)
     if tag == PY_TYPE_STR:                      # STR — FNV-1a with cache @32
         cached: int = load_i64(o, PYSTROBJECT_HASH_OFFSET)
         if cached != -1:
@@ -774,16 +855,16 @@ def py_obj_hash(o) -> int:
         data_ptr = ptr_add(o, PYBYTESOBJECT_DATA_OFFSET)
         return _fnv1a(data_ptr, bl)
     if tag == PY_TYPE_LIST:
-        py_raise(py_exc_new(3, cstr("unhashable type: 'list'")))
+        py_raise_owned(py_exc_new(3, cstr("unhashable type: 'list'")))
         return -1
     if tag == PY_TYPE_DICT:
-        py_raise(py_exc_new(3, cstr("unhashable type: 'dict'")))
+        py_raise_owned(py_exc_new(3, cstr("unhashable type: 'dict'")))
         return -1
     if tag == PY_TYPE_SET:
-        py_raise(py_exc_new(3, cstr("unhashable type: 'set'")))
+        py_raise_owned(py_exc_new(3, cstr("unhashable type: 'set'")))
         return -1
     if tag == PY_TYPE_BYTEARRAY:
-        py_raise(py_exc_new(3, cstr("unhashable type: 'bytearray'")))
+        py_raise_owned(py_exc_new(3, cstr("unhashable type: 'bytearray'")))
         return -1
     if tag == PY_TYPE_TUPLE:                      # TUPLE
         n: int = load_i64(o, PYTUPLEOBJECT_LEN_OFFSET)
@@ -804,10 +885,7 @@ def py_obj_hash(o) -> int:
                 handled = 1
             else:
                 if is_tagged_int(el) != 0:
-                    v: int = untag_int(el)
-                    el_hash = v
-                    if v == -1:
-                        el_hash = -2
+                    el_hash = _hash_i64(untag_int(el))
                     handled = 1
                 else:
                     el_tag: int = load_i32(el, PYOBJECTHEADER_TYPE_TAG_OFFSET)
@@ -818,10 +896,7 @@ def py_obj_hash(o) -> int:
                             el_hash = 1
                         handled = 1
                     elif el_tag == PY_TYPE_INT:
-                        v2: int = py_int_value_i64(el)
-                        el_hash = v2
-                        if v2 == -1:
-                            el_hash = -2
+                        el_hash = _hash_i64(py_int_value_i64(el))
                         handled = 1
                     elif el_tag == PY_TYPE_STR:
                         cached: int = load_i64(el, PYSTROBJECT_HASH_OFFSET)
@@ -935,8 +1010,20 @@ def py_obj_min_max(iterable, want_max: int):
     it = py_obj_iter(iterable)
     if ptr_is_null(it) != 0:
         return null()
+    moving_backend: int = pcc_gc_backend()
+    it_slot = stack_alloc(8)
+    store_ptr(it_slot, 0, it)
+    it_handle = null()
+    if moving_backend == 3 or moving_backend == 4:
+        it_handle = pcc_gc_scheduler_root_register_handle(it_slot)
+        if ptr_is_null(it_handle) != 0:
+            py_decref(it)
+            return null()
+        it = pcc_gc_load_ptr(null(), it_slot)
 
     best = py_obj_next(it)
+    if ptr_is_null(it_handle) == 0:
+        it = pcc_gc_load_ptr(null(), it_slot)
     if ptr_is_null(best) != 0:
         if py_err_occurred() != 0:
             current = py_current_exception()
@@ -944,18 +1031,42 @@ def py_obj_min_max(iterable, want_max: int):
             if py_exc_matches(current, stop) != 0:
                 py_clear_exception()
             else:
+                if ptr_is_null(it_handle) == 0:
+                    pcc_gc_scheduler_root_unregister_handle(it_handle)
                 py_decref(it)
                 return null()
+        if ptr_is_null(it_handle) == 0:
+            pcc_gc_scheduler_root_unregister_handle(it_handle)
         py_decref(it)
         if want_max != 0:
-            py_raise(py_exc_new(2, cstr("max() arg is an empty sequence")))
+            py_raise_owned(py_exc_new(2, cstr("max() arg is an empty sequence")))
         else:
-            py_raise(py_exc_new(2, cstr("min() arg is an empty sequence")))
+            py_raise_owned(py_exc_new(2, cstr("min() arg is an empty sequence")))
         return null()
+
+    best_slot = stack_alloc(8)
+    element_slot = stack_alloc(8)
+    store_ptr(best_slot, 0, best)
+    store_ptr(element_slot, 0, null())
+    best_handle = null()
+    if moving_backend == 3 or moving_backend == 4:
+        best_handle = pcc_gc_scheduler_root_register_handle(best_slot)
+        if ptr_is_null(best_handle) != 0:
+            py_decref(best)
+            if ptr_is_null(it_handle) == 0:
+                pcc_gc_scheduler_root_unregister_handle(it_handle)
+            py_decref(it)
+            return null()
 
     done: int = 0
     while done == 0:
+        if ptr_is_null(it_handle) == 0:
+            it = pcc_gc_load_ptr(null(), it_slot)
         element = py_obj_next(it)
+        if ptr_is_null(it_handle) == 0:
+            it = pcc_gc_load_ptr(null(), it_slot)
+        if ptr_is_null(best_handle) == 0:
+            best = pcc_gc_load_ptr(null(), best_slot)
         if ptr_is_null(element) != 0:
             if py_err_occurred() != 0:
                 current = py_current_exception()
@@ -963,23 +1074,59 @@ def py_obj_min_max(iterable, want_max: int):
                 if py_exc_matches(current, stop) != 0:
                     py_clear_exception()
                 else:
+                    if ptr_is_null(best_handle) == 0:
+                        best = pcc_gc_load_ptr(null(), best_slot)
+                        pcc_gc_scheduler_root_unregister_handle(best_handle)
                     py_decref(best)
+                    if ptr_is_null(it_handle) == 0:
+                        pcc_gc_scheduler_root_unregister_handle(it_handle)
                     py_decref(it)
                     return null()
             done = 1
         else:
+            store_ptr(element_slot, 0, element)
+            element_handle = null()
+            if moving_backend == 3 or moving_backend == 4:
+                element_handle = pcc_gc_scheduler_root_register_handle(element_slot)
+                if ptr_is_null(element_handle) != 0:
+                    py_decref(element)
+                    if ptr_is_null(best_handle) == 0:
+                        best = pcc_gc_load_ptr(null(), best_slot)
+                        pcc_gc_scheduler_root_unregister_handle(best_handle)
+                    py_decref(best)
+                    if ptr_is_null(it_handle) == 0:
+                        pcc_gc_scheduler_root_unregister_handle(it_handle)
+                    py_decref(it)
+                    return null()
             replace: int = 0
             if want_max != 0:
                 replace = py_obj_lt(best, element)
             else:
                 replace = py_obj_lt(element, best)
+            if ptr_is_null(best_handle) == 0:
+                best = pcc_gc_load_ptr(null(), best_slot)
+            if ptr_is_null(element_handle) == 0:
+                element = pcc_gc_load_ptr(null(), element_slot)
             if replace != 0:
-                py_decref(best)
+                old_best_slot = best_slot
+                best_slot = element_slot
+                element_slot = old_best_slot
+                old_best_handle = best_handle
+                best_handle = element_handle
+                element_handle = old_best_handle
                 best = element
-            else:
-                py_decref(element)
+            discard = pcc_gc_load_ptr(null(), element_slot)
+            store_ptr(element_slot, 0, null())
+            if ptr_is_null(element_handle) == 0:
+                pcc_gc_scheduler_root_unregister_handle(element_handle)
+            py_decref(discard)
 
+    if ptr_is_null(it_handle) == 0:
+        pcc_gc_scheduler_root_unregister_handle(it_handle)
     py_decref(it)
+    if ptr_is_null(best_handle) == 0:
+        best = pcc_gc_load_ptr(null(), best_slot)
+        pcc_gc_scheduler_root_unregister_handle(best_handle)
     return best
 
 
@@ -989,7 +1136,18 @@ def py_obj_min_max(iterable, want_max: int):
 def py_obj_sorted(x):
     if ptr_is_null(x) != 0:
         return null()
+    moving_backend: int = pcc_gc_backend()
+    x_slot = stack_alloc(8)
+    store_ptr(x_slot, 0, x)
+    x_handle = null()
+    if moving_backend == 3 or moving_backend == 4:
+        x_handle = pcc_gc_scheduler_root_register_handle(x_slot)
+        if ptr_is_null(x_handle) != 0:
+            return null()
+        x = pcc_gc_load_ptr(null(), x_slot)
     n: int = py_obj_len(x)
+    if ptr_is_null(x_handle) == 0:
+        x = pcc_gc_load_ptr(null(), x_slot)
     # py_obj_len is a sizing hint only; a custom iterator (no __len__) raises
     # from it, and a pending exception would abort the iterator loop below
     # (yielding []). Clear it — the iterator branch handles length-less srcs.
@@ -998,13 +1156,22 @@ def py_obj_sorted(x):
         n = 0
     out = py_list_new(n)
     if ptr_is_null(out) != 0:
+        if ptr_is_null(x_handle) == 0:
+            pcc_gc_scheduler_root_unregister_handle(x_handle)
         return null()
+    pcc_gc_pin(out)
     if _type_of(x) == PY_TYPE_SET:
-        entries = load_ptr(x, 40)
-        capacity: int = load_i64(x, 24)
         dummy = global_load_ptr("py_set_dummy")
         i: int = 0
-        while i < capacity:
+        set_done: int = 0
+        while set_done == 0:
+            if ptr_is_null(x_handle) == 0:
+                x = pcc_gc_load_ptr(null(), x_slot)
+            entries = load_ptr(x, 40)
+            capacity: int = load_i64(x, 24)
+            if i >= capacity:
+                set_done = 1
+                continue
             key = _set_key(x, entries, i * 16)
             if ptr_is_null(key) == 0:
                 if ptr_eq(key, dummy) == 0:
@@ -1018,6 +1185,7 @@ def py_obj_sorted(x):
         # default mode still fall to the indexable else-path, a follow-on.)
         keys = py_dict_keys(x)
         if ptr_is_null(keys) == 0:
+            pcc_gc_pin(keys)
             nk: int = py_list_len(keys)
             ki: int = 0
             while ki < nk:
@@ -1025,6 +1193,7 @@ def py_obj_sorted(x):
                 py_list_append(out, el)
                 py_decref(el)
                 ki = ki + 1
+            pcc_gc_unpin(keys)
             py_decref(keys)
     else:
         # General length-less iterable (custom __iter__/__next__ class,
@@ -1033,9 +1202,26 @@ def py_obj_sorted(x):
         # path yielded [] for anything without __len__/__getitem__.
         it = py_obj_iter(x)
         if ptr_is_null(it) == 0:
+            it_slot = stack_alloc(8)
+            store_ptr(it_slot, 0, it)
+            it_handle = null()
+            if moving_backend == 3 or moving_backend == 4:
+                it_handle = pcc_gc_scheduler_root_register_handle(it_slot)
+                if ptr_is_null(it_handle) != 0:
+                    py_decref(it)
+                    pcc_gc_unpin(out)
+                    py_decref(out)
+                    if ptr_is_null(x_handle) == 0:
+                        pcc_gc_scheduler_root_unregister_handle(x_handle)
+                    return null()
+                it = pcc_gc_load_ptr(null(), it_slot)
             it_done: int = 0
             while it_done == 0:
+                if ptr_is_null(it_handle) == 0:
+                    it = pcc_gc_load_ptr(null(), it_slot)
                 el = py_obj_next(it)
+                if ptr_is_null(it_handle) == 0:
+                    it = pcc_gc_load_ptr(null(), it_slot)
                 if ptr_is_null(el) != 0:
                     if py_err_occurred() != 0:
                         cur = py_current_exception()
@@ -1046,6 +1232,9 @@ def py_obj_sorted(x):
                 else:
                     py_list_append(out, el)
                     py_decref(el)
+            if ptr_is_null(it_handle) == 0:
+                it = pcc_gc_load_ptr(null(), it_slot)
+                pcc_gc_scheduler_root_unregister_handle(it_handle)
             py_decref(it)
     m: int = py_list_len(out)
     if m > 1:
@@ -1060,6 +1249,7 @@ def py_obj_sorted(x):
         # Stability: the right run only wins when strictly smaller.
         scratch = py_list_new(m)
         if ptr_is_null(scratch) == 0:
+            pcc_gc_pin(scratch)
             src_list = out
             dst_list = scratch
             width: int = 1
@@ -1094,9 +1284,15 @@ def py_obj_sorted(x):
                             src_list, ptr_add(src_items, mj * 8)
                         )
                         if _cmp_threeway(eb, ea) < 0:
+                            eb = pcc_gc_load_ptr(
+                                src_list, ptr_add(src_items, mj * 8)
+                            )
                             py_list_append(dst_list, eb)
                             mj = mj + 1
                         else:
+                            ea = pcc_gc_load_ptr(
+                                src_list, ptr_add(src_items, mi * 8)
+                            )
                             py_list_append(dst_list, ea)
                             mi = mi + 1
                     while mi < mid:
@@ -1148,7 +1344,11 @@ def py_obj_sorted(x):
                 py_list_set(scratch, si, null())
                 si = si + 1
             store_i64(scratch, 16, 0)
+            pcc_gc_unpin(scratch)
             py_decref(scratch)
+            pcc_gc_unpin(out)
+            if ptr_is_null(x_handle) == 0:
+                pcc_gc_scheduler_root_unregister_handle(x_handle)
             return out
         # malloc-failure fallback: original insertion sort.
         j: int = 1
@@ -1171,6 +1371,9 @@ def py_obj_sorted(x):
             py_list_set(out, k, cur)
             py_decref(cur)
             j = j + 1
+    pcc_gc_unpin(out)
+    if ptr_is_null(x_handle) == 0:
+        pcc_gc_scheduler_root_unregister_handle(x_handle)
     return out
 
 
@@ -1190,7 +1393,11 @@ def py_obj_contains(container, item) -> int:
         i: int = 0
         while i < n:
             el = py_tuple_get(container, i)
-            if py_obj_eq(el, item) != 0:
+            equal: int = py_obj_eq(el, item)
+            py_decref(el)
+            if py_err_occurred() != 0:
+                return 0
+            if equal != 0:
                 return 1
             i = i + 1
         return 0

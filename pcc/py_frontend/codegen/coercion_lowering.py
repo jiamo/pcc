@@ -247,6 +247,7 @@ class CoercionLoweringMixin:
                     [v],
                     name=self._fresh("truthy_obj"),
                 )
+                self._emit_post_call_err_check(None)
                 return self.builder.trunc(i32, _I1, name=self._fresh("truthy_obj_i1"))
             return self.builder.icmp_signed(
                 "!=", v, ir.Constant(v.type, 0), name=self._fresh("truthy_int")
@@ -258,6 +259,7 @@ class CoercionLoweringMixin:
                     [v],
                     name=self._fresh("truthy_int_obj"),
                 )
+                self._emit_post_call_err_check(None)
                 return self.builder.icmp_signed(
                     "!=",
                     truth,
@@ -285,6 +287,7 @@ class CoercionLoweringMixin:
                 [obj],
                 name=self._fresh("truthy_obj"),
             )
+            self._emit_post_call_err_check(None)
             return self.builder.trunc(i32, _I1, name=self._fresh("truthy_obj_i1"))
         if isinstance(ty, ClassType):
             # valueclass payloads box (always-truthy valuebox unless a user
@@ -299,6 +302,7 @@ class CoercionLoweringMixin:
                     [obj],
                     name=self._fresh("truthy_obj"),
                 )
+                self._emit_post_call_err_check(None)
                 return self.builder.trunc(i32, _I1, name=self._fresh("truthy_obj_i1"))
         raise NotImplementedError(
             f"Layer 1 cannot compute truthiness of {type(ty).__name__}"

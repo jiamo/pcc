@@ -5,6 +5,8 @@ module owns discovery, load-once registration, parent ordering, PEP 489 exec
 ordering, and failure cleanup without a hand-written C loader object.
 """
 
+__pcc_runtime_port__ = True
+
 from pcc.extern import c_abi_export, c_int32, c_int64, c_ptr, c_void, extern
 from pcc.unsafe import (
     access,
@@ -47,6 +49,8 @@ py_decref = extern("py_decref", (c_ptr,), c_void)
 py_err_occurred = extern("py_err_occurred", (), c_int64)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 pcc_platform_getenv = extern("pcc_platform_getenv", (c_ptr,), c_ptr)
 pcc_platform_write = extern("pcc_platform_write", (c_int64, c_ptr, c_int64), c_int64)
 dlerror = extern("dlerror", (), c_ptr)
@@ -199,7 +203,7 @@ def _runtime_error(prefix, detail):
     store_i8(message, prefix_len + 1, 32)
     memcpy(ptr_add(message, prefix_len + 2), detail, detail_len)
     store_i8(message, prefix_len + 2 + detail_len, 0)
-    py_raise(py_exc_new(7, message))
+    py_raise_owned(py_exc_new(7, message))
     return null()
 
 

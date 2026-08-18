@@ -135,7 +135,11 @@ typedef struct PyModuleDef {
 typedef struct PccBufferMeta {
     Py_ssize_t shape;
     Py_ssize_t strides;
+    PyObject *lease_owner;
+    PyObject *view_owner;
+    struct PccBufferMeta *next;
 } PccBufferMeta;
+static PccBufferMeta *pcc_buffer_leases = NULL;
 
 struct PyUnicodeWriter {
     char *data;
@@ -3085,7 +3089,9 @@ void *PyObject_Realloc(void *ptr, size_t new_size) {
 void PyObject_Free(void *ptr) {
     if (pcc_gc_pointer_is_managed((PyObject *)ptr) != 0) {
         pcc_gc_note_object_freeing((PyObject *)ptr);
-        (void)pcc_gc_pointer_unregister((PyObject *)ptr);
+        if (pcc_gc_pointer_unregister((PyObject *)ptr) < 0) return;
+    } else if (pcc_gc_granule_object_retire(ptr) < 0) {
+        return;
     }
     PyMem_Free(ptr);
 }
@@ -4401,7 +4407,7 @@ const char *PyUnicode_AsUTF8(PyObject *obj) {
         PyErr_SetString(PyExc_TypeError, "expected str");
         return NULL;
     }
-    return py_str_utf8(obj);
+    return pcc_capi_str_utf8_pinned(obj);
 }
 #endif /* PCC_PY_CAPI_UNICODE_RUNTIME */
 
@@ -4417,7 +4423,7 @@ const char *PyUnicode_AsUTF8AndSize(PyObject *obj, Py_ssize_t *size) {
     if (size != NULL) {
         *size = (Py_ssize_t)py_str_byte_len(obj);
     }
-    return py_str_utf8(obj);
+    return pcc_capi_str_utf8_pinned(obj);
 }
 #endif /* PCC_PY_CAPI_UNICODE_RUNTIME */
 
@@ -5023,6 +5029,11 @@ static void *pcc_capi_binary_number_slot(
         case 1: return methods->nb_subtract;
         case 2: return methods->nb_multiply;
         case 3: return methods->nb_true_divide;
+        case 6: return methods->nb_lshift;
+        case 7: return methods->nb_rshift;
+        case 8: return methods->nb_and;
+        case 9: return methods->nb_xor;
+        case 10: return methods->nb_or;
         default: return NULL;
     }
 }
@@ -5033,6 +5044,11 @@ static const char *pcc_capi_binary_number_slot_name(int64_t op) {
         case 1: return "nb_subtract";
         case 2: return "nb_multiply";
         case 3: return "nb_true_divide";
+        case 6: return "nb_lshift";
+        case 7: return "nb_rshift";
+        case 8: return "nb_and";
+        case 9: return "nb_xor";
+        case 10: return "nb_or";
         default: return "binary number slot";
     }
 }
@@ -5043,6 +5059,11 @@ static const char *pcc_capi_binary_number_symbol(int64_t op) {
         case 1: return "-";
         case 2: return "*";
         case 3: return "/";
+        case 6: return "<<";
+        case 7: return ">>";
+        case 8: return "&";
+        case 9: return "^";
+        case 10: return "|";
         default: return "binary operation";
     }
 }
@@ -5057,7 +5078,10 @@ PyObject *pcc_capi_cext_binary_number(
     PyObject *right,
     int64_t op
 ) {
-    if (op < 0 || op > 3) {
+    if (
+        op < 0
+        || (op > 3 && op != 6 && op != 7 && op != 8 && op != 9 && op != 10)
+    ) {
         PyErr_SetString(PyExc_ValueError, "invalid binary number operation");
         return NULL;
     }
@@ -5908,15 +5932,18 @@ int PyObject_IsInstance(PyObject *obj, PyObject *cls) {
 }
 
 int PyObject_RichCompareBool(PyObject *left, PyObject *right, int opid) {
+    int result;
     switch (opid) {
         case Py_LT:
             return py_obj_lt(left, right) ? 1 : 0;
         case Py_LE:
             return py_obj_le(left, right) ? 1 : 0;
         case Py_EQ:
-            return py_obj_eq(left, right) ? 1 : 0;
+            result = py_obj_eq(left, right) ? 1 : 0;
+            return py_err_occurred() != NULL ? -1 : result;
         case Py_NE:
-            return py_obj_eq(left, right) ? 0 : 1;
+            result = py_obj_eq(left, right) ? 0 : 1;
+            return py_err_occurred() != NULL ? -1 : result;
         case Py_GT:
             return py_obj_gt(left, right) ? 1 : 0;
         case Py_GE:
@@ -6539,6 +6566,7 @@ PyObject *PyTuple_GetItem(PyObject *obj, Py_ssize_t index) {
     }
     /* py_tuple_get returns an owned reference; CPython PyTuple_GetItem returns
      * borrowed. Drop the temporary ownership before returning the live slot. */
+    pcc_gc_pin(item);
     py_decref(item);
     return item;
 }
@@ -6640,13 +6668,20 @@ PyObject *PyList_GetItem(PyObject *obj, Py_ssize_t index) {
         return NULL;
     }
     /* py_list_get returns owned; CPython PyList_GetItem returns borrowed. */
+    pcc_gc_pin(item);
     py_decref(item);
     return item;
 }
 
 PyObject *PyList_GetItemRef(PyObject *obj, Py_ssize_t index) {
-    PyObject *item = PyList_GetItem(obj, index);
-    if (item != NULL) Py_INCREF(item);
+    if (!pcc_capi_is_exact_type(obj, PY_TYPE_LIST)) {
+        PyErr_SetString(PyExc_TypeError, "expected list");
+        return NULL;
+    }
+    PyObject *item = py_list_get(obj, (int64_t)index);
+    if (item == NULL) {
+        PyErr_SetString(PyExc_RuntimeError, "list index out of range");
+    }
     return item;
 }
 
@@ -6731,6 +6766,7 @@ PyObject *PyDict_GetItem(PyObject *dict, PyObject *key) {
     PyObject *item = py_dict_get(dict, key);
     if (item == NULL) return NULL;
     /* py_dict_get returns owned; CPython PyDict_GetItem returns borrowed. */
+    pcc_gc_pin(item);
     py_decref(item);
     return item;
 }
@@ -6752,6 +6788,7 @@ PyObject *PyDict_GetItemWithError(PyObject *dict, PyObject *key) {
     PyObject *item = py_dict_get(dict, key);
     if (item == NULL) return NULL;
     /* py_dict_get returns owned; CPython PyDict_GetItemWithError returns borrowed. */
+    pcc_gc_pin(item);
     py_decref(item);
     return item;
 }
@@ -7105,6 +7142,7 @@ char *PyBytes_AsString(PyObject *obj) {
         PyErr_SetString(PyExc_TypeError, "expected bytes");
         return NULL;
     }
+    pcc_gc_pin(obj);
     return ((PyBytesObject *)obj)->data;
 }
 
@@ -7118,6 +7156,7 @@ int PyBytes_AsStringAndSize(PyObject *obj, char **buffer, Py_ssize_t *length) {
         PyErr_SetString(PyExc_ValueError, "embedded null byte");
         return -1;
     }
+    pcc_gc_pin(obj);
     *buffer = bytes->data;
     if (length != NULL) {
         *length = (Py_ssize_t)bytes->byte_len;
@@ -7182,7 +7221,7 @@ static PyObject *pcc_capi_exception_class(PyObject *type) {
 }
 
 void PyErr_SetString(PyObject *type, const char *message) {
-    py_raise(py_exc_new(pcc_capi_exception_tag(type), message ? message : ""));
+    py_raise_owned(py_exc_new(pcc_capi_exception_tag(type), message ? message : ""));
 }
 
 void PyErr_SetNone(PyObject *type) {
@@ -7722,6 +7761,15 @@ static int pcc_capi_buffer_data(
     return -1;
 }
 
+static PyObject *pcc_capi_buffer_lease_owner(PyObject *obj) {
+    for (int depth = 0; depth < 16; depth++) {
+        if (obj == NULL || PY_IS_TAGGED_INT(obj)) return NULL;
+        if (py_type_of(obj) != PY_TYPE_MEMORYVIEW) return obj;
+        obj = pcc_gc_load_ptr(obj, &((PyMemoryViewObject *)obj)->base);
+    }
+    return NULL;
+}
+
 #if defined(PCC_PY_CAPI_BUFFER_RUNTIME)
 extern int PyObject_CheckBuffer(PyObject *obj);
 #else
@@ -7755,16 +7803,29 @@ int PyObject_GetBuffer(PyObject *obj, Py_buffer *view, int flags) {
         return -1;
     }
 
-    PccBufferMeta *meta = NULL;
-    if ((flags & PyBUF_ND) != 0) {
-        meta = (PccBufferMeta *)malloc(sizeof(PccBufferMeta));
-        if (meta == NULL) {
-            PyErr_SetString(PyExc_RuntimeError, "out of memory creating buffer view");
-            return -1;
-        }
-        meta->shape = len;
-        meta->strides = 1;
+    PyObject *lease_owner = pcc_capi_buffer_lease_owner(obj);
+    PccBufferMeta *meta = (PccBufferMeta *)calloc(1, sizeof(PccBufferMeta));
+    if (lease_owner == NULL || meta == NULL) {
+        free(meta);
+        PyErr_SetString(PyExc_RuntimeError, "out of memory creating buffer view");
+        return -1;
     }
+    meta->shape = len;
+    meta->strides = 1;
+    meta->lease_owner = lease_owner;
+    meta->view_owner = obj;
+    pcc_gc_root_slot_lock();
+    int owner_already_leased = 0;
+    int view_already_leased = 0;
+    for (PccBufferMeta *scan = pcc_buffer_leases; scan != NULL; scan = scan->next) {
+        if (scan->lease_owner == lease_owner || scan->view_owner == lease_owner) owner_already_leased = 1;
+        if (scan->lease_owner == obj || scan->view_owner == obj) view_already_leased = 1;
+    }
+    meta->next = pcc_buffer_leases;
+    pcc_buffer_leases = meta;
+    if (!owner_already_leased) pcc_gc_pin(lease_owner);
+    if (obj != lease_owner && !view_already_leased) pcc_gc_pin(obj);
+    pcc_gc_root_slot_unlock();
 
     view->buf = buf;
     view->obj = obj;
@@ -7773,8 +7834,8 @@ int PyObject_GetBuffer(PyObject *obj, Py_buffer *view, int flags) {
     view->readonly = readonly;
     view->ndim = (flags & PyBUF_ND) != 0 ? 1 : 0;
     view->format = (flags & PyBUF_FORMAT) != 0 ? "B" : NULL;
-    view->shape = meta != NULL ? &meta->shape : NULL;
-    view->strides = ((flags & PyBUF_STRIDES) != 0 && meta != NULL)
+    view->shape = (flags & PyBUF_ND) != 0 ? &meta->shape : NULL;
+    view->strides = (flags & PyBUF_STRIDES) != 0
         ? &meta->strides
         : NULL;
     view->suboffsets = NULL;
@@ -7790,12 +7851,26 @@ extern void PyBuffer_Release(Py_buffer *view);
 #else
 void PyBuffer_Release(Py_buffer *view) {
     if (view == NULL) return;
+    PccBufferMeta *meta = (PccBufferMeta *)view->internal;
+    if (meta != NULL && meta->lease_owner != NULL) {
+        pcc_gc_root_slot_lock();
+        PccBufferMeta **cursor = &pcc_buffer_leases;
+        while (*cursor != NULL && *cursor != meta) cursor = &(*cursor)->next;
+        if (*cursor == meta) *cursor = meta->next;
+        int owner_still_leased = 0;
+        int view_still_leased = 0;
+        for (PccBufferMeta *scan = pcc_buffer_leases; scan != NULL; scan = scan->next) {
+            if (scan->lease_owner == meta->lease_owner || scan->view_owner == meta->lease_owner) owner_still_leased = 1;
+            if (scan->lease_owner == meta->view_owner || scan->view_owner == meta->view_owner) view_still_leased = 1;
+        }
+        if (!owner_still_leased) pcc_gc_unpin(meta->lease_owner);
+        if (meta->view_owner != meta->lease_owner && !view_still_leased) pcc_gc_unpin(meta->view_owner);
+        pcc_gc_root_slot_unlock();
+    }
     if (view->obj != NULL) {
         py_decref(view->obj);
     }
-    if (view->internal != NULL) {
-        free(view->internal);
-    }
+    free(meta);
     memset(view, 0, sizeof(*view));
 }
 #endif /* PCC_PY_CAPI_MISC_RUNTIME */
@@ -8452,6 +8527,7 @@ Py_ssize_t PySequence_Fast_GET_SIZE(PyObject *obj) {
 }
 
 PyObject **PySequence_Fast_ITEMS(PyObject *obj) {
+    pcc_gc_pin(obj);
     if (PyTuple_Check(obj)) {
         return ((PyTupleObject *)obj)->items;
     }

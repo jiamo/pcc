@@ -3,7 +3,7 @@
 The pcc side builds unmodified NumPy 2.4.4 and simplejson 4.1.1 sources
 offline with the current pcc1.  It then compiles one closed-world application
 and executes that artifact under GC0..GC4 with host Python and libpython
-unavailable.  CPython 3.13.2 is a separate behavioral oracle; its package site
+unavailable.  CPython 3.15.0rc1 is a separate behavioral oracle; its package site
 is never exposed to the pcc compiler or the produced executable.
 
 The required 30-minute resource envelope is a release gate.  This bounded test
@@ -539,7 +539,7 @@ def _oracle_result(oracle: str, source: Path, oracle_site: str) -> dict[str, obj
         timeout=30,
     )
     assert version.returncode == 0, version.stdout + version.stderr
-    assert version.stdout.strip() == "3.13.2"
+    assert version.stdout.strip() == "3.15.0rc1"
     probe = subprocess.run(
         [
             oracle,
@@ -552,7 +552,7 @@ def _oracle_result(oracle: str, source: Path, oracle_site: str) -> dict[str, obj
         timeout=30,
     )
     assert probe.returncode == 0, (
-        "CPython 3.13.2 Level-2 oracle site must contain NumPy 2.4.4 and "
+        "CPython 3.15.0rc1 Level-2 oracle site must contain NumPy 2.4.4 and "
         "simplejson 4.1.1:\n" + probe.stdout + probe.stderr
     )
     assert probe.stdout.splitlines() == ["2.4.4", "4.1.1"]
@@ -717,7 +717,7 @@ def test_current_pcc1_replaces_cpython_for_frozen_scientific_build_corpus(
 
     report = {
         "claim_mode": "pcc1/pcc-native/self/no-libpython",
-        "cpython_oracle": "3.13.2",
+        "cpython_oracle": "3.15.0rc1",
         "gc": gc_reports,
         "numpy_tree_sha256": NUMPY_TREE_SHA256,
         "numpy_version": "2.4.4",

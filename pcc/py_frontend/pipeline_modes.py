@@ -15,7 +15,26 @@ SELF_BACKEND_PUBLISH_SYNC_ENV = "PCC_SELF_BACKEND_PUBLISH_SYNC"
 
 
 class PyPipelineError(RuntimeError):
-    """Raised when the Python pipeline fails in a user-visible way."""
+    """Raised when the Python pipeline fails in a user-visible way.
+
+    The message is ALSO stored in ``pcc_message``: under pcc1 this
+    exception has been observed with ``str()==""``, ``args is None`` and
+    no ``__cause__`` (2026-08-27 stage2 failures), so the diagnostic
+    formatter needs a storage path independent of the args machinery.
+    Eleven probe shapes failed to reproduce the loss outside a real
+    stage build; until the mechanism is found, this attribute makes the
+    next real failure self-diagnosing instead of printing "compile
+    failed" with no text.
+    """
+
+    def __init__(self, message: str = "") -> None:
+        # Preserve the exact CPython args shape: no-arg construction must
+        # keep args == (), not ('',).
+        if message:
+            RuntimeError.__init__(self, message)
+        else:
+            RuntimeError.__init__(self)
+        self.pcc_message = str(message)
 
 
 def normalize_gpu_backend_name(value: Optional[str]) -> str:

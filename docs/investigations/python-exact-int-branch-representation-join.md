@@ -142,3 +142,70 @@ Result: `1 passed in 0.31s`. The full file remains blocked at the earlier
 CPython-to-native target migration case tracked by the main investigation, so
 this adjacent Harness trigger is fixed without changing the investigation's
 active status.
+
+## Update — 2026-08-31 nullable-int dynamic bitwise projection
+
+The worker-owned direct-`.pco` Stage1 v32 canary exposed a distinct exact-int
+consumer bug after the earlier representation fixes.  The pcc1 assembler
+parsed four non-zero stable function IDs but encoded every numeric `.quad` as
+zero.  Decoding the retained object proved that its four stack-map function
+IDs were all zero; the host assembler encoded the same 3,576-byte stack-map
+payload with the expected non-zero IDs.
+
+The minimized pcc1 program mirrors `arm64_asm_driver._parse_int`:
+
+```python
+def parse_int(token: str) -> int | None:
+    return int(token, 0)
+
+value = parse_int("2891786578161389964")
+if value is not None:
+    encoded = (value & ((1 << 64) - 1)).to_bytes(8, "little")
+    print(int.from_bytes(encoded, "little"))
+```
+
+With direct `.pco` publication disabled only to isolate expression semantics,
+the frozen v32 pcc1 printed `0` instead of `2891786578161389964` under
+`tests/python/test_pcc1_python_smoke.py::test_pcc1_bigint_mask_to_bytes_preserves_quad_value`.
+The same expression is correct when `value` is an ordinary inferred `int`, so
+the failure specifically requires the nullable return's boxed `DynType`
+projection.
+
+Host-vs-pcc1 IR comparison established the mechanism: the Dyn bitwise path
+calls `py_int_to_i64` for both operands without consuming its overflow flag.
+The `(1 << 64) - 1` operand therefore becomes zero before the native `and`.
+This is not No.2's denied read-time recovery and must not be repaired by
+No.3's denied force-i64 projection.
+
+Proposal No.4 is to give Dyn `&`/`|`/`^` the same tagged fast path plus generic
+boxed slow path already used for Dyn `+`/`-`/`*`.  The slow path must preserve
+arbitrary-precision ints and dispatch supported set/dict, extension-number,
+and user `__op__`/`__rop__` semantics; it may not assume every Dyn value is an
+int.  Status: pending implementation and focused C/pcc-Python differential,
+IR-shape, pcc1 runtime, direct-`.pco`, and Stage1-canary gates.
+
+## Update — 2026-08-31 v33 isolates the preceding dynamic shift
+
+Proposal No.4 is source-complete and its focused boundary is confirmed: the
+Dyn bigint/set/dict runtime+IR test passes 3/3; user/reflected dunder dispatch
+passes under both the pcc-Python and C runtime mirrors; the pcc-Python module
+strict closure check passes; and the 225-module contextual compile remains
+zero-fallback with the assembler IR calling `py_obj_and`.  A v33 pcc1 also
+passes the minimized nullable-int bitwise test when its width is a statically
+known `int`.
+
+The v33 Stage1 strong canary nevertheless still encoded all four stack-map
+function IDs as zero.  A breakpoint at the exact `assemble_file` call site
+proved `py_obj_and` received a valid heap-int left operand but the tagged-int
+zero (`0x1`) as its right operand.  Therefore No.4 was not the remaining
+fault: its input mask had already become zero.
+
+The additional minimized pcc1 repro is `width = opaque(8)` followed by
+`(1 << (width * 8)) - 1`; it prints zero under v33.  The Dyn shift path still
+projects both operands to i64 and emits a machine shift.  AArch64 masks a
+64-bit shift count to zero, so this becomes `(1 << 0) - 1 == 0`.  Proposal
+No.5 is the analogous generic boxed dispatch for Dyn `<<`/`>>`: exact ints use
+`py_int_shl`/`py_int_shr`, extension numbers use their number slots, user
+objects use `__lshift__`/`__rlshift__` and `__rshift__`/`__rrshift__`, and
+negative counts retain Python exceptions.  Explicit `pcc.i64`/`pcc.u64`
+machine-lane shifts keep their existing modulo-width contract.

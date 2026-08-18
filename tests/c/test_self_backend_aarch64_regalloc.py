@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import pcc.backend.self_backend_aarch64_darwin_regalloc as aarch64_regalloc
 from pcc.backend.self_backend_aarch64_darwin_abi import (
     aggregate_returned_indirect,
 )
@@ -8,10 +9,13 @@ from pcc.backend.self_backend_aarch64_darwin_regalloc import (
 )
 from pcc.backend.self_backend_dispatch import emit_self_asm
 from pcc.backend.self_backend_ir import (
+    PhiIncoming,
+    PhiInstr,
     ParsedInstr,
     TypeDesc,
     text_key_mapping_get,
 )
+from pcc.backend.self_backend_kernel import get_indexed_function_kernel
 from pcc.backend.self_backend_prepare import prepare_module_for_target
 
 
@@ -39,17 +43,60 @@ def _prepared_function(ir_text: str):
     return prepared.functions[0]
 
 
+def _register_index(func, value_name: str) -> int | None:
+    kernel = get_indexed_function_kernel(func)
+    value_id = kernel.value_id(value_name)
+    return None if value_id < 0 else kernel.value_register(value_id)
+
+
 def test_aarch64_block_local_linear_scan_reuses_expired_registers():
     func = _prepared_function(_HOT_BLOCK_IR)
     allocate_aarch64_block_registers(func)
 
-    assert text_key_mapping_get(func.value_registers, "v0") == 1
-    assert text_key_mapping_get(func.value_registers, "v1") == 2
+    assert _register_index(func, "v0") == 1
+    assert _register_index(func, "v1") == 2
     # v1 dies as v2 is defined, then v0/v2 both die as v3 is defined.
-    assert text_key_mapping_get(func.value_registers, "v2") == 2
-    assert text_key_mapping_get(func.value_registers, "v3") == 1
+    assert _register_index(func, "v2") == 2
+    assert _register_index(func, "v3") == 1
     # Slots remain present as the mandatory fail-closed representation.
     assert all(name in func.value_slots for name in ("v0", "v1", "v2", "v3"))
+
+
+def test_aarch64_regalloc_reuses_indexed_stackprep_last_uses(monkeypatch):
+    func = _prepared_function(_HOT_BLOCK_IR)
+    # The dense kernel is authoritative; stackprep no longer publishes an
+    # object/string-keyed compatibility projection on the normal path.
+    assert func.block_local_last_uses is None
+    original_collect = aarch64_regalloc.collect_block_local_last_uses
+
+    def unexpected_recompute(_func):
+        raise AssertionError("regalloc recomputed stackprep last-use analysis")
+
+    monkeypatch.setattr(
+        aarch64_regalloc,
+        "collect_block_local_last_uses",
+        unexpected_recompute,
+    )
+    allocate_aarch64_block_registers(func)
+
+    direct_func = _prepared_function(_HOT_BLOCK_IR)
+    direct_func.block_local_last_uses = None
+    calls = 0
+
+    def counted_collect(target):
+        nonlocal calls
+        calls += 1
+        return original_collect(target)
+
+    monkeypatch.setattr(
+        aarch64_regalloc,
+        "collect_block_local_last_uses",
+        counted_collect,
+    )
+    allocate_aarch64_block_registers(direct_func)
+    # Clearing the legacy dict projection no longer discards the authoritative
+    # indexed analysis published by stackprep.
+    assert calls == 0
 
 
 def test_aarch64_hot_block_avoids_intermediate_slot_traffic():
@@ -88,10 +135,10 @@ entry:
     # pre dies strictly before the call.  before is both a call operand and
     # live after the call; called is a call result.  The latter two stay in
     # their mandatory slots, while pre/after are on one side of the clobber.
-    assert text_key_mapping_get(func.value_registers, "pre") == 1
-    assert text_key_mapping_get(func.value_registers, "before") is None
-    assert text_key_mapping_get(func.value_registers, "called") is None
-    assert text_key_mapping_get(func.value_registers, "after") == 1
+    assert _register_index(func, "pre") == 1
+    assert _register_index(func, "before") is None
+    assert _register_index(func, "called") is None
+    assert _register_index(func, "after") == 1
     asm = emit_self_asm(ir_text)
     assert "bl _opaque" in asm
     assert "[x29, #-" in asm
@@ -127,8 +174,8 @@ entry:
     # Nine simultaneously-live values exceed the eight-register pool.  The
     # farthest-ending v7 interval loses its optional mapping and therefore
     # uses the stack slot that stack preparation already assigned.
-    assert text_key_mapping_get(func.value_registers, "v7") is None
-    assert text_key_mapping_get(func.value_registers, "v8") is not None
+    assert _register_index(func, "v7") is None
+    assert _register_index(func, "v8") is not None
     assert "v7" in func.value_slots
 
 
@@ -148,12 +195,54 @@ merge:
     func = _prepared_function(ir_text)
     allocate_aarch64_block_registers(func)
 
-    assert text_key_mapping_get(func.value_registers, "seed") is None
-    assert text_key_mapping_get(func.value_registers, "joined") is None
-    assert text_key_mapping_get(func.value_registers, "local") == 1
-    assert text_key_mapping_get(func.value_registers, "result") == 1
+    assert _register_index(func, "seed") is None
+    assert _register_index(func, "joined") is None
+    assert _register_index(func, "local") == 1
+    assert _register_index(func, "result") == 1
     assert "seed" in func.value_slots
     assert "joined" in func.value_slots
+
+
+def test_aarch64_phi_input_set_survives_inconsistent_native_hashes():
+    class DifferentHashText(str):
+        def __hash__(self):
+            return super().__hash__() ^ 1
+
+    ir_text = _TRIPLE + """
+define i64 @with_false_hash_phi(i64 %arg) {
+entry:
+  %seed = add i64 %arg, 1
+  br label %merge
+merge:
+  %joined = phi i64 [ %seed, %entry ]
+    ret i64 %joined
+}
+"""
+    func = _prepared_function(ir_text)
+    kernel = get_indexed_function_kernel(func)
+    phi = kernel.diagnostic_phi(1, 0)
+    incoming = phi.incoming[0]
+    projected_phi = PhiInstr(
+        phi.dest,
+        phi.type,
+        (
+            PhiIncoming(
+                DifferentHashText(incoming.value),
+                incoming.label,
+            ),
+        ),
+    )
+    assert projected_phi.incoming[0].value == incoming.value
+    assert hash(projected_phi.incoming[0].value) != hash(incoming.value)
+
+    allocate_aarch64_block_registers(func)
+
+    # The explicit diagnostic projection is allowed to carry an equal spelling
+    # with a different hash, but it cannot mutate the authoritative indexed
+    # PHI edge consumed by register allocation.
+    assert _register_index(func, "seed") is None
+    assert _register_index(func, "joined") is None
+    assert text_key_mapping_get(func.value_slots, "seed") is not None
 
 
 def test_aarch64_cross_block_values_spill_while_new_block_locals_allocate():
@@ -170,8 +259,8 @@ next:
     func = _prepared_function(ir_text)
     allocate_aarch64_block_registers(func)
 
-    assert text_key_mapping_get(func.value_registers, "seed") is None
-    assert text_key_mapping_get(func.value_registers, "result") == 1
+    assert _register_index(func, "seed") is None
+    assert _register_index(func, "result") == 1
     assert "seed" in func.value_slots
 
 
@@ -192,17 +281,20 @@ next:
 }
 """
     func = _prepared_function(ir_text)
-    # Native bootstrap has produced equal SSA-name text objects with unequal
-    # hashes.  Model that boundary at the cross-block use: a raw dict/set
-    # liveness implementation would see only the entry-block spelling and
-    # could leave seed in a caller-saved register past its proven lifetime.
-    func.blocks[1].terminator = ParsedInstr(
+    kernel = get_indexed_function_kernel(func)
+    # An explicitly projected spelling may have an inconsistent native hash,
+    # but it cannot rewrite the indexed cross-block use already consumed by
+    # register allocation.
+    projected_term = ParsedInstr(
         "ret", (TypeDesc("int", 64), DifferentHashText("seed"))
     )
+    indexed_name = kernel.terminator_value(kernel.terminator_header(1).third)
+    assert projected_term.data[1] == indexed_name
+    assert hash(projected_term.data[1]) != hash(indexed_name)
     allocate_aarch64_block_registers(func)
 
-    assert text_key_mapping_get(func.value_registers, "seed") is None
-    assert text_key_mapping_get(func.value_registers, "local") == 1
+    assert _register_index(func, "seed") is None
+    assert _register_index(func, "local") == 1
     assert text_key_mapping_get(func.value_slots, "seed") is not None
 
 
@@ -227,8 +319,8 @@ entry:
     vector_func = _prepared_function(vector_ir)
     allocate_aarch64_block_registers(vector_func)
 
-    assert float_func.value_registers == {}
-    assert vector_func.value_registers == {}
+    assert _register_index(float_func, "sum") is None
+    assert _register_index(vector_func, "sum") is None
     assert "sum" in float_func.value_slots
     assert "sum" in vector_func.value_slots
 
@@ -250,11 +342,11 @@ entry:
 
     # Floating definitions retain slots without disabling unrelated scalar
     # intervals in the same block (the pinned value-array hot loop is mixed).
-    assert text_key_mapping_get(func.value_registers, "count") == 1
-    assert text_key_mapping_get(func.value_registers, "next") == 1
-    assert text_key_mapping_get(func.value_registers, "sum") is None
-    assert text_key_mapping_get(func.value_registers, "converted") is None
-    assert text_key_mapping_get(func.value_registers, "result") is None
+    assert _register_index(func, "count") == 1
+    assert _register_index(func, "next") == 1
+    assert _register_index(func, "sum") is None
+    assert _register_index(func, "converted") is None
+    assert _register_index(func, "result") is None
     assert all(
         text_key_mapping_get(func.value_slots, name) is not None
         for name in ("count", "next", "sum", "converted", "result")
@@ -275,5 +367,5 @@ entry:
     func = _prepared_function(ir_text)
     allocate_aarch64_block_registers(func)
 
-    assert text_key_mapping_get(func.value_registers, "ptr") == 1
-    assert text_key_mapping_get(func.value_registers, "loaded") == 1
+    assert _register_index(func, "ptr") == 1
+    assert _register_index(func, "loaded") == 1

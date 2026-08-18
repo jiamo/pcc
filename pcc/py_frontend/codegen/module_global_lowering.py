@@ -35,6 +35,7 @@ from .layer1_support import _import_from_module_or_empty
 
 _I8 = ir.IntType(8)
 _I1 = ir.IntType(1)
+_I64 = ir.IntType(64)
 _I32 = ir.IntType(32)
 _CSTR = _I8.as_pointer()
 
@@ -458,7 +459,10 @@ class ModuleGlobalLoweringMixin:
                 f"Layer 1/2 cannot allocate module global {name!r} "
                 f"of type {type(target_ty).__name__}"
             )
-        if isinstance(target_ty, IntType) and self._should_box_python_ints():
+        if isinstance(target_ty, IntType) and (
+            self._should_box_python_ints()
+            or name in self._boxed_int_module_global_names
+        ):
             ir_ty = _CSTR
         else:
             ir_ty = self._storage_ir_type(target_ty)
@@ -483,6 +487,71 @@ class ModuleGlobalLoweringMixin:
         init_flag.initializer = ir.Constant(_I1, 0)
         self._module_global_init_flags[name] = init_flag
         return self._module_globals[name]
+
+    def _emit_module_global_bound_check(self, name: str, expr) -> None:
+        """Raise ``NameError`` when a deleted module global is read.
+
+        Without this the slot cleared by ``del`` reads back as null, which is
+        neither the stale value nor the error Python promises.
+        """
+        flag = getattr(self, "_module_global_init_flags", {}).get(name)
+        if flag is None:
+            return
+        bound = self.builder.load(flag, name=self._fresh(f"{name}.bound"))
+        raise_bb = self.current_function.append_basic_block(
+            name=self._fresh(f"{name}.unbound")
+        )
+        ok_bb = self.current_function.append_basic_block(
+            name=self._fresh(f"{name}.bound.ok")
+        )
+        self.builder.cbranch(bound, ok_bb, raise_bb)
+
+        self.builder.position_at_end(raise_bb)
+        message = f"name '{name}' is not defined"
+        msg_gv, _ = self._cstr_literal(message)
+        exc = self.builder.call(
+            self.runtime["py_exc_new"],
+            [ir.Constant(_I64, 10), self._ptr_to_cstr(msg_gv)],
+            name=self._fresh(f"{name}.nameerror"),
+        )
+        self.builder.call(self.runtime["py_raise"], [exc])
+        # py_raise increfs for the TLS slot; this caller created the exception
+        # and still owns its own reference.
+        self._gc_release(exc)
+        self._emit_post_call_err_check(getattr(expr, "span", None))
+        self.builder.branch(ok_bb)
+
+        self.builder.position_at_end(ok_bb)
+
+    def _collect_module_del_targets(self, stmt) -> None:
+        """Record every module-level name used as a ``del`` target.
+
+        A module global can only become unbound if some ``del`` names it, so
+        this set is what keeps the read-side check off every other global.
+        """
+        from ..py_ast import Delete as _Delete, Name as _Name
+
+        targets = getattr(self, "_module_del_target_names", None)
+        if targets is None:
+            targets = set()
+            self._module_del_target_names = targets
+        stack = [stmt]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, _Delete):
+                for target in node.targets:
+                    if isinstance(target, _Name):
+                        targets.add(target.ident)
+                continue
+            for attr in ("body", "orelse", "finalbody", "handlers", "items"):
+                child = getattr(node, attr, None)
+                # Bodies are tuples on these AST nodes, not lists; matching
+                # only ``list`` silently skipped every function body.
+                if isinstance(child, (list, tuple)):
+                    stack.extend(x for x in child if hasattr(x, "__dict__"))
+
+    def _module_global_needs_bound_check(self, name: str) -> bool:
+        return name in getattr(self, "_module_del_target_names", set())
 
     def _mark_module_global_initialized(self, gv: ir.GlobalVariable) -> None:
         for name, (candidate, _declared_ty) in self._module_globals.items():
@@ -515,6 +584,13 @@ class ModuleGlobalLoweringMixin:
                     target_ty = s.annotation if s.annotation is not None else s.value.ty
                     for t in s.targets:
                         if isinstance(t, Name) and t.ident in global_names:
+                            if (
+                                isinstance(target_ty, IntType)
+                                and self._int_expr_needs_exact_object_boundary(
+                                    s.value
+                                )
+                            ):
+                                self._boxed_int_module_global_names.add(t.ident)
                             self._ensure_module_global_name(
                                 t.ident,
                                 target_ty,
@@ -600,6 +676,11 @@ class ModuleGlobalLoweringMixin:
                 or self._is_valueclass_payload_type(target_ty)
             ):
                 continue
+            if (
+                isinstance(target_ty, IntType)
+                and self._int_expr_needs_exact_object_boundary(stmt.value)
+            ):
+                self._boxed_int_module_global_names.add(t.ident)
             gv, _declared_ty = self._ensure_module_global_name(t.ident, target_ty)
             if (
                 self._python_library

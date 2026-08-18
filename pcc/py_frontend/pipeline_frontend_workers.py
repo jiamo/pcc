@@ -28,12 +28,80 @@ SOURCE_WORKER_CHUNKS_PER_JOB = 4
 # a few seconds but whose wall time grows by an order of magnitude when ten of
 # them start together.  Run those short-lived processes without overlapping
 # their peak heaps; the remaining shards can use a small bounded pool.
-SOURCE_WORKER_OVERSIZED_BYTES = 75_000
+SOURCE_WORKER_OVERSIZED_BYTES = 200_000
 SOURCE_WORKER_AUTO_SAFE_JOBS = 2
+SOURCE_WORKER_AST_OVERSIZED_BYTES = 6_000_000
+
+# Unified worker admission: jobs = min(cpu budget, hard risk cap, memory
+# budget / measured per-worker peak).  Executor differences enter only through
+# the measured peak constants; there is no per-stage special case.  Peaks were
+# measured on the 224-module compiler closure (docs/goal/evidence/
+# HARNESS-P0-STAGE2-MEMORY-SAFE-DEFAULT/002-stage2-critical-path-prediction.md):
+# host CPython frontend worker 1.7 GiB, compiled pcc1 safe-band worker
+# <=2.5 GiB (oversized-band pcc1 workers reach 6.0 GiB and stay serialized by
+# the source/AST split above this pool).  The budget arrives through
+# PCC_WORKER_TREE_BUDGET_BYTES; an absent or unparsable value means "unknown"
+# and preserves the historical cpu/hard-cap behavior.
+WORKER_TREE_BUDGET_ENV = "PCC_WORKER_TREE_BUDGET_BYTES"
+HOST_SOURCE_WORKER_PEAK_BYTES = 2147483648
+COMPILED_SAFE_WORKER_PEAK_BYTES = 3221225472
+WORKER_COORDINATOR_RESERVE_BYTES = 1073741824
+HOST_SOURCE_WORKER_AUTO_CAP = 10
+
+# Export workers parse/lift one module and summary workers decode one AST and
+# publish one compact effect wire.  They are short-lived one-module processes,
+# unlike codegen workers which retain inferred types, builder state and IR.
+# Same-source compiled checkpoint measurements put width-7 export+summary at
+# 7.49 GB tree peak versus 7.01 GB for width 2.  Keep 7 GiB unavailable to
+# these light lanes (the measured coordinator plus >1 GiB headroom), then
+# charge 512 MiB per worker.  At the production 8 GiB envelope both lanes stay
+# at the proven width 2; a larger shared envelope derives wider light lanes
+# without changing the 3 GiB codegen risk class.
+COMPILED_EXPORT_WORKER_PEAK_BYTES = 536870912
+COMPILED_EXPORT_COORDINATOR_RESERVE_BYTES = 7516192768
+COMPILED_EXPORT_AUTO_CAP = 10
+COMPILED_SUMMARY_WORKER_PEAK_BYTES = 536870912
+COMPILED_SUMMARY_COORDINATOR_RESERVE_BYTES = 7516192768
+COMPILED_SUMMARY_AUTO_CAP = 10
 
 
 class FrontendWorkerContractError(ValueError):
     """A worker manifest or result violated the frontend process contract."""
+
+
+def worker_tree_budget_bytes(raw: str) -> int:
+    normalized = str(raw or "").strip()
+    if not normalized:
+        return 0
+    try:
+        budget = int(normalized)
+    except ValueError:
+        return 0
+    if budget < 0:
+        return 0
+    return budget
+
+
+def budget_jobs(
+    cpu_budget: int,
+    memory_budget_bytes: int,
+    per_worker_peak_bytes: int,
+    hard_cap: int,
+) -> int:
+    jobs = int(cpu_budget)
+    cap = int(hard_cap)
+    if jobs > cap:
+        jobs = cap
+    budget = int(memory_budget_bytes)
+    if budget > 0:
+        by_memory = (budget - WORKER_COORDINATOR_RESERVE_BYTES) // int(
+            per_worker_peak_bytes
+        )
+        if by_memory < jobs:
+            jobs = by_memory
+    if jobs < 1:
+        return 1
+    return jobs
 
 
 def frontend_jobs(job_count_hint: int, raw: str, cpu_budget: int) -> int:
@@ -43,9 +111,12 @@ def frontend_jobs(job_count_hint: int, raw: str, cpu_budget: int) -> int:
     if normalized in ("0", "off", "false", "no"):
         return 1
     if normalized in _AUTO_VALUES:
-        jobs = int(cpu_budget)
-        if jobs > 10:
-            jobs = 10
+        jobs = budget_jobs(
+            int(cpu_budget),
+            worker_tree_budget_bytes(os.environ.get(WORKER_TREE_BUDGET_ENV, "")),
+            HOST_SOURCE_WORKER_PEAK_BYTES,
+            HOST_SOURCE_WORKER_AUTO_CAP,
+        )
     else:
         try:
             jobs = int(normalized)
@@ -56,6 +127,69 @@ def frontend_jobs(job_count_hint: int, raw: str, cpu_budget: int) -> int:
     if jobs > job_count_hint:
         jobs = job_count_hint
     return jobs
+
+
+def compiled_native_auto_jobs(jobs: int) -> int:
+    """Bound an automatic compiled-worker lane by its memory contract."""
+    selected = int(jobs)
+    if selected < 1:
+        return 1
+    return budget_jobs(
+        selected,
+        worker_tree_budget_bytes(os.environ.get(WORKER_TREE_BUDGET_ENV, "")),
+        COMPILED_SAFE_WORKER_PEAK_BYTES,
+        SOURCE_WORKER_AUTO_SAFE_JOBS,
+    )
+
+
+def _compiled_native_light_jobs(
+    jobs: int,
+    worker_peak_bytes: int,
+    coordinator_reserve_bytes: int,
+    hard_cap: int,
+) -> int:
+    selected = int(jobs)
+    if selected < 1:
+        return 1
+    if selected > int(hard_cap):
+        selected = int(hard_cap)
+    budget = worker_tree_budget_bytes(
+        os.environ.get(WORKER_TREE_BUDGET_ENV, "")
+    )
+    if budget <= 0:
+        if selected > SOURCE_WORKER_AUTO_SAFE_JOBS:
+            return SOURCE_WORKER_AUTO_SAFE_JOBS
+        return selected
+    by_memory = (budget - int(coordinator_reserve_bytes)) // int(
+        worker_peak_bytes
+    )
+    if by_memory < selected:
+        selected = by_memory
+    if selected < 1:
+        return 1
+    return selected
+
+
+def compiled_native_export_jobs(jobs: int) -> int:
+    """Derive the compiled export width from its measured memory class."""
+
+    return _compiled_native_light_jobs(
+        jobs,
+        COMPILED_EXPORT_WORKER_PEAK_BYTES,
+        COMPILED_EXPORT_COORDINATOR_RESERVE_BYTES,
+        COMPILED_EXPORT_AUTO_CAP,
+    )
+
+
+def compiled_native_summary_jobs(jobs: int) -> int:
+    """Derive the compiled summary width from its measured memory class."""
+
+    return _compiled_native_light_jobs(
+        jobs,
+        COMPILED_SUMMARY_WORKER_PEAK_BYTES,
+        COMPILED_SUMMARY_COORDINATOR_RESERVE_BYTES,
+        COMPILED_SUMMARY_AUTO_CAP,
+    )
 
 
 def numeric_jobs_override(raw: str) -> bool:
@@ -173,14 +307,19 @@ def split_codegen_chunks_by_source_size(
     src_paths,
     chunks,
     threshold_bytes: int = SOURCE_WORKER_OVERSIZED_BYTES,
+    *,
+    sidecar_dir: str = "",
+    sidecar_threshold_bytes: int = SOURCE_WORKER_AST_OVERSIZED_BYTES,
 ):
-    """Extract oversized sources into descending singleton chunks.
+    """Extract oversized source/AST inputs into descending singleton chunks.
 
     ``chunks`` already owns stable, source-order indices.  Safe residual
     chunks retain that order; oversized modules are largest-first so the
-    highest peak is released before any safe worker starts.  A missing source
-    is treated as safe here and remains a normal worker error later rather
-    than being hidden by scheduling policy.
+    highest peak is released before any safe worker starts.  Once export has
+    published AST sidecars, their byte size supplements source size: generated
+    compact source can expand into a much larger compiler object graph.  A
+    missing source/sidecar remains a normal worker error later rather than
+    being hidden by scheduling policy.
     """
 
     threshold = int(threshold_bytes)
@@ -195,8 +334,24 @@ def split_codegen_chunks_by_source_size(
                 source_bytes = os.path.getsize(src_paths[source_index])
             except OSError:
                 source_bytes = 0
-            if source_bytes >= threshold:
-                oversized.append((source_bytes, int(source_index)))
+            sidecar_bytes = 0
+            if sidecar_dir:
+                sidecar_path = os.path.join(
+                    sidecar_dir,
+                    "module_" + str(source_index) + ".json",
+                )
+                try:
+                    sidecar_bytes = os.path.getsize(sidecar_path)
+                except OSError:
+                    sidecar_bytes = 0
+            oversized_weight = source_bytes
+            is_oversized = source_bytes >= threshold
+            if sidecar_bytes >= int(sidecar_threshold_bytes):
+                is_oversized = True
+                if sidecar_bytes > oversized_weight:
+                    oversized_weight = sidecar_bytes
+            if is_oversized:
+                oversized.append((oversized_weight, int(source_index)))
             else:
                 safe_chunk.append(source_index)
         if safe_chunk:

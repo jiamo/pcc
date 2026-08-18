@@ -85,6 +85,8 @@ PyObject *py_tuple_new(int64_t n) {
     t->len        = n;
     if (n > 0) {
         memset(t->items, 0, (size_t)n * sizeof(PyObject *));
+    } else {
+        pcc_gc_publish_initialized((PyObject *)t);
     }
     return (PyObject *)t;
 }
@@ -119,7 +121,7 @@ PyObject *py_tuple_from_splat(PyObject *seq) {
         if (py_err_occurred()) return NULL;
     }
     if (n < 0) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "tuple() argument is not iterable"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "tuple() argument is not iterable"));
         return NULL;
     }
 
@@ -174,6 +176,17 @@ void py_tuple_set_item(PyObject *tuple, int64_t i, PyObject *item) {
             py_gc_track(tuple);
         }
     }
+    /* Only colored relocation waits for complete payload publication.
+     * Keep the store/ownership/tracking work above for every collector. */
+    if (pcc_gc_backend() != PCC_GC_KIND_COLORED_RELOCATING) return;
+    int complete = 1;
+    for (int64_t slot_index = 0; slot_index < t->len; slot_index++) {
+        if (pcc_gc_load_ptr(tuple, &t->items[slot_index]) == NULL) {
+            complete = 0;
+            break;
+        }
+    }
+    if (complete) pcc_gc_publish_initialized(tuple);
 }
 
 PyObject *py_tuple_get(PyObject *tuple, int64_t i) {
@@ -206,7 +219,7 @@ PyObject *py_tuple_getitem(PyObject *tuple, int64_t i) {
     PyTupleObject *t = (PyTupleObject *)tuple;
     if (i < 0) i += t->len;
     if (i < 0 || i >= t->len) {
-        py_raise(py_exc_new(PY_EXC_INDEXERROR, "tuple index out of range"));
+        py_raise_owned(py_exc_new(PY_EXC_INDEXERROR, "tuple index out of range"));
         return NULL;
     }
     PyObject *v = pcc_gc_load_ptr(tuple, &t->items[i]);

@@ -12,6 +12,8 @@ Owned surface (stable C ABI names):
   Py_BuildValue
 """
 
+__pcc_runtime_port__ = True
+
 from pcc.extern import (
     c_abi_typed_export,
     c_abi_variadic_export,
@@ -42,6 +44,8 @@ from pcc.unsafe import (
 py_incref = extern("py_incref", (c_ptr,), c_void)
 py_decref = extern("py_decref", (c_ptr,), c_void)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 PyLong_FromLong = extern("PyLong_FromLong", (c_int64,), c_ptr)
 PyLong_FromLongLong = extern("PyLong_FromLongLong", (c_int64,), c_ptr)
@@ -60,7 +64,7 @@ PyList_Append = extern("PyList_Append", (c_ptr, c_ptr), c_int64)
 
 
 def _value_error(message) -> None:
-    py_raise(py_exc_new(2, message))  # PY_EXC_VALUEERROR
+    py_raise_owned(py_exc_new(2, message))  # PY_EXC_VALUEERROR
 
 
 def _build_none() -> c_ptr:

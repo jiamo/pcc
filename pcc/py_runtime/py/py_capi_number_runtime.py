@@ -20,6 +20,9 @@ Public object type tags come from the generated ``py_abi_constants`` module.
 Private exception codes remain owned by the number C-API contract:
   PY_EXC_TYPEERROR = 3, PY_EXC_VALUEERROR = 2
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_BOOL,
     PY_TYPE_BYTEARRAY,
@@ -78,6 +81,8 @@ py_tuple_set_item = extern("py_tuple_set_item", (c_ptr, c_int64, c_ptr), c_void)
 py_incref = extern("py_incref", (c_ptr,), c_void)
 py_decref = extern("py_decref", (c_ptr,), c_void)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 py_err_occurred = extern("py_err_occurred", (), c_int64)
 py_runtime_error_if_unset = extern(
@@ -573,15 +578,15 @@ def _tuple_pack2(a, b) -> c_ptr:
 
 
 def _type_error(message) -> None:
-    py_raise(py_exc_new(3, message))  # PY_EXC_TYPEERROR
+    py_raise_owned(py_exc_new(3, message))  # PY_EXC_TYPEERROR
 
 
 def _zero_division_error() -> None:
-    py_raise(py_exc_new(9, cstr("integer division or modulo by zero")))  # PY_EXC_ZERODIVISIONERROR
+    py_raise_owned(py_exc_new(9, cstr("integer division or modulo by zero")))  # PY_EXC_ZERODIVISIONERROR
 
 
 def _overflow_error(message) -> None:
-    py_raise(py_exc_new(5, message))  # PY_EXC_OVERFLOWERROR
+    py_raise_owned(py_exc_new(5, message))  # PY_EXC_OVERFLOWERROR
 
 
 def _isfinite(value: float) -> int:

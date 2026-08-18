@@ -10,13 +10,21 @@ from pcc.llvm_capi.compat import ir
 from .freestanding_abi_constants import ABI_CONSTANTS
 
 from ..py_ast import (
+    Assign,
+    AugAssign,
+    BinOp,
+    ClassDef,
+    DynType,
     BoolType,
     Call,
     Expr,
     FloatType,
+    FuncDef,
+    Global,
     IntLit,
     IntType,
     Name,
+    Stmt,
     StrLit,
     UnaryOp,
 )
@@ -63,6 +71,7 @@ UNSAFE_INTRINSICS = frozenset(
         "ptr_to_int",
         "wrapping_mul_i64",
         "logical_shift_right_i64",
+        "logical_shift_left_i64",
         "unsigned_div_i64",
         "unsigned_rem_i64",
         "unsigned_greater_i64",
@@ -82,6 +91,8 @@ UNSAFE_INTRINSICS = frozenset(
         "tag_int",
         "untag_int",
         "load_i64",
+        "load_i64x4",
+        "load_i64x4_strided",
         "load_i32",
         "load_i8",
         "load_ptr",
@@ -242,6 +253,222 @@ _ATOMIC_ORDER_TO_LLVM = {
 _ATOMIC_RMW_OPS = ("add", "sub", "and", "or", "xchg")
 
 
+# Keep the giant unsafe dispatcher split at Python function boundaries.
+# The self-backend IR splitter cannot divide one LLVM function, so each
+# family stays below the residual oversized-worker threshold.  Tuple
+# membership uses equality rather than native string hashes.
+_UNSAFE_INTRINSIC_FAMILIES = (
+    (
+        'va_start',
+        'va_arg_i64',
+        'va_arg_i32',
+        'va_arg_u32',
+        'va_arg_ptr',
+        'va_arg_f64',
+        'va_cursor',
+        'va_end',
+        'wrapping_mul_i64',
+        'logical_shift_right_i64',
+        'logical_shift_left_i64',
+        'unsigned_div_i64',
+        'unsigned_rem_i64',
+        'unsigned_greater_i64',
+        'mul_overflow_i64',
+        'float_to_i64',
+        'i64_to_float',
+        'f64_div',
+        'f64_signbit',
+        'f64_bits',
+        'f64_pair_make',
+        'f64_pair_first',
+        'f64_pair_second',
+    ),
+    (
+        'page_alloc',
+        'page_free',
+        'syscall6',
+        'cstr',
+        'target_sys_platform',
+        'target_platform_machine',
+        'darwin_errno_location',
+        'abi_constant',
+        'global_addr',
+        'function_addr',
+        'int_to_ptr',
+        'ptr_to_int',
+        'global_load_ptr',
+        'global_store_ptr',
+        'malloc',
+        'calloc',
+        'realloc',
+        'free',
+        'ptr_add',
+        'ptr_diff',
+    ),
+    (
+        'null',
+        'ptr_eq',
+        'ptr_is_null',
+        'is_tagged_int',
+        'tag_int',
+        'untag_int',
+        'load_i64',
+        'load_i64x4',
+        'load_i64x4_strided',
+        'load_i32',
+        'load_i8',
+        'load_ptr',
+        'load_f64',
+        'store_i64',
+        'store_i32',
+        'store_i8',
+        'store_ptr',
+        'store_f64',
+        'memset',
+        'memcpy',
+        'memmove',
+    ),
+    (
+        'read',
+        'write',
+        'close',
+        'seek_file',
+        'open_readonly',
+        'darwin_current_rss_bytes',
+        'darwin_peak_rss_bytes',
+    ),
+    (
+        'open_file',
+        'rename_file',
+        'chmod_file',
+        'sync_file',
+    ),
+    (
+        'socket_open',
+        'socket_connect',
+        'socket_bind',
+        'socket_listen',
+        'socket_setsockopt',
+        'socket_getsockopt',
+        'fd_control',
+        'eventfd_create',
+    ),
+    (
+        'socket_send',
+        'socket_recv',
+        'socket_accept',
+        'socket_shutdown',
+        'socket_sockname',
+        'socket_peername',
+        'poll_fd',
+        'poll_readable_pair',
+    ),
+    (
+        'getpid',
+        'getcwd',
+        'readlink',
+        'mkdir',
+        'unlinkat',
+        'uname',
+        'uname_field',
+        'cpu_query',
+    ),
+    (
+        'clock_gettime',
+        'nanosleep',
+        'waitpid',
+        'kill',
+        'process_exit',
+    ),
+    (
+        'spawn_process_pipe',
+    ),
+    (
+        'spawn_process',
+    ),
+    (
+        'stack_alloc',
+        'strlen',
+        'getenv',
+        'setenv',
+        'unsetenv',
+        'initial_environ',
+        'access',
+        'stat_kind',
+        'stat_mtime',
+    ),
+    (
+        'call_ptr1',
+        'call_ptr0',
+        'call_void_ptr0',
+        'call_void_ptr1',
+        'call_void_ptr2',
+        'call_void_ptr_i64_ptr',
+        'call_ptr2',
+        'call_ptr_ptr_i64',
+        'call_ptr_ptr_ptr_i64_ptr',
+        'call_ptr_ptr_ptr_i32',
+        'call_ptr3',
+        'call_ptr4',
+        'call_i64_i64',
+        'call_i64_i64_ptr',
+        'call_i32_ptr1',
+        'call_i32_ptr_i64',
+        'call_i32_ptr_i32',
+        'call_i32_ptr_i32_i32',
+        'call_i32_ptr_i32_i32_i32',
+        'call_i32_ptr_i32_i32_i32_i32_i32_ptr_i32',
+        'call_i32_i32_ptr_i64',
+        'call_i32_i64_i64_ptr',
+        'call_i32_i64_i32_i64',
+    ),
+    (
+        'call_i64_ptr1',
+        'call_i64_ptr_ptr_ptr_i64',
+        'call_i64_ptr_i64',
+        'call_i64_ptr2',
+        'call_i64_ptr4_i64_i64',
+        'call_i64_ptr3_i64_i64_i64',
+        'call_ptr_i64_i64',
+        'call_i64_ptr3',
+        'call_i64_i64_i64_ptr',
+        'call_variadic_i64_ptr_i64_ptr',
+        'call_variadic_i64_ptr_i64_i64',
+        'call_variadic_i32_ptr_i32_ptr',
+        'call_variadic_i32_ptr_i32_i64',
+        'call_i64_ptr_i64_ptr',
+        'call_i64_ptr_i64_i64',
+        'call_i64_ptr_i64_ptr_i64',
+        'call_i64_ptr_i64_i64_ptr',
+        'call_i64_ptr_i64_ptr_ptr_ptr_ptr_bool',
+        'call_i64_ptr_ptr_ptr_ptr_ptr_bool',
+    ),
+    (
+        'dynamic_library_open',
+        'dynamic_library_open_global',
+        'dynamic_library_symbol',
+        'darwin_libsystem_symbol',
+        'dynamic_library_close',
+        'kqueue_create',
+        'kevent_call',
+        'epoll_create1',
+        'epoll_ctl',
+        'epoll_wait',
+        'thread_safepoint',
+        'gc_backend_current',
+    ),
+)
+
+
+def _unsafe_intrinsic_family(intrinsic: str) -> int:
+    family = 0
+    while family < len(_UNSAFE_INTRINSIC_FAMILIES):
+        if intrinsic in _UNSAFE_INTRINSIC_FAMILIES[family]:
+            return family
+        family += 1
+    return -1
+
+
 class UnsafeIntrinsicMixin:
     _UNSAFE_INTRINSICS = UNSAFE_INTRINSICS
 
@@ -304,27 +531,36 @@ class UnsafeIntrinsicMixin:
             )
         return platform_expr.value == self._target_sys_platform_text()
 
+    def _raw_addresses_are_ints(self) -> bool:
+        """Application modules type raw addresses as ``int``.
+
+        Freestanding kernels and runtime ports (``__pcc_runtime_port__``)
+        keep raw pointers in the pointer lane because they build objects out
+        of raw memory; see ``pipeline_freestanding``.
+        """
+        return not (
+            getattr(self, "_freestanding_module", False)
+            or getattr(self, "_runtime_port_module", False)
+        )
+
     def _unsafe_ptr_arg(self, expr: Expr) -> ir.Value:
         ptr = self._emit_expr(expr)
         if isinstance(ptr.type, ir.PointerType):
-            if self._ir_type_matches(ptr.type, _CSTR):
-                return ptr
-            return self.builder.bitcast(
-                ptr,
-                _CSTR,
-                name=self._fresh("unsafe.ptr.cast"),
-            )
-        # A small recovery path for late-stage mismatches between the
-        # value-level LLVM type and the Python-level object-flow intent.
-        # Some high-level pointer variables in pcc-Python runtime ports are
-        # intentionally unannotated; if inference briefly loses the opaque
-        # object abstraction and emits a plain integer, this lets us keep
-        # moving instead of hard-failing at compile time.
+            if not self._ir_type_matches(ptr.type, _CSTR):
+                ptr = self.builder.bitcast(
+                    ptr,
+                    _CSTR,
+                    name=self._fresh("unsafe.ptr.cast"),
+                )
+            return ptr
+        # Raw addresses are ``int`` outside runtime-port mode (see
+        # type_infer._POINTER_INTRINSICS); an integer-typed operand is the
+        # address itself.  Float/bool operands remain a compile-time error.
         if isinstance(ptr.type, ir.IntType):
             expr_ty = getattr(expr, "ty", None)
-            if isinstance(expr_ty, (IntType, FloatType, BoolType)):
+            if isinstance(expr_ty, (FloatType, BoolType)):
                 raise NotImplementedError(
-                    "pcc.unsafe pointer argument must be a pointer-typed value"
+                    "pcc.unsafe pointer argument must be a pointer or address value"
                 )
             if ptr.type.width == 64:
                 return self.builder.inttoptr(ptr, _CSTR)
@@ -334,6 +570,36 @@ class UnsafeIntrinsicMixin:
         raise NotImplementedError(
             "pcc.unsafe pointer argument must be a pointer-typed value"
         )
+
+    def _unsafe_address_arg(self, expr: Expr) -> ir.Value:
+        """Base-address operand of a raw-memory intrinsic (load/store/atomic/
+        memcpy/free/ptr_add).
+
+        Outside pointer-lane modules a raw address is an ``int``; a dynamic
+        value (an untyped helper parameter, a container element) may carry it
+        as a tagged small int.  A tagged value can never be a valid memory
+        address, so it is untagged at run time.  The result is rebuilt from
+        integer bits with ``inttoptr`` so the precise stack-map analysis sees a
+        raw address, never a managed SSA value of ambiguous provenance; a real
+        object pointer round-trips through the same bits unchanged.  Value
+        operands (``is_tagged_int``, ``ptr_eq``, ``store_ptr`` payloads, object
+        arguments) must NOT use this: for them a tagged small int is the value
+        itself.
+        """
+        ptr = self._unsafe_ptr_arg(expr)
+        expr_ty = getattr(expr, "ty", None)
+        if not (isinstance(expr_ty, DynType) and self._raw_addresses_are_ints()):
+            return ptr
+        bits = self.builder.ptrtoint(ptr, _I64, name=self._fresh("unsafe.dyn.bits"))
+        tag = self.builder.and_(bits, ir.Constant(_I64, 1), name=self._fresh("unsafe.dyn.tag"))
+        is_tagged = self.builder.icmp_unsigned(
+            "!=", tag, ir.Constant(_I64, 0), name=self._fresh("unsafe.dyn.is_tagged")
+        )
+        untagged = self.builder.ashr(bits, ir.Constant(_I64, 1), name=self._fresh("unsafe.dyn.untag"))
+        address_bits = self.builder.select(
+            is_tagged, untagged, bits, name=self._fresh("unsafe.dyn.addr.bits")
+        )
+        return self.builder.inttoptr(address_bits, _CSTR, name=self._fresh("unsafe.dyn.addr"))
 
     def _unsafe_i64_arg(self, expr: Expr) -> ir.Value:
         return self._to_int64(self._emit_expr(expr), expr.ty)
@@ -469,10 +735,109 @@ class UnsafeIntrinsicMixin:
                 value = info.get("value")
                 if type(value) is int or type(value) is bool:
                     return int(value)
+            module_value = self._module_scope_int_literal_binding(expr.ident)
+            if module_value is not None:
+                return module_value
+        if isinstance(expr, BinOp) and expr.op in ("+", "-", "*", "//", "%", "<<", ">>", "&", "|", "^"):
+            # Constant arithmetic over statically known integers, e.g.
+            # ``stack_alloc(_MAX_NAME + 1)``.  Each operand must itself be a
+            # constant by the rules above; division/modulo by zero and shifts
+            # by negative counts fail closed like any non-constant operand.
+            lhs = self._unsafe_const_i64_arg(expr.lhs)
+            rhs = self._unsafe_const_i64_arg(expr.rhs)
+            op = expr.op
+            if op == "+":
+                return lhs + rhs
+            if op == "-":
+                return lhs - rhs
+            if op == "*":
+                return lhs * rhs
+            if op == "//" and rhs != 0:
+                return lhs // rhs
+            if op == "%" and rhs != 0:
+                return lhs % rhs
+            if op == "<<" and 0 <= rhs < 64:
+                return lhs << rhs
+            if op == ">>" and 0 <= rhs < 64:
+                return lhs >> rhs
+            if op == "&":
+                return lhs & rhs
+            if op == "|":
+                return lhs | rhs
+            if op == "^":
+                return lhs ^ rhs
         raise NotImplementedError(
             "pcc.unsafe global definition intrinsics require integer literals "
             "or statically imported integer constants"
         )
+
+    def _module_scope_int_literal_binding(self, ident: str):
+        """Value of a module-scope ``NAME = <int literal>`` binding.
+
+        Accepted only when the module assigns ``NAME`` exactly once, at module
+        scope, to an integer literal (optionally negated), never augments it,
+        and no function or class body declares it ``global``.  Anything else
+        fails closed so a rebinding can never be folded away.  This lets an
+        out-of-tree package use its own size constants for ``stack_alloc`` and
+        the global-definition intrinsics the way pcc-owned modules do through
+        their native export tables.
+        """
+        body = getattr(self, "_ast_body", None)
+        if body is None:
+            module = getattr(self, "ast_module", None)
+            body = getattr(module, "body", None)
+        if not body:
+            return None
+        value = None
+        bindings = 0
+        for stmt in body:
+            if isinstance(stmt, Assign):
+                for target in stmt.targets:
+                    if isinstance(target, Name) and target.ident == ident:
+                        bindings += 1
+                        literal = stmt.value
+                        if isinstance(literal, IntLit):
+                            value = int(literal.value)
+                        elif (
+                            isinstance(literal, UnaryOp)
+                            and literal.op == "-"
+                            and isinstance(literal.operand, IntLit)
+                        ):
+                            value = -int(literal.operand.value)
+                        else:
+                            value = None
+            elif isinstance(stmt, AugAssign):
+                target = stmt.target
+                if isinstance(target, Name) and target.ident == ident:
+                    return None
+        if bindings != 1 or value is None:
+            return None
+        # A ``global NAME`` anywhere in the module means the binding is not
+        # constant.  Walk nested bodies iteratively (no closure conversion
+        # needed under self-host).
+        stack = list(body)
+        while stack:
+            node = stack.pop()
+            if isinstance(node, Global):
+                if ident in tuple(getattr(node, "names", ())):
+                    return None
+                continue
+            if isinstance(node, (FuncDef, ClassDef)):
+                stack.extend(getattr(node, "body", ()))
+                continue
+            for child_name in ("body", "orelse", "finalbody"):
+                children = getattr(node, child_name, None)
+                if isinstance(children, (list, tuple)):
+                    for child in children:
+                        if isinstance(child, Stmt):
+                            stack.append(child)
+            handlers = getattr(node, "handlers", None)
+            if isinstance(handlers, (list, tuple)):
+                for handler in handlers:
+                    for child in getattr(handler, "body", ()):
+                        if isinstance(child, Stmt):
+                            stack.append(child)
+        return value
 
     def _unsafe_abi_constant_value(self, expr: Call) -> int:
         self._unsafe_expect_arity("abi_constant", expr, 1)
@@ -746,7 +1111,7 @@ class UnsafeIntrinsicMixin:
         if intrinsic == "atomic_test_and_set":
             self._unsafe_expect_arity(intrinsic, expr, 3)
             addr = self._unsafe_typed_addr(
-                self._unsafe_ptr_arg(expr.args[0]),
+                self._unsafe_address_arg(expr.args[0]),
                 self._unsafe_i64_arg(expr.args[1]),
                 _I8,
             )
@@ -774,7 +1139,7 @@ class UnsafeIntrinsicMixin:
         if intrinsic == "atomic_clear":
             self._unsafe_expect_arity(intrinsic, expr, 3)
             addr = self._unsafe_typed_addr(
-                self._unsafe_ptr_arg(expr.args[0]),
+                self._unsafe_address_arg(expr.args[0]),
                 self._unsafe_i64_arg(expr.args[1]),
                 _I8,
             )
@@ -798,7 +1163,7 @@ class UnsafeIntrinsicMixin:
         if intrinsic in ("atomic_load_i32", "atomic_load_i64"):
             self._unsafe_expect_arity(intrinsic, expr, 3)
             addr = self._unsafe_typed_addr(
-                self._unsafe_ptr_arg(expr.args[0]),
+                self._unsafe_address_arg(expr.args[0]),
                 self._unsafe_i64_arg(expr.args[1]),
                 width_ty,
             )
@@ -1199,6 +1564,46 @@ class UnsafeIntrinsicMixin:
             return self._unsafe_void_result()
         if intrinsic.startswith("atomic_"):
             return self._emit_unsafe_atomic_call(intrinsic, expr)
+        family = _unsafe_intrinsic_family(intrinsic)
+        if family == 0:
+            return self._emit_unsafe_va_numeric_f64(intrinsic, expr)
+        if family == 1:
+            return self._emit_unsafe_page_global_alloc(intrinsic, expr)
+        if family == 2:
+            return self._emit_unsafe_ptr_memory(intrinsic, expr)
+        if family == 3:
+            return self._emit_unsafe_read_write_rss(intrinsic, expr)
+        if family == 4:
+            return self._emit_unsafe_file_mutation(intrinsic, expr)
+        if family == 5:
+            return self._emit_unsafe_socket_control(intrinsic, expr)
+        if family == 6:
+            return self._emit_unsafe_socket_io_poll(intrinsic, expr)
+        if family == 7:
+            return self._emit_unsafe_system_info(intrinsic, expr)
+        if family == 8:
+            return self._emit_unsafe_time_process_control(intrinsic, expr)
+        if family == 9:
+            return self._emit_unsafe_spawn_process_pipe(intrinsic, expr)
+        if family == 10:
+            return self._emit_unsafe_spawn_process(intrinsic, expr)
+        if family == 11:
+            return self._emit_unsafe_env_access_stat(intrinsic, expr)
+        if family == 12:
+            return self._emit_unsafe_indirect_calls_a(intrinsic, expr)
+        if family == 13:
+            return self._emit_unsafe_indirect_calls_b(intrinsic, expr)
+        if family == 14:
+            return self._emit_unsafe_loader_waitset_gc(intrinsic, expr)
+        raise NotImplementedError(
+            f"unknown pcc.unsafe intrinsic {intrinsic!r}"
+        )
+
+    def _emit_unsafe_va_numeric_f64(
+        self,
+        intrinsic: str,
+        expr: Call,
+    ) -> ir.Value:
         if intrinsic == "va_start":
             self._unsafe_expect_arity(intrinsic, expr, 0)
             if self.current_function is None or not getattr(
@@ -1320,6 +1725,13 @@ class UnsafeIntrinsicMixin:
                 self._unsafe_i64_arg(expr.args[1]),
                 name=self._fresh("unsafe.lshr.i64"),
             )
+        if intrinsic == "logical_shift_left_i64":
+            self._unsafe_expect_arity(intrinsic, expr, 2)
+            return self.builder.shl(
+                self._unsafe_i64_arg(expr.args[0]),
+                self._unsafe_i64_arg(expr.args[1]),
+                name=self._fresh("unsafe.shl.i64"),
+            )
         if intrinsic in ("unsigned_div_i64", "unsigned_rem_i64"):
             self._unsafe_expect_arity(intrinsic, expr, 2)
             value = self._unsafe_i64_arg(expr.args[0])
@@ -1438,6 +1850,15 @@ class UnsafeIntrinsicMixin:
                 0 if intrinsic == "f64_pair_first" else 1,
                 name=self._fresh("unsafe." + intrinsic),
             )
+        raise NotImplementedError(
+            "pcc.unsafe internal intrinsic family mismatch"
+        )
+
+    def _emit_unsafe_page_global_alloc(
+        self,
+        intrinsic: str,
+        expr: Call,
+    ) -> ir.Value:
         if intrinsic == "page_alloc":
             self._unsafe_expect_arity(intrinsic, expr, 1)
             size = self._unsafe_i64_arg(expr.args[0])
@@ -1718,13 +2139,13 @@ class UnsafeIntrinsicMixin:
             )
             self.builder.call(
                 free_fn,
-                [self._unsafe_ptr_arg(expr.args[0])],
+                [self._unsafe_address_arg(expr.args[0])],
             )
             return self._unsafe_void_result()
         if intrinsic == "ptr_add":
             self._unsafe_expect_arity(intrinsic, expr, 2)
             return self.builder.gep(
-                self._unsafe_ptr_arg(expr.args[0]),
+                self._unsafe_address_arg(expr.args[0]),
                 [self._unsafe_i64_arg(expr.args[1])],
                 name=self._fresh("unsafe.ptr.add"),
             )
@@ -1745,6 +2166,15 @@ class UnsafeIntrinsicMixin:
                 rhs_i,
                 name=self._fresh("unsafe.ptr.diff"),
             )
+        raise NotImplementedError(
+            "pcc.unsafe internal intrinsic family mismatch"
+        )
+
+    def _emit_unsafe_ptr_memory(
+        self,
+        intrinsic: str,
+        expr: Call,
+    ) -> ir.Value:
         if intrinsic == "null":
             self._unsafe_expect_arity(intrinsic, expr, 0)
             return ir.Constant(_CSTR, None)
@@ -1821,9 +2251,21 @@ class UnsafeIntrinsicMixin:
                 ir.Constant(_I64, 1),
                 name=self._fresh("unsafe.untag.int"),
             )
-        if intrinsic in ("load_i64", "load_i32", "load_i8", "load_ptr", "load_f64"):
-            self._unsafe_expect_arity(intrinsic, expr, 2)
-            base = self._unsafe_ptr_arg(expr.args[0])
+        if intrinsic in (
+            "load_i64",
+            "load_i64x4",
+            "load_i64x4_strided",
+            "load_i32",
+            "load_i8",
+            "load_ptr",
+            "load_f64",
+        ):
+            self._unsafe_expect_arity(
+                intrinsic,
+                expr,
+                3 if intrinsic == "load_i64x4_strided" else 2,
+            )
+            base = self._unsafe_address_arg(expr.args[0])
             offset = self._unsafe_i64_arg(expr.args[1])
             if intrinsic == "load_i64":
                 addr = self._unsafe_typed_addr(base, offset, _I64)
@@ -1831,6 +2273,48 @@ class UnsafeIntrinsicMixin:
                     addr,
                     name=self._fresh("unsafe.load.i64"),
                     align=1,
+                )
+            if intrinsic in ("load_i64x4", "load_i64x4_strided"):
+                quad_type = ir.LiteralStructType([_I64, _I64, _I64, _I64])
+                quad_slot = self.builder.alloca(
+                    quad_type,
+                    name=self._fresh("unsafe.load.i64x4.slot"),
+                )
+                zero = ir.Constant(_I32, 0)
+                stride = ir.Constant(_I64, 8)
+                if intrinsic == "load_i64x4_strided":
+                    stride = self._unsafe_i64_arg(expr.args[2])
+                lane_index = 0
+                while lane_index < 4:
+                    lane_offset = offset
+                    if lane_index:
+                        delta = self.builder.mul(
+                            stride,
+                            ir.Constant(_I64, lane_index),
+                            name=self._fresh("unsafe.load.i64x4.delta"),
+                        )
+                        lane_offset = self.builder.add(
+                            offset,
+                            delta,
+                            name=self._fresh("unsafe.load.i64x4.offset"),
+                        )
+                    lane_addr = self._unsafe_typed_addr(base, lane_offset, _I64)
+                    lane = self.builder.load(
+                        lane_addr,
+                        name=self._fresh("unsafe.load.i64x4.lane"),
+                        align=1,
+                    )
+                    lane_ptr = self.builder.gep(
+                        quad_slot,
+                        [zero, ir.Constant(_I32, lane_index)],
+                        inbounds=True,
+                        name=self._fresh("unsafe.load.i64x4.lane.ptr"),
+                    )
+                    self.builder.store(lane, lane_ptr)
+                    lane_index += 1
+                return self.builder.load(
+                    quad_slot,
+                    name=self._fresh("unsafe.load.i64x4.value"),
                 )
             if intrinsic == "load_i32":
                 addr = self._unsafe_typed_addr(base, offset, _I32)
@@ -1877,7 +2361,7 @@ class UnsafeIntrinsicMixin:
             "store_f64",
         ):
             self._unsafe_expect_arity(intrinsic, expr, 3)
-            base = self._unsafe_ptr_arg(expr.args[0])
+            base = self._unsafe_address_arg(expr.args[0])
             offset = self._unsafe_i64_arg(expr.args[1])
             if intrinsic == "store_i64":
                 addr = self._unsafe_typed_addr(base, offset, _I64)
@@ -1930,7 +2414,7 @@ class UnsafeIntrinsicMixin:
             return self.builder.call(
                 memset_fn,
                 [
-                    self._unsafe_ptr_arg(expr.args[0]),
+                    self._unsafe_address_arg(expr.args[0]),
                     self._unsafe_i32_arg(expr.args[1]),
                     self._unsafe_i64_arg(expr.args[2]),
                 ],
@@ -1946,12 +2430,21 @@ class UnsafeIntrinsicMixin:
             return self.builder.call(
                 copy_fn,
                 [
-                    self._unsafe_ptr_arg(expr.args[0]),
-                    self._unsafe_ptr_arg(expr.args[1]),
+                    self._unsafe_address_arg(expr.args[0]),
+                    self._unsafe_address_arg(expr.args[1]),
                     self._unsafe_i64_arg(expr.args[2]),
                 ],
                 name=self._fresh(f"unsafe.{intrinsic}"),
             )
+        raise NotImplementedError(
+            "pcc.unsafe internal intrinsic family mismatch"
+        )
+
+    def _emit_unsafe_read_write_rss(
+        self,
+        intrinsic: str,
+        expr: Call,
+    ) -> ir.Value:
         if intrinsic in ("read", "write"):
             self._unsafe_expect_arity(intrinsic, expr, 3)
             fd = self._unsafe_i32_arg(expr.args[0])
@@ -2222,6 +2715,15 @@ class UnsafeIntrinsicMixin:
                 ir.Constant(_I64, -1),
                 name=self._fresh("unsafe.rss.rusage.result"),
             )
+        raise NotImplementedError(
+            "pcc.unsafe internal intrinsic family mismatch"
+        )
+
+    def _emit_unsafe_file_mutation(
+        self,
+        intrinsic: str,
+        expr: Call,
+    ) -> ir.Value:
         if intrinsic == "open_file":
             self._unsafe_expect_arity(intrinsic, expr, 3)
             path = self._unsafe_ptr_arg(expr.args[0])
@@ -2428,6 +2930,15 @@ class UnsafeIntrinsicMixin:
             raise NotImplementedError(
                 "pcc.unsafe.sync_file supports Darwin libSystem and Linux x86_64 raw syscalls"
             )
+        raise NotImplementedError(
+            "pcc.unsafe internal intrinsic family mismatch"
+        )
+
+    def _emit_unsafe_socket_control(
+        self,
+        intrinsic: str,
+        expr: Call,
+    ) -> ir.Value:
         if intrinsic == "socket_open":
             self._unsafe_expect_arity(intrinsic, expr, 3)
             family = self._unsafe_i64_arg(expr.args[0])
@@ -2730,6 +3241,15 @@ class UnsafeIntrinsicMixin:
                 zero,
                 name=self._fresh("unsafe.eventfd_create.syscall"),
             )
+        raise NotImplementedError(
+            "pcc.unsafe internal intrinsic family mismatch"
+        )
+
+    def _emit_unsafe_socket_io_poll(
+        self,
+        intrinsic: str,
+        expr: Call,
+    ) -> ir.Value:
         if intrinsic in ("socket_send", "socket_recv"):
             self._unsafe_expect_arity(intrinsic, expr, 4)
             fd = self._unsafe_i64_arg(expr.args[0])
@@ -2949,6 +3469,15 @@ class UnsafeIntrinsicMixin:
                 value,
                 name=self._fresh("unsafe." + intrinsic + ".result"),
             )
+        raise NotImplementedError(
+            "pcc.unsafe internal intrinsic family mismatch"
+        )
+
+    def _emit_unsafe_system_info(
+        self,
+        intrinsic: str,
+        expr: Call,
+    ) -> ir.Value:
         if intrinsic == "getpid":
             self._unsafe_expect_arity(intrinsic, expr, 0)
             if self._target_sys_platform_text() == "darwin":
@@ -3350,6 +3879,15 @@ class UnsafeIntrinsicMixin:
             raise NotImplementedError(
                 "pcc.unsafe.cpu_query supports Darwin sysctlbyname and Linux x86_64 sched_getaffinity"
             )
+        raise NotImplementedError(
+            "pcc.unsafe internal intrinsic family mismatch"
+        )
+
+    def _emit_unsafe_time_process_control(
+        self,
+        intrinsic: str,
+        expr: Call,
+    ) -> ir.Value:
         if intrinsic == "clock_gettime":
             self._unsafe_expect_arity(intrinsic, expr, 2)
             logical_kind = self._unsafe_const_i64_arg(expr.args[0])
@@ -3618,6 +4156,15 @@ class UnsafeIntrinsicMixin:
             raise NotImplementedError(
                 "pcc.unsafe.process_exit supports Darwin libSystem and Linux x86_64 exit_group"
             )
+        raise NotImplementedError(
+            "pcc.unsafe internal intrinsic family mismatch"
+        )
+
+    def _emit_unsafe_spawn_process_pipe(
+        self,
+        intrinsic: str,
+        expr: Call,
+    ) -> ir.Value:
         if intrinsic == "spawn_process_pipe":
             self._unsafe_expect_arity(intrinsic, expr, 5)
             path = self._unsafe_ptr_arg(expr.args[0])
@@ -3996,6 +4543,15 @@ class UnsafeIntrinsicMixin:
             raise NotImplementedError(
                 "pcc.unsafe.spawn_process_pipe supports Darwin posix_spawn and Linux x86_64 raw syscalls"
             )
+        raise NotImplementedError(
+            "pcc.unsafe internal intrinsic family mismatch"
+        )
+
+    def _emit_unsafe_spawn_process(
+        self,
+        intrinsic: str,
+        expr: Call,
+    ) -> ir.Value:
         if intrinsic == "spawn_process":
             self._unsafe_expect_arity(intrinsic, expr, 4)
             path = self._unsafe_ptr_arg(expr.args[0])
@@ -4401,6 +4957,15 @@ class UnsafeIntrinsicMixin:
             raise NotImplementedError(
                 "pcc.unsafe.spawn_process supports Darwin posix_spawn and Linux x86_64 raw process syscalls"
             )
+        raise NotImplementedError(
+            "pcc.unsafe internal intrinsic family mismatch"
+        )
+
+    def _emit_unsafe_env_access_stat(
+        self,
+        intrinsic: str,
+        expr: Call,
+    ) -> ir.Value:
         if intrinsic == "stack_alloc":
             self._unsafe_expect_arity(intrinsic, expr, 1)
             size = self._unsafe_const_i64_arg(expr.args[0])
@@ -4556,6 +5121,15 @@ class UnsafeIntrinsicMixin:
             return self._emit_unsafe_stat_kind(expr)
         if intrinsic == "stat_mtime":
             return self._emit_unsafe_stat_mtime(expr)
+        raise NotImplementedError(
+            "pcc.unsafe internal intrinsic family mismatch"
+        )
+
+    def _emit_unsafe_indirect_calls_a(
+        self,
+        intrinsic: str,
+        expr: Call,
+    ) -> ir.Value:
         if intrinsic == "call_ptr1":
             self._unsafe_expect_arity(intrinsic, expr, 2)
             fnty = ir.FunctionType(_CSTR, [_CSTR])
@@ -4966,6 +5540,15 @@ class UnsafeIntrinsicMixin:
                 _I64,
                 name=self._fresh("unsafe.call.i32.i64.i32.i64"),
             )
+        raise NotImplementedError(
+            "pcc.unsafe internal intrinsic family mismatch"
+        )
+
+    def _emit_unsafe_indirect_calls_b(
+        self,
+        intrinsic: str,
+        expr: Call,
+    ) -> ir.Value:
         if intrinsic == "call_i64_ptr1":
             self._unsafe_expect_arity(intrinsic, expr, 2)
             fnty = ir.FunctionType(_I64, [_CSTR])
@@ -5311,6 +5894,15 @@ class UnsafeIntrinsicMixin:
                 ],
                 name=self._fresh("unsafe.call.i64.library.bridge"),
             )
+        raise NotImplementedError(
+            "pcc.unsafe internal intrinsic family mismatch"
+        )
+
+    def _emit_unsafe_loader_waitset_gc(
+        self,
+        intrinsic: str,
+        expr: Call,
+    ) -> ir.Value:
         if intrinsic == "dynamic_library_open":
             if not self._unsafe_dynamic_library_target_matches(
                 intrinsic, expr, 1
@@ -5687,4 +6279,6 @@ class UnsafeIntrinsicMixin:
                 [],
                 name=self._fresh("unsafe.gc.backend.current"),
             )
-        raise NotImplementedError(f"unknown pcc.unsafe intrinsic {intrinsic!r}")
+        raise NotImplementedError(
+            "pcc.unsafe internal intrinsic family mismatch"
+        )

@@ -22,21 +22,10 @@ from .user_function_lowering import (
     _low_ir_lower_typed_int_function,
 )
 from .errors import L1CodegenError
+from .debug_info_lowering import DebugInfoLoweringMixin
 
 
-
-
-
-
-
-
-
-
-
-
-
-
-class L1CodeGen(L1CodeGenEntrypointMixin, L1CodeGenMixinStack):
+class L1CodeGen(L1CodeGenEntrypointMixin, DebugInfoLoweringMixin, L1CodeGenMixinStack):
     # Class-local copies are required for the self-hosted stage compiler:
     # several host orchestration paths in layer1.py read these attrs directly,
     # and pcc1 does not yet reliably resolve class attrs through mixin bases.

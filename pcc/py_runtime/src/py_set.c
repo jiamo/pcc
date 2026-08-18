@@ -38,12 +38,39 @@
 
 /* ---- Forward decls ----------------------------------------------------- */
 static int py_set_rehash(PySetObject *s, int64_t new_capacity);
+static int py_set_maybe_grow(PySetObject *s);
 int64_t py_set_contains(PyObject *set, PyObject *item);
 
 static PyObject *py_set_entry_key(PySetObject *s, SetEntry *e) {
     PyObject *raw = e->key;
     if (raw == NULL || raw == py_set_dummy) return raw;
     return pcc_gc_load_ptr((PyObject *)s, &e->key);
+}
+
+static int py_set_prepare_moving_root(PyObject **slot, void **out_handle) {
+    if (out_handle == NULL) return -1;
+    *out_handle = NULL;
+    if (slot == NULL || *slot == NULL || PY_IS_TAGGED_INT(*slot)) return 0;
+    int64_t backend = pcc_gc_backend();
+    if (
+        backend != PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR
+        && backend != PCC_GC_KIND_COLORED_RELOCATING
+    ) return 0;
+    void *handle = pcc_gc_scheduler_root_register_handle(slot);
+    if (handle == NULL) return -1;
+    *slot = pcc_gc_load_ptr(NULL, slot);
+    *out_handle = handle;
+    return 0;
+}
+
+static PyObject *py_set_reload_moving_root(PyObject **slot, void *handle) {
+    if (slot == NULL) return NULL;
+    if (handle != NULL) *slot = pcc_gc_load_ptr(NULL, slot);
+    return *slot;
+}
+
+static void py_set_finish_moving_root(void *handle) {
+    if (handle != NULL) pcc_gc_scheduler_root_unregister_handle(handle);
 }
 
 /* ---- Allocation -------------------------------------------------------- */
@@ -81,6 +108,7 @@ PyObject *py_set_new(void) {
         return NULL;
     }
     py_gc_track((PyObject *)s);
+    pcc_gc_publish_initialized((PyObject *)s);
     return (PyObject *)s;
 }
 
@@ -99,7 +127,8 @@ static void py_set_lookup(PySetObject *s, int64_t hash, PyObject *key,
     int64_t j = (int64_t)((uint64_t)hash & (uint64_t)mask);
     int64_t first_tombstone = -1;
     int64_t probes = 0;
-    int64_t limit = s->capacity * 2;
+    /* See py_set.py: capacity * 2 is not a sufficient probe budget. */
+    int64_t limit = s->capacity + 16;
 
     while (probes < limit) {
         SetEntry *e = &s->entries[j];
@@ -125,41 +154,463 @@ static void py_set_lookup(PySetObject *s, int64_t hash, PyObject *key,
     *out_found = 0;
 }
 
+static int py_set_remove_rooted_slot(
+    PyObject **set_storage,
+    void *set_handle,
+    SetEntry *entries,
+    int64_t capacity,
+    int64_t slot
+) {
+    PyObject *set = py_set_reload_moving_root(set_storage, set_handle);
+    int64_t backend = pcc_gc_backend();
+    PccGcStoreRootPlan plan;
+    pcc_gc_store_ptr_plan_init(&plan, set, backend);
+    pcc_gc_root_slot_lock();
+    set = py_set_reload_moving_root(set_storage, set_handle);
+    int committed = 0;
+    if (
+        set != NULL && !PY_IS_TAGGED_INT(set)
+        && py_header(set)->type_tag == PY_TYPE_SET
+    ) {
+        PySetObject *s = (PySetObject *)set;
+        if (
+            s->entries == entries && s->capacity == capacity
+            && slot >= 0 && slot < capacity
+        ) {
+            SetEntry *entry = &entries[slot];
+            PyObject *key = py_set_entry_key(s, entry);
+            if (key != NULL && key != py_set_dummy) {
+                committed = pcc_gc_store_ptr_plan_commit_locked(
+                    &plan, set, &entry->key, py_set_dummy
+                ) != 0;
+                if (committed) s->size--;
+            }
+        }
+    }
+    pcc_gc_root_slot_unlock();
+    pcc_gc_store_ptr_plan_finish(&plan);
+    return committed;
+}
+
+static int py_set_add_rooted_slot(
+    PyObject **set_storage,
+    void *set_handle,
+    PyObject **item_storage,
+    void *item_handle,
+    SetEntry *entries,
+    int64_t capacity,
+    int64_t slot,
+    int64_t hash
+) {
+    PyObject *set = py_set_reload_moving_root(set_storage, set_handle);
+    PyObject *item = py_set_reload_moving_root(item_storage, item_handle);
+    int64_t backend = pcc_gc_backend();
+    PccGcStoreRootPlan plan;
+    pcc_gc_store_ptr_plan_init(&plan, set, backend);
+    pcc_gc_root_slot_lock();
+    set = py_set_reload_moving_root(set_storage, set_handle);
+    item = py_set_reload_moving_root(item_storage, item_handle);
+    int committed = 0;
+    if (
+        set != NULL && !PY_IS_TAGGED_INT(set)
+        && py_header(set)->type_tag == PY_TYPE_SET
+    ) {
+        PySetObject *s = (PySetObject *)set;
+        if (
+            s->entries == entries && s->capacity == capacity
+            && slot >= 0 && slot < capacity
+        ) {
+            SetEntry *entry = &entries[slot];
+            PyObject *old = py_set_entry_key(s, entry);
+            if (old == NULL || old == py_set_dummy) {
+                int was_tombstone = old == py_set_dummy;
+                committed = pcc_gc_store_ptr_plan_commit_locked(
+                    &plan, set, &entry->key, item
+                ) != 0;
+                if (committed) {
+                    entry->hash = hash;
+                    s->size++;
+                    if (!was_tombstone) s->fill++;
+                }
+            }
+        }
+    }
+    pcc_gc_root_slot_unlock();
+    pcc_gc_store_ptr_plan_finish(&plan);
+    if (committed) {
+        set = py_set_reload_moving_root(set_storage, set_handle);
+        (void)py_set_maybe_grow((PySetObject *)set);
+    }
+    return committed;
+}
+
+static int64_t py_set_lookup_rooted(
+    PyObject *set,
+    PyObject *item,
+    int mode
+) {
+    PyObject *set_storage = set;
+    PyObject *item_storage = item;
+    void *set_handle = NULL;
+    void *item_handle = NULL;
+    if (py_set_prepare_moving_root(&set_storage, &set_handle) != 0) return 0;
+    if (py_set_prepare_moving_root(&item_storage, &item_handle) != 0) {
+        py_set_finish_moving_root(set_handle);
+        return 0;
+    }
+    item = py_set_reload_moving_root(&item_storage, item_handle);
+    int64_t hash = py_obj_hash(item);
+    set = py_set_reload_moving_root(&set_storage, set_handle);
+    item = py_set_reload_moving_root(&item_storage, item_handle);
+    if (py_err_occurred()) {
+        py_set_finish_moving_root(item_handle);
+        py_set_finish_moving_root(set_handle);
+        return 0;
+    }
+
+    int attempts = 0;
+restart:
+    if (attempts++ >= 16) {
+        py_set_finish_moving_root(item_handle);
+        py_set_finish_moving_root(set_handle);
+        return 0;
+    }
+    set = py_set_reload_moving_root(&set_storage, set_handle);
+    item = py_set_reload_moving_root(&item_storage, item_handle);
+    if (
+        set == NULL || PY_IS_TAGGED_INT(set)
+        || py_header(set)->type_tag != PY_TYPE_SET
+    ) {
+        py_set_finish_moving_root(item_handle);
+        py_set_finish_moving_root(set_handle);
+        return 0;
+    }
+    PySetObject *s = (PySetObject *)set;
+    int64_t capacity = s->capacity;
+    SetEntry *entries = s->entries;
+    if (capacity <= 0 || entries == NULL) {
+        py_set_finish_moving_root(item_handle);
+        py_set_finish_moving_root(set_handle);
+        return 0;
+    }
+    int64_t mask = capacity - 1;
+    uint64_t perturb = (uint64_t)hash;
+    int64_t j = (int64_t)((uint64_t)hash & (uint64_t)mask);
+    int64_t first_tombstone = -1;
+    int64_t probes = 0;
+    while (probes < capacity + 16) {
+        SetEntry *entry = &entries[j];
+        PyObject *entry_key = py_set_entry_key(s, entry);
+        if (entry_key == NULL) {
+            if (mode == 2) {
+                int64_t target = first_tombstone >= 0
+                    ? first_tombstone : j;
+                int added = py_set_add_rooted_slot(
+                    &set_storage,
+                    set_handle,
+                    &item_storage,
+                    item_handle,
+                    entries,
+                    capacity,
+                    target,
+                    hash
+                );
+                py_set_finish_moving_root(item_handle);
+                py_set_finish_moving_root(set_handle);
+                return added ? 1 : 0;
+            }
+            break;
+        }
+        if (entry_key == py_set_dummy && first_tombstone < 0) {
+            first_tombstone = j;
+        }
+        if (
+            entry_key != py_set_dummy
+            && entry->hash == hash
+        ) {
+            if (entry_key == item) {
+                int removed = 1;
+                if (mode == 1) {
+                    removed = py_set_remove_rooted_slot(
+                        &set_storage, set_handle, entries, capacity, j
+                    );
+                }
+                py_set_finish_moving_root(item_handle);
+                py_set_finish_moving_root(set_handle);
+                return removed ? 1 : 0;
+            }
+            if (!(PY_IS_TAGGED_INT(entry_key) && PY_IS_TAGGED_INT(item))) {
+                py_incref(entry_key);
+                PyObject *candidate_storage = entry_key;
+                void *candidate_handle = NULL;
+                if (py_set_prepare_moving_root(
+                        &candidate_storage, &candidate_handle
+                    ) != 0) {
+                    py_decref(entry_key);
+                    break;
+                }
+                PyObject *before_set = set;
+                int equal = py_obj_eq(candidate_storage, item) != 0;
+                set = py_set_reload_moving_root(&set_storage, set_handle);
+                item = py_set_reload_moving_root(&item_storage, item_handle);
+                PyObject *candidate = py_set_reload_moving_root(
+                    &candidate_storage, candidate_handle
+                );
+                py_set_finish_moving_root(candidate_handle);
+                int stable = set == before_set
+                    && set != NULL
+                    && !PY_IS_TAGGED_INT(set)
+                    && py_header(set)->type_tag == PY_TYPE_SET
+                    && ((PySetObject *)set)->capacity == capacity
+                    && ((PySetObject *)set)->entries == entries
+                    && j < capacity
+                    && py_set_entry_key(
+                        (PySetObject *)set, &entries[j]
+                    ) == candidate;
+                py_decref(candidate);
+                if (py_err_occurred()) {
+                    py_set_finish_moving_root(item_handle);
+                    py_set_finish_moving_root(set_handle);
+                    return 0;
+                }
+                if (!stable) goto restart;
+                if (equal) {
+                    int removed = 1;
+                    if (mode == 1) {
+                        removed = py_set_remove_rooted_slot(
+                            &set_storage, set_handle, entries, capacity, j
+                        );
+                    }
+                    py_set_finish_moving_root(item_handle);
+                    py_set_finish_moving_root(set_handle);
+                    return removed ? 1 : 0;
+                }
+            }
+        }
+        perturb >>= 5;
+        j = (int64_t)(((uint64_t)j * 5u + perturb + 1u) & (uint64_t)mask);
+        probes++;
+    }
+    if (mode == 2 && first_tombstone >= 0) {
+        int added = py_set_add_rooted_slot(
+            &set_storage,
+            set_handle,
+            &item_storage,
+            item_handle,
+            entries,
+            capacity,
+            first_tombstone,
+            hash
+        );
+        py_set_finish_moving_root(item_handle);
+        py_set_finish_moving_root(set_handle);
+        return added ? 1 : 0;
+    }
+    py_set_finish_moving_root(item_handle);
+    py_set_finish_moving_root(set_handle);
+    return 0;
+}
+
 /* Rebuild the entries[] array at `new_capacity`. Moves refs (no
  * incref/decref) from old to new. */
-static int py_set_rehash(PySetObject *s, int64_t new_capacity) {
+static int64_t py_set_rehash_find_empty_slot(
+    SetEntry *entries,
+    int64_t capacity,
+    int64_t hash
+) {
+    int64_t mask = capacity - 1;
+    uint64_t perturb = (uint64_t)hash;
+    int64_t slot = (int64_t)((uint64_t)hash & (uint64_t)mask);
+    int64_t probes = 0;
+    while (probes < capacity + 16) {
+        if (entries[slot].key == NULL) return slot;
+        perturb >>= 5;
+        slot = (int64_t)(
+            ((uint64_t)slot * 5u + perturb + 1u) & (uint64_t)mask
+        );
+        probes++;
+    }
+    return -1;
+}
+
+static int py_set_rehash_refcount_fast(
+    PySetObject *s,
+    int64_t new_capacity
+) {
     SetEntry *old_entries = s->entries;
-    int64_t   old_capacity = s->capacity;
-
-    if (py_set_alloc_entries(s, new_capacity) != 0) {
-        /* Restore old state on failure. */
-        s->entries  = old_entries;
-        s->capacity = old_capacity;
-        return -1;
-    }
-
+    int64_t old_capacity = s->capacity;
+    SetEntry *new_entries = (SetEntry *)calloc(
+        (size_t)new_capacity, sizeof(SetEntry)
+    );
+    if (new_entries == NULL) return -1;
+    int64_t new_size = 0;
     for (int64_t i = 0; i < old_capacity; i++) {
-        PyObject *k = py_set_entry_key(s, &old_entries[i]);
-        if (k == NULL || k == py_set_dummy) continue;
-        int64_t slot;
-        int found;
-        py_set_lookup(s, old_entries[i].hash, k, &slot, &found);
-        /* found must be 0 during rehash — same keys never collide when
-         * we're reinserting distinct lives from an old table. */
-        (void)found;
-        s->entries[slot].hash = old_entries[i].hash;
-        s->entries[slot].key  = k;
-        /* Move (no incref/decref): the migrated key is still owned by the
-         * set, just relocated to a new slot. Route it through the slot
-         * write barrier so backend #3's generational remembered set and
-         * backend #4's relocation slot tracking observe the new slot.
-         * Mirrors the decomposed move-store in py_dict_rehash. */
-        pcc_gc_note_slot_write_barrier((PyObject *)s, &s->entries[slot].key, k);
-        s->size++;
-        s->fill++;
+        PyObject *key = old_entries[i].key;
+        if (key == NULL || key == py_set_dummy) continue;
+        int64_t slot = py_set_rehash_find_empty_slot(
+            new_entries, new_capacity, old_entries[i].hash
+        );
+        if (slot < 0) {
+            free(new_entries);
+            return -1;
+        }
+        new_entries[slot] = old_entries[i];
+        new_size++;
     }
+    s->entries = new_entries;
+    s->capacity = new_capacity;
+    s->size = new_size;
+    s->fill = new_size;
     free(old_entries);
     return 0;
+}
+
+static int py_set_rehash(PySetObject *s, int64_t new_capacity) {
+    if (s == NULL || new_capacity <= 0) return -1;
+    int64_t initial_backend = pcc_gc_backend();
+    if (initial_backend == PCC_GC_KIND_REFCOUNT_CYCLE) {
+        return py_set_rehash_refcount_fast(s, new_capacity);
+    }
+    PyObject *owner_slot = (PyObject *)s;
+    void *owner_handle = NULL;
+    if (
+        initial_backend == PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR
+        || initial_backend == PCC_GC_KIND_COLORED_RELOCATING
+    ) {
+        owner_handle = pcc_gc_scheduler_root_register_handle(&owner_slot);
+        if (owner_handle == NULL) return -1;
+    }
+
+    for (int attempt = 0; attempt < 8; attempt++) {
+        pcc_gc_root_slot_lock();
+        if (pcc_gc_backend() != initial_backend) {
+            pcc_gc_root_slot_unlock();
+            break;
+        }
+        if (owner_handle != NULL) {
+            owner_slot = pcc_gc_load_ptr(NULL, &owner_slot);
+        }
+        s = (PySetObject *)owner_slot;
+        SetEntry *old_entries = s->entries;
+        int64_t old_capacity = s->capacity;
+        int64_t old_size = s->size;
+        int64_t old_fill = s->fill;
+        pcc_gc_root_slot_unlock();
+        if (
+            old_entries == NULL
+            || old_capacity <= 0
+            || new_capacity < old_capacity
+            || old_size < 0
+            || old_size > new_capacity
+            || old_fill < old_size
+            || old_fill > old_capacity
+            || old_capacity > INT64_MAX / 2
+        ) break;
+
+        SetEntry *new_entries = (SetEntry *)calloc(
+            (size_t)new_capacity, sizeof(SetEntry)
+        );
+        PyObject ***slot_pairs = (PyObject ***)calloc(
+            (size_t)old_capacity * 2u,
+            sizeof(PyObject **)
+        );
+        if (new_entries == NULL || slot_pairs == NULL) {
+            free(slot_pairs);
+            free(new_entries);
+            break;
+        }
+
+        pcc_gc_root_slot_lock();
+        if (pcc_gc_backend() != initial_backend) {
+            pcc_gc_root_slot_unlock();
+            free(slot_pairs);
+            free(new_entries);
+            break;
+        }
+        if (owner_handle != NULL) {
+            owner_slot = pcc_gc_load_ptr(NULL, &owner_slot);
+        }
+        s = (PySetObject *)owner_slot;
+        if (
+            s->entries != old_entries
+            || s->capacity != old_capacity
+            || s->size != old_size
+            || s->fill != old_fill
+        ) {
+            pcc_gc_root_slot_unlock();
+            free(slot_pairs);
+            free(new_entries);
+            continue;
+        }
+
+        int64_t new_size = 0;
+        int64_t pair_count = 0;
+        int copy_valid = 1;
+        for (int64_t i = 0; i < old_capacity; i++) {
+            PyObject *key = py_set_entry_key(s, &old_entries[i]);
+            if (key == NULL || key == py_set_dummy) continue;
+            int64_t slot = py_set_rehash_find_empty_slot(
+                new_entries, new_capacity, old_entries[i].hash
+            );
+            if (slot < 0) {
+                copy_valid = 0;
+                break;
+            }
+            new_entries[slot].hash = old_entries[i].hash;
+            new_entries[slot].key = key;
+            slot_pairs[pair_count * 2] = &old_entries[i].key;
+            slot_pairs[pair_count * 2 + 1] = &new_entries[slot].key;
+            pair_count++;
+            new_size++;
+        }
+        int64_t retargeted = 0;
+        if (copy_valid) {
+            retargeted = pcc_gc_backend4_retarget_mutator_payload_locked(
+                (PyObject *)s,
+                old_entries,
+                old_capacity * (int64_t)sizeof(SetEntry),
+                new_entries,
+                new_capacity * (int64_t)sizeof(SetEntry),
+                slot_pairs,
+                pair_count
+            );
+        }
+        if (!copy_valid || retargeted == 0) {
+            pcc_gc_root_slot_unlock();
+            free(slot_pairs);
+            free(new_entries);
+            break;
+        }
+        for (int64_t i = 0; i < pair_count; i++) {
+            PyObject **new_slot = slot_pairs[i * 2 + 1];
+            pcc_gc_note_slot_write_barrier(
+                (PyObject *)s, new_slot, *new_slot
+            );
+        }
+        s->entries = new_entries;
+        s->capacity = new_capacity;
+        s->size = new_size;
+        s->fill = new_size;
+        if (retargeted == 2) {
+            (void)pcc_gc_backend4_zpage_register_owner_payload_span(
+                (PyObject *)s,
+                new_entries,
+                new_capacity * (int64_t)sizeof(SetEntry)
+            );
+        }
+        pcc_gc_root_slot_unlock();
+
+        free(old_entries);
+        free(slot_pairs);
+        if (owner_handle != NULL) {
+            pcc_gc_scheduler_root_unregister_handle(owner_handle);
+        }
+        return 0;
+    }
+    if (owner_handle != NULL) {
+        pcc_gc_scheduler_root_unregister_handle(owner_handle);
+    }
+    return -1;
 }
 
 static int py_set_maybe_grow(PySetObject *s) {
@@ -176,35 +627,97 @@ static int py_set_maybe_grow(PySetObject *s) {
 
 void py_set_add(PyObject *set, PyObject *item) {
     if (set == NULL || item == NULL) return;
-    PySetObject *s = (PySetObject *)set;
-    int64_t hash = py_obj_hash(item);
-    if (py_err_occurred()) return;
-    int64_t slot;
-    int found;
-    py_set_lookup(s, hash, item, &slot, &found);
-    if (found) return;  /* already present */
-
-    SetEntry *e = &s->entries[slot];
-    int was_tombstone = (e->key == py_set_dummy);
-    e->hash = hash;
-    e->key = NULL;
-    pcc_gc_store_ptr(set, &e->key, item);
-    s->size++;
-    if (!was_tombstone) s->fill++;
-
-    (void)py_set_maybe_grow(s);
+    (void)py_set_lookup_rooted(set, item, 2);
 }
 
 void py_set_update(PyObject *dst, PyObject *src) {
     if (dst == NULL || src == NULL) return;
-    if (PY_IS_TAGGED_INT(src)) return;
-    if (py_header(src)->type_tag != PY_TYPE_SET) return;
-    PySetObject *s = (PySetObject *)src;
-    for (int64_t i = 0; i < s->capacity; i++) {
-        PyObject *k = py_set_entry_key(s, &s->entries[i]);
-        if (k == NULL || k == py_set_dummy) continue;
-        py_set_add(dst, k);
+    PyObject *dst_storage = dst;
+    PyObject *src_storage = src;
+    void *dst_handle = NULL;
+    void *src_handle = NULL;
+    if (py_set_prepare_moving_root(&dst_storage, &dst_handle) != 0) return;
+    if (py_set_prepare_moving_root(&src_storage, &src_handle) != 0) {
+        py_set_finish_moving_root(dst_handle);
+        return;
     }
+    src = py_set_reload_moving_root(&src_storage, src_handle);
+    if (
+        PY_IS_TAGGED_INT(src)
+        || py_header(src)->type_tag != PY_TYPE_SET
+    ) {
+        py_set_finish_moving_root(src_handle);
+        py_set_finish_moving_root(dst_handle);
+        return;
+    }
+
+    /* Snapshot the source before invoking destination hash/equality callbacks.
+     * A callback may relocate either set or mutate the source; walking the raw
+     * source entries across py_set_add would otherwise retain stale payload
+     * addresses and would not match Python's consume-the-input-first behavior. */
+    PySetObject *source_set = (PySetObject *)src;
+    PyObject *snapshot_storage = py_list_new(
+        source_set->size > 0 ? source_set->size : 4
+    );
+    if (snapshot_storage == NULL) {
+        py_set_finish_moving_root(src_handle);
+        py_set_finish_moving_root(dst_handle);
+        return;
+    }
+    void *snapshot_handle = NULL;
+    if (py_set_prepare_moving_root(
+            &snapshot_storage, &snapshot_handle
+        ) != 0) {
+        py_decref(snapshot_storage);
+        py_set_finish_moving_root(src_handle);
+        py_set_finish_moving_root(dst_handle);
+        return;
+    }
+    src = py_set_reload_moving_root(&src_storage, src_handle);
+    source_set = (PySetObject *)src;
+    int64_t source_capacity = source_set->capacity;
+    for (int64_t i = 0; i < source_capacity; i++) {
+        src = py_set_reload_moving_root(&src_storage, src_handle);
+        source_set = (PySetObject *)src;
+        PyObject *key = py_set_entry_key(
+            source_set, &source_set->entries[i]
+        );
+        if (key == NULL || key == py_set_dummy) continue;
+        PyObject *snapshot = py_set_reload_moving_root(
+            &snapshot_storage, snapshot_handle
+        );
+        py_list_append(snapshot, key);
+        if (py_err_occurred()) break;
+    }
+
+    PyObject *snapshot = py_set_reload_moving_root(
+        &snapshot_storage, snapshot_handle
+    );
+    int64_t snapshot_len = py_list_len(snapshot);
+    for (int64_t i = 0; i < snapshot_len && !py_err_occurred(); i++) {
+        snapshot = py_set_reload_moving_root(
+            &snapshot_storage, snapshot_handle
+        );
+        PyObject *key_storage = py_list_get(snapshot, i);
+        if (key_storage == NULL) break;
+        void *key_handle = NULL;
+        if (py_set_prepare_moving_root(&key_storage, &key_handle) != 0) {
+            py_decref(key_storage);
+            break;
+        }
+        dst = py_set_reload_moving_root(&dst_storage, dst_handle);
+        py_set_add(dst, key_storage);
+        key_storage = py_set_reload_moving_root(&key_storage, key_handle);
+        py_set_finish_moving_root(key_handle);
+        py_decref(key_storage);
+    }
+    snapshot = py_set_reload_moving_root(
+        &snapshot_storage, snapshot_handle
+    );
+    py_set_finish_moving_root(snapshot_handle);
+    py_decref(snapshot);
+    py_set_finish_moving_root(src_handle);
+    py_set_finish_moving_root(dst_handle);
 }
 
 PyObject *py_set_intersection(PyObject *a, PyObject *b) {
@@ -376,30 +889,12 @@ PyObject *py_set_pop(PyObject *set) {
 
 int64_t py_set_contains(PyObject *set, PyObject *item) {
     if (set == NULL || item == NULL) return 0;
-    PySetObject *s = (PySetObject *)set;
-    int64_t hash = py_obj_hash(item);
-    if (py_err_occurred()) return 0;
-    int64_t slot;
-    int found;
-    py_set_lookup(s, hash, item, &slot, &found);
-    return found;
+    return py_set_lookup_rooted(set, item, 0);
 }
 
 int64_t py_set_remove(PyObject *set, PyObject *item) {
     if (set == NULL || item == NULL) return -1;
-    PySetObject *s = (PySetObject *)set;
-    int64_t hash = py_obj_hash(item);
-    if (py_err_occurred()) return -1;
-    int64_t slot;
-    int found;
-    py_set_lookup(s, hash, item, &slot, &found);
-    if (!found) return -1;
-    SetEntry *e = &s->entries[slot];
-    PyObject *k = py_set_entry_key(s, e);
-    py_decref(k);
-    e->key = py_set_dummy;   /* tombstone; fill unchanged */
-    s->size--;
-    return 0;
+    return py_set_lookup_rooted(set, item, 1) ? 0 : -1;
 }
 
 int64_t py_set_len(PyObject *set) {

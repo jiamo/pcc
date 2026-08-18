@@ -34,7 +34,12 @@ REPO = repo_root()
 _LANE_MAX = (1 << 62) - 1
 
 # Compiled into pcc1/pcc2. Runtime ports under py_runtime/py are covered by
-# their own freestanding gates and use a different literal pipeline.
+# their own freestanding gates and use a different literal pipeline — probed
+# 2026-08-27: extending this sweep there flags 11+ WORKING over-lane
+# allocator poison canaries (e.g. 5783538902897647427), so the extension is
+# deliberately not applied.  The compiler defect itself no longer
+# reproduces: a pcc1-built probe prints 2**63, 2**64-1, their negatives,
+# and a 128-bit literal correctly under both backends.
 _CLOSURE_DIRS = ("pcc/py_frontend", "pcc/backend")
 
 

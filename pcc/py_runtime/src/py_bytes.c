@@ -316,6 +316,7 @@ PyObject *py_memoryview_new(PyObject *o) {
     if (m == NULL) return NULL;
     m->base = NULL;
     pcc_gc_store_ptr((PyObject *)m, &m->base, o);
+    pcc_gc_publish_initialized((PyObject *)m);
     return (PyObject *)m;
 }
 
@@ -462,13 +463,13 @@ PyObject *py_bytes_decode_with_encoding(
             && tag != PY_TYPE_BYTEARRAY
             && tag != PY_TYPE_MEMORYVIEW)
     ) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "decoding to str: need bytes-like object"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "decoding to str: need bytes-like object"));
         return NULL;
     }
     int64_t n = 0;
     const char *data = bytes_data(o, &n);
     if (!pcc_str_is_utf8_name(encoding)) {
-        py_raise(py_exc_new(PY_EXC_LOOKUPERROR, "pcc-native bytes decode supports utf-8 only"));
+        py_raise_owned(py_exc_new(PY_EXC_LOOKUPERROR, "pcc-native bytes decode supports utf-8 only"));
         return NULL;
     }
     if (errors == NULL || errors == py_None || pcc_str_is_ascii_word(errors, "strict")) {
@@ -477,7 +478,7 @@ PyObject *py_bytes_decode_with_encoding(
     if (pcc_str_is_ascii_word(errors, "ignore")) {
         return py_bytes_decode_utf8_ignore(o);
     }
-    py_raise(py_exc_new(PY_EXC_LOOKUPERROR, "unsupported pcc-native bytes decode errors mode"));
+    py_raise_owned(py_exc_new(PY_EXC_LOOKUPERROR, "unsupported pcc-native bytes decode errors mode"));
     return NULL;
 }
 
@@ -525,7 +526,7 @@ PyObject *py_bytes_getitem(PyObject *o, PyObject *k) {
     const char *data = bytes_data(o, &n);
     if (i < 0) i += n;
     if (data == NULL || i < 0 || i >= n) {
-        py_raise(py_exc_new(PY_EXC_INDEXERROR, "bytes index out of range"));
+        py_raise_owned(py_exc_new(PY_EXC_INDEXERROR, "bytes index out of range"));
         return NULL;
     }
     return py_int_from_i64((unsigned char)data[i]);
@@ -589,6 +590,78 @@ PyObject *py_bytes_concat(PyObject *a, PyObject *b) {
     return out;
 }
 
+PyObject *py_bytes_join(PyObject *sep, PyObject *list) {
+    /* bytes.join / bytearray.join over a list or tuple of bytes-like items.
+     * Mirror of py_bytes_join in py/py_obj_stubs.py. */
+    if (sep == NULL || list == NULL) return NULL;
+    sep = pcc_gc_note_relocation_read(sep);
+    list = pcc_gc_note_relocation_read(list);
+    if (!bytes_concat_operand(sep)) {
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "bytes.join receiver must be bytes-like"));
+        return NULL;
+    }
+    int32_t sequence_tag = py_type_of(list);
+    if (sequence_tag != PY_TYPE_LIST && sequence_tag != PY_TYPE_TUPLE) {
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "bytes.join argument must be a list or tuple"));
+        return NULL;
+    }
+    int64_t length = sequence_tag == PY_TYPE_LIST
+        ? ((PyListObject *)list)->length
+        : ((PyTupleObject *)list)->len;
+    if (length == 0) return bytes_new_same_family(sep, NULL, 0);
+    int64_t sep_n = 0;
+    const char *sep_d = bytes_data(sep, &sep_n);
+    if (sep_d == NULL || sep_n < 0) return NULL;
+
+    int64_t total = 0;
+    for (int64_t i = 0; i < length; i++) {
+        PyObject **slot = sequence_tag == PY_TYPE_LIST
+            ? &((PyListObject *)list)->items[i]
+            : &((PyTupleObject *)list)->items[i];
+        PyObject *e = pcc_gc_load_ptr(list, slot);
+        if (e == NULL) return NULL;
+        if (!bytes_concat_operand(e)) {
+            py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "sequence item: expected a bytes-like object"));
+            return NULL;
+        }
+        int64_t n = 0;
+        if (bytes_data(e, &n) == NULL || n < 0) return NULL;
+        if (i > 0) {
+            if (total > INT64_MAX - sep_n) return NULL;
+            total += sep_n;
+        }
+        if (total > INT64_MAX - n) return NULL;
+        total += n;
+    }
+
+    PyObject *out = bytes_new_same_family(sep, NULL, total);
+    if (out == NULL) return NULL;
+    /* Result allocation may relocate the rooted inputs. */
+    sep = pcc_gc_note_relocation_read(sep);
+    list = pcc_gc_note_relocation_read(list);
+    sep_d = bytes_data(sep, &sep_n);
+    int64_t out_n = 0;
+    char *dst = bytes_mutable_data(out, &out_n);
+    if (dst == NULL || out_n != total) return NULL;
+    int64_t off = 0;
+    for (int64_t i = 0; i < length; i++) {
+        PyObject **slot = sequence_tag == PY_TYPE_LIST
+            ? &((PyListObject *)list)->items[i]
+            : &((PyTupleObject *)list)->items[i];
+        PyObject *e = pcc_gc_load_ptr(list, slot);
+        if (i > 0 && sep_n > 0) {
+            memcpy(dst + off, sep_d, (size_t)sep_n);
+            off += sep_n;
+        }
+        int64_t n = 0;
+        const char *ed = bytes_data(e, &n);
+        if (n > 0) memcpy(dst + off, ed, (size_t)n);
+        off += n;
+    }
+    dst[total] = '\0';
+    return out;
+}
+
 PyObject *py_bytes_repeat(PyObject *src, int64_t count) {
     if (src == NULL) return NULL;
     int32_t tag = py_type_of(src);
@@ -619,11 +692,11 @@ PyObject *py_bytes_maketrans(PyObject *x, PyObject *y) {
     const char *xd = bytes_data(x, &xn);
     const char *yd = bytes_data(y, &yn);
     if (xd == NULL || yd == NULL) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "maketrans arguments must be bytes-like"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "maketrans arguments must be bytes-like"));
         return NULL;
     }
     if (xn != yn) {
-        py_raise(py_exc_new(
+        py_raise_owned(py_exc_new(
             PY_EXC_VALUEERROR,
             "maketrans arguments must have the same length"
         ));
@@ -645,11 +718,11 @@ PyObject *py_bytes_translate(PyObject *src, PyObject *table) {
     const char *data = bytes_data(src, &n);
     const char *map = bytes_data(table, &table_n);
     if (data == NULL || map == NULL) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "translate arguments must be bytes-like"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "translate arguments must be bytes-like"));
         return NULL;
     }
     if (table_n != 256) {
-        py_raise(py_exc_new(PY_EXC_VALUEERROR, "translation table must be 256 characters long"));
+        py_raise_owned(py_exc_new(PY_EXC_VALUEERROR, "translation table must be 256 characters long"));
         return NULL;
     }
     PyObject *out = bytes_new_same_family(src, NULL, n);
@@ -715,7 +788,7 @@ PyObject *py_bytes_fromhex(PyObject *text) {
     const char *data = NULL;
     int64_t n = 0;
     if (text == NULL) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "fromhex() argument must be str"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "fromhex() argument must be str"));
         return NULL;
     }
     int32_t tag = py_type_of(text);
@@ -726,7 +799,7 @@ PyObject *py_bytes_fromhex(PyObject *text) {
         data = bytes_data(text, &n);
     }
     if (data == NULL) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "fromhex() argument must be str or bytes-like"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "fromhex() argument must be str or bytes-like"));
         return NULL;
     }
     char *tmp = (char *)malloc((size_t)(n / 2 + 1));
@@ -740,7 +813,7 @@ PyObject *py_bytes_fromhex(PyObject *text) {
         int v = hex_value(c);
         if (v < 0) {
             free(tmp);
-            py_raise(py_exc_new(PY_EXC_VALUEERROR, "non-hexadecimal number found in fromhex() arg"));
+            py_raise_owned(py_exc_new(PY_EXC_VALUEERROR, "non-hexadecimal number found in fromhex() arg"));
             return NULL;
         }
         if (!have_hi) {
@@ -753,7 +826,7 @@ PyObject *py_bytes_fromhex(PyObject *text) {
     }
     if (have_hi) {
         free(tmp);
-        py_raise(py_exc_new(PY_EXC_VALUEERROR, "non-hexadecimal number found in fromhex() arg"));
+        py_raise_owned(py_exc_new(PY_EXC_VALUEERROR, "non-hexadecimal number found in fromhex() arg"));
         return NULL;
     }
     PyObject *out = py_bytes_new(tmp, out_n);
@@ -769,7 +842,7 @@ PyObject *py_bytes_replace(PyObject *src, PyObject *old, PyObject *new_value) {
     const char *old_data = bytes_data(old, &old_n);
     const char *new_data = bytes_data(new_value, &new_n);
     if (data == NULL || old_data == NULL || new_data == NULL) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "replace arguments must be bytes-like"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "replace arguments must be bytes-like"));
         return NULL;
     }
     if (old_n <= 0) {
@@ -840,12 +913,12 @@ static int i64_buffer_shape(PyObject *buffer, const char **data,
         raw = bytes_data(buffer, &byte_len);
     }
     if (raw == NULL) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR,
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR,
                             "signed-i64 buffer must be bytes-like"));
         return -1;
     }
     if ((byte_len & 7) != 0) {
-        py_raise(py_exc_new(PY_EXC_VALUEERROR,
+        py_raise_owned(py_exc_new(PY_EXC_VALUEERROR,
                             "signed-i64 buffer byte length must be divisible by 8"));
         return -1;
     }
@@ -856,14 +929,14 @@ static int i64_buffer_shape(PyObject *buffer, const char **data,
 
 PyObject *py_i64_buffer_new(int64_t element_count) {
     if (element_count < 1 || element_count > 1048576) {
-        py_raise(py_exc_new(PY_EXC_VALUEERROR,
+        py_raise_owned(py_exc_new(PY_EXC_VALUEERROR,
                             "pcc.i64_buffer length must be between 1 and 1048576"));
         return NULL;
     }
     int64_t byte_len = element_count * 8;
     PyObject *out = py_bytes_new(NULL, byte_len);
     if (out == NULL) {
-        py_raise(py_exc_new(PY_EXC_MEMORYERROR,
+        py_raise_owned(py_exc_new(PY_EXC_MEMORYERROR,
                             "unable to allocate pcc.i64_buffer"));
         return NULL;
     }
@@ -877,14 +950,14 @@ int64_t py_i64_buffer_set_item(PyObject *buffer, int64_t index,
     int64_t count = 0;
     if (i64_buffer_shape(buffer, &raw, &count, 1) != 0) return -1;
     if (index < 0 || index >= count) {
-        py_raise(py_exc_new(PY_EXC_INDEXERROR,
+        py_raise_owned(py_exc_new(PY_EXC_INDEXERROR,
                             "pcc.i64_buffer assignment index out of range"));
         return -1;
     }
     int overflow = 0;
     int64_t integer = py_int_to_i64(value, &overflow);
     if (overflow) {
-        py_raise(py_exc_new(PY_EXC_OVERFLOWERROR,
+        py_raise_owned(py_exc_new(PY_EXC_OVERFLOWERROR,
                             "pcc.i64_buffer element does not fit signed i64"));
         return -1;
     }
@@ -902,7 +975,7 @@ PyObject *py_i64_buffer_get_item(PyObject *buffer, int64_t index) {
     int64_t count = 0;
     if (i64_buffer_shape(buffer, &raw, &count, 0) != 0) return NULL;
     if (index < 0 || index >= count) {
-        py_raise(py_exc_new(PY_EXC_INDEXERROR,
+        py_raise_owned(py_exc_new(PY_EXC_INDEXERROR,
                             "pcc.i64_buffer index out of range"));
         return NULL;
     }
@@ -944,7 +1017,7 @@ PyObject *py_i64_buffer_dot_scalar(PyObject *left, PyObject *right,
     if (i64_buffer_shape(left, &left_data, &left_count, 0) != 0) return NULL;
     if (i64_buffer_shape(right, &right_data, &right_count, 0) != 0) return NULL;
     if (left_count != expected_count || right_count != expected_count) {
-        py_raise(py_exc_new(PY_EXC_VALUEERROR,
+        py_raise_owned(py_exc_new(PY_EXC_VALUEERROR,
                             "guarded_i64_dot buffers must match the declared length"));
         return NULL;
     }
@@ -1097,7 +1170,7 @@ PyObject *py_bytes_split(PyObject *src, PyObject *sep) {
     const char *sep_data = bytes_data(sep, &sep_n);
     if (sep_data == NULL) return NULL;
     if (sep_n == 0) {
-        py_raise(py_exc_new(PY_EXC_VALUEERROR, "empty separator"));
+        py_raise_owned(py_exc_new(PY_EXC_VALUEERROR, "empty separator"));
         return NULL;
     }
     PyObject *list = py_list_new(4);
@@ -1175,11 +1248,11 @@ PyObject *py_bytes_partition(PyObject *src, PyObject *sep) {
 
 PyObject *py_bytearray_extend(PyObject *o, PyObject *iterable) {
     if (o == NULL || py_type_of(o) != PY_TYPE_BYTEARRAY) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "bytearray.extend target must be bytearray"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "bytearray.extend target must be bytearray"));
         return NULL;
     }
     if (iterable == NULL) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "bytearray.extend argument must be iterable"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "bytearray.extend argument must be iterable"));
         return NULL;
     }
 
@@ -1199,12 +1272,12 @@ PyObject *py_bytearray_extend(PyObject *o, PyObject *iterable) {
     }
     if (ad == NULL || bd == NULL || an < 0 || bn < 0) {
         if (tmp != NULL) py_decref(tmp);
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "bytearray.extend argument must be bytes-like or an int sequence"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "bytearray.extend argument must be bytes-like or an int sequence"));
         return NULL;
     }
     if (an > INT64_MAX - bn) {
         if (tmp != NULL) py_decref(tmp);
-        py_raise(py_exc_new(PY_EXC_OVERFLOWERROR, "bytearray too large"));
+        py_raise_owned(py_exc_new(PY_EXC_OVERFLOWERROR, "bytearray too large"));
         return NULL;
     }
 
@@ -1229,28 +1302,28 @@ PyObject *py_bytearray_extend(PyObject *o, PyObject *iterable) {
 
 PyObject *py_bytearray_append(PyObject *o, PyObject *item) {
     if (o == NULL || py_type_of(o) != PY_TYPE_BYTEARRAY) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "bytearray.append target must be bytearray"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "bytearray.append target must be bytearray"));
         return NULL;
     }
     if (item == NULL || py_type_of(item) != PY_TYPE_INT) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR,
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR,
                             "'object' object cannot be interpreted as an integer"));
         return NULL;
     }
     int64_t byte = py_int_value_i64(item);
     if (byte < 0 || byte > 255) {
-        py_raise(py_exc_new(PY_EXC_VALUEERROR, "byte must be in range(0, 256)"));
+        py_raise_owned(py_exc_new(PY_EXC_VALUEERROR, "byte must be in range(0, 256)"));
         return NULL;
     }
 
     int64_t an = 0;
     const char *ad = bytes_data(o, &an);
     if (ad == NULL || an < 0) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "bytearray.append target must be bytearray"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "bytearray.append target must be bytearray"));
         return NULL;
     }
     if (an > INT64_MAX - 1) {
-        py_raise(py_exc_new(PY_EXC_OVERFLOWERROR, "bytearray too large"));
+        py_raise_owned(py_exc_new(PY_EXC_OVERFLOWERROR, "bytearray too large"));
         return NULL;
     }
 
@@ -1275,33 +1348,33 @@ PyObject *py_bytearray_append(PyObject *o, PyObject *item) {
  * with an exception set. */
 PyObject *py_bytearray_insert(PyObject *o, PyObject *index, PyObject *item) {
     if (o == NULL || py_type_of(o) != PY_TYPE_BYTEARRAY) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "bytearray.insert target must be bytearray"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "bytearray.insert target must be bytearray"));
         return NULL;
     }
     if (index == NULL || py_type_of(index) != PY_TYPE_INT) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR,
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR,
                             "'object' object cannot be interpreted as an integer"));
         return NULL;
     }
     if (item == NULL || py_type_of(item) != PY_TYPE_INT) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR,
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR,
                             "'object' object cannot be interpreted as an integer"));
         return NULL;
     }
     int64_t byte = py_int_value_i64(item);
     if (byte < 0 || byte > 255) {
-        py_raise(py_exc_new(PY_EXC_VALUEERROR, "byte must be in range(0, 256)"));
+        py_raise_owned(py_exc_new(PY_EXC_VALUEERROR, "byte must be in range(0, 256)"));
         return NULL;
     }
 
     int64_t an = 0;
     const char *ad = bytes_data(o, &an);
     if (ad == NULL || an < 0) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "bytearray.insert target must be bytearray"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "bytearray.insert target must be bytearray"));
         return NULL;
     }
     if (an > INT64_MAX - 1) {
-        py_raise(py_exc_new(PY_EXC_OVERFLOWERROR, "bytearray too large"));
+        py_raise_owned(py_exc_new(PY_EXC_OVERFLOWERROR, "bytearray too large"));
         return NULL;
     }
 
@@ -1333,13 +1406,13 @@ PyObject *py_bytearray_insert(PyObject *o, PyObject *index, PyObject *item) {
  * exception set. */
 PyObject *py_bytearray_pop(PyObject *o, PyObject *index) {
     if (o == NULL || py_type_of(o) != PY_TYPE_BYTEARRAY) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "pop() requires a bytearray"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "pop() requires a bytearray"));
         return NULL;
     }
     PyByteArrayObject *b = (PyByteArrayObject *)o;
     int64_t len = b->byte_len;
     if (len <= 0) {
-        py_raise(py_exc_new(PY_EXC_INDEXERROR, "pop from empty bytearray"));
+        py_raise_owned(py_exc_new(PY_EXC_INDEXERROR, "pop from empty bytearray"));
         return NULL;
     }
 
@@ -1351,7 +1424,7 @@ PyObject *py_bytearray_pop(PyObject *o, PyObject *index) {
         if (at < 0) at += len;
     }
     if (at < 0 || at >= len) {
-        py_raise(py_exc_new(PY_EXC_INDEXERROR, "pop index out of range"));
+        py_raise_owned(py_exc_new(PY_EXC_INDEXERROR, "pop index out of range"));
         return NULL;
     }
 

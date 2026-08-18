@@ -27,10 +27,50 @@ from dataclasses import dataclass
 from . import macho_spec as spec
 from .aarch64_fp_immediates import direct_fp_immediate_encoding
 from .macho_obj import DataInCodeRegion, Relocation
+from .self_backend_value_arena import CompilerIntArena
 
 
 class EncodeError(Exception):
     """The instruction is outside the differentially proven subset."""
+
+
+STRUCTURED_RELOCATION_NONE = 0
+STRUCTURED_RELOCATION_BRANCH26 = 1
+STRUCTURED_RELOCATION_PAGE21 = 2
+STRUCTURED_RELOCATION_PAGEOFF12 = 3
+STRUCTURED_RELOCATION_GOT_LOAD_PAGE21 = 4
+STRUCTURED_RELOCATION_GOT_LOAD_PAGEOFF12 = 5
+# Compiler-private fixups, resolved using the final text layout before object
+# publication. Positive kinds above remain native-object relocations.
+STRUCTURED_FIXUP_CALL = -1
+STRUCTURED_FIXUP_BRANCH26 = -26
+STRUCTURED_FIXUP_BRANCH19 = -19
+
+EMITTED_INSTRUCTION_FALLBACK = 0
+EMITTED_INSTRUCTION_UNSCALED = 1
+EMITTED_INSTRUCTION_MOVE = 2
+EMITTED_INSTRUCTION_CALL = 3
+EMITTED_INSTRUCTION_SCALAR = 4
+
+
+def encode_emitted_nop_parts() -> int:
+    """Canonical fixed word shared by text and native fragment producers."""
+    return 0xD503201F
+
+
+def validate_emitted_label_name(name: str) -> None:
+    """Accept one emitted symbol, never an assembly line or directive."""
+    if name.isascii() and name.isidentifier():
+        return
+    if not _is_symbol(name) or not name.isascii():
+        raise EncodeError(f"invalid emitted label {name!r}")
+    identifier = name
+    if "." in identifier:
+        identifier = identifier.replace(".", "_")
+    if "$" in identifier:
+        identifier = identifier.replace("$", "_")
+    if not identifier.isidentifier():
+        raise EncodeError(f"invalid emitted label {name!r}")
 
 
 # --- operand parsing --------------------------------------------------------
@@ -268,6 +308,477 @@ def _enc_ldst_unscaled(size: int, opc: int, rt, rn, imm9: int) -> int:
     )
 
 
+_EMITTED_REG_X = 0
+_EMITTED_REG_W = 1
+_EMITTED_REG_D = 2
+_EMITTED_REG_S = 3
+
+
+def _emitted_register_code(token: str) -> int:
+    """Return number|kind<<6 for exact emitter register spellings."""
+
+    if token == "sp" or token == "xzr":
+        return 31 | (_EMITTED_REG_X << 6)
+    if token == "wsp" or token == "wzr":
+        return 31 | (_EMITTED_REG_W << 6)
+    if token == "fp":
+        return 29 | (_EMITTED_REG_X << 6)
+    if token == "lr":
+        return 30 | (_EMITTED_REG_X << 6)
+    if len(token) < 2 or token[0] not in "xwds":
+        return -1
+    digits = token[1:]
+    if not digits.isdigit():
+        return -1
+    number = int(digits)
+    if number < 0 or number > 30:
+        return -1
+    first = token[0]
+    if first == "x":
+        kind = _EMITTED_REG_X
+    elif first == "w":
+        kind = _EMITTED_REG_W
+    elif first == "d":
+        kind = _EMITTED_REG_D
+    else:
+        kind = _EMITTED_REG_S
+    return number | (kind << 6)
+
+
+def encode_emitted_unscaled_load_store(line: str) -> int | None:
+    """Encode one exact emitter ldur/stur family line without operand objects.
+
+    Unrecognised or malformed text returns ``None`` so the ordinary assembler
+    remains the diagnostic oracle. The structured transport calls this only
+    after target-final labels and peepholes are frozen.
+    """
+
+    if not line.startswith("  "):
+        return None
+    mnemonic_end = line.find(" ", 2)
+    if mnemonic_end < 0:
+        return None
+    mnemonic = line[2:mnemonic_end]
+    if mnemonic not in ("ldur", "stur", "ldurb", "sturb"):
+        return None
+    register_start = mnemonic_end + 1
+    register_end = line.find(", ", register_start)
+    if register_end < 0:
+        return None
+    register_code = _emitted_register_code(
+        line[register_start:register_end]
+    )
+    if register_code < 0:
+        return None
+    memory = line[register_end + 2:]
+    if len(memory) < 3 or memory[0] != "[" or memory[-1] != "]":
+        return None
+    inner = memory[1:-1]
+    offset_start = inner.find(", #")
+    if offset_start < 0:
+        base_token = inner
+        immediate = 0
+    else:
+        base_token = inner[:offset_start]
+        immediate_token = inner[offset_start + 3:]
+        try:
+            immediate = int(immediate_token, 0)
+        except ValueError:
+            return None
+    if immediate < -256 or immediate > 255:
+        return None
+    base_code = _emitted_register_code(base_token)
+    if base_code < 0 or base_code >> 6 != _EMITTED_REG_X:
+        return None
+    register_kind = register_code >> 6
+    register_number = register_code & 63
+    base_number = base_code & 63
+    is_load = mnemonic == "ldur" or mnemonic == "ldurb"
+    if mnemonic == "ldurb" or mnemonic == "sturb":
+        if register_kind != _EMITTED_REG_W:
+            return None
+        return _enc_ldst_unscaled(
+            0,
+            1 if is_load else 0,
+            register_number,
+            base_number,
+            immediate,
+        )
+    if register_kind == _EMITTED_REG_X:
+        size = 3
+        vector = 0
+    elif register_kind == _EMITTED_REG_W:
+        size = 2
+        vector = 0
+    elif register_kind == _EMITTED_REG_D:
+        size = 3
+        vector = 1 << 26
+    elif register_kind == _EMITTED_REG_S:
+        size = 2
+        vector = 1 << 26
+    else:
+        return None
+    return _enc_ldst_unscaled(
+        size,
+        1 if is_load else 0,
+        register_number,
+        base_number,
+        immediate,
+    ) | vector
+
+
+def encode_emitted_move(line: str) -> int | None:
+    """Encode exact emitter mov/movz/movk spellings without operand lists."""
+
+    if not line.startswith("  "):
+        return None
+    mnemonic_end = line.find(" ", 2)
+    if mnemonic_end < 0:
+        return None
+    mnemonic = line[2:mnemonic_end]
+    if mnemonic not in ("mov", "movz", "movk"):
+        return None
+    destination_start = mnemonic_end + 1
+    destination_end = line.find(", ", destination_start)
+    if destination_end < 0:
+        return None
+    destination_token = line[destination_start:destination_end]
+    destination_code = _emitted_register_code(destination_token)
+    if destination_code < 0:
+        return None
+    destination_kind = destination_code >> 6
+    if destination_kind not in (_EMITTED_REG_X, _EMITTED_REG_W):
+        return None
+    destination_number = destination_code & 63
+    rest = line[destination_end + 2:]
+    destination_is_64 = destination_kind == _EMITTED_REG_X
+
+    if mnemonic == "mov":
+        if "," in rest or " " in rest:
+            return None
+        source_code = _emitted_register_code(rest)
+        if source_code < 0 or source_code >> 6 != destination_kind:
+            return None
+        source_number = source_code & 63
+        if destination_token in ("sp", "wsp") or rest in ("sp", "wsp"):
+            return _enc_addsub_imm(
+                0,
+                destination_number,
+                source_number,
+                0,
+                destination_is_64,
+            )
+        return _enc_logical_reg(
+            1,
+            destination_number,
+            31,
+            source_number,
+            destination_is_64,
+        )
+
+    shift_marker = ", lsl #"
+    shift_start = rest.find(shift_marker)
+    if shift_start < 0:
+        immediate_token = rest
+        shift = 0
+    else:
+        immediate_token = rest[:shift_start]
+        shift_token = rest[shift_start + len(shift_marker):]
+        try:
+            shift = int(shift_token, 0)
+        except ValueError:
+            return None
+    if not immediate_token.startswith("#"):
+        return None
+    try:
+        immediate = int(immediate_token[1:], 0)
+    except ValueError:
+        return None
+    if immediate < 0 or immediate > 0xFFFF:
+        return None
+    max_shift = 48 if destination_is_64 else 16
+    if shift < 0 or shift > max_shift or shift % 16:
+        return None
+    return _enc_movewide(
+        2 if mnemonic == "movz" else 3,
+        destination_number,
+        immediate,
+        shift,
+        destination_is_64,
+    )
+
+
+def encode_emitted_move_register_parts(
+    destination: str,
+    source: str,
+) -> int:
+    destination_code = _emitted_register_code(destination)
+    source_code = _emitted_register_code(source)
+    if destination_code < 0 or source_code < 0:
+        raise EncodeError("bad emitted move register")
+    destination_kind = destination_code >> 6
+    if (
+        destination_kind not in (_EMITTED_REG_X, _EMITTED_REG_W)
+        or source_code >> 6 != destination_kind
+    ):
+        raise EncodeError("emitted move register widths differ")
+    destination_number = destination_code & 63
+    source_number = source_code & 63
+    is_64 = destination_kind == _EMITTED_REG_X
+    if destination in ("sp", "wsp") or source in ("sp", "wsp"):
+        return _enc_addsub_imm(
+            0,
+            destination_number,
+            source_number,
+            0,
+            is_64,
+        )
+    return _enc_logical_reg(
+        1,
+        destination_number,
+        31,
+        source_number,
+        is_64,
+    )
+
+
+def encode_emitted_movewide_parts(
+    mnemonic: str,
+    destination: str,
+    immediate: int,
+    shift: int = 0,
+) -> int:
+    if mnemonic not in ("movz", "movk"):
+        raise EncodeError("unsupported emitted move-wide mnemonic " + mnemonic)
+    if shift < 0:
+        raise EncodeError("negative emitted move-wide shift")
+    destination_code = _emitted_register_code(destination)
+    if destination_code < 0:
+        raise EncodeError("bad emitted move-wide register " + destination)
+    destination_kind = destination_code >> 6
+    if destination_kind not in (_EMITTED_REG_X, _EMITTED_REG_W):
+        raise EncodeError("emitted move-wide requires an integer register")
+    return _enc_movewide(
+        2 if mnemonic == "movz" else 3,
+        destination_code & 63,
+        immediate,
+        shift,
+        destination_kind == _EMITTED_REG_X,
+    )
+
+
+def encode_emitted_addsub_register_parts(
+    mnemonic: str,
+    destination: str,
+    left: str,
+    right: str,
+) -> int:
+    if mnemonic not in ("add", "sub"):
+        raise EncodeError("unsupported emitted add/sub mnemonic " + mnemonic)
+    destination_code = _emitted_register_code(destination)
+    left_code = _emitted_register_code(left)
+    right_code = _emitted_register_code(right)
+    if destination_code < 0 or left_code < 0 or right_code < 0:
+        raise EncodeError("bad emitted arithmetic register")
+    kind = destination_code >> 6
+    if (
+        kind not in (_EMITTED_REG_X, _EMITTED_REG_W)
+        or left_code >> 6 != kind
+        or right_code >> 6 != kind
+    ):
+        raise EncodeError("emitted arithmetic register widths differ")
+    rd = destination_code & 63
+    rn = left_code & 63
+    rm = right_code & 63
+    is_64 = kind == _EMITTED_REG_X
+    if destination in ("sp", "wsp") or left in ("sp", "wsp"):
+        return _enc_addsub_ext(1 if mnemonic == "sub" else 0, rd, rn, rm, is_64)
+    return _enc_addsub_reg(1 if mnemonic == "sub" else 0, rd, rn, rm, is_64)
+
+
+def encode_emitted_addsub_immediate_parts(
+    mnemonic: str,
+    destination: str,
+    left: str,
+    immediate: int,
+) -> int:
+    if mnemonic not in ("add", "sub"):
+        raise EncodeError("unsupported emitted add/sub mnemonic " + mnemonic)
+    destination_code = _emitted_register_code(destination)
+    left_code = _emitted_register_code(left)
+    if destination_code < 0 or left_code < 0:
+        raise EncodeError("bad emitted arithmetic register")
+    kind = destination_code >> 6
+    if (
+        kind not in (_EMITTED_REG_X, _EMITTED_REG_W)
+        or left_code >> 6 != kind
+    ):
+        raise EncodeError("emitted arithmetic register widths differ")
+    return _enc_addsub_imm(
+        1 if mnemonic == "sub" else 0,
+        destination_code & 63,
+        left_code & 63,
+        immediate,
+        kind == _EMITTED_REG_X,
+    )
+
+
+def encode_emitted_compare_register_parts(left: str, right: str) -> int:
+    left_code = _emitted_register_code(left)
+    right_code = _emitted_register_code(right)
+    if left_code < 0 or right_code < 0:
+        raise EncodeError("bad emitted compare register")
+    kind = left_code >> 6
+    if (
+        kind not in (_EMITTED_REG_X, _EMITTED_REG_W)
+        or right_code >> 6 != kind
+    ):
+        raise EncodeError("emitted compare register widths differ")
+    if left in ("sp", "wsp"):
+        return _enc_addsub_ext(
+            1,
+            31,
+            left_code & 63,
+            right_code & 63,
+            kind == _EMITTED_REG_X,
+            set_flags=1,
+        )
+    return _enc_addsub_reg(
+        1,
+        31,
+        left_code & 63,
+        right_code & 63,
+        kind == _EMITTED_REG_X,
+        set_flags=1,
+    )
+
+
+def encode_emitted_compare_immediate_parts(left: str, immediate: int) -> int:
+    left_code = _emitted_register_code(left)
+    if left_code < 0 or left_code >> 6 not in (
+        _EMITTED_REG_X,
+        _EMITTED_REG_W,
+    ):
+        raise EncodeError("bad emitted compare register")
+    return _enc_addsub_imm(
+        1,
+        31,
+        left_code & 63,
+        immediate,
+        left_code >> 6 == _EMITTED_REG_X,
+        set_flags=1,
+    )
+
+
+def encode_emitted_cset_parts(destination: str, condition: str) -> int:
+    destination_code = _emitted_register_code(destination)
+    if destination_code < 0 or destination_code >> 6 not in (
+        _EMITTED_REG_X,
+        _EMITTED_REG_W,
+    ):
+        raise EncodeError("bad emitted cset register")
+    return (
+        _sf(destination_code >> 6 == _EMITTED_REG_X)
+        | 0x1A800400
+        | (31 << 16)
+        | ((_cond(condition) ^ 1) << 12)
+        | (31 << 5)
+        | (destination_code & 63)
+    )
+
+
+def encode_emitted_adrp_parts(destination: str) -> int:
+    register = _emitted_register_code(destination)
+    if register < 0 or register >> 6 != _EMITTED_REG_X:
+        raise EncodeError("emitted adrp requires an x register")
+    return 0x90000000 | (register & 63)
+
+
+def encode_emitted_add_pageoff_parts(destination: str, base: str) -> int:
+    destination_code = _emitted_register_code(destination)
+    base_code = _emitted_register_code(base)
+    if (
+        destination_code < 0
+        or base_code < 0
+        or destination_code >> 6 != _EMITTED_REG_X
+        or base_code >> 6 != _EMITTED_REG_X
+    ):
+        raise EncodeError("emitted PAGEOFF add requires x registers")
+    return _enc_addsub_imm(
+        0,
+        destination_code & 63,
+        base_code & 63,
+        0,
+        True,
+    )
+
+
+def encode_emitted_ldr_got_pageoff_parts(
+    destination: str,
+    base: str,
+) -> int:
+    destination_code = _emitted_register_code(destination)
+    base_code = _emitted_register_code(base)
+    if (
+        destination_code < 0
+        or base_code < 0
+        or destination_code >> 6 != _EMITTED_REG_X
+        or base_code >> 6 != _EMITTED_REG_X
+    ):
+        raise EncodeError("emitted GOTPAGEOFF load requires x registers")
+    return _enc_ldst_unsigned(
+        3,
+        1,
+        destination_code & 63,
+        base_code & 63,
+        0,
+    )
+
+
+def encode_emitted_branch_base_parts(
+    mnemonic: str,
+    register: str = "",
+) -> int:
+    if mnemonic == "b":
+        return 0x14000000
+    if mnemonic.startswith("b."):
+        return 0x54000000 | _cond(mnemonic[2:])
+    if mnemonic == "cbz" or mnemonic == "cbnz":
+        register_code = _emitted_register_code(register)
+        if register_code < 0 or register_code >> 6 not in (
+            _EMITTED_REG_X,
+            _EMITTED_REG_W,
+        ):
+            raise EncodeError("bad emitted zero-branch register")
+        word = (
+            0x35000000 if mnemonic == "cbnz" else 0x34000000
+        ) | (register_code & 63)
+        if register_code >> 6 == _EMITTED_REG_X:
+            word |= 0x80000000
+        return word
+    raise EncodeError("unsupported emitted branch mnemonic " + mnemonic)
+
+
+def emitted_direct_call_target(line: str) -> str | None:
+    """Return the exact target of an emitter-owned direct ``bl`` line."""
+
+    prefix = "  bl "
+    if not line.startswith(prefix):
+        return None
+    target = line[len(prefix):]
+    if (
+        not target
+        or " " in target
+        or "\t" in target
+        or "," in target
+        or "@" in target
+    ):
+        return None
+    if target[0] != "_" and not target[0].isalpha():
+        return None
+    return target
+
+
 def _enc_ldst_unsigned(size: int, opc: int, rt, rn, imm: int) -> int:
     scale = size
     if imm % (1 << scale) != 0:
@@ -279,6 +790,76 @@ def _enc_ldst_unsigned(size: int, opc: int, rt, rn, imm: int) -> int:
         (size << 30) | 0x39000000 | (opc << 22)
         | (imm12 << 10) | (rn << 5) | rt
     )
+
+
+def encode_emitted_load_store_parts(
+    mnemonic: str,
+    register: str,
+    base: str,
+    immediate: int,
+) -> int:
+    """Encode one emitter-owned scalar memory instruction from typed parts."""
+
+    unscaled = mnemonic in (
+        "ldur",
+        "stur",
+        "ldurb",
+        "sturb",
+    )
+    scaled = mnemonic in (
+        "ldr",
+        "str",
+        "ldrb",
+        "strb",
+    )
+    if not unscaled and not scaled:
+        raise EncodeError("unsupported emitted load/store mnemonic " + mnemonic)
+    register_code = _emitted_register_code(register)
+    base_code = _emitted_register_code(base)
+    if register_code < 0:
+        raise EncodeError("bad emitted load/store register " + register)
+    if base_code < 0 or base_code >> 6 != _EMITTED_REG_X:
+        raise EncodeError("bad emitted load/store base " + base)
+
+    register_kind = register_code >> 6
+    byte_access = mnemonic.endswith("b")
+    half_access = mnemonic.endswith("h")
+    if byte_access or half_access:
+        if register_kind != _EMITTED_REG_W:
+            raise EncodeError("narrow emitted load/store requires a w register")
+        size = 0 if byte_access else 1
+        vector = 0
+    elif register_kind == _EMITTED_REG_X:
+        size = 3
+        vector = 0
+    elif register_kind == _EMITTED_REG_W:
+        size = 2
+        vector = 0
+    elif register_kind == _EMITTED_REG_D:
+        size = 3
+        vector = 1 << 26
+    elif register_kind == _EMITTED_REG_S:
+        size = 2
+        vector = 1 << 26
+    else:
+        raise EncodeError("unsupported emitted load/store register class")
+
+    is_load = mnemonic.startswith("ld")
+    if unscaled:
+        return _enc_ldst_unscaled(
+            size,
+            1 if is_load else 0,
+            register_code & 63,
+            base_code & 63,
+            immediate,
+        ) | vector
+    return _enc_ldst_unsigned(
+        size,
+        1 if is_load else 0,
+        register_code & 63,
+        base_code & 63,
+        immediate,
+    ) | vector
 
 
 def _enc_ldstp(load: int, mode: str, rt, rt2, rn, imm: int, is64: bool) -> int:
@@ -299,6 +880,1215 @@ def _enc_ldstp(load: int, mode: str, rt, rt2, rn, imm: int, is64: bool) -> int:
     return word
 
 
+def encode_emitted_frame_pair_parts(load: bool) -> int:
+    if load:
+        return _enc_ldstp(1, "post", 29, 30, 31, 16, True)
+    return _enc_ldstp(0, "pre", 29, 30, 31, -16, True)
+
+
+def _emitted_register_code_span(text: str, start: int, end: int) -> int:
+    """Parse one exact emitter register without allocating a token string."""
+
+    length = end - start
+    if length == 2:
+        first = text[start]
+        second = text[start + 1]
+        if first == "s" and second == "p":
+            return 31 | (_EMITTED_REG_X << 6)
+        if first == "f" and second == "p":
+            return 29 | (_EMITTED_REG_X << 6)
+        if first == "l" and second == "r":
+            return 30 | (_EMITTED_REG_X << 6)
+    if length == 3:
+        first = text[start]
+        if first == "w" and text[start + 1] == "s" and text[start + 2] == "p":
+            return 31 | (_EMITTED_REG_W << 6)
+        if first == "x" and text[start + 1] == "z" and text[start + 2] == "r":
+            return 31 | (_EMITTED_REG_X << 6)
+        if first == "w" and text[start + 1] == "z" and text[start + 2] == "r":
+            return 31 | (_EMITTED_REG_W << 6)
+    if length < 2:
+        return -1
+    first = text[start]
+    if first not in "xwds":
+        return -1
+    number = 0
+    index = start + 1
+    while index < end:
+        code = ord(text[index]) - 48
+        if code < 0 or code > 9:
+            return -1
+        number = number * 10 + code
+        index += 1
+    if number > 30:
+        return -1
+    if first == "x":
+        kind = _EMITTED_REG_X
+    elif first == "w":
+        kind = _EMITTED_REG_W
+    elif first == "d":
+        kind = _EMITTED_REG_D
+    else:
+        kind = _EMITTED_REG_S
+    return number | (kind << 6)
+
+
+def _emitted_immediate_span(text: str, start: int, end: int) -> int | None:
+    if start >= end or text[start] != "#":
+        return None
+    index = start + 1
+    negative = False
+    if index < end and text[index] == "-":
+        negative = True
+        index += 1
+    base = 10
+    if index + 1 < end and text[index] == "0" and text[index + 1] in "xX":
+        base = 16
+        index += 2
+    if index >= end:
+        return None
+    value = 0
+    while index < end:
+        code = ord(text[index])
+        if 48 <= code <= 57:
+            digit = code - 48
+        elif base == 16 and 65 <= code <= 70:
+            digit = code - 55
+        elif base == 16 and 97 <= code <= 102:
+            digit = code - 87
+        else:
+            return None
+        if digit >= base:
+            return None
+        value = value * base + digit
+        index += 1
+    return -value if negative else value
+
+
+def _emitted_condition_span(text: str, start: int, end: int) -> int:
+    if end - start != 2:
+        return -1
+    first = text[start]
+    second = text[start + 1]
+    if first == "e" and second == "q":
+        return 0
+    if first == "n" and second == "e":
+        return 1
+    if (first == "c" and second == "s") or (first == "h" and second == "s"):
+        return 2
+    if (first == "c" and second == "c") or (first == "l" and second == "o"):
+        return 3
+    if first == "m" and second == "i":
+        return 4
+    if first == "p" and second == "l":
+        return 5
+    if first == "v" and second == "s":
+        return 6
+    if first == "v" and second == "c":
+        return 7
+    if first == "h" and second == "i":
+        return 8
+    if first == "l" and second == "s":
+        return 9
+    if first == "g" and second == "e":
+        return 10
+    if first == "l" and second == "t":
+        return 11
+    if first == "g" and second == "t":
+        return 12
+    if first == "l" and second == "e":
+        return 13
+    return -1
+
+
+def _emitted_branch_bits(
+    target: str,
+    width_bits: int,
+    text_offset: int,
+    label_offsets: dict[str, int],
+) -> int:
+    if target not in label_offsets:
+        return -1
+    delta = label_offsets[target] - text_offset
+    if delta % 4:
+        return -1
+    words = delta >> 2
+    limit = 1 << (width_bits - 1)
+    if words < -limit or words >= limit:
+        return -1
+    return words & ((1 << width_bits) - 1)
+
+
+def _emitted_symbol_id(
+    symbol: str,
+    symbol_ids: dict[str, int],
+    symbol_names: list[str],
+) -> int:
+    if symbol in symbol_ids:
+        return symbol_ids[symbol]
+    symbol_id = len(symbol_names)
+    symbol_ids[symbol] = symbol_id
+    symbol_names.append(symbol)
+    return symbol_id
+
+
+def intern_emitted_symbol(
+    symbol: str,
+    symbol_ids: dict[str, int],
+    symbol_names: list[str],
+) -> int:
+    return _emitted_symbol_id(symbol, symbol_ids, symbol_names)
+
+
+def append_emitted_local_branch_record(
+    base_word: int,
+    width_bits: int,
+    target: str,
+    line_index: int,
+    text_offset: int,
+    label_offsets: dict[str, int],
+    records: CompilerIntArena,
+) -> None:
+    bits = _emitted_branch_bits(
+        target,
+        width_bits,
+        text_offset,
+        label_offsets,
+    )
+    if bits < 0:
+        raise EncodeError("direct emitted branch target is out of range")
+    word = base_word | (bits if width_bits == 26 else bits << 5)
+    records.append4(
+        line_index,
+        word,
+        STRUCTURED_RELOCATION_NONE,
+        -1,
+    )
+
+
+def append_emitted_direct_call_record(
+    target: str,
+    line_index: int,
+    text_offset: int,
+    current_atom_offset: int,
+    label_offsets: dict[str, int] | None,
+    records: CompilerIntArena,
+    symbol_ids: dict[str, int],
+    symbol_names: list[str],
+) -> None:
+    """Publish one direct call from a producer-owned target spelling."""
+
+    if label_offsets is None:
+        symbol_id = _emitted_symbol_id(target, symbol_ids, symbol_names)
+        records.append4(line_index, 0x94000000, STRUCTURED_FIXUP_CALL, symbol_id)
+        return
+    target_offset = label_offsets.get(target)
+    inline_call = target_offset is not None and (
+        target.startswith("L") or target_offset == current_atom_offset
+    )
+    if inline_call:
+        bits = _emitted_branch_bits(
+            target,
+            26,
+            text_offset,
+            label_offsets,
+        )
+        if bits < 0:
+            raise EncodeError("direct emitted call target is out of range")
+        records.append4(
+            line_index,
+            0x94000000 | bits,
+            STRUCTURED_RELOCATION_NONE,
+            -1,
+        )
+        return
+    symbol_id = _emitted_symbol_id(
+        target,
+        symbol_ids,
+        symbol_names,
+    )
+    records.append4(
+        line_index,
+        0x94000000,
+        STRUCTURED_RELOCATION_BRANCH26,
+        symbol_id,
+    )
+
+
+def append_emitted_instruction_record(
+    line: str,
+    line_index: int,
+    text_offset: int,
+    current_atom_offset: int,
+    label_offsets: dict[str, int] | None,
+    records: CompilerIntArena,
+    symbol_ids: dict[str, int],
+    symbol_names: list[str],
+) -> int:
+    """Publish one exact instruction; None layout defers branches to the builder."""
+
+    word = encode_emitted_unscaled_load_store(line)
+    if word is not None:
+        records.append4(line_index, word, STRUCTURED_RELOCATION_NONE, -1)
+        return EMITTED_INSTRUCTION_UNSCALED
+    word = encode_emitted_move(line)
+    if word is not None:
+        records.append4(line_index, word, STRUCTURED_RELOCATION_NONE, -1)
+        return EMITTED_INSTRUCTION_MOVE
+    call_target = emitted_direct_call_target(line)
+    if call_target is not None:
+        try:
+            append_emitted_direct_call_record(
+                call_target,
+                line_index,
+                text_offset,
+                current_atom_offset,
+                label_offsets,
+                records,
+                symbol_ids,
+                symbol_names,
+            )
+        except EncodeError:
+            return EMITTED_INSTRUCTION_FALLBACK
+        return EMITTED_INSTRUCTION_CALL
+
+    fixed_word = -1
+    if line == "  ret":
+        fixed_word = 0xD65F03C0
+    elif line == "  nop":
+        fixed_word = encode_emitted_nop_parts()
+    elif line == "  paciasp":
+        fixed_word = 0xD503233F
+    elif line == "  autiasp":
+        fixed_word = 0xD50323BF
+    if fixed_word >= 0:
+        records.append4(
+            line_index, fixed_word, STRUCTURED_RELOCATION_NONE, -1
+        )
+        return EMITTED_INSTRUCTION_SCALAR
+
+    if line.startswith("  adrp "):
+        destination_start = 7
+        destination_end = line.find(", ", destination_start)
+        if destination_end < 0:
+            return EMITTED_INSTRUCTION_FALLBACK
+        destination = _emitted_register_code_span(
+            line, destination_start, destination_end
+        )
+        if destination < 0 or destination >> 6 != _EMITTED_REG_X:
+            return EMITTED_INSTRUCTION_FALLBACK
+        target_start = destination_end + 2
+        relocation_kind = STRUCTURED_RELOCATION_NONE
+        suffix_length = 0
+        if line.endswith("@GOTPAGE"):
+            relocation_kind = STRUCTURED_RELOCATION_GOT_LOAD_PAGE21
+            suffix_length = len("@GOTPAGE")
+        elif line.endswith("@PAGE"):
+            relocation_kind = STRUCTURED_RELOCATION_PAGE21
+            suffix_length = len("@PAGE")
+        if relocation_kind == STRUCTURED_RELOCATION_NONE:
+            return EMITTED_INSTRUCTION_FALLBACK
+        symbol = line[target_start : len(line) - suffix_length]
+        if not symbol:
+            return EMITTED_INSTRUCTION_FALLBACK
+        symbol_id = _emitted_symbol_id(symbol, symbol_ids, symbol_names)
+        records.append4(
+            line_index,
+            0x90000000 | (destination & 63),
+            relocation_kind,
+            symbol_id,
+        )
+        return EMITTED_INSTRUCTION_SCALAR
+
+    arithmetic_prefix = ""
+    op_sub = 0
+    if line.startswith("  add "):
+        arithmetic_prefix = "  add "
+    elif line.startswith("  sub "):
+        arithmetic_prefix = "  sub "
+        op_sub = 1
+    if arithmetic_prefix:
+        first_start = len(arithmetic_prefix)
+        first_end = line.find(", ", first_start)
+        second_start = first_end + 2
+        second_end = line.find(", ", second_start)
+        third_start = second_end + 2
+        if first_end < 0 or second_end < 0 or third_start >= len(line):
+            return EMITTED_INSTRUCTION_FALLBACK
+        first = _emitted_register_code_span(line, first_start, first_end)
+        second = _emitted_register_code_span(line, second_start, second_end)
+        if first < 0 or second < 0 or first >> 6 != second >> 6:
+            return EMITTED_INSTRUCTION_FALLBACK
+        kind = first >> 6
+        if kind not in (_EMITTED_REG_X, _EMITTED_REG_W):
+            return EMITTED_INSTRUCTION_FALLBACK
+        is_64 = kind == _EMITTED_REG_X
+        if op_sub == 0 and line.endswith("@PAGEOFF"):
+            symbol = line[third_start : -len("@PAGEOFF")]
+            if not symbol:
+                return EMITTED_INSTRUCTION_FALLBACK
+            symbol_id = _emitted_symbol_id(symbol, symbol_ids, symbol_names)
+            word = _enc_addsub_imm(
+                0,
+                first & 63,
+                second & 63,
+                0,
+                is_64,
+            )
+            records.append4(
+                line_index, word, STRUCTURED_RELOCATION_PAGEOFF12, symbol_id
+            )
+            return EMITTED_INSTRUCTION_SCALAR
+        immediate = _emitted_immediate_span(line, third_start, len(line))
+        if immediate is not None:
+            if immediate < 0 or immediate > 0xFFF:
+                return EMITTED_INSTRUCTION_FALLBACK
+            word = _enc_addsub_imm(
+                op_sub,
+                first & 63,
+                second & 63,
+                immediate,
+                is_64,
+            )
+        else:
+            third = _emitted_register_code_span(line, third_start, len(line))
+            if third < 0 or third >> 6 != kind:
+                return EMITTED_INSTRUCTION_FALLBACK
+            first_is_sp = line[first_start:first_end] in ("sp", "wsp")
+            second_is_sp = line[second_start:second_end] in ("sp", "wsp")
+            if first_is_sp or second_is_sp:
+                word = _enc_addsub_ext(
+                    op_sub,
+                    first & 63,
+                    second & 63,
+                    third & 63,
+                    is_64,
+                )
+            else:
+                word = _enc_addsub_reg(
+                    op_sub,
+                    first & 63,
+                    second & 63,
+                    third & 63,
+                    is_64,
+                )
+        records.append4(line_index, word, STRUCTURED_RELOCATION_NONE, -1)
+        return EMITTED_INSTRUCTION_SCALAR
+
+    if line.startswith("  cmp "):
+        first_start = 6
+        first_end = line.find(", ", first_start)
+        second_start = first_end + 2
+        if first_end < 0 or second_start >= len(line):
+            return EMITTED_INSTRUCTION_FALLBACK
+        first = _emitted_register_code_span(line, first_start, first_end)
+        if first < 0 or first >> 6 not in (_EMITTED_REG_X, _EMITTED_REG_W):
+            return EMITTED_INSTRUCTION_FALLBACK
+        is_64 = first >> 6 == _EMITTED_REG_X
+        immediate = _emitted_immediate_span(line, second_start, len(line))
+        if immediate is not None:
+            if immediate < 0 or immediate > 0xFFF:
+                return EMITTED_INSTRUCTION_FALLBACK
+            word = _enc_addsub_imm(
+                1, 31, first & 63, immediate, is_64, set_flags=1
+            )
+        else:
+            second = _emitted_register_code_span(line, second_start, len(line))
+            if second < 0 or second >> 6 != first >> 6:
+                return EMITTED_INSTRUCTION_FALLBACK
+            if line[first_start:first_end] in ("sp", "wsp"):
+                word = _enc_addsub_ext(
+                    1, 31, first & 63, second & 63, is_64, set_flags=1
+                )
+            else:
+                word = _enc_addsub_reg(
+                    1, 31, first & 63, second & 63, is_64, set_flags=1
+                )
+        records.append4(line_index, word, STRUCTURED_RELOCATION_NONE, -1)
+        return EMITTED_INSTRUCTION_SCALAR
+
+    if line.startswith("  cset "):
+        destination_start = 7
+        destination_end = line.find(", ", destination_start)
+        condition_start = destination_end + 2
+        if destination_end < 0:
+            return EMITTED_INSTRUCTION_FALLBACK
+        destination = _emitted_register_code_span(
+            line, destination_start, destination_end
+        )
+        condition = _emitted_condition_span(line, condition_start, len(line))
+        if destination < 0 or condition < 0:
+            return EMITTED_INSTRUCTION_FALLBACK
+        kind = destination >> 6
+        if kind not in (_EMITTED_REG_X, _EMITTED_REG_W):
+            return EMITTED_INSTRUCTION_FALLBACK
+        word = (
+            _sf(kind == _EMITTED_REG_X)
+            | 0x1A800400
+            | (31 << 16)
+            | ((condition ^ 1) << 12)
+            | (31 << 5)
+            | (destination & 63)
+        )
+        records.append4(line_index, word, STRUCTURED_RELOCATION_NONE, -1)
+        return EMITTED_INSTRUCTION_SCALAR
+
+    branch_prefix = ""
+    branch_base = 0
+    branch_width = 0
+    if line.startswith("  b "):
+        branch_prefix = "  b "
+        branch_base = 0x14000000
+        branch_width = 26
+    elif line.startswith("  b."):
+        condition_end = line.find(" ", 4)
+        condition = _emitted_condition_span(line, 4, condition_end)
+        if condition_end < 0 or condition < 0:
+            return EMITTED_INSTRUCTION_FALLBACK
+        target = line[condition_end + 1 :]
+        if label_offsets is None:
+            records.append4(
+                line_index, 0x54000000 | condition, STRUCTURED_FIXUP_BRANCH19,
+                _emitted_symbol_id(target, symbol_ids, symbol_names),
+            )
+            return EMITTED_INSTRUCTION_SCALAR
+        bits = _emitted_branch_bits(target, 19, text_offset, label_offsets)
+        if bits < 0:
+            return EMITTED_INSTRUCTION_FALLBACK
+        records.append4(
+            line_index,
+            0x54000000 | (bits << 5) | condition,
+            STRUCTURED_RELOCATION_NONE,
+            -1,
+        )
+        return EMITTED_INSTRUCTION_SCALAR
+    if branch_prefix:
+        target = line[len(branch_prefix) :]
+        if label_offsets is None:
+            records.append4(
+                line_index, branch_base, STRUCTURED_FIXUP_BRANCH26,
+                _emitted_symbol_id(target, symbol_ids, symbol_names),
+            )
+            return EMITTED_INSTRUCTION_SCALAR
+        bits = _emitted_branch_bits(
+            target, branch_width, text_offset, label_offsets
+        )
+        if bits < 0:
+            return EMITTED_INSTRUCTION_FALLBACK
+        records.append4(
+            line_index,
+            branch_base | bits,
+            STRUCTURED_RELOCATION_NONE,
+            -1,
+        )
+        return EMITTED_INSTRUCTION_SCALAR
+
+    zero_branch_prefix = ""
+    zero_branch_base = 0
+    if line.startswith("  cbz "):
+        zero_branch_prefix = "  cbz "
+        zero_branch_base = 0x34000000
+    elif line.startswith("  cbnz "):
+        zero_branch_prefix = "  cbnz "
+        zero_branch_base = 0x35000000
+    if zero_branch_prefix:
+        register_start = len(zero_branch_prefix)
+        register_end = line.find(", ", register_start)
+        target_start = register_end + 2
+        if register_end < 0:
+            return EMITTED_INSTRUCTION_FALLBACK
+        register = _emitted_register_code_span(line, register_start, register_end)
+        if register < 0 or register >> 6 not in (_EMITTED_REG_X, _EMITTED_REG_W):
+            return EMITTED_INSTRUCTION_FALLBACK
+        target = line[target_start:]
+        if label_offsets is None:
+            word = zero_branch_base | (register & 63)
+            if register >> 6 == _EMITTED_REG_X:
+                word |= 0x80000000
+            records.append4(
+                line_index, word, STRUCTURED_FIXUP_BRANCH19,
+                _emitted_symbol_id(target, symbol_ids, symbol_names),
+            )
+            return EMITTED_INSTRUCTION_SCALAR
+        bits = _emitted_branch_bits(target, 19, text_offset, label_offsets)
+        if bits < 0:
+            return EMITTED_INSTRUCTION_FALLBACK
+        word = zero_branch_base | (bits << 5) | (register & 63)
+        if register >> 6 == _EMITTED_REG_X:
+            word |= 0x80000000
+        records.append4(line_index, word, STRUCTURED_RELOCATION_NONE, -1)
+        return EMITTED_INSTRUCTION_SCALAR
+
+    load_store_prefix = ""
+    load_store_size = -1
+    load_store_opc = 0
+    if line.startswith("  ldr "):
+        load_store_prefix = "  ldr "
+        load_store_opc = 1
+    elif line.startswith("  str "):
+        load_store_prefix = "  str "
+    elif line.startswith("  ldrb "):
+        load_store_prefix = "  ldrb "
+        load_store_size = 0
+        load_store_opc = 1
+    elif line.startswith("  strb "):
+        load_store_prefix = "  strb "
+        load_store_size = 0
+    if load_store_prefix:
+        register_start = len(load_store_prefix)
+        register_end = line.find(", ", register_start)
+        memory_start = register_end + 2
+        if register_end < 0 or memory_start >= len(line):
+            return EMITTED_INSTRUCTION_FALLBACK
+        register = _emitted_register_code_span(line, register_start, register_end)
+        if register < 0 or line[memory_start] != "[" or line[-1] != "]":
+            return EMITTED_INSTRUCTION_FALLBACK
+        inner_start = memory_start + 1
+        inner_end = len(line) - 1
+        comma = line.find(", ", inner_start, inner_end)
+        base_end = inner_end if comma < 0 else comma
+        base = _emitted_register_code_span(line, inner_start, base_end)
+        if base < 0 or base >> 6 != _EMITTED_REG_X:
+            return EMITTED_INSTRUCTION_FALLBACK
+        if comma >= 0 and line.endswith("@GOTPAGEOFF]"):
+            if load_store_prefix != "  ldr " or register >> 6 != _EMITTED_REG_X:
+                return EMITTED_INSTRUCTION_FALLBACK
+            symbol_start = comma + 2
+            symbol_end = inner_end - len("@GOTPAGEOFF")
+            symbol = line[symbol_start:symbol_end]
+            if not symbol:
+                return EMITTED_INSTRUCTION_FALLBACK
+            symbol_id = _emitted_symbol_id(symbol, symbol_ids, symbol_names)
+            word = _enc_ldst_unsigned(3, 1, register & 63, base & 63, 0)
+            records.append4(
+                line_index,
+                word,
+                STRUCTURED_RELOCATION_GOT_LOAD_PAGEOFF12,
+                symbol_id,
+            )
+            return EMITTED_INSTRUCTION_SCALAR
+        immediate = 0
+        if comma >= 0:
+            parsed = _emitted_immediate_span(line, comma + 2, inner_end)
+            if parsed is None or parsed < 0:
+                return EMITTED_INSTRUCTION_FALLBACK
+            immediate = parsed
+        kind = register >> 6
+        vector = 0
+        if load_store_size < 0:
+            if kind == _EMITTED_REG_X:
+                load_store_size = 3
+            elif kind == _EMITTED_REG_W:
+                load_store_size = 2
+            elif kind == _EMITTED_REG_D:
+                load_store_size = 3
+                vector = 1 << 26
+            elif kind == _EMITTED_REG_S:
+                load_store_size = 2
+                vector = 1 << 26
+            else:
+                return EMITTED_INSTRUCTION_FALLBACK
+        elif kind != _EMITTED_REG_W:
+            return EMITTED_INSTRUCTION_FALLBACK
+        scale = 1 << load_store_size
+        if immediate % scale or immediate // scale > 0xFFF:
+            return EMITTED_INSTRUCTION_FALLBACK
+        word = _enc_ldst_unsigned(
+            load_store_size,
+            load_store_opc,
+            register & 63,
+            base & 63,
+            immediate,
+        ) | vector
+        records.append4(line_index, word, STRUCTURED_RELOCATION_NONE, -1)
+        return EMITTED_INSTRUCTION_SCALAR
+
+    pair_prefix = ""
+    pair_load = 0
+    if line.startswith("  ldp "):
+        pair_prefix = "  ldp "
+        pair_load = 1
+    elif line.startswith("  stp "):
+        pair_prefix = "  stp "
+    if pair_prefix:
+        first_start = len(pair_prefix)
+        first_end = line.find(", ", first_start)
+        second_start = first_end + 2
+        second_end = line.find(", ", second_start)
+        memory_start = second_end + 2
+        if first_end < 0 or second_end < 0 or memory_start >= len(line):
+            return EMITTED_INSTRUCTION_FALLBACK
+        first = _emitted_register_code_span(line, first_start, first_end)
+        second = _emitted_register_code_span(line, second_start, second_end)
+        if first < 0 or second < 0 or first >> 6 != second >> 6:
+            return EMITTED_INSTRUCTION_FALLBACK
+        kind = first >> 6
+        if kind not in (_EMITTED_REG_X, _EMITTED_REG_W):
+            return EMITTED_INSTRUCTION_FALLBACK
+        mode = "signed"
+        immediate = 0
+        memory_end = len(line)
+        post_marker = line.find("], #", memory_start)
+        if post_marker >= 0:
+            mode = "post"
+            base_end = post_marker
+            immediate_value = _emitted_immediate_span(
+                line, post_marker + 3, len(line)
+            )
+            if immediate_value is None:
+                return EMITTED_INSTRUCTION_FALLBACK
+            immediate = immediate_value
+            if line[memory_start] != "[" or line[base_end] != "]":
+                return EMITTED_INSTRUCTION_FALLBACK
+            base = _emitted_register_code_span(
+                line, memory_start + 1, base_end
+            )
+        elif line.endswith("]!"):
+            mode = "pre"
+            memory_end = len(line) - 2
+            comma = line.find(", ", memory_start + 1, memory_end)
+            if comma < 0:
+                return EMITTED_INSTRUCTION_FALLBACK
+            base = _emitted_register_code_span(
+                line, memory_start + 1, comma
+            )
+            immediate_value = _emitted_immediate_span(
+                line, comma + 2, memory_end
+            )
+            if immediate_value is None:
+                return EMITTED_INSTRUCTION_FALLBACK
+            immediate = immediate_value
+        elif line.endswith("]"):
+            memory_end = len(line) - 1
+            comma = line.find(", ", memory_start + 1, memory_end)
+            if comma < 0:
+                base = _emitted_register_code_span(
+                    line, memory_start + 1, memory_end
+                )
+            else:
+                base = _emitted_register_code_span(
+                    line, memory_start + 1, comma
+                )
+                immediate_value = _emitted_immediate_span(
+                    line, comma + 2, memory_end
+                )
+                if immediate_value is None:
+                    return EMITTED_INSTRUCTION_FALLBACK
+                immediate = immediate_value
+        else:
+            return EMITTED_INSTRUCTION_FALLBACK
+        if base < 0 or base >> 6 != _EMITTED_REG_X:
+            return EMITTED_INSTRUCTION_FALLBACK
+        scale = 8 if kind == _EMITTED_REG_X else 4
+        if immediate % scale or immediate // scale < -64 or immediate // scale > 63:
+            return EMITTED_INSTRUCTION_FALLBACK
+        word = _enc_ldstp(
+            pair_load,
+            mode,
+            first & 63,
+            second & 63,
+            base & 63,
+            immediate,
+            kind == _EMITTED_REG_X,
+        )
+        records.append4(line_index, word, STRUCTURED_RELOCATION_NONE, -1)
+        return EMITTED_INSTRUCTION_SCALAR
+
+    logical_prefix = ""
+    logical_opc = -1
+    if line.startswith("  and "):
+        logical_prefix = "  and "
+        logical_opc = 0
+    elif line.startswith("  orr "):
+        logical_prefix = "  orr "
+        logical_opc = 1
+    elif line.startswith("  eor "):
+        logical_prefix = "  eor "
+        logical_opc = 2
+    if logical_prefix:
+        first_start = len(logical_prefix)
+        first_end = line.find(", ", first_start)
+        second_start = first_end + 2
+        second_end = line.find(", ", second_start)
+        third_start = second_end + 2
+        if first_end < 0 or second_end < 0:
+            return EMITTED_INSTRUCTION_FALLBACK
+        first = _emitted_register_code_span(line, first_start, first_end)
+        second = _emitted_register_code_span(line, second_start, second_end)
+        if first < 0 or second < 0 or first >> 6 != second >> 6:
+            return EMITTED_INSTRUCTION_FALLBACK
+        kind = first >> 6
+        if kind not in (_EMITTED_REG_X, _EMITTED_REG_W):
+            return EMITTED_INSTRUCTION_FALLBACK
+        immediate = _emitted_immediate_span(line, third_start, len(line))
+        if immediate is not None:
+            if logical_opc != 0:
+                return EMITTED_INSTRUCTION_FALLBACK
+            n_bit, immr, imms = _logical_imm(
+                immediate, kind == _EMITTED_REG_X
+            )
+            word = (
+                _sf(kind == _EMITTED_REG_X)
+                | 0x12000000
+                | (n_bit << 22)
+                | (immr << 16)
+                | (imms << 10)
+                | ((second & 63) << 5)
+                | (first & 63)
+            )
+        else:
+            third = _emitted_register_code_span(line, third_start, len(line))
+            if third < 0 or third >> 6 != kind:
+                return EMITTED_INSTRUCTION_FALLBACK
+            word = _enc_logical_reg(
+                logical_opc,
+                first & 63,
+                second & 63,
+                third & 63,
+                kind == _EMITTED_REG_X,
+            )
+        records.append4(line_index, word, STRUCTURED_RELOCATION_NONE, -1)
+        return EMITTED_INSTRUCTION_SCALAR
+
+    variable_shift_op2 = -1
+    variable_shift_prefix = ""
+    if line.startswith("  lslv "):
+        variable_shift_prefix = "  lslv "
+        variable_shift_op2 = 0b1000
+    elif line.startswith("  lsrv "):
+        variable_shift_prefix = "  lsrv "
+        variable_shift_op2 = 0b1001
+    elif line.startswith("  asrv "):
+        variable_shift_prefix = "  asrv "
+        variable_shift_op2 = 0b1010
+    if variable_shift_prefix:
+        first_start = len(variable_shift_prefix)
+        first_end = line.find(", ", first_start)
+        if first_end < 0:
+            return EMITTED_INSTRUCTION_FALLBACK
+        second_start = first_end + 2
+        second_end = line.find(", ", second_start)
+        if second_end < 0:
+            return EMITTED_INSTRUCTION_FALLBACK
+        third_start = second_end + 2
+        first = _emitted_register_code_span(line, first_start, first_end)
+        second = _emitted_register_code_span(line, second_start, second_end)
+        third = _emitted_register_code_span(line, third_start, len(line))
+        if (
+            first < 0
+            or second < 0
+            or third < 0
+            or first >> 6 != second >> 6
+            or first >> 6 != third >> 6
+            or first >> 6 not in (_EMITTED_REG_X, _EMITTED_REG_W)
+        ):
+            return EMITTED_INSTRUCTION_FALLBACK
+        word = (
+            _sf(first >> 6 == _EMITTED_REG_X)
+            | 0x1AC00000
+            | ((third & 63) << 16)
+            | (variable_shift_op2 << 10)
+            | ((second & 63) << 5)
+            | (first & 63)
+        )
+        records.append4(line_index, word, STRUCTURED_RELOCATION_NONE, -1)
+        return EMITTED_INSTRUCTION_SCALAR
+
+    if line.startswith("  asr "):
+        first_start = 6
+        first_end = line.find(", ", first_start)
+        if first_end < 0:
+            return EMITTED_INSTRUCTION_FALLBACK
+        second_start = first_end + 2
+        second_end = line.find(", ", second_start)
+        if second_end < 0:
+            return EMITTED_INSTRUCTION_FALLBACK
+        third_start = second_end + 2
+        first = _emitted_register_code_span(line, first_start, first_end)
+        second = _emitted_register_code_span(line, second_start, second_end)
+        shift = _emitted_immediate_span(line, third_start, len(line))
+        if (
+            first < 0
+            or second < 0
+            or shift is None
+            or first >> 6 != second >> 6
+            or first >> 6 not in (_EMITTED_REG_X, _EMITTED_REG_W)
+        ):
+            return EMITTED_INSTRUCTION_FALLBACK
+        is_64 = first >> 6 == _EMITTED_REG_X
+        width = 64 if is_64 else 32
+        if shift < 0 or shift >= width:
+            return EMITTED_INSTRUCTION_FALLBACK
+        word = (
+            _sf(is_64)
+            | 0x13000000
+            | ((1 << 22) if is_64 else 0)
+            | (shift << 16)
+            | ((width - 1) << 10)
+            | ((second & 63) << 5)
+            | (first & 63)
+        )
+        records.append4(line_index, word, STRUCTURED_RELOCATION_NONE, -1)
+        return EMITTED_INSTRUCTION_SCALAR
+
+    integer_three_prefix = ""
+    integer_three_kind = 0
+    if line.startswith("  mul "):
+        integer_three_prefix = "  mul "
+        integer_three_kind = 1
+    elif line.startswith("  sdiv "):
+        integer_three_prefix = "  sdiv "
+        integer_three_kind = 2
+    elif line.startswith("  smulh "):
+        integer_three_prefix = "  smulh "
+        integer_three_kind = 3
+    if integer_three_prefix:
+        first_start = len(integer_three_prefix)
+        first_end = line.find(", ", first_start)
+        if first_end < 0:
+            return EMITTED_INSTRUCTION_FALLBACK
+        second_start = first_end + 2
+        second_end = line.find(", ", second_start)
+        if second_end < 0:
+            return EMITTED_INSTRUCTION_FALLBACK
+        third_start = second_end + 2
+        first = _emitted_register_code_span(line, first_start, first_end)
+        second = _emitted_register_code_span(line, second_start, second_end)
+        third = _emitted_register_code_span(line, third_start, len(line))
+        if (
+            first < 0
+            or second < 0
+            or third < 0
+            or first >> 6 != second >> 6
+            or first >> 6 != third >> 6
+            or first >> 6 not in (_EMITTED_REG_X, _EMITTED_REG_W)
+        ):
+            return EMITTED_INSTRUCTION_FALLBACK
+        is_64 = first >> 6 == _EMITTED_REG_X
+        if integer_three_kind == 1:
+            word = (
+                _sf(is_64)
+                | 0x1B007C00
+                | ((third & 63) << 16)
+                | ((second & 63) << 5)
+                | (first & 63)
+            )
+        elif integer_three_kind == 2:
+            word = (
+                _sf(is_64)
+                | 0x1AC00800
+                | (1 << 10)
+                | ((third & 63) << 16)
+                | ((second & 63) << 5)
+                | (first & 63)
+            )
+        else:
+            if not is_64:
+                return EMITTED_INSTRUCTION_FALLBACK
+            word = (
+                0x9B407C00
+                | ((third & 63) << 16)
+                | ((second & 63) << 5)
+                | (first & 63)
+            )
+        records.append4(line_index, word, STRUCTURED_RELOCATION_NONE, -1)
+        return EMITTED_INSTRUCTION_SCALAR
+
+    if line.startswith("  msub ") or line.startswith("  csel "):
+        is_msub = line.startswith("  msub ")
+        prefix = "  msub " if is_msub else "  csel "
+        first_start = len(prefix)
+        first_end = line.find(", ", first_start)
+        if first_end < 0:
+            return EMITTED_INSTRUCTION_FALLBACK
+        second_start = first_end + 2
+        second_end = line.find(", ", second_start)
+        if second_end < 0:
+            return EMITTED_INSTRUCTION_FALLBACK
+        third_start = second_end + 2
+        third_end = line.find(", ", third_start)
+        if third_end < 0:
+            return EMITTED_INSTRUCTION_FALLBACK
+        fourth_start = third_end + 2
+        first = _emitted_register_code_span(line, first_start, first_end)
+        second = _emitted_register_code_span(line, second_start, second_end)
+        third = _emitted_register_code_span(line, third_start, third_end)
+        if (
+            first < 0
+            or second < 0
+            or third < 0
+            or first >> 6 != second >> 6
+            or first >> 6 != third >> 6
+            or first >> 6 not in (_EMITTED_REG_X, _EMITTED_REG_W)
+        ):
+            return EMITTED_INSTRUCTION_FALLBACK
+        is_64 = first >> 6 == _EMITTED_REG_X
+        if is_msub:
+            fourth = _emitted_register_code_span(
+                line, fourth_start, len(line)
+            )
+            if fourth < 0 or fourth >> 6 != first >> 6:
+                return EMITTED_INSTRUCTION_FALLBACK
+            word = (
+                _sf(is_64)
+                | 0x1B000000
+                | (1 << 15)
+                | ((third & 63) << 16)
+                | ((fourth & 63) << 10)
+                | ((second & 63) << 5)
+                | (first & 63)
+            )
+        else:
+            condition = _emitted_condition_span(
+                line, fourth_start, len(line)
+            )
+            if condition < 0:
+                return EMITTED_INSTRUCTION_FALLBACK
+            word = (
+                _sf(is_64)
+                | 0x1A800000
+                | ((third & 63) << 16)
+                | (condition << 12)
+                | ((second & 63) << 5)
+                | (first & 63)
+            )
+        records.append4(line_index, word, STRUCTURED_RELOCATION_NONE, -1)
+        return EMITTED_INSTRUCTION_SCALAR
+
+    if line.startswith("  blr "):
+        register = _emitted_register_code_span(line, 6, len(line))
+        if register < 0 or register >> 6 != _EMITTED_REG_X:
+            return EMITTED_INSTRUCTION_FALLBACK
+        records.append4(
+            line_index,
+            0xD63F0000 | ((register & 63) << 5),
+            STRUCTURED_RELOCATION_NONE,
+            -1,
+        )
+        return EMITTED_INSTRUCTION_SCALAR
+
+    if line.startswith("  brk "):
+        immediate = _emitted_immediate_span(line, 6, len(line))
+        if immediate is None or immediate < 0 or immediate > 0xFFFF:
+            return EMITTED_INSTRUCTION_FALLBACK
+        records.append4(
+            line_index,
+            0xD4200000 | (immediate << 5),
+            STRUCTURED_RELOCATION_NONE,
+            -1,
+        )
+        return EMITTED_INSTRUCTION_SCALAR
+
+    float_binary_prefix = ""
+    float_binary_opcode = 0
+    if line.startswith("  fmul "):
+        float_binary_prefix = "  fmul "
+        float_binary_opcode = 0x0800
+    elif line.startswith("  fdiv "):
+        float_binary_prefix = "  fdiv "
+        float_binary_opcode = 0x1800
+    elif line.startswith("  fadd "):
+        float_binary_prefix = "  fadd "
+        float_binary_opcode = 0x2800
+    elif line.startswith("  fsub "):
+        float_binary_prefix = "  fsub "
+        float_binary_opcode = 0x3800
+    if float_binary_prefix:
+        first_start = len(float_binary_prefix)
+        first_end = line.find(", ", first_start)
+        if first_end < 0:
+            return EMITTED_INSTRUCTION_FALLBACK
+        second_start = first_end + 2
+        second_end = line.find(", ", second_start)
+        if second_end < 0:
+            return EMITTED_INSTRUCTION_FALLBACK
+        third_start = second_end + 2
+        first = _emitted_register_code_span(line, first_start, first_end)
+        second = _emitted_register_code_span(line, second_start, second_end)
+        third = _emitted_register_code_span(line, third_start, len(line))
+        if (
+            first < 0
+            or second < 0
+            or third < 0
+            or first >> 6 != _EMITTED_REG_D
+            or second >> 6 != _EMITTED_REG_D
+            or third >> 6 != _EMITTED_REG_D
+        ):
+            return EMITTED_INSTRUCTION_FALLBACK
+        word = (
+            0x1E600000
+            | float_binary_opcode
+            | ((third & 63) << 16)
+            | ((second & 63) << 5)
+            | (first & 63)
+        )
+        records.append4(line_index, word, STRUCTURED_RELOCATION_NONE, -1)
+        return EMITTED_INSTRUCTION_SCALAR
+
+    if line.startswith("  fneg "):
+        first_start = 7
+        first_end = line.find(", ", first_start)
+        if first_end < 0:
+            return EMITTED_INSTRUCTION_FALLBACK
+        second_start = first_end + 2
+        first = _emitted_register_code_span(line, first_start, first_end)
+        second = _emitted_register_code_span(line, second_start, len(line))
+        if (
+            first < 0
+            or second < 0
+            or first >> 6 != _EMITTED_REG_D
+            or second >> 6 != _EMITTED_REG_D
+        ):
+            return EMITTED_INSTRUCTION_FALLBACK
+        records.append4(
+            line_index,
+            0x1E614000 | ((second & 63) << 5) | (first & 63),
+            STRUCTURED_RELOCATION_NONE,
+            -1,
+        )
+        return EMITTED_INSTRUCTION_SCALAR
+
+    if line.startswith("  fmov "):
+        first_start = 7
+        first_end = line.find(", ", first_start)
+        if first_end < 0:
+            return EMITTED_INSTRUCTION_FALLBACK
+        second_start = first_end + 2
+        first = _emitted_register_code_span(line, first_start, first_end)
+        if first < 0:
+            return EMITTED_INSTRUCTION_FALLBACK
+        if line[second_start] == "#":
+            literal = line[second_start + 1 :]
+            immediate = direct_fp_immediate_encoding(literal)
+            if immediate is None or first >> 6 not in (
+                _EMITTED_REG_D,
+                _EMITTED_REG_S,
+            ):
+                return EMITTED_INSTRUCTION_FALLBACK
+            base = 0x1E601000 if first >> 6 == _EMITTED_REG_D else 0x1E201000
+            word = base | (immediate << 13) | (first & 63)
+        else:
+            second = _emitted_register_code_span(
+                line, second_start, len(line)
+            )
+            if second < 0:
+                return EMITTED_INSTRUCTION_FALLBACK
+            first_kind = first >> 6
+            second_kind = second >> 6
+            if first_kind == _EMITTED_REG_D and second_kind == _EMITTED_REG_D:
+                word = 0x1E604000 | ((second & 63) << 5) | (first & 63)
+            elif first_kind == _EMITTED_REG_D and second_kind == _EMITTED_REG_X:
+                word = 0x9E670000 | ((second & 63) << 5) | (first & 63)
+            elif first_kind == _EMITTED_REG_X and second_kind == _EMITTED_REG_D:
+                word = 0x9E660000 | ((second & 63) << 5) | (first & 63)
+            else:
+                return EMITTED_INSTRUCTION_FALLBACK
+        records.append4(line_index, word, STRUCTURED_RELOCATION_NONE, -1)
+        return EMITTED_INSTRUCTION_SCALAR
+
+    if line.startswith("  scvtf ") or line.startswith("  fcvtzs "):
+        is_scvtf = line.startswith("  scvtf ")
+        prefix = "  scvtf " if is_scvtf else "  fcvtzs "
+        first_start = len(prefix)
+        first_end = line.find(", ", first_start)
+        if first_end < 0:
+            return EMITTED_INSTRUCTION_FALLBACK
+        second_start = first_end + 2
+        first = _emitted_register_code_span(line, first_start, first_end)
+        second = _emitted_register_code_span(line, second_start, len(line))
+        if first < 0 or second < 0:
+            return EMITTED_INSTRUCTION_FALLBACK
+        if is_scvtf:
+            if first >> 6 != _EMITTED_REG_D or second >> 6 not in (
+                _EMITTED_REG_X,
+                _EMITTED_REG_W,
+            ):
+                return EMITTED_INSTRUCTION_FALLBACK
+            word = (
+                0x9E620000
+                if second >> 6 == _EMITTED_REG_X
+                else 0x1E620000
+            ) | ((second & 63) << 5) | (first & 63)
+        else:
+            if first >> 6 not in (
+                _EMITTED_REG_X,
+                _EMITTED_REG_W,
+            ) or second >> 6 != _EMITTED_REG_D:
+                return EMITTED_INSTRUCTION_FALLBACK
+            word = (
+                0x9E780000
+                if first >> 6 == _EMITTED_REG_X
+                else 0x1E780000
+            ) | ((second & 63) << 5) | (first & 63)
+        records.append4(line_index, word, STRUCTURED_RELOCATION_NONE, -1)
+        return EMITTED_INSTRUCTION_SCALAR
+
+    if line.startswith("  fcmp "):
+        first_start = 7
+        first_end = line.find(", ", first_start)
+        if first_end < 0:
+            return EMITTED_INSTRUCTION_FALLBACK
+        second_start = first_end + 2
+        first = _emitted_register_code_span(line, first_start, first_end)
+        if first < 0 or first >> 6 != _EMITTED_REG_D:
+            return EMITTED_INSTRUCTION_FALLBACK
+        if line[second_start:] in ("#0", "#0.0"):
+            word = 0x1E602008 | ((first & 63) << 5)
+        else:
+            second = _emitted_register_code_span(
+                line, second_start, len(line)
+            )
+            if second < 0 or second >> 6 != _EMITTED_REG_D:
+                return EMITTED_INSTRUCTION_FALLBACK
+            word = (
+                0x1E602000
+                | ((second & 63) << 16)
+                | ((first & 63) << 5)
+            )
+        records.append4(line_index, word, STRUCTURED_RELOCATION_NONE, -1)
+        return EMITTED_INSTRUCTION_SCALAR
+
+    if line.startswith("  fcsel "):
+        first_start = 8
+        first_end = line.find(", ", first_start)
+        if first_end < 0:
+            return EMITTED_INSTRUCTION_FALLBACK
+        second_start = first_end + 2
+        second_end = line.find(", ", second_start)
+        if second_end < 0:
+            return EMITTED_INSTRUCTION_FALLBACK
+        third_start = second_end + 2
+        third_end = line.find(", ", third_start)
+        if third_end < 0:
+            return EMITTED_INSTRUCTION_FALLBACK
+        fourth_start = third_end + 2
+        first = _emitted_register_code_span(line, first_start, first_end)
+        second = _emitted_register_code_span(line, second_start, second_end)
+        third = _emitted_register_code_span(line, third_start, third_end)
+        condition = _emitted_condition_span(line, fourth_start, len(line))
+        if (
+            first < 0
+            or second < 0
+            or third < 0
+            or condition < 0
+            or first >> 6 != _EMITTED_REG_D
+            or second >> 6 != _EMITTED_REG_D
+            or third >> 6 != _EMITTED_REG_D
+        ):
+            return EMITTED_INSTRUCTION_FALLBACK
+        word = (
+            0x1E600C00
+            | ((third & 63) << 16)
+            | (condition << 12)
+            | ((second & 63) << 5)
+            | (first & 63)
+        )
+        records.append4(line_index, word, STRUCTURED_RELOCATION_NONE, -1)
+        return EMITTED_INSTRUCTION_SCALAR
+
+    return EMITTED_INSTRUCTION_FALLBACK
+
+
 # --- the assembler -----------------------------------------------------------
 
 
@@ -316,60 +2106,129 @@ def _is_symbol(tok: str) -> bool:
     return bool(t) and (t[0] == "_" or t[0].isalpha()) and "@" not in t
 
 
-def assemble_text(asm_text: str) -> AssembledText:
-    """Two-pass assembly of one __text body written in the self backend's
-    dialect.
+def _encode_inline_text_data(line: str) -> bytes:
+    directive, _, rest = line.partition(" ")
+    if directive == ".space":
+        try:
+            count = int(rest.strip(), 0)
+        except ValueError as exc:
+            raise EncodeError(f"bad inline {line!r}") from exc
+        if count < 0:
+            raise EncodeError(f"bad inline {line!r}")
+        return b"\0" * count
+    widths = {".byte": 1, ".short": 2, ".long": 4, ".quad": 8}
+    width = widths[directive]
+    parts: list[bytes] = []
+    for item in (piece.strip() for piece in rest.split(",")):
+        if not item:
+            continue
+        try:
+            value = int(item, 0)
+        except ValueError as exc:
+            raise EncodeError(
+                f"symbol-valued inline data not proven: {line!r}"
+            ) from exc
+        parts.append((value & ((1 << (width * 8)) - 1)).to_bytes(width, "little"))
+    return b"".join(parts)
 
-    The only directives accepted here are a matched ``.data_region`` /
-    ``.end_data_region`` pair and numeric data within it.  Mach-O needs those
-    bytes kept in ``__text`` plus an LC_DATA_IN_CODE range; treating them as
-    instructions would make disassembly, atomization, and linker transforms
-    incorrect.
+
+def _validate_text_fixup_word(word: int, kind: int) -> None:
+    if kind == STRUCTURED_FIXUP_CALL:
+        valid = word == 0x94000000
+    elif kind == STRUCTURED_FIXUP_BRANCH26:
+        valid = word == 0x14000000
+    elif kind == STRUCTURED_FIXUP_BRANCH19:
+        valid = (word & 0xFFFFFFF0) == 0x54000000 or (
+            (word & 0x7FFFFFE0) in (0x34000000, 0x35000000)
+        )
+    else:
+        raise EncodeError("structured fixup kind is not proven")
+    if not valid:
+        raise EncodeError("structured fixup requires an unpatched branch word")
+
+
+class PackedAArch64TextBuilder:
+    """One native entry/layout owner; textual instructions are an explicit adapter.
+
+    The ordinary text API and structured directive driver share this parser.
+    Encoded instructions occupy only arena scalars, never blank string slots.
+    Label names and data blobs are module/section side tables; their remaining
+    projection is distinct from the instruction-buffer closure.
     """
-    lines: list[tuple[str, str | bytes]] = []  # (insn|data, payload)
-    labels: dict[str, int] = {}
-    data_in_code: list[DataInCodeRegion] = []
-    active_data_region: tuple[int, int] | None = None
-    pc = 0
 
-    region_kinds = {
-        "": spec.DICE_KIND_DATA,
-        "jt8": spec.DICE_KIND_JUMP_TABLE8,
-        "jt16": spec.DICE_KIND_JUMP_TABLE16,
-        "jt32": spec.DICE_KIND_JUMP_TABLE32,
-    }
+    def __init__(
+        self,
+        structured_symbol_names: list[str] | tuple[str, ...] = (),
+        initial_capacity: int = 8,
+    ) -> None:
+        self.entries = CompilerIntArena(max(1, initial_capacity))
+        self.structured_relocations = CompilerIntArena()
+        self.instruction_lines: list[str] = []
+        self.data_chunks: list[bytes] = []
+        self.labels: dict[str, int] = {}
+        self.data_in_code: list[DataInCodeRegion] = []
+        self.structured_symbol_names = structured_symbol_names
+        self.pc: int = 0
+        self.active_data_start: int = -1
+        self.active_data_kind: int = -1
+        self.closed: bool = False
 
-    def encode_inline_data(line: str) -> bytes:
-        directive, _, rest = line.partition(" ")
-        if directive == ".space":
-            try:
-                count = int(rest.strip(), 0)
-            except ValueError as exc:
-                raise EncodeError(f"bad inline {line!r}") from exc
-            if count < 0:
-                raise EncodeError(f"bad inline {line!r}")
-            return b"\0" * count
-        widths = {".byte": 1, ".short": 2, ".long": 4, ".quad": 8}
-        width = widths[directive]
-        out = bytearray()
-        for item in (piece.strip() for piece in rest.split(",")):
-            if not item:
-                continue
-            try:
-                value = int(item, 0)
-            except ValueError as exc:
-                raise EncodeError(
-                    f"symbol-valued inline data not proven: {line!r}"
-                ) from exc
-            out += (value & ((1 << (width * 8)) - 1)).to_bytes(
-                width, "little"
+    def append_encoded(self, word: int, relocation_kind: int, symbol_id: int) -> None:
+        if self.closed:
+            raise EncodeError("text builder is closed")
+        if word < 0 or word > 0xFFFFFFFF:
+            raise EncodeError("structured instruction word is outside uint32")
+        if relocation_kind == STRUCTURED_RELOCATION_NONE:
+            if symbol_id != -1:
+                raise EncodeError("non-relocating structured instruction has a symbol")
+        elif relocation_kind in (
+            STRUCTURED_RELOCATION_BRANCH26,
+            STRUCTURED_RELOCATION_PAGE21,
+            STRUCTURED_RELOCATION_PAGEOFF12,
+            STRUCTURED_RELOCATION_GOT_LOAD_PAGE21,
+            STRUCTURED_RELOCATION_GOT_LOAD_PAGEOFF12,
+            STRUCTURED_FIXUP_CALL,
+            STRUCTURED_FIXUP_BRANCH26,
+            STRUCTURED_FIXUP_BRANCH19,
+        ):
+            if symbol_id < 0 or symbol_id >= len(self.structured_symbol_names):
+                raise EncodeError("structured instruction symbol id is out of range")
+        else:
+            raise EncodeError("structured instruction relocation kind is not proven")
+        if relocation_kind < 0:
+            _validate_text_fixup_word(word, relocation_kind)
+        if self.active_data_start >= 0:
+            raise EncodeError("structured instruction inside .data_region is not proven")
+        if self.pc % 4:
+            raise EncodeError("structured instruction at unaligned __text offset")
+        if relocation_kind != STRUCTURED_RELOCATION_NONE:
+            self.structured_relocations.append3(
+                len(self.entries) // 2, relocation_kind, symbol_id,
             )
-        return bytes(out)
+        self.entries.append2(2, word)
+        self.pc += 4
 
-    for raw in asm_text.splitlines():
+    def append_branch(self, base_word: int, width_bits: int, symbol_id: int) -> None:
+        if width_bits not in (19, 26):
+            raise EncodeError("structured branch width is not proven")
+        self.append_encoded(base_word, -width_bits, symbol_id)
+
+    def append_call(self, symbol_id: int) -> None:
+        self.append_encoded(0x94000000, STRUCTURED_FIXUP_CALL, symbol_id)
+
+    def append_label(self, name: str) -> None:
+        if self.closed:
+            raise EncodeError("text builder is closed")
+        if name in self.labels:
+            raise EncodeError(f"duplicate label {name!r}")
+        self.labels[name] = self.pc
+
+    def append_line(self, raw: str) -> None:
+        if self.closed:
+            raise EncodeError("text builder is closed")
         line = raw.split(";")[0].split("//")[0].strip()
         if not line:
-            continue
+            return
         directive = line.split(None, 1)[0]
         if directive == ".p2align":
             parts = line.split()
@@ -379,45 +2238,52 @@ def assemble_text(asm_text: str) -> AssembledText:
                 raise EncodeError(f"bad text alignment {line!r}") from exc
             if not 0 <= align_log2 <= 2:
                 raise EncodeError(f"bad text alignment {line!r}")
-            mask = (1 << align_log2) - 1
-            padding = (-pc) & mask
+            padding = (-self.pc) & ((1 << align_log2) - 1)
             if padding:
-                if active_data_region is None:
-                    raise EncodeError(
-                        "non-data text alignment padding is not proven"
-                    )
-                lines.append(("data", b"\0" * padding))
-                pc += padding
-            continue
+                if self.active_data_start < 0:
+                    raise EncodeError("non-data text alignment padding is not proven")
+                self.entries.append2(1, len(self.data_chunks))
+                self.data_chunks.append(b"\0" * padding)
+                self.pc += padding
+            return
         if directive == ".data_region":
-            if active_data_region is not None:
+            if self.active_data_start >= 0:
                 raise EncodeError("nested .data_region is not proven")
             parts = line.split()
             spelling = parts[1] if len(parts) == 2 else ""
+            region_kinds = {
+                "": spec.DICE_KIND_DATA,
+                "jt8": spec.DICE_KIND_JUMP_TABLE8,
+                "jt16": spec.DICE_KIND_JUMP_TABLE16,
+                "jt32": spec.DICE_KIND_JUMP_TABLE32,
+            }
             if len(parts) > 2 or spelling not in region_kinds:
                 raise EncodeError(f"bad data-region kind in {line!r}")
-            active_data_region = (pc, region_kinds[spelling])
-            continue
+            self.active_data_start = self.pc
+            self.active_data_kind = region_kinds[spelling]
+            return
         if directive == ".end_data_region":
             if line != ".end_data_region":
                 raise EncodeError(f"bad data-region terminator {line!r}")
-            if active_data_region is None:
+            if self.active_data_start < 0:
                 raise EncodeError(".end_data_region without .data_region")
-            start, kind = active_data_region
-            if pc == start:
+            if self.pc == self.active_data_start:
                 raise EncodeError("empty data-in-code region is not proven")
-            data_in_code.append(DataInCodeRegion(start, pc - start, kind))
-            active_data_region = None
-            continue
+            self.data_in_code.append(DataInCodeRegion(
+                self.active_data_start, self.pc - self.active_data_start,
+                self.active_data_kind,
+            ))
+            self.active_data_start = -1
+            self.active_data_kind = -1
+            return
         if directive in (".byte", ".short", ".long", ".quad", ".space"):
-            if active_data_region is None:
-                raise EncodeError(
-                    f"inline data outside .data_region: {line!r}"
-                )
-            raw_data = encode_inline_data(line)
-            lines.append(("data", raw_data))
-            pc += len(raw_data)
-            continue
+            if self.active_data_start < 0:
+                raise EncodeError(f"inline data outside .data_region: {line!r}")
+            raw_data = _encode_inline_text_data(line)
+            self.entries.append2(1, len(self.data_chunks))
+            self.data_chunks.append(raw_data)
+            self.pc += len(raw_data)
+            return
         if line.startswith("."):
             raise EncodeError(
                 f"directive {line.split()[0]!r} reached the instruction "
@@ -425,23 +2291,149 @@ def assemble_text(asm_text: str) -> AssembledText:
             )
         if line.endswith(":"):
             name = line[:-1].strip()
-            if name in labels:
-                raise EncodeError(f"duplicate label {name!r}")
-            labels[name] = pc
-            continue
-        if active_data_region is not None:
+            self.append_label(name)
+            return
+        if self.active_data_start >= 0:
             raise EncodeError("instruction inside .data_region is not proven")
-        if pc % 4 != 0:
+        if self.pc % 4:
             raise EncodeError(
-                f"instruction at unaligned __text offset {pc} after data region"
+                f"instruction at unaligned __text offset {self.pc} after data region"
             )
-        lines.append(("insn", line))
-        pc += 4
+        self.entries.append2(0, len(self.instruction_lines))
+        self.instruction_lines.append(line)
+        self.pc += 4
 
-    if active_data_region is not None:
-        raise EncodeError("unterminated .data_region")
+    def finish(self) -> AssembledText:
+        try:
+            if self.closed:
+                raise EncodeError("text builder is closed")
+            if self.active_data_start >= 0:
+                raise EncodeError("unterminated .data_region")
+            return _finalize_text_entries(
+                self.entries, self.instruction_lines, self.data_chunks,
+                self.structured_relocations, self.structured_symbol_names,
+                self.labels, self.data_in_code,
+            )
+        finally:
+            self.close()
 
-    code = bytearray()
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.entries.close()
+        self.structured_relocations.close()
+        self.instruction_lines.clear()
+        self.data_chunks.clear()
+        self.closed = True
+
+
+def assemble_text_lines(
+    asm_lines: list[str],
+    encoded_line_records: CompilerIntArena | None = None,
+    structured_symbol_names: list[str] | tuple[str, ...] = (),
+) -> AssembledText:
+    """Compatibility line input over the canonical packed text/layout builder."""
+    if encoded_line_records is not None and len(encoded_line_records) % 4:
+        raise EncodeError(
+            "structured instruction records need line/word/relocation/symbol"
+        )
+    encoded_record_count = (
+        0 if encoded_line_records is None else len(encoded_line_records) // 4
+    )
+    builder = PackedAArch64TextBuilder(structured_symbol_names, max(1, len(asm_lines) * 2))
+    try:
+        encoded_record_index = 0
+        line_index = 0
+        while line_index < len(asm_lines):
+            current_line_index = line_index
+            raw = asm_lines[line_index]
+            line_index += 1
+            if encoded_record_index < encoded_record_count:
+                encoded_offset = encoded_record_index * 4
+                encoded_index = encoded_line_records.get_unchecked(encoded_offset)
+                if encoded_index < current_line_index:
+                    raise EncodeError("structured instruction indices are not ordered")
+                if encoded_index == current_line_index:
+                    builder.append_encoded(
+                        encoded_line_records.get_unchecked(encoded_offset + 1),
+                        encoded_line_records.get_unchecked(encoded_offset + 2),
+                        encoded_line_records.get_unchecked(encoded_offset + 3),
+                    )
+                    encoded_record_index += 1
+                    continue
+            builder.append_line(raw)
+        if encoded_record_index != encoded_record_count:
+            raise EncodeError("structured instruction index exceeds text input")
+        return builder.finish()
+    finally:
+        builder.close()
+
+
+def assemble_native_text_entries(
+    entries: CompilerIntArena,
+    data_chunks: list[bytes],
+    structured_relocations: CompilerIntArena,
+    structured_symbol_names: list[str] | tuple[str, ...],
+    labels: dict[str, int],
+    data_in_code: list[DataInCodeRegion],
+) -> AssembledText:
+    """Consume packed word/data entries through the canonical finalizer.
+
+    Ownership of the entry and relocation arenas transfers to this call.
+    Kind 1 indexes a data blob; kind 2 carries a final instruction word.
+    Symbol/label and inline-data metadata are module-owned, not per-instruction
+    string slots. The producer/driver integration is a separate migration gate.
+    """
+    if len(entries) % 2 or len(structured_relocations) % 3:
+        entries.close()
+        structured_relocations.close()
+        raise EncodeError("native text entry or relocation arena has invalid width")
+    return _finalize_text_entries(
+        entries, [], data_chunks, structured_relocations,
+        structured_symbol_names, labels, data_in_code,
+    )
+
+
+def _finalize_text_entries(
+    entries: CompilerIntArena,
+    instruction_lines: list[str],
+    data_chunks: list[bytes],
+    structured_relocations: CompilerIntArena,
+    structured_symbol_names: list[str] | tuple[str, ...],
+    labels: dict[str, int],
+    data_in_code: list[DataInCodeRegion],
+) -> AssembledText:
+    word_run = CompilerIntArena()
+    try:
+        return _encode_text_entries_active(
+            entries, instruction_lines, data_chunks, structured_relocations,
+            structured_symbol_names, labels, data_in_code, word_run,
+        )
+    finally:
+        word_run.close()
+        entries.close()
+        structured_relocations.close()
+
+
+def _encode_text_entries_active(
+    entries: CompilerIntArena,
+    instruction_lines: list[str],
+    data_chunks: list[bytes],
+    structured_relocations: CompilerIntArena,
+    structured_symbol_names: list[str] | tuple[str, ...],
+    labels: dict[str, int],
+    data_in_code: list[DataInCodeRegion],
+    word_run: CompilerIntArena,
+) -> AssembledText:
+    entry_instruction = 0
+    entry_data = 1
+    entry_word = 2
+    # Chunks plus one join, never ``bytearray +=``: pcc's bytearray append/
+    # extend allocate a replacement buffer (PY-P0-BYTEARRAY-INPLACE-IDENTITY-
+    # MUTATION), so the per-instruction append was O(n^2) under pcc1 -- a
+    # 472 KB __text cost 13.6 GiB and 66.8% of samples in _py_bytes_concat.
+    chunks: list[bytes] = []
+    code_len = 0
     relocations: list[Relocation] = []
     undefined: set[str] = set()
 
@@ -469,32 +2461,157 @@ def assemble_text(asm_text: str) -> AssembledText:
     def same_atom(target: str, at: int) -> bool:
         if target not in labels or target.startswith("L"):
             return False
-        enclosing = 0
-        for start in atom_starts:
-            if start <= at:
-                enclosing = start
+        # A native call now reaches this canonical rule for every call site.
+        # Locate its atom without a per-call scan of all preceding functions.
+        low = 0
+        high = len(atom_starts)
+        while low < high:
+            middle = (low + high) // 2
+            if atom_starts[middle] <= at:
+                low = middle + 1
             else:
-                break
+                high = middle
+        enclosing = atom_starts[low - 1] if low else 0
         return labels[target] == enclosing
 
-    for kind, payload in lines:
-        if kind == "data":
-            code += payload
+    entry_index = 0
+    structured_relocation_index = 0
+    structured_relocation_count = len(structured_relocations) // 3
+    while entry_index < len(entries) // 2:
+        entry_offset = entry_index * 2
+        kind = entries.get_unchecked(entry_offset)
+        payload_index = entries.get_unchecked(entry_offset + 1)
+        if kind == entry_data:
+            if payload_index < 0 or payload_index >= len(data_chunks):
+                raise EncodeError("text data index is outside its owner")
+            if len(word_run):
+                chunks.append(word_run.pack_u32_bytes())
+                word_run.clear()
+            payload = data_chunks[payload_index]
+            chunks.append(payload)
+            code_len += len(payload)
+            entry_index += 1
             continue
-        at = len(code)
+        if kind == entry_word:
+            if code_len % 4:
+                raise EncodeError("instruction at unaligned __text offset after data")
+            if payload_index < 0 or payload_index > 0xFFFFFFFF:
+                raise EncodeError("text word is outside u32 range")
+            if structured_relocation_index < structured_relocation_count:
+                relocation_offset = structured_relocation_index * 3
+                relocation_entry = structured_relocations.get_unchecked(
+                    relocation_offset
+                )
+                if relocation_entry < entry_index:
+                    raise EncodeError(
+                        "structured relocation records are not ordered"
+                    )
+                if relocation_entry == entry_index:
+                    relocation_kind = structured_relocations.get_unchecked(
+                        relocation_offset + 1
+                    )
+                    symbol_id = structured_relocations.get_unchecked(
+                        relocation_offset + 2
+                    )
+                    if symbol_id < 0 or symbol_id >= len(structured_symbol_names):
+                        raise EncodeError("text relocation symbol is outside its owner")
+                    symbol = structured_symbol_names[symbol_id]
+                    if relocation_kind < 0:
+                        _validate_text_fixup_word(payload_index, relocation_kind)
+                    if relocation_kind in (
+                        STRUCTURED_FIXUP_BRANCH26, STRUCTURED_FIXUP_BRANCH19,
+                    ):
+                        width = -relocation_kind
+                        bits = resolve_branch(symbol, width, code_len)
+                        payload_index |= bits if width == 26 else bits << 5
+                        relocation_kind = STRUCTURED_RELOCATION_NONE
+                    elif relocation_kind == STRUCTURED_FIXUP_CALL:
+                        if (
+                            symbol.startswith("L") and symbol in labels
+                        ) or same_atom(symbol, code_len):
+                            payload_index |= resolve_branch(symbol, 26, code_len)
+                            relocation_kind = STRUCTURED_RELOCATION_NONE
+                        else:
+                            relocation_kind = STRUCTURED_RELOCATION_BRANCH26
+                    if relocation_kind == STRUCTURED_RELOCATION_NONE:
+                        native_relocation_kind = -1
+                        relocation_pcrel = False
+                    elif relocation_kind == STRUCTURED_RELOCATION_BRANCH26:
+                        native_relocation_kind = spec.ARM64_RELOC_BRANCH26
+                        relocation_pcrel = True
+                    elif relocation_kind == STRUCTURED_RELOCATION_PAGE21:
+                        native_relocation_kind = spec.ARM64_RELOC_PAGE21
+                        relocation_pcrel = True
+                    elif relocation_kind == STRUCTURED_RELOCATION_PAGEOFF12:
+                        native_relocation_kind = spec.ARM64_RELOC_PAGEOFF12
+                        relocation_pcrel = False
+                    elif relocation_kind == STRUCTURED_RELOCATION_GOT_LOAD_PAGE21:
+                        native_relocation_kind = spec.ARM64_RELOC_GOT_LOAD_PAGE21
+                        relocation_pcrel = True
+                    elif (
+                        relocation_kind
+                        == STRUCTURED_RELOCATION_GOT_LOAD_PAGEOFF12
+                    ):
+                        native_relocation_kind = (
+                            spec.ARM64_RELOC_GOT_LOAD_PAGEOFF12
+                        )
+                        relocation_pcrel = False
+                    else:
+                        raise EncodeError(
+                            "structured relocation kind is not proven"
+                        )
+                    if native_relocation_kind >= 0:
+                        undefined_or_local(symbol, labels, undefined)
+                        relocations.append(Relocation(
+                            code_len,
+                            symbol,
+                            native_relocation_kind,
+                            pcrel=relocation_pcrel,
+                        ))
+                    structured_relocation_index += 1
+            word_run.append(payload_index)
+            code_len += 4
+            entry_index += 1
+            continue
+        if (
+            kind != entry_instruction
+            or payload_index < 0
+            or payload_index >= len(instruction_lines)
+        ):
+            raise EncodeError("text instruction index is outside its owner")
+        if code_len % 4:
+            raise EncodeError("instruction at unaligned __text offset after data")
+        at = code_len
         word = _encode_one(
-            payload, at, labels, resolve_branch, relocations, undefined,
+            instruction_lines[payload_index],
+            at,
+            labels,
+            resolve_branch,
+            relocations,
+            undefined,
             same_atom,
         )
-        code += word.to_bytes(4, "little")
+        word_run.append(word)
+        code_len += 4
+        entry_index += 1
 
+    if structured_relocation_index != structured_relocation_count:
+        raise EncodeError("structured relocation exceeds text entries")
+    if len(word_run):
+        chunks.append(word_run.pack_u32_bytes())
     return AssembledText(
-        code=bytes(code),
+        code=b"".join(chunks),
         relocations=relocations,
         undefined=sorted(undefined),
         labels=labels,
         data_in_code=data_in_code,
     )
+
+
+def assemble_text(asm_text: str) -> AssembledText:
+    """Compatibility string projection for the proven text dialect."""
+
+    return assemble_text_lines(asm_text.splitlines())
 
 
 def _encode_one(line, at, labels, resolve_branch, relocations, undefined,
@@ -509,7 +2626,7 @@ def _encode_one(line, at, labels, resolve_branch, relocations, undefined,
     if mn == "nop":
         if ops:
             raise EncodeError(f"nop takes no operands: {line!r}")
-        return 0xD503201F
+        return encode_emitted_nop_parts()
     if mn == "paciasp":
         return 0xD503233F
     if mn == "autiasp":
@@ -896,12 +3013,28 @@ def _encode_one(line, at, labels, resolve_branch, relocations, undefined,
         opc = {"fmul": 0x0800, "fdiv": 0x1800, "fadd": 0x2800, "fsub": 0x3800}[mn]
         return 0x1E600000 | opc | (rm << 16) | (rn << 5) | rd
 
-    if mn in ("fneg", "fabs", "fsqrt"):
+    if mn in (
+        "fneg", "fabs", "fsqrt",
+        "frintn", "frintp", "frintm", "frintz",
+    ):
         rd, kd = _freg(ops[0])
         rn, _ = _freg(ops[1])
         if kd != "d":
             raise EncodeError(f"{mn} only proven for double precision")
-        opc = {"fabs": 0x0C000, "fneg": 0x14000, "fsqrt": 0x1C000}[mn]
+        # FP data-processing (1 source): opc packs opcode<<15 with the fixed
+        # 10000 field at bits 14-10 (0x4000).  The frint* opcodes are 001000
+        # (N, nearest-even), 001001 (P, +inf), 001010 (M, -inf) and 001011
+        # (Z, toward zero) -- the four the aarch64 call lowering emits for
+        # round/ceil/floor/trunc.
+        opc = {
+            "fabs": 0x0C000,
+            "fneg": 0x14000,
+            "fsqrt": 0x1C000,
+            "frintn": 0x44000,
+            "frintp": 0x4C000,
+            "frintm": 0x54000,
+            "frintz": 0x5C000,
+        }[mn]
         return 0x1E600000 | opc | (rn << 5) | rd
 
     if mn == "fmov":

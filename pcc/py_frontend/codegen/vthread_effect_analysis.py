@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from typing import Optional
 
+from pcc.backend.self_backend_value_arena import CompilerIntArena
+
 from ..py_ast import (
     Assign,
     Attr,
@@ -41,6 +43,10 @@ from ..py_ast import (
     With,
 )
 from .hoist_analysis import _dataclass_field_names, _dataclass_field_value
+from ..vthread_effect_summary_wire import (
+    read_summary as _read_vthread_effect_summary_wire,
+    write_summary as _write_vthread_effect_summary_wire,
+)
 
 
 _SUSPENSION_EXPORTS = (
@@ -991,13 +997,13 @@ def vthread_proven_method_call_key(
     return key
 
 
-def vthread_proven_export_method_call_key(
+def _vthread_proven_export_method_call_target(
     expr: Call,
     native_exports: Optional[dict],
     module: Optional[Module] = None,
     proof_cache: Optional[dict] = None,
-) -> Optional[str]:
-    """Resolve one statically typed compiled-sibling method effect."""
+) -> Optional[tuple[str, str, str, dict]]:
+    """Resolve one compiled-sibling method without reading its effect bit."""
     if native_exports is None or not isinstance(expr.func, Attr):
         return None
     receiver = expr.func.obj
@@ -1044,19 +1050,32 @@ def vthread_proven_export_method_call_key(
             continue
         if method_info.get("name") != expr.func.name:
             continue
-        if bool(method_info.get("may_park", False)):
-            # Re-export facades retain the defining module in
-            # ``owning_module``.  The continuation frame name must use the
-            # same canonical owner as method-call lowering; otherwise the
-            # collector reserves ``facade.Class.method`` while emission asks
-            # for ``owner.Class.method`` and the managed child slot appears
-            # to be missing.
-            owning_module = class_info.get("owning_module")
-            if not isinstance(owning_module, str) or not owning_module:
-                owning_module = module_name
-            return owning_module + "." + class_name + "." + expr.func.name
-        return None
+        owning_module = class_info.get("owning_module")
+        if not isinstance(owning_module, str) or not owning_module:
+            owning_module = module_name
+        export_name = class_info.get("export_name")
+        if not isinstance(export_name, str) or not export_name:
+            export_name = class_name
+        return owning_module, export_name, class_name, method_info
     return None
+
+
+def vthread_proven_export_method_call_key(
+    expr: Call,
+    native_exports: Optional[dict],
+    module: Optional[Module] = None,
+    proof_cache: Optional[dict] = None,
+) -> Optional[str]:
+    """Resolve one statically typed compiled-sibling method effect."""
+    target = _vthread_proven_export_method_call_target(
+        expr,
+        native_exports,
+        module,
+        proof_cache,
+    )
+    if target is None or not bool(target[3].get("may_park", False)):
+        return None
+    return target[0] + "." + target[2] + "." + expr.func.name
 
 
 def _local_method_call_keys(
@@ -1094,6 +1113,65 @@ def _local_method_call_keys(
     return keys
 
 
+_VTHREAD_EFFECT_SUMMARY_SCHEMA = "pcc.vthread.effect-summary.v1"
+
+
+def _vthread_effect_function_key(
+    module_name: str,
+    function_name: str,
+    native_exports: dict,
+) -> str:
+    info = native_exports.get(module_name, {}).get(function_name)
+    if isinstance(info, dict) and info.get("kind") == "function":
+        module_name = str(info.get("owning_module", module_name))
+        function_name = str(info.get("export_name", function_name))
+    return "f:" + module_name + ":" + function_name
+
+
+def _vthread_effect_method_key(
+    module_name: str,
+    class_name: str,
+    method_name: str,
+    native_exports: dict,
+) -> str:
+    info = native_exports.get(module_name, {}).get(class_name)
+    if isinstance(info, dict) and info.get("kind") == "class":
+        module_name = str(info.get("owning_module", module_name))
+        class_name = str(info.get("export_name", class_name))
+    return "m:" + module_name + ":" + class_name + ":" + method_name
+
+
+def _vthread_summary_append_unique(values: list[str], value: str) -> None:
+    if value not in values:
+        values.append(value)
+
+
+def _vthread_summary_add_edge(summary: dict, caller: str, callee: str) -> None:
+    edges = summary["edges"]
+    index = 0
+    while index + 1 < len(edges):
+        if edges[index] == caller and edges[index + 1] == callee:
+            return
+        index += 2
+    edges.append(caller)
+    edges.append(callee)
+
+
+def _vthread_summary_reset_caller(summary: dict, caller: str) -> None:
+    seeds = summary["seeds"]
+    while caller in seeds:
+        seeds.remove(caller)
+    edges = summary["edges"]
+    kept = []
+    index = 0
+    while index + 1 < len(edges):
+        if edges[index] != caller:
+            kept.append(edges[index])
+            kept.append(edges[index + 1])
+        index += 2
+    summary["edges"] = kept
+
+
 def _add_local_callable_effect(
     node_key: str,
     fd: FuncDef,
@@ -1112,6 +1190,8 @@ def _add_local_callable_effect(
     threading_context,
     callable_context,
     proof_cache,
+    effect_summary: Optional[dict] = None,
+    summary_module_name: str = "",
 ) -> None:
     """Add one function/method node without a self-host closure."""
     scope_nodes, binding_state, attribute_calls, local_class_hints = (
@@ -1133,40 +1213,107 @@ def _add_local_callable_effect(
         edge = "function:" + callee
         if edge not in edges:
             edges.append(edge)
-    for method_key in _local_method_call_keys(
+    method_callees = _local_method_call_keys(
         fd,
         current_class,
         methods,
         bases,
         attribute_calls=attribute_calls,
         local_hints=local_class_hints,
-    ):
+    )
+    for method_key in method_callees:
         edge = "method:" + method_key
         if edge not in edges:
             edges.append(edge)
     graph[node_key] = edges
-    if direct or _function_has_threading_suspension(
+    direct_effect = direct or _function_has_threading_suspension(
         fd,
         module,
         current_class,
         threading_context=threading_context,
         attribute_calls=attribute_calls,
-    ):
+    )
+    summary_caller = ""
+    if effect_summary is not None and native_exports is not None:
+        if current_class is None:
+            summary_caller = _vthread_effect_function_key(
+                summary_module_name,
+                fd.name,
+                native_exports,
+            )
+        else:
+            summary_caller = _vthread_effect_method_key(
+                summary_module_name,
+                current_class,
+                fd.name,
+                native_exports,
+            )
+        _vthread_summary_reset_caller(effect_summary, summary_caller)
+        _vthread_summary_append_unique(effect_summary["publish"], summary_caller)
+        for callee in callees:
+            _vthread_summary_add_edge(
+                effect_summary,
+                summary_caller,
+                _vthread_effect_function_key(
+                    summary_module_name,
+                    callee,
+                    native_exports,
+                ),
+            )
+        for method_key in method_callees:
+            class_name, method_name = method_key.split(".", 1)
+            _vthread_summary_add_edge(
+                effect_summary,
+                summary_caller,
+                _vthread_effect_method_key(
+                    summary_module_name,
+                    class_name,
+                    method_name,
+                    native_exports,
+                ),
+            )
+    if direct_effect:
         effects.add(node_key)
+        if effect_summary is not None and summary_caller:
+            _vthread_summary_append_unique(
+                effect_summary["seeds"],
+                summary_caller,
+            )
         return
     for call in attribute_calls:
-        if (
-            vthread_proven_export_method_call_key(
-                call,
-                native_exports,
-                module,
-                proof_cache,
+        target = _vthread_proven_export_method_call_target(
+            call,
+            native_exports,
+            module,
+            proof_cache,
+        )
+        if target is None:
+            continue
+        if effect_summary is not None and summary_caller:
+            _vthread_summary_add_edge(
+                effect_summary,
+                summary_caller,
+                _vthread_effect_method_key(
+                    target[0],
+                    target[1],
+                    str(target[3].get("name", "")),
+                    native_exports,
+                ),
             )
-            is not None
-        ):
+        if bool(target[3].get("may_park", False)):
             effects.add(node_key)
             return
     for target in siblings:
+        if effect_summary is not None and summary_caller:
+            _vthread_summary_add_edge(
+                effect_summary,
+                summary_caller,
+                _vthread_effect_function_key(
+                    target[0],
+                    target[1],
+                    native_exports,
+                ),
+            )
         if _export_target_is_may_park(native_exports, target):
             effects.add(node_key)
             return
@@ -1175,6 +1322,9 @@ def _add_local_callable_effect(
 def _compute_local_vthread_effects(
     module: Module,
     native_exports: Optional[dict],
+    *,
+    effect_summary: Optional[dict] = None,
+    summary_module_name: str = "",
 ) -> tuple[set[int], set[str], set[int], set[str]]:
     """Compute one fixed point spanning functions and proven local methods."""
     module_aliases, value_aliases = _vthread_import_aliases(module)
@@ -1247,6 +1397,8 @@ def _compute_local_vthread_effects(
             threading_context,
             callable_context,
             proof_cache,
+            effect_summary,
+            summary_module_name,
         )
     for class_name, fd in method_defs:
         _add_local_callable_effect(
@@ -1267,6 +1419,8 @@ def _compute_local_vthread_effects(
             threading_context,
             callable_context,
             proof_cache,
+            effect_summary,
+            summary_module_name,
         )
 
     changed = True
@@ -1304,6 +1458,207 @@ def _compute_local_vthread_effects(
         method_effect_ids,
         method_effect_keys,
     )
+
+
+def build_closed_world_vthread_effect_summary(
+    module: Module,
+    module_name: str,
+    native_exports: dict,
+) -> dict:
+    """Build one deterministic, object-free-at-consumption module summary."""
+    summary = {
+        "schema": _VTHREAD_EFFECT_SUMMARY_SCHEMA,
+        "module_name": module_name,
+        "seeds": [],
+        "edges": [],
+        "publish": [],
+    }
+    _compute_local_vthread_effects(
+        module,
+        native_exports,
+        effect_summary=summary,
+        summary_module_name=module_name,
+    )
+    return summary
+
+
+def closed_world_vthread_effect_export_surface(native_exports: dict) -> dict:
+    """Project only metadata read by per-module vthread summary workers."""
+    result = {}
+    for module_name, exports in native_exports.items():
+        module_result = {}
+        for export_name, info in exports.items():
+            if not isinstance(info, dict):
+                continue
+            kind = info.get("kind")
+            if kind == "function":
+                module_result[export_name] = {
+                    "kind": "function",
+                    "owning_module": str(
+                        info.get("owning_module", module_name)
+                    ),
+                    "export_name": str(info.get("export_name", export_name)),
+                    "semantic_decorator": bool(
+                        info.get("semantic_decorator", False)
+                    ),
+                    "may_park": bool(info.get("may_park", False)),
+                }
+                continue
+            if kind != "class":
+                continue
+            methods = []
+            for method_info in info.get("methods", ()):
+                if isinstance(method_info, dict):
+                    methods.append(
+                        {
+                            "name": str(method_info.get("name", "")),
+                            "may_park": bool(method_info.get("may_park", False)),
+                        }
+                    )
+            module_result[export_name] = {
+                "kind": "class",
+                "owning_module": str(info.get("owning_module", module_name)),
+                "export_name": str(info.get("export_name", export_name)),
+                "methods": tuple(methods),
+            }
+        result[module_name] = module_result
+    return result
+
+
+def write_closed_world_vthread_effect_summary(path: str, summary: dict) -> None:
+    if summary.get("schema") != _VTHREAD_EFFECT_SUMMARY_SCHEMA:
+        raise ValueError("invalid vthread effect summary schema")
+    _write_vthread_effect_summary_wire(
+        path,
+        summary["module_name"],
+        summary["seeds"],
+        summary["edges"],
+        summary["publish"],
+    )
+
+
+def read_closed_world_vthread_effect_summary(path: str) -> dict:
+    payload = _read_vthread_effect_summary_wire(path)
+    payload["schema"] = _VTHREAD_EFFECT_SUMMARY_SCHEMA
+    return payload
+
+
+def _vthread_effect_node_id(
+    node_ids: dict[str, int],
+    effects: CompilerIntArena,
+    key: str,
+) -> int:
+    node_id = node_ids.get(key, -1)
+    if node_id < 0:
+        node_id = len(effects)
+        node_ids[key] = node_id
+        effects.append(0)
+    return node_id
+
+
+def annotate_closed_world_vthread_effect_summaries(
+    summary_paths: list[str],
+    native_exports: dict,
+) -> tuple[int, int, int]:
+    """Merge module wires and solve their dense-ID fixed point in the parent."""
+    node_ids: dict[str, int] = {}
+    publish_keys: dict[str, bool] = {}
+    effects = CompilerIntArena()
+    edge_pairs = CompilerIntArena()
+    try:
+        for module_name, exports in native_exports.items():
+            for export_name, info in exports.items():
+                if not isinstance(info, dict):
+                    continue
+                if info.get("kind") == "function":
+                    if bool(info.get("may_park", False)):
+                        key = _vthread_effect_function_key(
+                            module_name, export_name, native_exports
+                        )
+                        node_id = _vthread_effect_node_id(node_ids, effects, key)
+                        effects.set_unchecked(node_id, 1)
+                    continue
+                if info.get("kind") != "class":
+                    continue
+                for method_info in info.get("methods", ()):
+                    if not isinstance(method_info, dict) or not bool(
+                        method_info.get("may_park", False)
+                    ):
+                        continue
+                    key = _vthread_effect_method_key(
+                        module_name,
+                        export_name,
+                        str(method_info.get("name", "")),
+                        native_exports,
+                    )
+                    node_id = _vthread_effect_node_id(node_ids, effects, key)
+                    effects.set_unchecked(node_id, 1)
+
+        for path in summary_paths:
+            summary = read_closed_world_vthread_effect_summary(path)
+            for key in summary["seeds"]:
+                node_id = _vthread_effect_node_id(node_ids, effects, key)
+                effects.set_unchecked(node_id, 1)
+            for key in summary["publish"]:
+                publish_keys[key] = True
+                _vthread_effect_node_id(node_ids, effects, key)
+            edges = summary["edges"]
+            index = 0
+            while index < len(edges):
+                edge_pairs.append2(
+                    _vthread_effect_node_id(node_ids, effects, edges[index]),
+                    _vthread_effect_node_id(
+                        node_ids, effects, edges[index + 1]
+                    ),
+                )
+                index += 2
+
+        changed = True
+        while changed:
+            changed = False
+            index = 0
+            while index < len(edge_pairs):
+                caller = edge_pairs.get_unchecked(index)
+                callee = edge_pairs.get_unchecked(index + 1)
+                if effects.get_unchecked(callee) and not effects.get_unchecked(
+                    caller
+                ):
+                    effects.set_unchecked(caller, 1)
+                    changed = True
+                index += 2
+
+        for module_name, exports in native_exports.items():
+            for export_name, info in exports.items():
+                if not isinstance(info, dict):
+                    continue
+                if info.get("kind") == "function":
+                    key = _vthread_effect_function_key(
+                        module_name, export_name, native_exports
+                    )
+                    if publish_keys.get(key, False):
+                        info["may_park"] = bool(
+                            effects.get_unchecked(node_ids[key])
+                        )
+                    continue
+                if info.get("kind") != "class":
+                    continue
+                for method_info in info.get("methods", ()):
+                    if not isinstance(method_info, dict):
+                        continue
+                    key = _vthread_effect_method_key(
+                        module_name,
+                        export_name,
+                        str(method_info.get("name", "")),
+                        native_exports,
+                    )
+                    if publish_keys.get(key, False):
+                        method_info["may_park"] = bool(
+                            effects.get_unchecked(node_ids[key])
+                        )
+        return len(summary_paths), len(effects), len(edge_pairs) // 2
+    finally:
+        effects.close()
+        edge_pairs.close()
 
 
 def compute_vthread_may_park_methods(

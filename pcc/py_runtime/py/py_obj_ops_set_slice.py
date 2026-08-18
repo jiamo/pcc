@@ -4,6 +4,9 @@ Keep ``py_obj_set_slice`` in its own archive member so generic truthy/add/getite
 dispatch does not force list/extension set-slice support into ordinary
 executables.
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_INT,
     PY_TYPE_LIST,

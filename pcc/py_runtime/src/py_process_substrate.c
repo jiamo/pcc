@@ -99,7 +99,7 @@ PyObject *py_subprocess_check_output(PyObject *argv) {
     }
     int status = pclose(fp);
     if (status != 0) {
-        py_raise(py_exc_new(PY_EXC_OSERROR, "subprocess failed"));
+        py_raise_owned(py_exc_new(PY_EXC_OSERROR, "subprocess failed"));
         free(out);
         return NULL;
     }

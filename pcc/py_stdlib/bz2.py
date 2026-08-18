@@ -16,7 +16,7 @@ except ImportError:
     # pcc publishes this provider as the top-level stdlib module ``bz2``.
     from _compression_stream import CompressionWriter, DecompressReader
 
-from pcc.extern import c_int64, c_ptr, extern
+from pcc.extern import c_int64, c_ptr, extern, c_obj
 from pcc.unsafe import (
     call_i32_ptr1,
     call_i32_ptr_i32,
@@ -41,7 +41,7 @@ from pcc.unsafe import (
 )
 
 
-_py_bytes_new: "extern" = extern("py_bytes_new", (c_ptr, c_int64), c_ptr)
+_py_bytes_new: "extern" = extern("py_bytes_new", (c_ptr, c_int64), c_obj)
 
 _BZ_STREAM_SIZE = 80
 _MAX_NATIVE_INPUT = 0xFFFFFFFF

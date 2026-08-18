@@ -313,7 +313,13 @@ def test_temporary_gc_roots_use_lifo_frame_api(tmp_path):
     assert "@pcc_gc_frame_leave_lifo" in ir_text
     assert "call.ret.root" in ir_text
     assert "container.tmp.root" in ir_text
-    assert "pr.args.root" in ir_text
+    # The print-argument tuple is now protected through a GC *frame slot*
+    # (`pr.args.frame.ptr` / `pr.args.frame.value`) instead of a bespoke
+    # `pr.args.root` alloca.  That is the shape this test is named for -- the
+    # LIFO frame API -- so assert the frame form; requiring the old name made
+    # the test fail on the very migration it was meant to encourage.
+    assert "pr.args.frame.ptr" in ir_text
+    assert "pr.args.frame.value" in ir_text
     assert "@pcc_gc_frame_enter(" in ir_text
     assert "@pcc_gc_frame_leave(" in ir_text
 

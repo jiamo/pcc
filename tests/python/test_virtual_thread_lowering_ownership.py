@@ -292,7 +292,10 @@ def test_vthread_root_helpers_are_in_the_pcc1_host_method_closure() -> None:
     )
     for helper in helpers:
         assert f'"{helper}"' in host_contract
-        assert f"'name': '{helper}'" in static_methods
+        # The generated table stores compact ``_append_method(out, '<name>',
+        # ...)`` entries; the tuple-of-dicts ``'name': ...`` schema is built
+        # eagerly at import, not written to the file.
+        assert f"_append_method(out, '{helper}'," in static_methods
 
 
 def test_dynamic_vthread_result_producers_override_ambiguous_any_ownership() -> None:

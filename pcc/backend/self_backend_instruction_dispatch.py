@@ -14,8 +14,25 @@ def emit_instruction_dispatch(
     emit_memory: Callable[[ParsedFunction, str, tuple], list[str] | None],
     emit_compute: Callable[[ParsedFunction, str, tuple], list[str] | None],
 ) -> list[str]:
-    kind = instr.kind
-    data = instr.data
+    return emit_instruction_dispatch_parts(
+        func,
+        block,
+        instr.kind,
+        instr.data,
+        emit_memory=emit_memory,
+        emit_compute=emit_compute,
+    )
+
+
+def emit_instruction_dispatch_parts(
+    func: ParsedFunction,
+    block: ParsedBlock,
+    kind: str,
+    data: tuple,
+    *,
+    emit_memory: Callable[[ParsedFunction, str, tuple], list[str] | None],
+    emit_compute: Callable[[ParsedFunction, str, tuple], list[str] | None],
+) -> list[str]:
 
     memory_lines = emit_memory(func, kind, data)
     if memory_lines is not None:
@@ -28,3 +45,6 @@ def emit_instruction_dispatch(
     raise BackendUnavailable(
         f"self backend hit unknown instruction kind in {func.name!r}/{block.name!r}: {kind}"
     )
+
+
+__all__ = ["emit_instruction_dispatch", "emit_instruction_dispatch_parts"]

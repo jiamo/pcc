@@ -1,5 +1,7 @@
 """Native asyncio socket/relay helpers authored in pcc-Python."""
 
+__pcc_runtime_port__ = True
+
 from pcc.extern import c_abi_export, c_int32, c_int64, c_ptr, c_void, extern
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_BYTEARRAY,
@@ -30,6 +32,8 @@ from pcc.unsafe import (
 
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_incref = extern("py_incref", (c_ptr,), c_void)
 py_int_from_i64 = extern("py_int_from_i64", (c_int64,), c_ptr)
 py_int_value_i64 = extern("py_int_value_i64", (c_ptr,), c_int64)
@@ -132,7 +136,7 @@ def _owned_none():
 def _raise_oserror(message) -> None:
     # py_runtime.h::PY_EXC_OSERROR.  Keep the pcc-Python mirror aligned with
     # the C oracle; 9 is ZeroDivisionError, not OSError.
-    py_raise(py_exc_new(14, message))
+    py_raise_owned(py_exc_new(14, message))
 
 
 def _register_tcp_fd(fd: int, message) -> int:

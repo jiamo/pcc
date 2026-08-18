@@ -32,6 +32,24 @@ definition:
     )
 
 
+def test_self_ir_verifier_keeps_duplicate_definition_diagnostic_after_indexing():
+    _rejects(
+        """
+define i64 @bad_duplicate(i1 %cond) {
+entry:
+  %value = add i64 1, 2
+  br i1 %cond, label %left, label %right
+left:
+  %value = add i64 3, 4
+  ret i64 %value
+right:
+  ret i64 %value
+}
+""",
+        "ssa-definition",
+    )
+
+
 def test_self_ir_verifier_rejects_operand_type_disagreement():
     _rejects(
         """

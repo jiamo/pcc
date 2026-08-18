@@ -15,6 +15,15 @@ from pcc.py_frontend.codegen.runtime_abi import FREESTANDING_GC_RUNTIME_GLOBALS
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNTIME_DIR = REPO_ROOT / "pcc" / "py_runtime"
 STRICT_SOURCE = RUNTIME_DIR / "py" / "freestanding_gc_barrier_dispatcher.py"
+STRICT_SCHEDULER_SOURCE = (
+    RUNTIME_DIR
+    / "py"
+    / "freestanding_gc_incremental_concurrent_scheduler.py"
+)
+STRICT_STATE_SOURCE = RUNTIME_DIR / "py" / "freestanding_gc_state.py"
+GENERATIONAL_SOURCE = (
+    RUNTIME_DIR / "py" / "freestanding_gc_generational_scheduler.py"
+)
 MANAGED_SOURCE = RUNTIME_DIR / "py" / "py_gc_backend.py"
 MAKEFILE = RUNTIME_DIR / "Makefile"
 
@@ -34,14 +43,16 @@ RAW_PROVIDER_SYMBOLS = {
     "pcc_gc_backend4_store_buffer_enqueue",
 }
 RAW_FUNCTION_IMPORTS = {
+    "pcc_gc_backend3_drain_promotion_worklist",
     "pcc_gc_backend3_remember_owner",
     "pcc_gc_backend4_evacuation_page_drain",
-    "pcc_gc_backend4_remap_and_retire_unlocked",
+    "pcc_gc_backend4_remap_and_retire_stopped_world",
     "pcc_gc_backend4_select_relocation_pages",
     "pcc_gc_config_ensure",
     "pcc_gc_generational_step",
     "pcc_gc_incremental_concurrent_step",
     "pcc_gc_object_is_known_no_lock",
+    "pcc_gc_pointer_is_managed",
     "pcc_gc_tracing_has_sweep_candidate",
     "pcc_gc_tracing_record_pause",
     "pcc_gc_tracing_step_cycle",
@@ -53,6 +64,8 @@ RAW_FUNCTION_IMPORTS = {
 } | RAW_PROVIDER_SYMBOLS
 RAW_GLOBAL_IMPORTS = {
     "pcc_gc_backend4_genzgc_store_barriers",
+    "pcc_gc_backend4_remap_active",
+    "pcc_gc_backend4_store_buffer_entries_count",
     "pcc_gc_backend_selected",
     "pcc_gc_cms_wb_flushes",
     "pcc_gc_config_initialized",
@@ -61,7 +74,6 @@ RAW_GLOBAL_IMPORTS = {
     "pcc_gc_forwarding_population",
     "pcc_gc_mark_active",
     "pcc_gc_metric_step",
-    "pcc_gc_relocation_set_head",
 }
 
 
@@ -92,13 +104,22 @@ def _literal_global_imports() -> set[str]:
 
 def test_barrier_dispatcher_has_one_strict_source_owner() -> None:
     strict = STRICT_SOURCE.read_text(encoding="utf-8")
+    generational = GENERATIONAL_SOURCE.read_text(encoding="utf-8")
     managed = MANAGED_SOURCE.read_text(encoding="utf-8")
     makefile = MAKEFILE.read_text(encoding="utf-8")
 
     assert "__pcc_freestanding__ = True" in strict
     assert _exported_symbols(strict) == OWNED_SYMBOLS
     assert _exported_symbols(managed).isdisjoint(OWNED_SYMBOLS)
-    assert RAW_PROVIDER_SYMBOLS <= _exported_symbols(managed)
+    assert RAW_PROVIDER_SYMBOLS <= (
+        _exported_symbols(managed) | _exported_symbols(generational)
+    )
+    assert "pcc_gc_backend4_step_generation_aging" in _exported_symbols(
+        generational
+    )
+    assert "pcc_gc_backend4_step_generation_aging" not in _exported_symbols(
+        managed
+    )
     assert "freestanding_gc_barrier_dispatcher" in makefile
     for symbol in PUBLIC_SYMBOLS:
         assert f'"{symbol}"' in managed
@@ -172,13 +193,19 @@ def test_barrier_dispatcher_preserves_backend_order_and_lock_contract() -> None:
     assert step.index("pcc_gc_backend4_step_remembered_roots") < step.index(
         "pcc_gc_backend4_step_generation_aging"
     )
+    explicit_gc4 = step.split(
+        'elif backend == 4:', 1
+    )[1].split("else:", 1)[0]
+    assert explicit_gc4.index(
+        "pcc_gc_backend3_drain_promotion_worklist("
+    ) < explicit_gc4.index("pcc_gc_tracing_step_cycle(")
     assert step.index("pcc_gc_backend4_step_generation_aging") < step.index(
         "pcc_gc_backend4_evacuation_page_drain"
     )
     assert step.index("pcc_gc_backend4_evacuation_page_drain") < step.index(
         "pcc_gc_backend4_select_relocation_pages"
     )
-    assert "pcc_gc_backend4_remap_and_retire_unlocked()" in step
+    assert "pcc_gc_backend4_remap_and_retire_stopped_world()" in step
     assert "pcc_gc_tracing_record_pause(" in step
 
     assert "_ptr_can_have_header(owner)" in barrier
@@ -191,6 +218,40 @@ def test_barrier_dispatcher_preserves_backend_order_and_lock_contract() -> None:
     assert "pcc_gc_object_is_known_no_lock(value)" in barrier
     assert "pcc_gc_backend3_remember_owner(owner, owner_flags)" in barrier
     assert "pcc_gc_backend4_store_buffer_enqueue(owner, slot, value)" in barrier
+
+
+def test_strict_cms_barrier_has_no_tls_wb_queue_lock_contract() -> None:
+    strict = STRICT_SOURCE.read_text(encoding="utf-8")
+    scheduler = STRICT_SCHEDULER_SOURCE.read_text(encoding="utf-8")
+    strict_gc_closure = tuple(
+        sorted((RUNTIME_DIR / "py").glob("freestanding_gc_*.py"))
+    ) + (MANAGED_SOURCE,)
+    assert STRICT_SOURCE in strict_gc_closure
+    assert STRICT_SCHEDULER_SOURCE in strict_gc_closure
+    assert STRICT_STATE_SOURCE in strict_gc_closure
+    assert MANAGED_SOURCE in strict_gc_closure
+    combined = "\n".join(
+        path.read_text(encoding="utf-8") for path in strict_gc_closure
+    )
+    for c_only_mechanism in (
+        "pcc_gc_cms_wb_buffer",
+        "pcc_gc_cms_wb_flush_pending",
+        "pcc_gc_cms_wb_overflow_pending",
+        "pcc_gc_cms_wb_epoch",
+        "pcc_gc_cms_queue_epoch",
+        "pcc_gc_cms_queue_lock",
+        "pcc_gc_cms_queue_push_unlocked",
+        "pcc_gc_cms_flush_wb_buffer",
+        "PCC_GC_CMS_RESCAN_WORK",
+    ):
+        assert c_only_mechanism not in combined
+
+    barrier = _export_body(strict, "pcc_gc_note_slot_write_barrier")
+    assert "pcc_py_gc_minor_graph_lock()" in barrier
+    assert "pcc_py_gc_minor_graph_unlock()" in barrier
+    assert "pcc_gc_cms_wb_flushes" in barrier
+    assert "pcc_gc_cms_flush_wb_buffer" not in barrier
+    assert "pcc_thread_safepoint" not in barrier
 
 
 def test_production_archive_has_one_barrier_dispatcher_owner(

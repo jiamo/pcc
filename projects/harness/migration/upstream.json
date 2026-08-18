@@ -1,9 +1,0 @@
-{
-  "schema": "pcc.harness.upstream.v1",
-  "remote": "https://github.com/deepseek-ai/deepseek-harness.git",
-  "branch": "master",
-  "last_audited_commit": "47f943859bef60e4160492346772ded9b24f765a",
-  "last_audited_commit_time": "2026-08-13T19:38:46+08:00",
-  "last_audited_subject": "Merge pull request #2519 from deepseek-harness/feat/npm-public",
-  "source_checkout": "/Users/jiamo/deepseek-harness"
-}

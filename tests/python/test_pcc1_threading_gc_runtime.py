@@ -607,11 +607,11 @@ def test_pcc1_c_runtime_threaded_backend4_exercises_zpage_allocator(
             textwrap.dedent(
                 """
                 import gc
-                from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void
+                from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void, c_obj
 
                 pcc_gc_backend = extern("pcc_gc_backend", (), c_int64)
                 pcc_gc_alloc = extern(
-                    "pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr
+                    "pcc_gc_alloc", (c_int64, c_int32, c_int32), c_obj
                 )
                 pcc_gc_step = extern("pcc_gc_step", (c_int64,), c_int64)
                 pcc_gc_telemetry_reset = extern(

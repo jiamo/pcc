@@ -130,7 +130,7 @@ static PyObject *pcc_extension_runtime_error(const char *prefix, const char *det
     buf[pn + 1] = ' ';
     memcpy(buf + pn + 2, d, dn);
     buf[pn + 2 + dn] = '\0';
-    py_raise(py_exc_new(PY_EXC_RUNTIMEERROR, buf));
+    py_raise_owned(py_exc_new(PY_EXC_RUNTIMEERROR, buf));
     return NULL;
 }
 

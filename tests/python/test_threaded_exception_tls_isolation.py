@@ -266,9 +266,9 @@ def test_pcc_python_exception_slot_is_compiler_owned_tls_and_registered_root():
     thread_kernel = (
         RUNTIME_DIR / "py" / "freestanding_thread_kernel_pthread.py"
     ).read_text(encoding="utf-8")
-    unregister = thread_kernel.split("def _thread_unregister_current()", 1)[1].split(
-        "\n\n@c_abi_export", 1
-    )[0]
+    unregister = thread_kernel.split(
+        "def pcc_thread_unregister_current()", 1
+    )[1].split("\n\n@c_abi_export", 1)[0]
     assert unregister.index("py_clear_exception()") < unregister.index(
         "pcc_gc_thread_unregister_buffers()"
     )

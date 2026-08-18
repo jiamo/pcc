@@ -7,6 +7,9 @@ from pathlib import Path
 import pytest
 
 from pcc.py_frontend import pipeline
+from pcc.py_frontend.codegen.runtime_abi import (
+    FREESTANDING_GC_CROSS_OBJECT_SIGNATURES,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -17,21 +20,57 @@ BARRIER_SOURCE = RUNTIME_DIR / "py" / "freestanding_gc_barrier_dispatcher.py"
 MAKEFILE = RUNTIME_DIR / "Makefile"
 
 OWNED_SYMBOLS = {
+    "pcc_gc_backend3_frame_root_scan_reset_locked",
+    "pcc_gc_backend3_scheduler_root_scan_reset_locked",
+    "pcc_gc_backend4_step_generation_aging",
+    "pcc_gc_backend4_step_remembered_roots",
     "pcc_gc_generational_promote_frame_roots",
+    "pcc_gc_generational_promote_scheduler_roots",
+    "pcc_gc_generational_promote_extension_module_state_root",
     "pcc_gc_generational_promote_tls_exception_root",
     "pcc_gc_generational_step",
 }
 RAW_FUNCTION_IMPORTS = {
+    "free",
+    "pcc_capi_visit_extension_module_state_roots",
+    "pcc_gc_backend3_continuation_root_scan_cursor",
+    "pcc_gc_backend4_store_buffer_drain_batches_count",
+    "pcc_gc_backend4_store_buffer_drained_entries_count",
+    "pcc_gc_backend4_store_buffer_entries_count",
+    "pcc_gc_backend4_store_buffer_full_batches_count",
+    "pcc_gc_backend4_store_buffer_head",
+    "pcc_gc_backend4_store_buffer_incomplete_drains_count",
+    "pcc_gc_backend4_store_buffer_max_batch_size_count",
+    "pcc_gc_backend4_store_buffer_medium_count",
+    "pcc_gc_backend4_store_buffer_medium_flushed_entries_count",
+    "pcc_gc_backend4_store_buffer_medium_flushes_count",
+    "pcc_gc_backend4_store_buffer_medium_full_flushes_count",
+    "pcc_gc_backend4_store_buffer_medium_head",
+    "pcc_gc_backend4_young_promotions",
+    "pcc_gc_backend3_frame_root_scan_cursor",
+    "pcc_gc_backend3_frame_root_scan_phase",
+    "pcc_gc_backend3_frame_root_scan_slot",
     "pcc_gc_backend3_drain_remembered_owners",
+    "pcc_gc_backend3_drain_promotion_worklist",
+    "pcc_gc_backend3_finish_detached_remembered_owners",
+    "pcc_gc_backend3_scheduler_root_scan_cursor",
+    "pcc_gc_backend3_scheduler_root_scan_phase",
+    "pcc_gc_backend3_scheduler_root_scan_slot",
     "pcc_gc_backend3_young_link_head",
     "pcc_gc_backend3_young_list_head",
     "pcc_gc_backend3_young_unlink",
     "pcc_gc_forwarding_find",
+    "pcc_gc_continuation_root_head",
+    "pcc_gc_frame_head",
     "pcc_gc_generational_oldify_copy",
+    "pcc_gc_generational_promote_owned_slot_mode",
     "pcc_gc_generational_promote_young_if_known",
+    "pcc_gc_object_is_known_no_lock",
     "pcc_gc_object_node_is_active",
+    "pcc_gc_root_registry_revision",
+    "pcc_gc_scheduler_root_head",
     "pcc_gc_trace_referents_for_promotion",
-    "pcc_gc_visit_registered_root_slots",
+    "pcc_gc_visit_mapped_root_slot",
     "pcc_py_gc_minor_graph_lock",
     "pcc_py_gc_minor_graph_unlock",
     "pcc_thread_safepoint",
@@ -39,6 +78,7 @@ RAW_FUNCTION_IMPORTS = {
     "py_incref",
     "py_tls_exc_get",
     "py_tls_exc_set",
+    "py_subs_exc_cache_slot",
 }
 
 
@@ -130,26 +170,205 @@ def test_generational_scheduler_preserves_root_order_budget_and_retry_contract()
     step = _export_body(strict, "pcc_gc_generational_step")
 
     assert tls.index("py_incref(oldified)") < tls.index("py_tls_exc_set(oldified)")
+    assert "py_decref(current)" not in tls
     assert tls.index("py_tls_exc_set(oldified)") < tls.index(
-        "py_decref(current)"
+        "store_ptr(cleanup_out, 0, current)"
     )
     assert "pcc_gc_generational_promote_young_if_known(current)" in tls
 
-    assert step.index("pcc_py_gc_minor_graph_lock()") < step.index(
-        "pcc_gc_generational_promote_frame_roots(remaining_budget)"
-    )
     assert step.index("pcc_gc_generational_promote_frame_roots") < step.index(
-        "pcc_gc_generational_promote_tls_exception_root()"
+        "pcc_gc_generational_promote_scheduler_roots(batch_budget)"
+    )
+    assert step.index("pcc_gc_generational_promote_scheduler_roots") < step.index(
+        "pcc_py_gc_minor_graph_lock()"
+    )
+    assert step.index("pcc_py_gc_minor_graph_lock()") < step.index(
+        "pcc_gc_generational_promote_tls_exception_root(tls_cleanup)"
     )
     assert step.index("pcc_gc_generational_promote_tls_exception_root") < step.index(
         "pcc_gc_backend3_drain_remembered_owners"
     )
-    assert "local_processed < remaining_budget" in step
+    assert "local_processed < batch_budget" in step
     assert "pcc_gc_backend3_young_unlink(node)" in step
     assert "pcc_gc_backend3_young_link_head(node)" in step
     assert "break" in step
     assert step.rindex("pcc_py_gc_minor_graph_unlock()") < step.rindex(
         "return local_processed"
+    )
+
+
+def test_generational_registered_root_walks_bound_each_graph_lock_tenure() -> None:
+    strict = STRICT_SOURCE.read_text(encoding="utf-8")
+    strict_frame = _export_body(
+        strict, "pcc_gc_generational_promote_frame_roots"
+    )
+    strict_scheduler = _export_body(
+        strict, "pcc_gc_generational_promote_scheduler_roots"
+    )
+    strict_step = _export_body(strict, "pcc_gc_generational_step")
+
+    for body in (strict_frame, strict_scheduler):
+        assert "while examined < remaining_budget:" in body
+        assert body.index("pcc_py_gc_minor_graph_lock()") < body.index(
+            "while examined < remaining_budget:"
+        )
+        assert body.index("while examined < remaining_budget:") < body.index(
+            "pcc_py_gc_minor_graph_unlock()"
+        )
+        assert "pcc_gc_root_registry_revision" in body
+
+    strict_first_lock = strict_step.index("pcc_py_gc_minor_graph_lock()")
+    assert strict_step.index(
+        "pcc_gc_generational_promote_frame_roots(batch_budget)"
+    ) < strict_first_lock
+    assert strict_step.index(
+        "pcc_gc_generational_promote_scheduler_roots(batch_budget)"
+    ) < strict_first_lock
+
+    c_source = (RUNTIME_DIR / "src" / "py_gc_backend.c").read_text(
+        encoding="utf-8"
+    )
+    c_frame = c_source.split(
+        "void pcc_gc_generational_promote_frame_roots(", 1
+    )[1].split(
+        "void pcc_gc_generational_promote_scheduler_roots(", 1
+    )[0]
+    c_scheduler = c_source.split(
+        "void pcc_gc_generational_promote_scheduler_roots(", 1
+    )[1].split(
+        "static void pcc_gc_promote_remembered_owner_referents", 1
+    )[0]
+    for body in (c_frame, c_scheduler):
+        assert "while (examined < budget)" in body
+        assert body.index("pcc_gc_graph_lock();") < body.index(
+            "while (examined < budget)"
+        )
+        assert body.index("while (examined < budget)") < body.index(
+            "pcc_gc_graph_unlock();"
+        )
+        assert "pcc_gc_root_registry_revision" in body
+
+    c_step = c_source.rsplit(
+        "static int64_t pcc_gc_step_generational_promotion(", 1
+    )[1].split(
+        "static int64_t pcc_gc_step_colored_remembered_roots", 1
+    )[0]
+    c_first_lock = c_step.index("pcc_gc_graph_lock();")
+    assert c_step.index(
+        "pcc_gc_generational_promote_frame_roots(batch_budget);"
+    ) < c_first_lock
+    assert c_step.index(
+        "pcc_gc_generational_promote_scheduler_roots(batch_budget);"
+    ) < c_first_lock
+
+    state = (RUNTIME_DIR / "py" / "freestanding_gc_state.py").read_text(
+        encoding="utf-8"
+    )
+    root_registry = (
+        RUNTIME_DIR / "py" / "freestanding_gc_root_registry.py"
+    ).read_text(encoding="utf-8")
+    frame_registry = (
+        RUNTIME_DIR / "py" / "freestanding_gc_frame_registry.py"
+    ).read_text(encoding="utf-8")
+    assert 'define_global_i64("pcc_gc_root_registry_revision", 0)' in state
+    assert "pcc_gc_root_registry_note_mutation_locked()" in root_registry
+    assert "pcc_gc_root_registry_note_mutation_locked()" in frame_registry
+    c_retarget = c_source.split(
+        "static void pcc_gc_retarget_continuation_root_slots_unlocked(", 1
+    )[1].split("static int64_t pcc_gc_backend4_zpage_population", 1)[0]
+    strict_retarget = (
+        RUNTIME_DIR / "py" / "freestanding_gc_relocation_payload.py"
+    ).read_text(encoding="utf-8").split(
+        "def _retarget_continuation_root_slots", 1
+    )[1].split("\n@c_abi_export", 1)[0]
+    assert "pcc_gc_root_registry_revision_advance_unlocked()" in c_retarget
+    assert "pcc_gc_root_registry_note_mutation_locked()" in strict_retarget
+
+
+def test_tls_exception_oldification_cleanup_finishes_after_graph_unlock() -> None:
+    strict = STRICT_SOURCE.read_text(encoding="utf-8")
+    c_src = (RUNTIME_DIR / "src" / "py_gc_backend.c").read_text(
+        encoding="utf-8"
+    )
+
+    strict_tls = _export_body(
+        strict, "pcc_gc_generational_promote_tls_exception_root"
+    )
+    strict_step = _export_body(strict, "pcc_gc_generational_step")
+    assert "cleanup_out: c_ptr" in strict_tls
+    assert "py_decref(" not in strict_tls
+    assert strict_tls.index("py_tls_exc_set(oldified)") < strict_tls.index(
+        "store_ptr(cleanup_out, 0, current)"
+    )
+    strict_unlock = strict_step.rindex("pcc_py_gc_minor_graph_unlock()")
+    strict_finish = strict_step.index(
+        "pcc_gc_backend3_finish_detached_remembered_owners", strict_unlock
+    )
+    strict_decref = strict_step.index("py_decref(tls_cleanup_value)")
+    assert strict_unlock < strict_finish < strict_decref
+
+    c_tls = c_src.split(
+        "static void pcc_gc_promote_tls_exception_root", 1
+    )[1].split(
+        "static void pcc_gc_promote_extension_module_state_root", 1
+    )[0]
+    c_step = c_src.rsplit(
+        "static int64_t pcc_gc_step_generational_promotion(", 1
+    )[1].split(
+        "static int64_t pcc_gc_step_colored_remembered_roots", 1
+    )[0]
+    assert "PyObject **cleanup_out" in c_tls
+    assert "py_decref(" not in c_tls
+    assert c_tls.index("py_tls_exc_set(oldified)") < c_tls.index(
+        "*cleanup_out = cur"
+    )
+    c_unlock = c_step.rindex("pcc_gc_graph_unlock();")
+    c_finish = c_step.index(
+        "pcc_gc_backend3_finish_detached_remembered_owners", c_unlock
+    )
+    c_decref = c_step.index("py_decref(tls_cleanup);")
+    assert c_unlock < c_finish < c_decref
+
+
+def test_extension_module_traverse_runs_after_graph_unlock() -> None:
+    strict = STRICT_SOURCE.read_text(encoding="utf-8")
+    c_src = (RUNTIME_DIR / "src" / "py_gc_backend.c").read_text(
+        encoding="utf-8"
+    )
+    assert FREESTANDING_GC_CROSS_OBJECT_SIGNATURES[
+        "pcc_capi_visit_extension_module_state_roots"
+    ] == (("c_ptr", "c_ptr"), "c_void")
+
+    strict_callback = _export_body(
+        strict, "pcc_gc_generational_promote_extension_module_state_root"
+    )
+    strict_step = _export_body(strict, "pcc_gc_generational_step")
+    assert strict_callback.index("pcc_py_gc_minor_graph_lock()") < (
+        strict_callback.index("pcc_gc_generational_promote_young_if_known(root)")
+    )
+    assert strict_callback.index("pcc_gc_generational_promote_young_if_known(root)") < (
+        strict_callback.index("pcc_py_gc_minor_graph_unlock()")
+    )
+    assert strict_step.rindex("pcc_py_gc_minor_graph_unlock()") < strict_step.index(
+        "pcc_capi_visit_extension_module_state_roots("
+    )
+
+    c_callback = c_src.split(
+        "static void pcc_gc_promote_extension_module_state_root", 1
+    )[1].split("typedef void (*PccGcOwnerSlotVisitor)", 1)[0]
+    c_step = c_src.rsplit(
+        "static int64_t pcc_gc_step_generational_promotion(", 1
+    )[1].split(
+        "static int64_t pcc_gc_step_colored_remembered_roots", 1
+    )[0]
+    assert c_callback.index("pcc_gc_graph_lock();") < c_callback.index(
+        "pcc_gc_promote_young_object(root);"
+    )
+    assert c_callback.index("pcc_gc_promote_young_object(root);") < (
+        c_callback.index("pcc_gc_graph_unlock();")
+    )
+    assert c_step.rindex("pcc_gc_graph_unlock();") < c_step.index(
+        "pcc_capi_visit_extension_module_state_roots("
     )
 
 

@@ -6,6 +6,8 @@ implemented here so the production runtime archive needs no hand-written C
 semantic helper for package acquisition.
 """
 
+__pcc_runtime_port__ = True
+
 from pcc.extern import c_abi_export, c_int64, c_ptr, c_void, extern
 from pcc.unsafe import (
     call_i64_ptr1,

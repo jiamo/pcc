@@ -36,12 +36,12 @@ def test_native_large_inputs_are_capped_not_serialized(monkeypatch):
     unbounded = config.jobs_for_input_sizes(many_inputs, native_worker=False)
     bounded = config.jobs_for_input_sizes(many_inputs, native_worker=True)
 
-    assert bounded <= config.LARGE_INPUT_CONCURRENCY
+    assert bounded <= config.COMPILED_NATIVE_SAFE_JOBS
     assert bounded >= 1
     # The cap must actually bind on a batch wide enough to want more workers,
     # otherwise this test would pass with the cap removed entirely.
-    if unbounded > config.LARGE_INPUT_CONCURRENCY:
-        assert bounded == config.LARGE_INPUT_CONCURRENCY
+    if unbounded > config.COMPILED_NATIVE_SAFE_JOBS:
+        assert bounded == config.COMPILED_NATIVE_SAFE_JOBS
         assert bounded < unbounded
 
     # An explicit job count still wins over the cap.
@@ -50,3 +50,11 @@ def test_native_large_inputs_are_capped_not_serialized(monkeypatch):
         [2_000_000, 1],
         native_worker=True,
     ) == 2
+
+
+def test_compiled_native_small_inputs_do_not_inherit_stage1_width(monkeypatch):
+    monkeypatch.delenv(config.SELF_BACKEND_JOBS_ENV, raising=False)
+    monkeypatch.setattr(config, "parallel_cpu_budget", lambda: 12)
+
+    assert config.jobs_for_input_sizes([1] * 20, native_worker=False) == 8
+    assert config.jobs_for_input_sizes([1] * 20, native_worker=True) == 2

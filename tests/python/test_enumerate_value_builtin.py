@@ -13,6 +13,7 @@ Expected output is the CPython oracle for the same program.
 """
 from __future__ import annotations
 
+import os
 import subprocess
 import textwrap
 
@@ -65,3 +66,55 @@ def test_enumerate_value_forms_match_cpython(tmp_path):
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout.splitlines() == _EXPECTED
+
+
+def test_enumerate_value_custom_iterator_reenters_gc4(tmp_path):
+    from pcc.py_frontend.pipeline import compile_python
+
+    src = tmp_path / "enum_value_gc4.py"
+    src.write_text(
+        textwrap.dedent(
+            """
+            import gc
+
+            class Values:
+                def __init__(self, values):
+                    self.values = values
+                    self.index = 0
+
+                def __iter__(self):
+                    return self
+
+                def __next__(self):
+                    if self.index >= len(self.values):
+                        raise StopIteration
+                    gc.collect()
+                    value = self.values[self.index]
+                    self.index += 1
+                    return value
+
+            def main() -> int:
+                print(list(enumerate(Values([7, 8, 9]), 5)))
+                return 0
+
+            main()
+            """
+        ),
+        encoding="utf-8",
+    )
+    exe = tmp_path / "enum_value_gc4"
+    compile_python(
+        str(src),
+        str(exe),
+        libpython_mode="off",
+        ir_scaffold_mode="on",
+        backend="self",
+    )
+    env = os.environ.copy()
+    env.pop("LC_ALL", None)
+    env["PCC_GC_BACKEND"] = "4"
+    result = subprocess.run(
+        [str(exe)], capture_output=True, text=True, timeout=60, env=env
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == "[(5, 7), (6, 8), (7, 9)]"

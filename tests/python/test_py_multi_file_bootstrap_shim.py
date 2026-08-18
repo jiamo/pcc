@@ -24,6 +24,19 @@ _COMPILED_REPO_MAIN_CACHE_DIR = None
 _COMPILED_REPO_MAIN_CACHE = {}
 
 
+def _successful_self_link_subprocess(cmd, **_kwargs):
+    """Model the pcc link driver's executable publication contract."""
+
+    if "--out" in cmd:
+        linked_output = cmd[cmd.index("--out") + 1]
+        with open(linked_output, "w", encoding="utf-8") as stream:
+            stream.write("linked")
+        os.chmod(linked_output, 0o755)
+    elif cmd[:2] == ["/bin/mv", "-f"]:
+        os.replace(cmd[2], cmd[3])
+    return subprocess.CompletedProcess(cmd, 0)
+
+
 def _cleanup_compile_cache():
     if _COMPILED_REPO_MAIN_CACHE_DIR is not None:
         shutil.rmtree(_COMPILED_REPO_MAIN_CACHE_DIR, ignore_errors=True)
@@ -1166,10 +1179,23 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
                 # pass performance is covered separately and can dominate this
                 # large bootstrap-facing closure.
                 "PCC_PYTHON_IR_PASSES": "off",
+                # scripts/pcc_multi.py has no sys.path pin, and the venv's
+                # editable-install .pth appends the DEVELOPMENT worktree to
+                # every interpreter.  Without this pin, running the test from
+                # a source snapshot still compiles the worktree's pcc — the
+                # gate must test the tree this file lives in.
+                "PYTHONPATH": os.pathsep.join(
+                    p
+                    for p in (repo_root, os.environ.get("PYTHONPATH", ""))
+                    if p
+                ),
             },
             capture_output=True,
             text=True,
-            timeout=180,
+            # Only holds with a warm content-addressed object cache when this
+            # closure's cache keys already exist; PCC_PYTHON_IR_PASSES=off
+            # shapes key separately, and a cold build measured ~500s.
+            timeout=600,
         )
         self.assertEqual(build.returncode, 0, msg=build.stderr)
 
@@ -1537,6 +1563,24 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         self.assertEqual(len(python_args), 1)
         self.assertTrue(os.path.isabs(python_args[0].split("=", 1)[1]))
         self.assertNotEqual(python_args[0], "PYTHON=/tmp/pcc1")
+        self.assertIn("PCC_PYTHON_IR_PASSES=default", make_cmds[0])
+
+    def test_runtime_python_ir_pass_mode_has_independent_override(self):
+        from pcc.py_frontend.pipeline_runtime_archive import (
+            runtime_python_ir_pass_mode,
+        )
+
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(runtime_python_ir_pass_mode(), "default")
+        with mock.patch.dict(
+            os.environ,
+            {
+                "PCC_PYTHON_IR_PASSES": "off",
+                "PCC_RUNTIME_PYTHON_IR_PASSES": "off",
+            },
+            clear=True,
+        ):
+            self.assertEqual(runtime_python_ir_pass_mode(), "off")
 
     def test_host_python_prefers_source_root_venv_outside_repo_cwd(self):
         from pcc.py_frontend import pipeline
@@ -1649,8 +1693,12 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
                 return "/tmp/generic_ext/_native.pcc3-pcc_native-test.so"
             return None
 
+        # The implementation moved to pipeline_libpython, which imports the
+        # resolver from pipeline_packages into ITS namespace -- patching the
+        # old pipeline-module alias intercepted nothing and the gate went red
+        # while the behavior it guards stayed correct.
         with mock.patch(
-            "pcc.py_frontend.pipeline._resolve_pcc_native_extension_path",
+            "pcc.py_frontend.pipeline_libpython.resolve_pcc_native_extension_path",
             side_effect=resolve_extension,
         ):
             needs_exports = pipeline._module_imports_pcc_native_extension(
@@ -1739,7 +1787,7 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
                 ) as emit_mock:
                     with mock.patch(
                         "pcc.py_frontend.pipeline.subprocess.run",
-                        return_value=subprocess.CompletedProcess(["cc"], 0),
+                        side_effect=_successful_self_link_subprocess,
                     ) as run_mock:
                         pipeline._link_with_self_backend(
                             [ll_path],
@@ -1757,22 +1805,22 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         )
         self.assertFalse(emit_mock.call_args.args[1])
         run_cmds = [call.args[0] for call in run_mock.call_args_list]
+        link_cmds = [
+            cmd
+            for cmd in run_cmds
+            if any(part.endswith("pcc_link_macho.py") for part in cmd)
+        ]
+        self.assertEqual(len(link_cmds), 1, msg=run_cmds)
+        link_cmd = link_cmds[0]
+        self.assertIn("--asm", link_cmd)
         self.assertTrue(
-            any(
-                cmd[0] == "cc" and any(part.endswith("self_backend.s") for part in cmd)
-                for cmd in run_cmds
-            ),
-            msg=run_cmds,
+            link_cmd[link_cmd.index("--asm") + 1].endswith("self_backend.s"),
+            msg=link_cmd,
         )
-        self.assertTrue(
-            any("/tmp/libpy_runtime.a" in cmd for cmd in run_cmds),
-            msg=run_cmds,
+        self.assertEqual(
+            link_cmd[link_cmd.index("--archive") + 1],
+            "/tmp/libpy_runtime.a",
         )
-        if sys.platform == "darwin":
-            self.assertTrue(
-                any("-Wl,-dead_strip" in cmd for cmd in run_cmds),
-                msg=run_cmds,
-            )
 
     def test_self_native_link_keeps_in_process_emission_for_multiple_modules(self):
         from pcc.py_frontend import pipeline
@@ -1791,7 +1839,7 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
             ll_paths.append(ll_path)
 
         def fake_run(cmd, **kwargs):
-            return subprocess.CompletedProcess(cmd, 0)
+            return _successful_self_link_subprocess(cmd, **kwargs)
 
         with mock.patch(
             "pcc.py_frontend.pipeline._host_target_triple_for_self_backend",
@@ -1819,23 +1867,27 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
 
         check_output_mock.assert_not_called()
         self.assertEqual(emit_mock.call_count, 2)
-        object_compile_cmds = [
-            call.args[0]
-            for call in run_mock.call_args_list
-            if len(call.args[0]) > 1 and call.args[0][1] == "-c"
-        ]
-        self.assertEqual(len(object_compile_cmds), 2)
         link_cmds = [
             call.args[0]
             for call in run_mock.call_args_list
-            if "/tmp/libpy_runtime.a" in call.args[0]
+            if any(
+                part.endswith("pcc_link_macho.py")
+                for part in call.args[0]
+            )
         ]
         self.assertEqual(len(link_cmds), 1)
         link_cmd = link_cmds[0]
-        linked_objects = [part for part in link_cmd if "self_backend_native_" in part]
-        self.assertEqual(len(linked_objects), 2)
-        self.assertIn("/tmp/libpy_runtime.a", link_cmd)
-        self.assertNotIn("self_backend_input_", " ".join(link_cmd))
+        asm_inputs = [
+            link_cmd[index + 1]
+            for index, part in enumerate(link_cmd)
+            if part == "--asm"
+        ]
+        self.assertEqual(len(asm_inputs), 2)
+        self.assertTrue(all(path.endswith(".s") for path in asm_inputs))
+        self.assertEqual(
+            link_cmd[link_cmd.index("--archive") + 1],
+            "/tmp/libpy_runtime.a",
+        )
 
     def test_self_native_emitter_collects_incrementally(self):
         from pcc.py_frontend import pipeline
@@ -1870,7 +1922,7 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         self.assertEqual(len(pairs), 5)
         self.assertEqual(collect_mock.call_count, 2)
 
-    def test_self_native_emitter_reuses_bounded_compiled_stage_workers(self):
+    def test_self_native_emitter_uses_fresh_compiled_stage_workers(self):
         from pcc.py_frontend import pipeline
 
         ir_text = (
@@ -1880,7 +1932,7 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
 
         def fake_worker_commands(commands, max_parallel=None):
             self.assertEqual(max_parallel, 2)
-            self.assertEqual(len(commands), 3)
+            self.assertEqual(len(commands), 10)
             for command in commands:
                 parts = command.split()
                 self.assertIn(pipeline._SELF_BACKEND_EMIT_BATCH_WORKER_ARG, parts)
@@ -1891,10 +1943,7 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
                 )
                 payload = manifest_lines[1:]
                 self.assertEqual(len(payload) % 4, 0)
-                self.assertLessEqual(
-                    len(payload) // 4,
-                    pipeline._SELF_BACKEND_EMIT_BATCH_MAX_ITEMS,
-                )
+                self.assertEqual(len(payload) // 4, 1)
                 item = 0
                 while item < len(payload):
                     _ir_path = payload[item]
@@ -1949,12 +1998,12 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         worker_commands_mock.assert_called_once()
         collect_mock.assert_not_called()
         commands = worker_commands_mock.call_args.args[0]
-        self.assertEqual(len(commands), 3)
+        self.assertEqual(len(commands), 10)
         self.assertTrue(
             all(pipeline._SELF_BACKEND_EMIT_BATCH_WORKER_ARG in cmd for cmd in commands)
         )
 
-    def test_self_native_emitter_serializes_only_residual_oversized_shards(self):
+    def test_self_native_emitter_bounds_residual_oversized_shards(self):
         from pcc.py_frontend import pipeline
 
         ir_text = (
@@ -1996,6 +2045,11 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
                 pipeline, "_python_frontend_worker_executable", return_value="/tmp/pcc1"
             ),
             mock.patch.object(pipeline, "_self_backend_jobs", return_value=2),
+            mock.patch.object(
+                pipeline,
+                "_self_backend_jobs_for_input_sizes",
+                return_value=2,
+            ),
             mock.patch.object(pipeline, "_SELF_BACKEND_EMIT_BATCH_MAX_ITEMS", 1),
             mock.patch.object(
                 pipeline,
@@ -2030,7 +2084,7 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         self.assertEqual(len(command_batches), 2)
         oversized_commands, oversized_parallel = command_batches[0]
         safe_commands, safe_parallel = command_batches[1]
-        self.assertEqual(oversized_parallel, 1)
+        self.assertEqual(oversized_parallel, 2)
         self.assertEqual(len(oversized_commands), 2)
         self.assertTrue(
             all(
@@ -2086,14 +2140,33 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         pool_calls = []
         profile = {}
 
-        def fake_pool(worker_prefix, worker_items, cc, tmp_dir, label, max_parallel):
-            pool_calls.append((label, max_parallel, len(worker_items)))
+        def fake_pool(
+            worker_prefix,
+            worker_items,
+            cc,
+            tmp_dir,
+            label,
+            max_parallel,
+            fresh_process_per_item,
+            item_bytes=None,
+            admission_byte_cap=0,
+        ):
+            pool_calls.append(
+                (
+                    label,
+                    max_parallel,
+                    fresh_process_per_item,
+                    len(worker_items),
+                    list(item_bytes or []),
+                    admission_byte_cap,
+                )
+            )
             for result_path, obj_path, _ir_path in worker_items:
                 with open(obj_path, "w", encoding="utf-8") as f:
                     f.write("object\n")
                 with open(result_path, "w", encoding="utf-8") as f:
                     f.write("self-aarch64-darwin-v0\n" + obj_path)
-            return 1
+            return len(worker_items)
 
         with (
             mock.patch.dict(
@@ -2126,11 +2199,22 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
             )
 
         self.assertEqual(len(pairs), 2)
-        self.assertEqual(pool_calls, [("oversized", 2, 2)])
+        self.assertEqual(
+            pool_calls,
+            [("oversized", 2, True, 2, [len(ir_text), len(ir_text)], 0)],
+        )
         self.assertEqual(profile["counters"]["link_self_native_configured_jobs"], 2)
         self.assertEqual(profile["counters"]["link_self_native_safe_emit_jobs"], 0)
         self.assertEqual(profile["counters"]["link_self_native_emit_jobs"], 2)
         self.assertEqual(profile["counters"]["link_self_native_oversized_emit_jobs"], 2)
+        self.assertEqual(
+            profile["counters"]["link_self_native_oversized_emit_pool_processes"],
+            2,
+        )
+        self.assertEqual(
+            profile["counters"]["link_self_native_emit_pool_processes"],
+            2,
+        )
 
     def test_self_native_emitter_stops_before_safe_lane_on_oversized_failure(self):
         from pcc.py_frontend import pipeline
@@ -2149,7 +2233,13 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
             _tmp_dir,
             label,
             _max_parallel,
+            fresh_process_per_item,
+            item_bytes=None,
+            admission_byte_cap=0,
         ):
+            self.assertTrue(fresh_process_per_item)
+            self.assertIsNotNone(item_bytes)
+            self.assertGreater(admission_byte_cap, 0)
             pool_calls.append(label)
             if label == "oversized":
                 raise subprocess.CalledProcessError(1, ["/tmp/pcc1"])
@@ -2328,8 +2418,8 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
                 mock.patch.object(pipeline, "_self_backend_jobs", return_value=2),
                 mock.patch.object(
                     pipeline,
-                    "_SELF_BACKEND_EMIT_BATCH_MAX_ITEMS",
-                    1,
+                    "_self_backend_jobs_for_input_sizes",
+                    return_value=2,
                 ),
             ):
                 with mock.patch.object(
@@ -2389,10 +2479,17 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
                         f.write("self-aarch64-darwin-v0\n" + obj_path)
                     item += 4
 
-        with mock.patch.object(
-            pipeline,
-            "_python_frontend_worker_executable",
-            return_value="",
+        with (
+            mock.patch.object(
+                pipeline,
+                "_python_frontend_worker_executable",
+                return_value="",
+            ),
+            mock.patch.object(
+                pipeline,
+                "_self_backend_jobs_for_input_sizes",
+                return_value=1,
+            ),
         ):
             with mock.patch.object(
                 pipeline,
@@ -2407,7 +2504,7 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
                     with mock.patch.object(
                         pipeline,
                         "_split_self_backend_large_ir_modules",
-                        return_value=[ir_text, ir_text],
+                        return_value=[ir_text] * 10,
                     ) as split_mock:
                         with mock.patch.object(
                             pipeline,
@@ -2423,9 +2520,17 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
                             )
 
         split_mock.assert_called_once_with([ir_text])
-        self.assertEqual(len(pairs), 2)
+        self.assertEqual(len(pairs), 10)
         self.assertEqual(len(command_batches), 1)
         self.assertEqual(command_batches[0][1], 1)
+        self.assertEqual(len(command_batches[0][0]), 3)
+        manifest_item_counts = []
+        for command in command_batches[0][0]:
+            manifest_path = command.split()[-1]
+            with open(manifest_path, "r", encoding="utf-8") as f:
+                manifest_payload = f.read().splitlines()[1:]
+            manifest_item_counts.append(len(manifest_payload) // 4)
+        self.assertEqual(manifest_item_counts, [4, 4, 2])
         self.assertTrue(
             all(
                 command.startswith("/usr/bin/python3 -m pcc ")
@@ -2886,6 +2991,18 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
                 results.append(("self-aarch64-darwin-v0", obj_path))
             return results
 
+        def fake_link_run(cmd, check):
+            self.assertTrue(check)
+            if "--out" in cmd:
+                out_index = cmd.index("--out") + 1
+                linked_output = cmd[out_index]
+                with open(linked_output, "w", encoding="utf-8") as f:
+                    f.write("linked")
+                os.chmod(linked_output, 0o755)
+            elif cmd[:2] == ["/bin/mv", "-f"]:
+                os.replace(cmd[2], cmd[3])
+            return subprocess.CompletedProcess(cmd, 0)
+
         with mock.patch.dict(
             os.environ,
             {
@@ -2904,7 +3021,7 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
                 ) as emit_many:
                     with mock.patch(
                         "pcc.py_frontend.pipeline.subprocess.run",
-                        return_value=subprocess.CompletedProcess(["cc"], 0),
+                        side_effect=fake_link_run,
                     ) as run_mock:
                         pipeline._link_with_self_backend_ir_texts(
                             [ir_text],
@@ -3091,6 +3208,28 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
 
         self.assertEqual(rc, 7)
         worker.assert_called_once_with(manifest)
+
+    def test_bootstrap_cli_dispatches_indexed_module_emit_worker(self):
+        from pcc import cli_bootstrap
+
+        sidecar = os.path.join(self.td, "module.pidx")
+        output = os.path.join(self.td, "module.pco")
+        with mock.patch.object(
+            cli_bootstrap,
+            "_run_self_backend_indexed_emit_worker",
+            return_value=9,
+        ) as worker:
+            rc = cli_bootstrap.bootstrap_cli_main(
+                [
+                    "--pcc-self-backend-indexed-emit-worker",
+                    sidecar,
+                    output,
+                    "PCO",
+                ]
+            )
+
+        self.assertEqual(rc, 9)
+        worker.assert_called_once_with(sidecar, output, "PCO")
 
     def test_resolve_python_config_command_uses_sysconfig_bindir(self):
         from pcc.py_frontend import pipeline
@@ -3282,6 +3421,15 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
         )
         self.assertTrue(os.path.isfile(out_ll))
         self._assert_no_libpython_fallback_calls(out_ll)
+        with open(out_ll, "r", encoding="utf-8") as f:
+            ir_text = f.read()
+        start = ir_text.index(
+            "define ptr @user_pcc_parse_py_lift__Lifter__s_Expr"
+        )
+        end = ir_text.index("\ndefine ", start + 1)
+        expr_lifter_ir = ir_text[start:end]
+        self.assertIn("@.pyattr.expr", expr_lifter_ir)
+        self.assertNotIn("@.pyattr.kind_id", expr_lifter_ir)
 
     def test_native_type_infer_stack_compiles_without_libpython(self):
         from pcc.py_frontend.pipeline import compile_python_multi

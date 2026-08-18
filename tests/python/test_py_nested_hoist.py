@@ -138,6 +138,135 @@ def test_nested_hoist_free_name_analysis_is_cached(monkeypatch, tmp_path):
     assert stats["sibling_effective_free_names_calls"] <= 6
 
 
+def test_free_name_cache_rejects_reused_object_id(monkeypatch):
+    from pcc.py_frontend.codegen import hoist_free_names
+    from pcc.py_frontend.py_ast import (
+        DynType,
+        ExprStmt,
+        FuncDef,
+        Name,
+        SourceSpan,
+    )
+
+    span = SourceSpan("cache_identity_probe.py", 1, 0, 1, 1)
+    dyn = DynType("dyn")
+
+    def make_func(name: str, captured: str) -> FuncDef:
+        return FuncDef(
+            span,
+            name,
+            (),
+            None,
+            (ExprStmt(span, Name(span, dyn, captured)),),
+        )
+
+    first = make_func("first", "left_capture")
+    second = make_func("second", "right_capture")
+    cache = {}
+    monkeypatch.setattr(hoist_free_names, "id", lambda _value: 7, raising=False)
+
+    def analyze(fd):
+        return hoist_free_names.compute_free_names(
+            fd,
+            excluded=(),
+            own_name=None,
+            outer_scope_names=("left_capture", "right_capture"),
+            module_scope_names_base=(),
+            existing_top_or_hoisted_names=(),
+            cache=cache,
+            profile_enabled=False,
+            stats={},
+        )
+
+    assert analyze(first) == ("left_capture",)
+    assert analyze(second) == ("right_capture",)
+
+
+def test_nested_hoist_caches_reject_reused_object_id(monkeypatch, tmp_path):
+    from pcc.py_frontend.codegen import hoist_free_names, hoist_lowering
+    from pcc.py_frontend.pipeline import compile_python
+
+    monkeypatch.setattr(hoist_free_names, "id", lambda _value: 11, raising=False)
+    monkeypatch.setattr(hoist_lowering, "id", lambda _value: 11, raising=False)
+
+    src = tmp_path / "nested_cache_identity_probe.py"
+    exe = tmp_path / "nested_cache_identity_probe.out"
+    src.write_text(
+        textwrap.dedent(
+            """
+            def outer(left: int, right: int) -> int:
+                def from_left(value: int) -> int:
+                    return left + value
+
+                def from_right(value: int) -> int:
+                    return right + value
+
+                def combine(value: int) -> int:
+                    return from_left(value) + from_right(value)
+
+                return combine(3)
+
+            def main() -> None:
+                print(outer(10, 20))
+
+            if __name__ == "__main__":
+                main()
+            """
+        ).lstrip(),
+        encoding="utf-8",
+    )
+    compile_python(
+        str(src),
+        str(exe),
+        ir_scaffold_mode="on",
+        libpython_mode="off",
+        backend="self",
+    )
+    run = subprocess.run(
+        [str(exe)],
+        capture_output=True,
+        text=True,
+        timeout=20,
+    )
+    assert run.returncode == 0, run.stderr
+    assert run.stdout == "36\n"
+
+
+def test_empty_synthetic_comprehension_call_uses_generic_free_name_walk():
+    from pcc.py_frontend.codegen.hoist_free_names import compute_free_names
+    from pcc.py_frontend.py_ast import (
+        Call,
+        DynType,
+        ExprStmt,
+        FuncDef,
+        Name,
+        SourceSpan,
+    )
+
+    span = SourceSpan("probe.py", 1, 0, 1, 1)
+    dyn = DynType("dyn")
+    call = Call(
+        span,
+        dyn,
+        Name(span, dyn, "_list_comp"),
+        (),
+        (("value", Name(span, dyn, "captured")),),
+    )
+    fd = FuncDef(span, "inner", (), None, (ExprStmt(span, call),))
+
+    assert compute_free_names(
+        fd,
+        excluded=(),
+        own_name=None,
+        outer_scope_names=("captured",),
+        module_scope_names_base=(),
+        existing_top_or_hoisted_names=(),
+        cache={},
+        profile_enabled=False,
+        stats={},
+    ) == ("captured",)
+
+
 def test_value_position_nested_capture_propagates_through_sibling_cycle():
     program = textwrap.dedent(
         """

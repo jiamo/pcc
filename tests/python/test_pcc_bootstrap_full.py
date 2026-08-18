@@ -56,6 +56,7 @@ from tests.python.process_timeout import (
 )
 
 _BOOTSTRAP_SH = _REPO_ROOT / "scripts" / "bootstrap.sh"
+_PROCESS_TREE_SAMPLER = _REPO_ROOT / "scripts" / "run_process_tree_sample.py"
 _SHARED_STAGE1_DIR = _REPO_ROOT / "build" / "bootstrap-pytest-shared-stage1"
 _SHARED_STAGE1_LOCK = _REPO_ROOT / "build" / "bootstrap-pytest-shared-stage1.lock"
 _SHARED_STAGE1_REBUILD_STAMP = _SHARED_STAGE1_DIR / ".rebuild-run-id"
@@ -71,21 +72,15 @@ _BOOTSTRAP_SUCCESS_MANIFEST = "backend-success.json"
 _BOOTSTRAP_STAGE2_SUCCESS_SCHEMA = "pcc.bootstrap_full.stage2_success.v1"
 _BOOTSTRAP_STAGE2_SUCCESS_MANIFEST = "stage2-success.json"
 _GC_BOOTSTRAP_WEIGHT = {"0": 60, "4": 50, "3": 40, "1": 30, "2": 30}
-# A full stage2/stage3 chain retains several GiB while its frontend and native
-# emit workers are active.  Three concurrent chains measured 18.2 GiB RSS on
-# the 12-core development gate, so the unattended default admits at most two.
-# PCC_BOOTSTRAP_FULL_MAX_ACTIVE_GC remains the explicit operator override.
-_GC_BOOTSTRAP_MAX_ACTIVE_BACKENDS = 2
-_GC_BOOTSTRAP_MAX_FRONTEND_JOBS = 4
+# Full bootstrap chains are multi-gigabyte workloads.  A retained Jetsam/panic
+# receipt showed that concurrent pcc1 chains can exhaust compressor segments
+# and swap, so the default and ordinary environment overrides stay sequential.
+_GC_BOOTSTRAP_MAX_ACTIVE_BACKENDS = 1
+_GC_BOOTSTRAP_MAX_FRONTEND_JOBS = 2
 _GC_BOOTSTRAP_MAX_SELF_BACKEND_JOBS = 2
-_GC_BOOTSTRAP_PARALLEL_MIN_JOBS = 6
-# A clean stage currently takes about 10-11 minutes on the 12-core macOS gate
-# host.  This repository is also exercised by multiple concurrent goal loops;
-# under measured three-core external contention a healthy stage crossed the old
-# 900-second limit while its codegen workers were still making progress.  Keep
-# a bounded watchdog, but leave enough headroom for that supported shared-host
-# execution mode so healthy late self-backend emit workers reach link.
-_BOOTSTRAP_STAGE_TIMEOUT_S = 2400
+_GC_BOOTSTRAP_PARALLEL_MIN_JOBS = 2
+_BOOTSTRAP_MAX_TREE_RSS_BYTES = 8 * 1024 * 1024 * 1024
+_BOOTSTRAP_STAGE_TIMEOUT_S = 600
 
 
 @dataclass(frozen=True)
@@ -808,7 +803,11 @@ def _bootstrap_gc_active_limit(parallel_slots: int) -> int:
     slots = _clamp_int(int(parallel_slots), minimum=1, maximum=len(_GC_BACKENDS))
     override = _env_int("PCC_BOOTSTRAP_FULL_MAX_ACTIVE_GC")
     if override is not None:
-        return _clamp_int(override, minimum=1, maximum=slots)
+        return _clamp_int(
+            override,
+            minimum=1,
+            maximum=min(slots, _GC_BOOTSTRAP_MAX_ACTIVE_BACKENDS),
+        )
     if slots <= 1:
         return 1
     return min(_GC_BOOTSTRAP_MAX_ACTIVE_BACKENDS, slots)
@@ -1054,21 +1053,23 @@ def _bootstrap_matrix_plan(
     backend_count = len(selected)
 
     if max_workers is None:
-        if backend_count == 1:
-            workers = 1
-        else:
-            workers = _clamp_int(cpu // 6, minimum=1, maximum=backend_count)
+        workers = 1
     else:
-        workers = _clamp_int(int(max_workers), minimum=1, maximum=backend_count)
+        workers = _clamp_int(
+            int(max_workers),
+            minimum=1,
+            maximum=min(backend_count, _GC_BOOTSTRAP_MAX_ACTIVE_BACKENDS),
+        )
 
     if frontend_jobs is None:
-        if backend_count == 1:
-            py_jobs = min(10, cpu)
-        else:
-            py_jobs = cpu // workers
+        py_jobs = min(_GC_BOOTSTRAP_MAX_FRONTEND_JOBS, cpu)
     else:
         py_jobs = int(frontend_jobs)
-    py_jobs = _clamp_int(py_jobs, minimum=1, maximum=max(1, min(10, cpu)))
+    py_jobs = _clamp_int(
+        py_jobs,
+        minimum=1,
+        maximum=max(1, min(_GC_BOOTSTRAP_MAX_FRONTEND_JOBS, cpu)),
+    )
 
     if self_backend_jobs is None:
         if backend_count == 1:
@@ -1078,7 +1079,11 @@ def _bootstrap_matrix_plan(
         self_jobs = min(self_jobs, _GC_BOOTSTRAP_MAX_SELF_BACKEND_JOBS)
     else:
         self_jobs = int(self_backend_jobs)
-    self_jobs = _clamp_int(self_jobs, minimum=1, maximum=cpu)
+    self_jobs = _clamp_int(
+        self_jobs,
+        minimum=1,
+        maximum=max(1, min(_GC_BOOTSTRAP_MAX_SELF_BACKEND_JOBS, cpu)),
+    )
 
     return BootstrapMatrixPlan(
         backends=_bootstrap_backend_run_order(selected),
@@ -1123,12 +1128,16 @@ def _bootstrap_gc_backend_plan(
 ) -> BootstrapMatrixPlan:
     cpu = max(1, int(cpu_count or os.cpu_count() or 1))
     if active_slots_override is None:
-        active_slots = _bootstrap_active_parallel_slots(parallel_slots)
+        active_slots = _bootstrap_gc_active_limit(parallel_slots)
     else:
         active_slots = _clamp_int(
             int(active_slots_override),
             minimum=1,
-            maximum=min(len(_GC_BACKENDS), cpu),
+            maximum=min(
+                len(_GC_BACKENDS),
+                cpu,
+                _GC_BOOTSTRAP_MAX_ACTIVE_BACKENDS,
+            ),
         )
     cpu_ids = _cpu_ids_for_gc_backend(
         gc_backend,
@@ -1162,7 +1171,7 @@ def _bootstrap_gc_backend_plan(
     frontend_jobs = _clamp_int(
         int(frontend_jobs),
         minimum=1,
-        maximum=max(1, min(10, cpu)),
+        maximum=max(1, min(_GC_BOOTSTRAP_MAX_FRONTEND_JOBS, cpu)),
     )
 
     if self_backend_jobs is None:
@@ -1174,7 +1183,11 @@ def _bootstrap_gc_backend_plan(
                 max(slot_cpu_count, _bootstrap_parallel_min_jobs(cpu)),
                 _GC_BOOTSTRAP_MAX_SELF_BACKEND_JOBS,
             )
-    self_backend_jobs = _clamp_int(int(self_backend_jobs), minimum=1, maximum=cpu)
+    self_backend_jobs = _clamp_int(
+        int(self_backend_jobs),
+        minimum=1,
+        maximum=max(1, min(_GC_BOOTSTRAP_MAX_SELF_BACKEND_JOBS, cpu)),
+    )
 
     return BootstrapMatrixPlan(
         backends=(str(gc_backend),),
@@ -1192,6 +1205,44 @@ def _load_bootstrap_profile_report(
         return build_bootstrap_profile_report(profile_dir, top=4), None
     except Exception as exc:  # pragma: no cover - diagnostic only.
         return None, str(exc)
+
+
+def _bootstrap_stage_sampler_command(
+    command: list[str],
+    *,
+    profile_dir: Path,
+    stage: int,
+) -> tuple[list[str], Path, Path]:
+    prefix = profile_dir / ("stage" + str(stage) + ".process")
+    result_path = Path(str(prefix) + ".result.json")
+    samples_path = Path(str(prefix) + ".samples.tsv")
+    stdout_path = Path(str(prefix) + ".stdout")
+    stderr_path = Path(str(prefix) + ".stderr")
+    sampler_command = [
+        sys.executable,
+        str(_PROCESS_TREE_SAMPLER),
+        "--result",
+        str(result_path),
+        "--samples",
+        str(samples_path),
+        "--stdout",
+        str(stdout_path),
+        "--stderr",
+        str(stderr_path),
+        "--cwd",
+        str(_REPO_ROOT),
+        "--timeout",
+        str(_BOOTSTRAP_STAGE_TIMEOUT_S),
+        "--interval",
+        "0.25",
+        "--progress-interval",
+        "30",
+        "--max-tree-rss-bytes",
+        str(_BOOTSTRAP_MAX_TREE_RSS_BYTES),
+        "--",
+        *command,
+    ]
+    return sampler_command, stdout_path, stderr_path
 
 
 def _run_bootstrap_stage(
@@ -1234,10 +1285,37 @@ def _run_bootstrap_stage(
     env["PCC_BOOTSTRAP_PROFILE_DIR"] = str(profile_dir)
     env["PCC_BOOTSTRAP_PY_FRONTEND_JOBS"] = str(frontend_jobs)
     env["PCC_SELF_BACKEND_JOBS"] = str(self_backend_jobs)
+    env["PCC_BOOTSTRAP_EXTERNAL_MEMORY_GUARD"] = "1"
     _configure_bootstrap_compiler_caches(env)
     start = time.monotonic()
-    process = run_process_group_timeout(
-        cmd, timeout=_BOOTSTRAP_STAGE_TIMEOUT_S, env=env
+    sampler_command, target_stdout, target_stderr = (
+        _bootstrap_stage_sampler_command(
+            cmd,
+            profile_dir=profile_dir,
+            stage=stage,
+        )
+    )
+    sampled = run_process_group_timeout(
+        sampler_command,
+        timeout=_BOOTSTRAP_STAGE_TIMEOUT_S + 60,
+        env=env,
+    )
+    try:
+        stdout = target_stdout.read_text(encoding="utf-8")
+    except OSError:
+        stdout = ""
+    try:
+        stderr = target_stderr.read_text(encoding="utf-8")
+    except OSError:
+        stderr = ""
+    sampler_diagnostics = (sampled.stdout or "") + (sampled.stderr or "")
+    if sampler_diagnostics:
+        stderr += "\n[process-tree sampler]\n" + sampler_diagnostics
+    process = subprocess.CompletedProcess(
+        cmd,
+        sampled.returncode,
+        stdout=stdout,
+        stderr=stderr,
     )
     elapsed = time.monotonic() - start
     profile_report, profile_error = _load_bootstrap_profile_report(profile_dir)
@@ -1408,19 +1486,38 @@ def test_bootstrap_matrix_plan_uses_bounded_parallelism_on_12_cpu_host():
     plan = _bootstrap_matrix_plan(_GC_BACKENDS, cpu_count=12)
 
     assert plan.backends == ("0", "4", "3", "1", "2")
-    assert plan.max_workers == 2
-    assert plan.frontend_jobs == 6
+    assert plan.max_workers == 1
+    assert plan.frontend_jobs == 2
     assert plan.self_backend_jobs == 2
     assert plan.max_workers * plan.frontend_jobs <= 12
     assert plan.max_workers * plan.self_backend_jobs <= 12
 
 
-def test_bootstrap_matrix_plan_single_backend_keeps_full_local_parallelism():
+def test_bootstrap_stage_sampler_enforces_eight_gib_and_600_seconds(tmp_path):
+    command, stdout_path, stderr_path = _bootstrap_stage_sampler_command(
+        ["/bin/echo", "stage"],
+        profile_dir=tmp_path,
+        stage=2,
+    )
+
+    assert command[command.index("--timeout") + 1] == "600"
+    assert command[command.index("--max-tree-rss-bytes") + 1] == str(
+        8 * 1024 * 1024 * 1024
+    )
+    assert command[-3:] == ["--", "/bin/echo", "stage"]
+    assert stdout_path.name == "stage2.process.stdout"
+    assert stderr_path.name == "stage2.process.stderr"
+    assert Path(command[command.index("--result") + 1]).name == (
+        "stage2.process.result.json"
+    )
+
+
+def test_bootstrap_matrix_plan_single_backend_keeps_safe_local_parallelism():
     plan = _bootstrap_matrix_plan(["4"], cpu_count=12)
 
     assert plan.backends == ("4",)
     assert plan.max_workers == 1
-    assert plan.frontend_jobs == 10
+    assert plan.frontend_jobs == 2
     assert plan.self_backend_jobs == 2
 
 
@@ -1433,8 +1530,8 @@ def test_bootstrap_matrix_plan_clamps_overrides_to_backend_and_cpu_limits():
         self_backend_jobs=0,
     )
 
-    assert plan.max_workers == 2
-    assert plan.frontend_jobs == 4
+    assert plan.max_workers == 1
+    assert plan.frontend_jobs == 2
     assert plan.self_backend_jobs == 1
 
 
@@ -1490,27 +1587,27 @@ def test_bootstrap_gc_backend_plan_partitions_worker_budget_for_parallel_files(
     gc0 = _bootstrap_gc_backend_plan("0", cpu_count=12, parallel_slots=5)
     gc4 = _bootstrap_gc_backend_plan("4", cpu_count=12, parallel_slots=5)
 
-    assert gc0.cpu_ids == (0, 1, 2)
+    assert gc0.cpu_ids == tuple(range(12))
     assert gc0.frontend_jobs == 2
     assert gc0.self_backend_jobs == 2
-    assert gc4.cpu_ids == (10, 11)
+    assert gc4.cpu_ids == tuple(range(12))
     assert gc4.frontend_jobs == 2
     assert gc4.self_backend_jobs == 2
 
 
-def test_bootstrap_active_gc_limit_defaults_to_two_heavy_chains(monkeypatch):
+def test_bootstrap_active_gc_limit_defaults_to_one_heavy_chain(monkeypatch):
     monkeypatch.delenv("PCC_BOOTSTRAP_FULL_MAX_ACTIVE_GC", raising=False)
 
     assert _bootstrap_gc_active_limit(1) == 1
-    assert _bootstrap_gc_active_limit(2) == 2
-    assert _bootstrap_gc_active_limit(5) == 2
+    assert _bootstrap_gc_active_limit(2) == 1
+    assert _bootstrap_gc_active_limit(5) == 1
 
 
-def test_bootstrap_active_gc_limit_keeps_explicit_operator_override(monkeypatch):
+def test_bootstrap_active_gc_limit_clamps_explicit_operator_override(monkeypatch):
     monkeypatch.setenv("PCC_BOOTSTRAP_FULL_MAX_ACTIVE_GC", "3")
 
-    assert _bootstrap_gc_active_limit(2) == 2
-    assert _bootstrap_gc_active_limit(5) == 3
+    assert _bootstrap_gc_active_limit(2) == 1
+    assert _bootstrap_gc_active_limit(5) == 1
 
 
 def test_bootstrap_gc_backend_plan_expands_for_not_yet_started_gc_after_done(
@@ -1530,7 +1627,7 @@ def test_bootstrap_gc_backend_plan_expands_for_not_yet_started_gc_after_done(
     assert initial.self_backend_jobs == 2
     assert after_one_done.frontend_jobs == 2
     assert after_one_done.self_backend_jobs == 2
-    assert only_gc4_left.frontend_jobs == 4
+    assert only_gc4_left.frontend_jobs == 2
     assert only_gc4_left.self_backend_jobs == 2
 
 
@@ -1544,7 +1641,7 @@ def test_bootstrap_gc_backend_plan_respects_active_lease_slots(monkeypatch):
         active_slots_override=2,
     )
 
-    assert plan.cpu_ids == (0, 1, 2, 3, 4, 5)
+    assert plan.cpu_ids == tuple(range(12))
     assert plan.frontend_jobs == 2
     assert plan.self_backend_jobs == 2
 
@@ -1557,7 +1654,7 @@ def test_bootstrap_gc_backend_plan_single_file_keeps_memory_safe_frontend_parall
     plan = _bootstrap_gc_backend_plan("4", cpu_count=12, parallel_slots=1)
 
     assert plan.cpu_ids == tuple(range(12))
-    assert plan.frontend_jobs == 4
+    assert plan.frontend_jobs == 2
     assert plan.self_backend_jobs == 2
 
 
@@ -1567,7 +1664,7 @@ def test_bootstrap_gc_backend_plan_keeps_explicit_self_job_override(monkeypatch)
 
     plan = _bootstrap_gc_backend_plan("0", cpu_count=12, parallel_slots=1)
 
-    assert plan.self_backend_jobs == 5
+    assert plan.self_backend_jobs == 2
 
 
 def test_bootstrap_gc_backend_plan_keeps_explicit_frontend_job_override(monkeypatch):
@@ -1581,7 +1678,7 @@ def test_bootstrap_gc_backend_plan_keeps_explicit_frontend_job_override(monkeypa
         active_slots_override=2,
     )
 
-    assert plan.frontend_jobs == 5
+    assert plan.frontend_jobs == 2
 
 
 def test_bootstrap_active_gc_lease_grants_full_budget_to_last_chain(monkeypatch):

@@ -14,6 +14,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -22,6 +23,7 @@ from typing import Callable, ParamSpec, TypeVar
 from pcc.backend.self_backend_cache_identity import (
     self_backend_emitter_source_identity,
 )
+from pcc.py_frontend.pipeline_runtime_archive import target_id, write_target_stamp
 from pcc.tools.runtime_archive_provenance import (
     ProvenanceError,
     capi_inventory_path_for_archive,
@@ -55,7 +57,8 @@ _PCC_PY_ARCHIVE_ENV_KEYS = (
 
 _REPO_ROOT = Path(__file__).absolute().parents[1]
 _RUNTIME_DIR = _REPO_ROOT / "pcc" / "py_runtime"
-_PCC_RUNTIME_CACHE_MARKER_SCHEMA = "pcc.runtime-build-cache.v2"
+_PCC_RUNTIME_CACHE_MARKER_SCHEMA = "pcc.runtime-build-cache.v4"
+_C_RUNTIME_CACHE_KEY_SCHEMA = "pcc.c-runtime-build-cache.v2"
 
 
 def _sha256_file(path: Path) -> str:
@@ -69,12 +72,14 @@ def _sha256_file(path: Path) -> str:
 def _pcc_runtime_cache_marker_value(*, key: str, archive: Path) -> dict[str, str]:
     manifest = manifest_path_for_archive(archive)
     capi_inventory = capi_inventory_path_for_archive(archive)
+    target = Path(str(archive) + ".target")
     return {
         "schema": _PCC_RUNTIME_CACHE_MARKER_SCHEMA,
         "key": key,
         "archive_sha256": _sha256_file(archive),
         "manifest_sha256": _sha256_file(manifest),
         "capi_inventory_sha256": _sha256_file(capi_inventory),
+        "target_sha256": _sha256_file(target),
     }
 
 
@@ -87,19 +92,27 @@ def _pcc_runtime_cache_is_complete(
 ) -> bool:
     manifest = manifest_path_for_archive(archive)
     capi_inventory = capi_inventory_path_for_archive(archive)
+    target = Path(str(archive) + ".target")
     if (
         not archive.is_file()
         or not manifest.is_file()
         or not capi_inventory.is_file()
+        or not target.is_file()
         or not marker.is_file()
     ):
         return False
     try:
         marker_value = json.loads(marker.read_text(encoding="utf-8"))
+        verified = verify_runtime_archive_manifest(archive, runtime_root=runtime)
+        manifest_target = verified.get("target_triple")
+        if not isinstance(manifest_target, str):
+            return False
+        expected_target = target_id(manifest_target) + "\n"
+        if target.read_text(encoding="utf-8") != expected_target:
+            return False
         expected = _pcc_runtime_cache_marker_value(key=key, archive=archive)
         if marker_value != expected:
             return False
-        verify_runtime_archive_manifest(archive, runtime_root=runtime)
     except (OSError, UnicodeError, json.JSONDecodeError, ProvenanceError):
         return False
     return True
@@ -227,6 +240,8 @@ def _c_runtime_source_key() -> str:
     """Hash inputs that can change the default C runtime archive."""
 
     digest = hashlib.sha256()
+    digest.update(_C_RUNTIME_CACHE_KEY_SCHEMA.encode("ascii"))
+    digest.update(b"\0")
     for name in (
         "CC",
         "CFLAGS",
@@ -296,9 +311,12 @@ def _cached_c_runtime(*, threaded: bool) -> Path:
             )
             env = dict(os.environ)
             env.pop("LC_ALL", None)
-            command = ["make", "-C", str(work_runtime)]
-            if threaded:
-                command.append("PCC_WITH_THREADS=1")
+            command = [
+                "make",
+                "-C",
+                str(work_runtime),
+                f"PCC_WITH_THREADS={1 if threaded else 0}",
+            ]
             command.append("libpy_runtime.a")
             result = subprocess.run(
                 command,
@@ -354,7 +372,18 @@ def cache_runtime_build(
     return wrapped
 
 
-def _pcc_runtime_source_key(pcc_bin: Path) -> str:
+def _selected_runtime_source(runtime_source: Path | None) -> Path:
+    if runtime_source is None:
+        return _RUNTIME_DIR
+    selected = Path(runtime_source).expanduser().resolve()
+    if not selected.is_dir():
+        raise NotADirectoryError(f"runtime source directory does not exist: {selected}")
+    return selected
+
+
+def _pcc_runtime_source_key(
+    pcc_bin: Path, *, runtime_source: Path | None = None,
+) -> str:
     digest = hashlib.sha256()
     digest.update(sys.version.encode("utf-8"))
     digest.update(os.path.realpath(pcc_bin).encode("utf-8"))
@@ -374,28 +403,65 @@ def _pcc_runtime_source_key(pcc_bin: Path) -> str:
         _REPO_ROOT / "pcc" / "py_frontend",
         _REPO_ROOT / "pcc" / "tools",
     )
+    selected_runtime = _selected_runtime_source(runtime_source)
     files = []
     for root in roots:
-        for path in root.rglob("*"):
-            if not path.is_file():
+        source_root = selected_runtime if root == _RUNTIME_DIR else root
+        for source_path in source_root.rglob("*"):
+            if not source_path.is_file():
                 continue
+            # Override location and snapshot permissions are not build inputs.
+            # Preserve the original logical paths and ordering in the digest.
+            path = root / source_path.relative_to(source_root)
             if any(
                 part.startswith(".") or part == "__pycache__" for part in path.parts
             ):
                 continue
             if path.suffix not in {".c", ".h", ".py"} and path.name != "Makefile":
                 continue
-            files.append(path)
-    for path in sorted(files):
+            files.append((path, source_path))
+    for path, source_path in sorted(files):
         digest.update(path.relative_to(_REPO_ROOT).as_posix().encode("utf-8"))
-        digest.update(path.read_bytes())
+        digest.update(source_path.read_bytes())
     return digest.hexdigest()[:24]
 
 
-def _cached_pcc_python_runtime(*, threaded: bool) -> Path:
+def _pcc_runtime_cache_key(
+    pcc_bin: Path, *, variant: str, runtime_source: Path | None = None,
+) -> str:
+    """Bind the immutable cache directory to its publication format."""
+
+    digest = hashlib.sha256()
+    digest.update(_PCC_RUNTIME_CACHE_MARKER_SCHEMA.encode("utf-8"))
+    digest.update(b"\0")
+    source_key = (
+        _pcc_runtime_source_key(pcc_bin)
+        if runtime_source is None
+        else _pcc_runtime_source_key(pcc_bin, runtime_source=runtime_source)
+    )
+    digest.update(source_key.encode("ascii"))
+    return digest.hexdigest()[:24] + "-" + variant
+
+
+def _make_runtime_staging_writable(runtime: Path) -> None:
+    """Change only the copied tree; frozen source snapshots stay read-only."""
+    runtime.chmod(stat.S_IMODE(runtime.stat().st_mode) | stat.S_IRWXU)
+    for directory, directories, files in os.walk(runtime):
+        for name in directories:
+            path = Path(directory) / name
+            path.chmod(stat.S_IMODE(path.stat().st_mode) | stat.S_IRWXU)
+        for name in files:
+            path = Path(directory) / name
+            path.chmod(stat.S_IMODE(path.stat().st_mode) | stat.S_IRUSR | stat.S_IWUSR)
+
+
+def _cached_pcc_python_runtime(
+    *, threaded: bool, runtime_source: Path | None = None,
+) -> Path:
+    selected_runtime = _selected_runtime_source(runtime_source)
     pcc_bin = _REPO_ROOT / ".venv" / "bin" / "pcc"
     variant = "threaded-pcc-py" if threaded else "pcc-py"
-    key = _pcc_runtime_source_key(pcc_bin) + "-" + variant
+    key = _pcc_runtime_cache_key(pcc_bin, variant=variant, runtime_source=runtime_source)
     cache_root = Path.home() / ".cache" / "pcc" / "test-artifacts" / "runtime-builds"
     cache_root.mkdir(parents=True, exist_ok=True)
     runtime = cache_root / key
@@ -424,7 +490,7 @@ def _cached_pcc_python_runtime(*, threaded: bool) -> Path:
             staging_root = Path(tempfile.mkdtemp(prefix=key + ".", dir=str(cache_root)))
             work_runtime = staging_root / "py_runtime"
             shutil.copytree(
-                _RUNTIME_DIR,
+                selected_runtime,
                 work_runtime,
                 ignore=shutil.ignore_patterns(
                     "_native",
@@ -437,6 +503,7 @@ def _cached_pcc_python_runtime(*, threaded: bool) -> Path:
                     "*.a.capi_syms",
                 ),
             )
+            _make_runtime_staging_writable(work_runtime)
             command = [
                 "make",
                 "-C",
@@ -445,8 +512,7 @@ def _cached_pcc_python_runtime(*, threaded: bool) -> Path:
                 f"PYTHON={sys.executable}",
                 f"PCC_REPO_ROOT={_REPO_ROOT}",
             ]
-            if threaded:
-                command.append("PCC_WITH_THREADS=1")
+            command.append(f"PCC_WITH_THREADS={1 if threaded else 0}")
             command.append("libpy_runtime_pcc_py.a")
             result = subprocess.run(
                 command,
@@ -456,10 +522,24 @@ def _cached_pcc_python_runtime(*, threaded: bool) -> Path:
             )
             assert result.returncode == 0, result.stdout + result.stderr
             work_archive = work_runtime / archive.name
-            verify_runtime_archive_manifest(
+            verified = verify_runtime_archive_manifest(
                 work_archive,
                 runtime_root=work_runtime,
             )
+            manifest_target = verified.get("target_triple")
+            if not isinstance(manifest_target, str):
+                raise ProvenanceError(
+                    "runtime archive manifest target triple is missing"
+                )
+            expected_target = target_id(manifest_target)
+            write_target_stamp(str(work_archive), expected_target)
+            work_target = Path(str(work_archive) + ".target")
+            if (
+                not work_target.is_file()
+                or work_target.read_text(encoding="utf-8")
+                != expected_target + "\n"
+            ):
+                raise OSError("failed to publish runtime target stamp")
             _write_pcc_runtime_cache_marker(
                 work_runtime / marker.name,
                 key=key,
@@ -474,13 +554,13 @@ def _cached_pcc_python_runtime(*, threaded: bool) -> Path:
                 fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
-def cached_pcc_python_runtime() -> Path:
-    """Build/reuse one immutable default pcc-Python runtime source tree."""
+def cached_pcc_python_runtime(*, runtime_source: Path | None = None) -> Path:
+    """Build selected runtime sources with the current compiler into a private cache."""
 
-    return _cached_pcc_python_runtime(threaded=False)
+    return _cached_pcc_python_runtime(threaded=False, runtime_source=runtime_source)
 
 
-def cached_threaded_pcc_python_runtime() -> Path:
+def cached_threaded_pcc_python_runtime(*, runtime_source: Path | None = None) -> Path:
     """Build/reuse one immutable threaded pcc-Python runtime source tree."""
 
-    return _cached_pcc_python_runtime(threaded=True)
+    return _cached_pcc_python_runtime(threaded=True, runtime_source=runtime_source)

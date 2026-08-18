@@ -1,4 +1,7 @@
 """pcc-Python replacement for most public py_int_* operation dispatch."""
+
+__pcc_runtime_port__ = True
+
 from pcc.extern import extern, c_abi_export, c_double, c_int32, c_int64, c_ptr, c_void
 from pcc.py_runtime.py.py_abi_constants import (
     PYFLOATOBJECT_VALUE_OFFSET,
@@ -15,6 +18,7 @@ from pcc.unsafe import (
     cstr,
     free,
     is_tagged_int,
+    logical_shift_left_i64,
     load_i32,
     load_ptr,
     malloc,
@@ -48,6 +52,8 @@ py_bigint_shl = extern("py_bigint_shl", (c_ptr, c_int64), c_ptr)
 py_bigint_shr = extern("py_bigint_shr", (c_ptr, c_int64), c_ptr)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 pow_c = extern("pow", (c_double, c_double), c_double)
 pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
 
@@ -337,7 +343,7 @@ def py_int_shl(a, b):
         return null()
     n: int = _int_i64_value(b)
     if n < 0:
-        py_raise(py_exc_new(2, cstr("negative shift count")))
+        py_raise_owned(py_exc_new(2, cstr("negative shift count")))
         return null()
     if n == 0:
         if is_tagged_int(a):
@@ -345,7 +351,11 @@ def py_int_shl(a, b):
         py_incref(a)
         return a
     if is_tagged_int(a) and n < 63:
-        factor: int = 1 << n
+        # This is the proven machine projection inside the bigint primitive:
+        # n < 63 and the following bound check proves av * factor fits i64.
+        # Spell it as an intrinsic so compiling the implementation cannot
+        # recursively lower this operation back to py_int_shl.
+        factor: int = logical_shift_left_i64(1, n)
         av: int = untag_int(a)
         limit: int = 9223372036854775807 // factor
         if av >= (0 - limit) and av <= limit:
@@ -364,7 +374,7 @@ def py_int_shr(a, b):
         return null()
     n: int = _int_i64_value(b)
     if n < 0:
-        py_raise(py_exc_new(2, cstr("negative shift count")))
+        py_raise_owned(py_exc_new(2, cstr("negative shift count")))
         return null()
     if n == 0:
         if is_tagged_int(a):
@@ -399,12 +409,12 @@ def py_int_pow_mod(base, exp, mod):
         return null()
 
     if py_int_cmp(mod, zero) == 0:
-        py_raise(py_exc_new(2, cstr("pow() 3rd argument cannot be 0")))
+        py_raise_owned(py_exc_new(2, cstr("pow() 3rd argument cannot be 0")))
         py_decref(one)
         py_decref(zero)
         return null()
     if py_int_cmp(exp, zero) < 0:
-        py_raise(
+        py_raise_owned(
             py_exc_new(
                 2,
                 cstr("pow() negative exponent with modulus not supported"),
@@ -478,7 +488,7 @@ def py_int_isqrt(n):
     if ptr_is_null(zero):
         return null()
     if py_int_cmp(n, zero) < 0:
-        py_raise(py_exc_new(2, cstr("isqrt() argument must be nonnegative")))
+        py_raise_owned(py_exc_new(2, cstr("isqrt() argument must be nonnegative")))
         py_decref(zero)
         return null()
     if py_int_cmp(n, zero) == 0:

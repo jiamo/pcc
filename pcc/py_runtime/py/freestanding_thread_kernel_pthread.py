@@ -6,6 +6,8 @@ thread-registration, join/detach, mutex, condition, and atomic-refcount
 contracts formerly mixed into ``pcc_threads.c``.
 """
 
+__pcc_runtime_port__ = True
+
 from pcc.extern import c_abi_export, c_int64, c_ptr, c_void, extern
 from pcc.unsafe import (
     atomic_load_i64,
@@ -43,6 +45,8 @@ define_global_i32("pcc_thread_stop_requested", 0)
 define_thread_local_i32("pcc_native_thread_identity_token", 0)
 define_thread_local_ptr_null("pcc_tls_thread_id_py")
 define_thread_local_i32("pcc_tls_thread_parked_py", 0)
+define_thread_local_i32("pcc_tls_no_park_depth_py", 0)
+define_thread_local_i32("pcc_tls_unregister_in_progress_py", 0)
 define_thread_local_ptr_null("pcc_tls_parked_epoch_py")
 define_global_ptr_null("pcc_world_lock_py")
 define_global_ptr_null("pcc_world_cond_py")
@@ -53,6 +57,7 @@ define_global_i64("pcc_parked_thread_count_py", 0)
 define_global_i64("pcc_stop_owner_thread_id_py", 0)
 define_global_i64("pcc_stop_epoch_py", 0)
 define_global_i64("pcc_stop_depth_py", 0)
+define_global_i64("pcc_registration_waiter_count_py", 0)
 
 
 pthread_create = extern(
@@ -75,6 +80,7 @@ pthread_cond_signal = extern("pthread_cond_signal", (c_ptr,), c_int64)
 pthread_cond_broadcast = extern("pthread_cond_broadcast", (c_ptr,), c_int64)
 sched_yield = extern("sched_yield", (), c_int64)
 pcc_platform_wall_time_us = extern("pcc_platform_wall_time_us", (), c_int64)
+pcc_platform_abort = extern("pcc_platform_abort", (), c_void)
 pcc_gc_thread_unregister_buffers = extern(
     "pcc_gc_thread_unregister_buffers", (), c_void
 )
@@ -98,7 +104,9 @@ def _world_store_i64(slot, value: int) -> None:
 
 
 def _world_init() -> int:
-    state = load_i32(global_addr("pcc_world_init_state_py"), 0)
+    state = atomic_load_i32(
+        global_addr("pcc_world_init_state_py"), 0, "acquire"
+    )
     if state == 2:
         return 0
     observed = atomic_cas_i32(
@@ -134,6 +142,13 @@ def _world_init() -> int:
 @c_abi_export("pcc_threads_enabled")
 def pcc_threads_enabled() -> int:
     return 1
+
+
+@c_abi_export("pcc_thread_stop_requested_acquire")
+def pcc_thread_stop_requested_acquire() -> int:
+    return atomic_load_i32(
+        global_addr("pcc_thread_stop_requested"), 0, "acquire"
+    )
 
 
 @c_abi_export("pcc_refcount_strategy")
@@ -282,10 +297,34 @@ def pcc_current_thread_id() -> int:
     if thread_id != 0:
         return thread_id
     if _world_init() != 0:
-        return 1
+        # Registration is a lease in the stopped-world accounting.  Returning
+        # a synthetic id here would let a caller run without joining the live
+        # set and would make a no-park region fail open.
+        pcc_platform_abort()
+        return 0
     lock = global_load_ptr("pcc_world_lock_py")
+    cond = global_load_ptr("pcc_world_cond_py")
     pthread_mutex_lock(lock)
     thread_id = _tls_i64(global_addr("pcc_tls_thread_id_py"))
+    # A first-time raw/extension pthread is outside the stopped epoch's live
+    # count.  It must not return into user code until the owner resumes.
+    waiting_for_admission = 0
+    while thread_id == 0 and load_i32(
+        global_addr("pcc_thread_stop_requested"), 0
+    ) != 0:
+        if waiting_for_admission == 0:
+            _world_store_i64(
+                global_addr("pcc_registration_waiter_count_py"),
+                _world_i64(global_addr("pcc_registration_waiter_count_py")) + 1,
+            )
+            waiting_for_admission = 1
+        pcc_cond_wait(cond, lock)
+        thread_id = _tls_i64(global_addr("pcc_tls_thread_id_py"))
+    if waiting_for_admission != 0:
+        _world_store_i64(
+            global_addr("pcc_registration_waiter_count_py"),
+            _world_i64(global_addr("pcc_registration_waiter_count_py")) - 1,
+        )
     if thread_id == 0:
         thread_id = _world_i64(global_addr("pcc_next_thread_id_py"))
         _world_store_i64(global_addr("pcc_next_thread_id_py"), thread_id + 1)
@@ -299,9 +338,52 @@ def pcc_current_thread_id() -> int:
     return thread_id
 
 
+@c_abi_export("pcc_thread_no_park_enter")
+def pcc_thread_no_park_enter() -> None:
+    # Registration is defensive; a raw newcomer must register before it
+    # acquires any managed owner/slot.  Do not safepoint an already-registered
+    # live caller here: it may have just canonicalized the owner, and
+    # live/unparked accounting makes the STW owner wait for outer exit.
+    depth = load_i32(global_addr("pcc_tls_no_park_depth_py"), 0)
+    if depth < 0 or depth == 2147483647:
+        pcc_platform_abort()
+        return
+    if depth != 0:
+        store_i32(global_addr("pcc_tls_no_park_depth_py"), 0, depth + 1)
+        return
+    pcc_current_thread_id()
+    if _tls_i64(global_addr("pcc_tls_thread_id_py")) == 0:
+        # Defensive fail-stop: depth must never become nonzero unless this
+        # pthread is represented in the live-thread count.
+        pcc_platform_abort()
+        return
+    store_i32(global_addr("pcc_tls_no_park_depth_py"), 0, depth + 1)
+
+
+@c_abi_export("pcc_thread_no_park_exit")
+def pcc_thread_no_park_exit() -> None:
+    depth = load_i32(global_addr("pcc_tls_no_park_depth_py"), 0)
+    if depth <= 0:
+        pcc_platform_abort()
+        return
+    depth = depth - 1
+    store_i32(global_addr("pcc_tls_no_park_depth_py"), 0, depth)
+    if depth == 0:
+        # Use the real locked safepoint path instead of a racy stop-flag poll.
+        pcc_thread_safepoint()
+
+
+@c_abi_export("pcc_thread_no_park_depth")
+def pcc_thread_no_park_depth() -> int:
+    return load_i32(global_addr("pcc_tls_no_park_depth_py"), 0)
+
+
 @c_abi_export("pcc_thread_safepoint")
 def pcc_thread_safepoint() -> None:
+    if load_i32(global_addr("pcc_tls_no_park_depth_py"), 0) != 0:
+        return
     if _world_init() != 0:
+        pcc_platform_abort()
         return
     self_id = pcc_current_thread_id()
     lock = global_load_ptr("pcc_world_lock_py")
@@ -326,6 +408,35 @@ def pcc_thread_safepoint() -> None:
         store_i32(global_addr("pcc_tls_thread_parked_py"), 0, 0)
         _tls_store_i64(global_addr("pcc_tls_parked_epoch_py"), 0)
     pthread_mutex_unlock(lock)
+
+
+@c_abi_export("pcc_thread_owns_stopped_world")
+def pcc_thread_owns_stopped_world() -> int:
+    if _world_init() != 0:
+        return 0
+    self_id = _tls_i64(global_addr("pcc_tls_thread_id_py"))
+    if self_id == 0:
+        return 0
+    lock = global_load_ptr("pcc_world_lock_py")
+    pthread_mutex_lock(lock)
+    owns = 0
+    if load_i32(global_addr("pcc_thread_stop_requested"), 0) != 0 and _world_i64(
+        global_addr("pcc_stop_owner_thread_id_py")
+    ) == self_id:
+        owns = 1
+    pthread_mutex_unlock(lock)
+    return owns
+
+
+@c_abi_export("pcc_thread_registration_waiter_count")
+def pcc_thread_registration_waiter_count() -> int:
+    # The diagnostic itself must not let a raw newcomer cross an active stop.
+    pcc_current_thread_id()
+    lock = global_load_ptr("pcc_world_lock_py")
+    pthread_mutex_lock(lock)
+    count = _world_i64(global_addr("pcc_registration_waiter_count_py"))
+    pthread_mutex_unlock(lock)
+    return count
 
 
 @c_abi_export("pcc_stop_the_world")
@@ -363,7 +474,9 @@ def pcc_stop_the_world() -> int:
         )
         pthread_mutex_unlock(lock)
         return 0
-    store_i32(global_addr("pcc_thread_stop_requested"), 0, 1)
+    atomic_store_i32(
+        global_addr("pcc_thread_stop_requested"), 0, 1, "release"
+    )
     _world_store_i64(global_addr("pcc_stop_owner_thread_id_py"), self_id)
     _world_store_i64(global_addr("pcc_stop_depth_py"), 1)
     epoch = _world_i64(global_addr("pcc_stop_epoch_py")) + 1
@@ -398,7 +511,9 @@ def pcc_resume_world() -> int:
         _world_store_i64(global_addr("pcc_stop_depth_py"), depth - 1)
         pthread_mutex_unlock(lock)
         return 0
-    store_i32(global_addr("pcc_thread_stop_requested"), 0, 0)
+    atomic_store_i32(
+        global_addr("pcc_thread_stop_requested"), 0, 0, "release"
+    )
     _world_store_i64(global_addr("pcc_stop_owner_thread_id_py"), 0)
     _world_store_i64(global_addr("pcc_stop_depth_py"), 0)
     _world_store_i64(global_addr("pcc_parked_thread_count_py"), 0)
@@ -407,17 +522,45 @@ def pcc_resume_world() -> int:
     return 0
 
 
-def _thread_unregister_current() -> None:
+@c_abi_export("pcc_thread_unregister_current")
+def pcc_thread_unregister_current() -> None:
+    if pcc_thread_no_park_depth() != 0:
+        pcc_platform_abort()
+        return
+    if load_i32(global_addr("pcc_tls_unregister_in_progress_py"), 0) != 0:
+        pcc_platform_abort()
+        return
+    if _tls_i64(global_addr("pcc_tls_thread_id_py")) == 0:
+        return
+    # The owner must finish the active stop before leaving the live set.  This
+    # check precedes exception/buffer cleanup because either can decref and
+    # reenter runtime code.
+    if pcc_thread_owns_stopped_world() != 0:
+        pcc_platform_abort()
+        return
+    store_i32(global_addr("pcc_tls_unregister_in_progress_py"), 0, 1)
     # The current-exception slot owns its reference and, in the pcc-Python
     # runtime, publishes its native-TLS address through the common GC root
     # registry.  Retire both before the pthread's TLS storage disappears.
     py_clear_exception()
     pcc_gc_thread_unregister_buffers()
     if _world_init() != 0:
+        pcc_platform_abort()
         return
     lock = global_load_ptr("pcc_world_lock_py")
     pthread_mutex_lock(lock)
-    if _tls_i64(global_addr("pcc_tls_thread_id_py")) != 0:
+    self_id = _tls_i64(global_addr("pcc_tls_thread_id_py"))
+    # Cleanup above can decref and reenter.  Revalidate depth and STW
+    # ownership under the same lock that protects live/owner accounting.
+    if pcc_thread_no_park_depth() != 0 or (
+        self_id != 0
+        and load_i32(global_addr("pcc_thread_stop_requested"), 0) != 0
+        and _world_i64(global_addr("pcc_stop_owner_thread_id_py")) == self_id
+    ):
+        pthread_mutex_unlock(lock)
+        pcc_platform_abort()
+        return
+    if self_id != 0:
         if load_i32(global_addr("pcc_tls_thread_parked_py"), 0) != 0:
             store_i32(global_addr("pcc_tls_thread_parked_py"), 0, 0)
             parked = _world_i64(global_addr("pcc_parked_thread_count_py"))
@@ -432,6 +575,7 @@ def _thread_unregister_current() -> None:
             _world_store_i64(global_addr("pcc_live_thread_count_py"), live - 1)
         pcc_cond_broadcast(global_load_ptr("pcc_world_cond_py"))
     pthread_mutex_unlock(lock)
+    store_i32(global_addr("pcc_tls_unregister_in_progress_py"), 0, 0)
 
 
 @c_abi_export("pcc_thread_trampoline_py")
@@ -443,16 +587,22 @@ def _thread_trampoline(start):
     pcc_current_thread_id()
     pcc_thread_safepoint()
     result = call_ptr1(entry, arg)
-    _thread_unregister_current()
     state_lock = load_ptr(handle, 8)
-    pcc_mutex_lock(state_lock)
+    if pcc_mutex_lock(state_lock) != 0:
+        pcc_platform_abort()
+        return result
     store_ptr(handle, 24, result)
     store_i32(handle, 16, 1)
     detached = load_i32(handle, 20)
-    pcc_mutex_unlock(state_lock)
+    if pcc_mutex_unlock(state_lock) != 0:
+        pcc_platform_abort()
+        return result
     if detached != 0:
         pcc_mutex_free(state_lock)
         free(handle)
+    # Keep teardown as the final runtime action.  A later mutex/safepoint call
+    # could register this pthread again and strand it in the live count.
+    pcc_thread_unregister_current()
     return result
 
 

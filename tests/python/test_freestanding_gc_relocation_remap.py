@@ -21,6 +21,9 @@ MAKEFILE = RUNTIME_DIR / "Makefile"
 OWNED_SYMBOLS = {
     "pcc_gc_backend4_relocate_copy_supported_tag",
     "pcc_gc_backend4_remap_heal_slot",
+    "pcc_gc_backend4_remap_cext_ctx_valid",
+    "pcc_gc_backend4_remap_cext_referents_unlocked",
+    "pcc_gc_backend4_remap_cext_slot_transaction",
     "pcc_gc_backend4_remap_referents",
     "pcc_gc_backend4_remap_slot",
 }
@@ -30,6 +33,17 @@ RAW_FUNCTION_IMPORTS = {
     "pcc_gc_generational_oldify_supported_tag",
     "pcc_gc_memoryview_refresh_owned_buffer",
     "pcc_gc_visit_object_slots",
+    "pcc_py_gc_minor_graph_lock",
+    "pcc_py_gc_minor_graph_unlock",
+    "pcc_gc_backend4_remap_active",
+    "pcc_gc_backend4_remap_epoch",
+    "pcc_gc_backend4_remap_pending_obj",
+    "pcc_gc_backend4_reseed_page_revision",
+    "pcc_gc_backend4_reseed_relocation_revision",
+    "pcc_gc_backend_selected",
+    "pcc_gc_forwarding_head",
+    "pcc_gc_forwarding_population",
+    "pcc_gc_object_list_revision",
 }
 
 
@@ -127,7 +141,8 @@ def test_relocation_remap_uses_shared_slot_contract_and_one_epoch_flags() -> Non
     assert "pcc_gc_backend4_remap_slot" in remap
     assert "pcc_gc_forwarding_find(value)" in heal
     assert "store_ptr(base, offset, target)" in heal
-    assert "pcc_gc_backend4_remap_referents(load_ptr(node, 0))" in retire
+    assert "pcc_capi_is_cext_type_tag(load_i32(obj, 8)) == 0" in retire
+    assert "pcc_gc_backend4_remap_referents(obj)" in retire
     assert "old_flags & 131072" in retire
     assert "old_flags | 131072" in retire
     assert "old_flags & ~(2048 | 131072)" in retire

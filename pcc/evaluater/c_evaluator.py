@@ -249,6 +249,38 @@ def _normalize_compile_cache_dir(cache_dir):
     )
 
 
+def _normalize_llvm_dump_dir(llvmdump, cache_dir=None):
+    """Return the directory that owns explicit LLVM diagnostic dumps.
+
+    ``True`` retains the historical opt-in behavior without writing into the
+    caller's working directory.  A path selects an exact artifact directory;
+    the environment override gives CLI users the same control while preserving
+    the existing boolean flag.
+    """
+    if not llvmdump:
+        return None
+    if isinstance(llvmdump, (str, os.PathLike)):
+        requested = os.fspath(llvmdump)
+    else:
+        requested = os.environ.get("PCC_LLVM_DUMP_DIR")
+        if not requested:
+            requested = os.path.join(
+                _normalize_compile_cache_dir(cache_dir),
+                "llvm-dumps",
+                str(os.getpid()),
+            )
+    dump_dir = os.path.abspath(os.path.expanduser(requested))
+    os.makedirs(dump_dir, exist_ok=True)
+    return dump_dir
+
+
+def _write_llvm_dump(dump_dir, name, text):
+    path = os.path.join(dump_dir, name)
+    with open(path, "w") as stream:
+        stream.write(text)
+    return path
+
+
 def _normalize_cheap_llvm_pass_name(name):
     return name.strip().lower().replace("-", "").replace("_", "")
 
@@ -1600,6 +1632,8 @@ class CEvaluator(object):
         if not codestr.strip():
             raise ValueError("evaluate() received empty source code")
 
+        llvm_dump_dir = _normalize_llvm_dump_dir(llvmdump, cache_dir)
+
         # SEC-P1-UBSAN: normalize the opt-in `-fsanitize` check list. Empty /
         # None keeps every guard OFF (the default) so lowering is unchanged.
         fsanitize = _normalize_fsanitize(fsanitize)
@@ -1615,7 +1649,7 @@ class CEvaluator(object):
 
         # Fast path 1: in-memory JIT cache keyed on source text + entry + opt.
         # Avoids ALL work — preprocessing, parsing, codegen, LLVM, and JIT.
-        if not llvmdump and not prog_args and not fsanitize:
+        if not llvm_dump_dir and not prog_args and not fsanitize:
             src_hash = hashlib.sha256(codestr.encode("utf-8")).hexdigest()
             jit_key = (
                 src_hash,
@@ -1682,7 +1716,7 @@ class CEvaluator(object):
         # Build native shared-library disk cache for future fast cold starts.
         if (
             self.backend != "self"
-            and not llvmdump
+            and not llvm_dump_dir
             and not prog_args
             and not self.is_cross
             and _compile_cache_enabled(use_compile_cache)
@@ -1700,9 +1734,8 @@ class CEvaluator(object):
                 self.target, opt_level, cheap_passes=cheap_passes,
             )
 
-        if llvmdump:
-            with open("temp.ir", "w") as f:
-                f.write(ir_text)
+        if llvm_dump_dir:
+            _write_llvm_dump(llvm_dump_dir, "temp.ir", ir_text)
 
         if self.backend == "self":
             if entry != "main":
@@ -1752,19 +1785,21 @@ class CEvaluator(object):
                 cheap_passes=cheap_passes,
                 pass_ctx=pass_ctx,
             )
-        if llvmdump and opt_mode != "none":
+        if llvm_dump_dir and opt_mode != "none":
             tempbcode = str(llvmmod)
-            with open("temp.ooptimize.bcode", "w") as f:
-                f.write(tempbcode)
+            _write_llvm_dump(
+                llvm_dump_dir,
+                "temp.ooptimize.bcode",
+                tempbcode,
+            )
         _load_mcjit_link_libraries(link_args)
 
         self.ee = llvm.create_mcjit_compiler(llvmmod, target_machine)
         self.ee.finalize_object()
 
-        if llvmdump:
+        if llvm_dump_dir:
             tempbcode = target_machine.emit_assembly(llvmmod)
-            with open("temp.bcode", "w") as f:
-                f.write(tempbcode)
+            _write_llvm_dump(llvm_dump_dir, "temp.bcode", tempbcode)
 
         return_type = _entry_return_type_from_artifact(artifact, entry)
 
@@ -1784,7 +1819,7 @@ class CEvaluator(object):
                 args = []
             # Cache the JIT state for future calls. Never cache an
             # instrumented result under the un-instrumented key (SEC-P1-UBSAN).
-            if not llvmdump and not fsanitize:
+            if not llvm_dump_dir and not fsanitize:
                 src_hash = hashlib.sha256(codestr.encode("utf-8")).hexdigest()
                 jit_key = (
                     src_hash,
@@ -1863,9 +1898,13 @@ class CEvaluator(object):
         self, unit_name, ir_text, target_machine, optimize=True, llvmdump=False
     ):
         safe_name = re.sub(r"\W+", "_", unit_name)
-        if llvmdump:
-            with open(f"temp.{safe_name}.ir", "w") as f:
-                f.write(ir_text)
+        llvm_dump_dir = _normalize_llvm_dump_dir(llvmdump)
+        if llvm_dump_dir:
+            _write_llvm_dump(
+                llvm_dump_dir,
+                f"temp.{safe_name}.ir",
+                ir_text,
+            )
 
         opt_level = self._normalize_opt_level(optimize)
         ir_text, external_mode = _apply_external_llvm_pipeline_to_text(
@@ -1885,9 +1924,12 @@ class CEvaluator(object):
         opt_mode = external_mode
         if opt_mode is None:
             opt_mode = _apply_llvm_optimizations(llvmmod, target_machine, opt_level)
-        if llvmdump and opt_mode != "none":
-            with open(f"temp.{safe_name}.opt.ll", "w") as f:
-                f.write(str(llvmmod))
+        if llvm_dump_dir and opt_mode != "none":
+            _write_llvm_dump(
+                llvm_dump_dir,
+                f"temp.{safe_name}.opt.ll",
+                str(llvmmod),
+            )
 
         return llvmmod
 
@@ -1896,6 +1938,7 @@ class CEvaluator(object):
     ):
         combined = None
         main_return_type = None
+        llvm_dump_dir = _normalize_llvm_dump_dir(llvmdump)
 
         for unit_name, ir_text, unit_return_type, _external_defs in compiled_units:
             llvmmod = self._prepare_llvm_module(
@@ -1903,7 +1946,7 @@ class CEvaluator(object):
                 ir_text,
                 target_machine,
                 optimize=optimize,
-                llvmdump=llvmdump,
+                llvmdump=llvm_dump_dir,
             )
             if combined is None:
                 combined = llvmmod

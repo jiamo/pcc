@@ -20,6 +20,124 @@ def _load_pcc_link_driver():
     return module
 
 
+def test_internal_input_manifest_preserves_mixed_module_order(tmp_path: Path) -> None:
+    driver = _load_pcc_link_driver()
+    manifest = tmp_path / "inputs.txt"
+    manifest.write_text(
+        "pcc.macho-internal-inputs.v1\n"
+        "3\n"
+        "PCO\t/tmp/first.pco\n"
+        "ASM\t/tmp/second.s\n"
+        "PCO\t/tmp/third.pco\n",
+        encoding="utf-8",
+    )
+
+    assert driver._read_internal_input_manifest(str(manifest)) == [
+        ("PCO", "/tmp/first.pco"),
+        ("ASM", "/tmp/second.s"),
+        ("PCO", "/tmp/third.pco"),
+    ]
+
+
+def test_direct_artifact_link_writes_ordered_mixed_manifest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asm = tmp_path / "large.s"
+    pco = tmp_path / "small.pco"
+    asm.write_text(".text\n", encoding="utf-8")
+    pco.write_bytes(b"pco")
+    captured = []
+
+    monkeypatch.setattr(pipeline.sys, "platform", "darwin")
+    monkeypatch.setattr(pipeline, "_macho_semantic_layout_enabled", lambda: False)
+    monkeypatch.setattr(pipeline, "_resolve_self_link_mode", lambda: "pcc")
+    monkeypatch.setattr(
+        pipeline,
+        "_validate_pcc_self_link_surface",
+        lambda **_kwargs: None,
+    )
+
+    def fake_link(*_args, **kwargs):
+        manifest = Path(kwargs["pcc_internal_input_manifest"])
+        captured.extend(manifest.read_text(encoding="utf-8").splitlines())
+
+    monkeypatch.setattr(pipeline, "_run_self_link_command", fake_link)
+    monkeypatch.setattr(
+        pipeline,
+        "_finish_self_backend_executable",
+        lambda *_args, **_kwargs: None,
+    )
+
+    pipeline._link_with_self_backend_direct_artifacts(
+        [
+            ("first", "PCO", str(pco)),
+            ("second", "ASM", str(asm)),
+        ],
+        str(tmp_path / "program"),
+        None,
+        False,
+    )
+
+    assert captured == [
+        "pcc.macho-internal-inputs.v1",
+        "2",
+        "PCO\t" + str(pco.resolve()),
+        "ASM\t" + str(asm.resolve()),
+    ]
+
+
+def test_direct_artifact_link_can_defer_after_compiled_coordinator_exit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    asm = tmp_path / "large.s"
+    pco = tmp_path / "small.pco"
+    runtime = tmp_path / "runtime.a"
+    asm.write_text(".text\n", encoding="utf-8")
+    pco.write_bytes(b"pco")
+    runtime.write_bytes(b"archive")
+    plan = tmp_path / "deferred.plan"
+
+    monkeypatch.setenv("PCC_DEFER_SELF_LINK_PLAN", str(plan))
+    monkeypatch.setattr(pipeline.sys, "platform", "darwin")
+    monkeypatch.setattr(pipeline, "_macho_semantic_layout_enabled", lambda: False)
+    monkeypatch.setattr(pipeline, "_resolve_self_link_mode", lambda: "pcc")
+    monkeypatch.setattr(
+        pipeline,
+        "_validate_pcc_self_link_surface",
+        lambda **_kwargs: None,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "_run_self_link_command",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("compiled coordinator must exit before deferred link")
+        ),
+    )
+
+    pipeline._link_with_self_backend_direct_artifacts(
+        [
+            ("first", "PCO", str(pco)),
+            ("second", "ASM", str(asm)),
+        ],
+        str(tmp_path / "program"),
+        str(runtime),
+        False,
+    )
+
+    lines = plan.read_text(encoding="utf-8").splitlines()
+    assert lines[0] == "pcc.deferred-self-link.v1"
+    assert lines[1] == str((tmp_path / "program").resolve())
+    assert lines[2] == str(runtime.resolve())
+    internal_manifest = Path(lines[3])
+    assert internal_manifest.is_file()
+    assert internal_manifest.read_text(encoding="utf-8").splitlines()[2:] == [
+        "PCO\t" + str(pco.resolve()),
+        "ASM\t" + str(asm.resolve()),
+    ]
+
+
 def test_self_link_mode_uses_host_default_and_accepts_explicit_modes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -783,7 +901,7 @@ def test_pcc_link_driver_keeps_assembly_internal_until_final_link(
 ) -> None:
     from pcc.backend import arm64_asm_driver, macho_codesign, macho_exec
     from pcc.backend.macho_obj import TEXT_SECTION_FLAGS, Section, TextSymbol
-    from pcc.backend.native_object import NativeObject
+    from pcc.backend.native_object import PackedNativeObject
 
     driver = _load_pcc_link_driver()
     first = tmp_path / "first.s"
@@ -841,7 +959,9 @@ def test_pcc_link_driver_keeps_assembly_internal_until_final_link(
         str(output),
     ]) == 0
 
-    assert all(isinstance(value, NativeObject) for value in linked_inputs[:2])
+    assert all(
+        isinstance(value, PackedNativeObject) for value in linked_inputs[:2]
+    )
     assert linked_inputs[2:] == [b"external-macho"]
     assert output.read_bytes() == b"signed-image"
 
@@ -881,14 +1001,22 @@ def test_pcc_link_driver_does_not_accept_native_codec_as_object(
 def test_pcc_link_driver_accepts_explicit_native_object_input(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
+    import json
+
     from pcc.backend import macho_codesign, macho_exec
     from pcc.backend.macho_obj import TEXT_SECTION_FLAGS, Section, TextSymbol
-    from pcc.backend.native_object import NativeObject, encode_native_object
+    from pcc.backend.native_object import (
+        NativeObject,
+        PackedNativeObject,
+        encode_native_object,
+    )
 
     driver = _load_pcc_link_driver()
     native_path = tmp_path / "input.pco"
     output = tmp_path / "output"
+    profile = tmp_path / "link-profile.json"
     native = NativeObject.from_sections([Section(
         sectname="__text",
         segname="__TEXT",
@@ -929,10 +1057,31 @@ def test_pcc_link_driver_accepts_explicit_native_object_input(
         str(native_path),
         "--out",
         str(output),
+        "--profile-json",
+        str(profile),
     ]) == 0
 
-    assert linked_inputs == [native]
+    assert len(linked_inputs) == 1
+    assert isinstance(linked_inputs[0], PackedNativeObject)
+    assert linked_inputs[0].encoded == encode_native_object(native)
     assert output.read_bytes() == b"signed-image"
+    payload = json.loads(profile.read_text(encoding="utf-8"))
+    assert payload["schema"] == "pcc.macho-link-profile.v1"
+    assert set(payload["phases_ms"]) == {
+        "assemble_pool",
+        "decode_pco",
+        "prepare_link",
+        "sign",
+        "validate",
+        "write",
+    }
+    assert payload["inputs"] == {
+        "archive": 0,
+        "asm": 0,
+        "native_object": 1,
+        "object": 0,
+    }
+    assert "PCC_LINK_PROFILE " in capsys.readouterr().err
 
 
 def test_pcc_link_driver_materializes_frontend_semantic_policy(

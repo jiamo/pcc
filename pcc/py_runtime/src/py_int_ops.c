@@ -245,7 +245,7 @@ PyObject *py_int_shl(PyObject *a, PyObject *b) {
     int64_t n = py_int_to_i64(b, &overflow);
     if (overflow) return NULL;
     if (n < 0) {
-        py_raise(py_exc_new(PY_EXC_VALUEERROR, "negative shift count"));
+        py_raise_owned(py_exc_new(PY_EXC_VALUEERROR, "negative shift count"));
         return NULL;
     }
     if (n == 0) {
@@ -275,7 +275,7 @@ PyObject *py_int_shr(PyObject *a, PyObject *b) {
     int64_t n = py_int_to_i64(b, &overflow);
     if (overflow) return NULL;
     if (n < 0) {
-        py_raise(py_exc_new(PY_EXC_VALUEERROR, "negative shift count"));
+        py_raise_owned(py_exc_new(PY_EXC_VALUEERROR, "negative shift count"));
         return NULL;
     }
     if (n == 0) {

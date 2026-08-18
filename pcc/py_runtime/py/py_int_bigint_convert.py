@@ -1,4 +1,7 @@
 """Phase 4c: pcc-Python port of py_int_bigint_convert.c."""
+
+__pcc_runtime_port__ = True
+
 from pcc.extern import c_abi_export
 from pcc.py_runtime.py.py_abi_constants import (
     PYINTOBJECT_DIGITS_OFFSET,

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import sys
+import os
 from pcc.llvm_capi.compat import ir
 
 from ..py_ast import (
@@ -875,7 +877,18 @@ class CallExpressionLoweringMixin:
                 return delegated
         unsafe_intrinsic = self._unsafe_intrinsic_for_name(name)
         if unsafe_intrinsic is not None:
-            return self._emit_unsafe_intrinsic_call(unsafe_intrinsic, expr)
+            value = self._emit_unsafe_intrinsic_call(unsafe_intrinsic, expr)
+            # Pointer-producing intrinsics are typed ``int`` outside
+            # runtime-port mode (raw address as integer); project the IR
+            # pointer to i64 so the value matches its static type.
+            if (
+                isinstance(getattr(expr, "ty", None), IntType)
+                and isinstance(getattr(value, "type", None), ir.PointerType)
+            ):
+                value = self.builder.ptrtoint(
+                    value, _I64, name=self._fresh("unsafe.addr.int")
+                )
+            return value
         if name in _BUILTIN_EXC_TAG and name not in self.env:
             return self._build_exception_value(expr)
         if name == "__await__":
@@ -1741,24 +1754,40 @@ class CallExpressionLoweringMixin:
         if name == "reversed" and len(expr.args) == 1 and not expr.kwargs:
             return self._emit_reversed_builtin(expr)
         if name == "repr" and len(expr.args) == 1:
-            return self.builder.call(
+            arg_obj = self._emit_expr_as_pcc_object(expr.args[0])
+            result = self.builder.call(
                 self.runtime["py_obj_repr"],
-                [self._emit_expr_as_pcc_object(expr.args[0])],
+                [arg_obj],
                 name=self._fresh("repr"),
             )
+            # The runtime helper borrows its operand, so a temporary produced
+            # by the argument expression is consumed here.  A borrowed operand
+            # is left alone by the classifier.
+            self._gc_release_if_owned(arg_obj, expr.args[0])
+            return result
         if name == "ascii" and len(expr.args) == 1:
-            return self.builder.call(
+            arg_obj = self._emit_expr_as_pcc_object(expr.args[0])
+            result = self.builder.call(
                 self.runtime["py_obj_ascii"],
-                [self._emit_expr_as_pcc_object(expr.args[0])],
+                [arg_obj],
                 name=self._fresh("ascii"),
             )
+            # The runtime helper borrows its operand, so a temporary produced
+            # by the argument expression is consumed here.  A borrowed operand
+            # is left alone by the classifier.
+            self._gc_release_if_owned(arg_obj, expr.args[0])
+            return result
         if name == "hash" and len(expr.args) == 1:
+            arg_obj = self._emit_expr_as_pcc_object(expr.args[0])
             result = self.builder.call(
                 self.runtime["py_obj_hash"],
-                [self._emit_expr_as_pcc_object(expr.args[0])],
+                [arg_obj],
                 name=self._fresh("hash"),
             )
             self._emit_post_call_err_check(self._expr_span_or_none(expr))
+            # Released after the error check so a raising __hash__ takes the
+            # error edge with the operand still live.
+            self._gc_release_if_owned(arg_obj, expr.args[0])
             return result
         if name == "id" and len(expr.args) == 1:
             v = self._emit_as_object(expr.args[0])
@@ -1816,8 +1845,10 @@ class CallExpressionLoweringMixin:
                     [n_obj],
                     name=self._fresh("hasattr.name"),
                 )
+            # The no-raise probe: a plain miss returns NULL without paying an
+            # AttributeError construction that the branch below would clear.
             got = self.builder.call(
-                self.runtime["py_obj_getattr"],
+                self.runtime["py_obj_getattr_maybe"],
                 [obj, name_ptr],
                 name=self._fresh("hasattr.got"),
             )
@@ -1844,6 +1875,13 @@ class CallExpressionLoweringMixin:
             self.builder.branch(end_bb)
             missing_exit = self.builder._block
             self.builder.position_at_end(present_bb)
+            # Every py_obj_getattr(_maybe) edge returns an OWNED reference
+            # (instance/class getattr, dunder-class, and the builtin bound
+            # helpers all incref or fabricate).  hasattr only needs the i1, so
+            # the found object must be released here or every probe that
+            # fabricates (e.g. hasattr(lst, "pop") building a bound method)
+            # leaks one object per call.
+            self.builder.call(self.runtime["py_decref"], [got])
             self.builder.branch(end_bb)
             present_exit = self.builder._block
             self.builder.position_at_end(end_bb)

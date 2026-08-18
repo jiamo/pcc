@@ -888,7 +888,10 @@ def test_typed_list_i64_runtime_helpers_match_c_fast_path():
         "py_list_len",
     ):
         match = re.search(
-            rf"def {helper}\([^)]*\).*?(?=\n\n@c_abi_export|\n\n@c_abi_export|\Z)",
+            # Stop at the next top-level definition (decorated or not): the
+            # helper after py_list_get_i64_nonnegative is an undecorated
+            # private def, and the old lookahead ran past it.
+            rf"def {helper}\([^)]*\).*?(?=\n\n(?:@|def )|\Z)",
             text,
             re.DOTALL,
         )

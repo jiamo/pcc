@@ -19,6 +19,9 @@ Not yet moved (kept C-side, each a later bounded slice):
 
 Public object type tags come from the generated ``py_abi_constants`` module.
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_BYTES,
     PY_TYPE_STR,
@@ -45,6 +48,9 @@ from pcc.unsafe import (
 
 py_str_new = extern("py_str_new", (c_ptr, c_int64), c_ptr)
 py_str_utf8 = extern("py_str_utf8", (c_ptr,), c_ptr)
+pcc_capi_str_utf8_pinned = extern(
+    "pcc_capi_str_utf8_pinned", (c_ptr,), c_ptr
+)
 py_str_byte_len = extern("py_str_byte_len", (c_ptr,), c_int64)
 py_str_len = extern("py_str_len", (c_ptr,), c_int64)
 py_str_concat = extern("py_str_concat", (c_ptr, c_ptr), c_ptr)
@@ -65,6 +71,8 @@ py_obj_lt = extern("py_obj_lt", (c_ptr, c_ptr), c_int64)
 py_decref = extern("py_decref", (c_ptr,), c_void)
 py_err_occurred = extern("py_err_occurred", (), c_int64)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 PyErr_Fetch = extern("PyErr_Fetch", (c_ptr, c_ptr, c_ptr), c_void)
 PyErr_Restore = extern("PyErr_Restore", (c_ptr, c_ptr, c_ptr), c_void)
@@ -79,11 +87,11 @@ def _is_str(obj) -> int:
 
 
 def _type_error(message) -> None:
-    py_raise(py_exc_new(3, message))  # PY_EXC_TYPEERROR
+    py_raise_owned(py_exc_new(3, message))  # PY_EXC_TYPEERROR
 
 
 def _value_error(message) -> None:
-    py_raise(py_exc_new(2, message))  # PY_EXC_VALUEERROR
+    py_raise_owned(py_exc_new(2, message))  # PY_EXC_VALUEERROR
 
 
 @c_abi_typed_export("PyUnicode_FromString", "ptr", ("ptr",))
@@ -123,7 +131,7 @@ def PyUnicode_AsUTF8(obj) -> c_ptr:
     if _is_str(obj) == 0:
         _type_error(cstr("expected str"))
         return null()
-    return py_str_utf8(obj)
+    return pcc_capi_str_utf8_pinned(obj)
 
 
 @c_abi_typed_export("PyUnicode_AsUTF8AndSize", "ptr", ("ptr", "ptr"))
@@ -133,7 +141,7 @@ def PyUnicode_AsUTF8AndSize(obj, size_ptr) -> c_ptr:
         return null()
     if not ptr_is_null(size_ptr):
         store_i64(size_ptr, 0, py_str_byte_len(obj))
-    return py_str_utf8(obj)
+    return pcc_capi_str_utf8_pinned(obj)
 
 
 @c_abi_typed_export("PyUnicode_AsUTF8String", "ptr", ("ptr",))
@@ -643,7 +651,7 @@ def _raise_system_error(message) -> None:
     # The compact native exception table intentionally represents
     # PyExc_SystemError with the RuntimeError class/tag (see
     # pcc_capi_exception_tag).  Tag 6 is AttributeError.
-    py_raise(py_exc_new(7, message))  # PY_EXC_RUNTIMEERROR / SystemError bridge
+    py_raise_owned(py_exc_new(7, message))  # PY_EXC_RUNTIMEERROR / SystemError bridge
 
 
 @c_abi_typed_export("PyUnicode_Decode", "ptr", ("ptr", "i64", "ptr", "ptr"))
@@ -709,11 +717,11 @@ def PyUnicode_FromEncodedObject(obj, encoding, errors) -> c_ptr:
 @c_abi_typed_export("PyUnicode_New", "ptr", ("i64", "i64"))
 def PyUnicode_New(size: int, maxchar: int) -> c_ptr:
     if size < 0:
-        py_raise(py_exc_new(7, cstr("negative PyUnicode_New size")))  # PY_EXC_SYSTEMERROR
+        py_raise_owned(py_exc_new(7, cstr("negative PyUnicode_New size")))  # PY_EXC_SYSTEMERROR
         return null()
     if size == 0:
         return py_str_new(cstr(""), 0)
-    py_raise(
+    py_raise_owned(
         py_exc_new(11, cstr("nonempty writable PyUnicode_New storage is not supported"))
     )  # PY_EXC_NOTIMPLEMENTEDERROR
     return null()

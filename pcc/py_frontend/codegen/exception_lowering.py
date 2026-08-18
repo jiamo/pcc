@@ -7,6 +7,11 @@ import sys
 from typing import Optional
 
 from pcc.llvm_capi.compat import ir
+from pcc.llvm_capi.ir import (
+    IRBuilder_can_inline_error_edge,
+    IRBuilder_declare_inline_error_landing,
+    IRBuilder_try_inline_error_edge,
+)
 
 from ..py_ast import (
     Assign,
@@ -39,6 +44,22 @@ _I32 = ir.IntType(32)
 _I64 = ir.IntType(64)
 _CSTR = _I8.as_pointer()
 _OPTIONAL_IMPORT_MISSING_NONE = "pcc.optional_import_missing.None"
+
+
+def _inline_error_edge_env_enabled(name: str) -> bool:
+    return str(os.environ.get(name, "") or "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
+
+
+_DIRECT_INLINE_ERROR_EDGE_ENABLED = (
+    _inline_error_edge_env_enabled("PCC_DIRECT_INLINE_ERROR_EDGE_CAPTURE")
+    and _inline_error_edge_env_enabled("PCC_DIRECT_INDEXED_KERNEL_CAPTURE")
+    and _inline_error_edge_env_enabled("PCC_DIRECT_INDEXED_KERNEL_EMIT")
+)
 
 
 class ExceptionLoweringMixin:
@@ -989,19 +1010,9 @@ class ExceptionLoweringMixin:
             "not supported"
         )
 
-    def _emit_exception_frame(
-        self,
-        exc: ir.Value,
-        span: Optional[SourceSpan],
-    ) -> None:
-        if span is None:
-            return
-        func_name = "<module>"
-        if self.current_func_def is not None:
-            func_name = self.current_func_def.name
-        func_ptr = self._pooled_cstr_ptr(func_name, ".tb.func")
+    def _traceback_source_text(self, span: SourceSpan) -> str:
+        """The stripped source line a traceback frame prints for ``span``."""
         file_name = span.file or "<unknown>"
-        file_ptr = self._pooled_cstr_ptr(file_name, ".tb.file")
         source_line = ""
         if file_name and not file_name.startswith("<") and int(span.line) > 0:
             # Read and split each source file once.  Every traceback frame
@@ -1023,7 +1034,152 @@ class ExceptionLoweringMixin:
             source_index = int(span.line) - 1
             if source_index >= 0 and source_index < len(source_lines):
                 source_line = source_lines[source_index].strip()
-        source_ptr = self._pooled_cstr_ptr(source_line, ".tb.source")
+        return source_line
+
+    def _traceback_index_for(self, span: SourceSpan) -> int:
+        """Index of ``span``'s (line, source text) pair in the module tables."""
+        file_name = span.file or "<unknown>"
+        line = int(span.line)
+        by_line = self._tb_index_by_file.get(file_name)
+        if by_line is None:
+            by_line = {}
+            self._tb_index_by_file[file_name] = by_line
+        existing = by_line.get(line)
+        if existing is not None:
+            return existing
+        index = len(self._tb_index_lines)
+        self._tb_index_lines.append(line)
+        self._tb_index_sources.append(
+            self._pooled_cstr_global(
+                self._traceback_source_text(span), ".tb.source"
+            )
+        )
+        by_line[line] = index
+        return index
+
+    def _direct_frame_landing(
+        self,
+        err_target: ir.Block,
+        span: SourceSpan,
+    ) -> tuple:
+        """Shared traceback landing for ``err_target`` plus this site's payload.
+
+        Direct/no-text functions keep one landing block per (function, error
+        target) instead of one ``err.frame`` block per source line.  The
+        landing reads the raise site's table index from an i32 entry slot that
+        the inline edge's cold stub (or the explicit cleanup block) stored,
+        then records exactly the frame the per-line block recorded.  Returns
+        ``(landing_block, payload_slot, payload_index)``.
+        """
+        parent_fn = self.current_function
+        by_target = self._direct_frame_landings.get(id(parent_fn))
+        if by_target is None:
+            by_target = {}
+            self._direct_frame_landings[id(parent_fn)] = by_target
+        landing = by_target.get(err_target.name)
+        payload = self._traceback_index_for(span)
+        if landing is not None:
+            return (landing[0], landing[1], payload)
+        if self._tb_lines_global is None:
+            lines_global = ir.GlobalVariable(
+                self.module, ir.ArrayType(_I32, 0), name=".pcc.tb.lines"
+            )
+            lines_global.linkage = "internal"
+            lines_global.global_constant = True
+            self._tb_lines_global = lines_global
+            sources_global = ir.GlobalVariable(
+                self.module, ir.ArrayType(_CSTR, 0), name=".pcc.tb.sources"
+            )
+            sources_global.linkage = "internal"
+            sources_global.global_constant = True
+            self._tb_sources_global = sources_global
+        slot = self._alloca_in_entry(_I32, name=self._fresh("err.frame.index"))
+        landing_bb = parent_fn.append_basic_block(
+            name=self._fresh("err.frame.land")
+        )
+        by_target[err_target.name] = (landing_bb, slot)
+        save_block = self.builder._block
+        save_pos = self.builder._pos
+        self.builder.position_at_end(landing_bb)
+        index_value = self.builder.load(
+            slot, name=self._fresh("err.frame.index.value")
+        )
+        exc = self.builder.call(
+            self.runtime["py_current_exception"],
+            [],
+            name=self._fresh("err.frame.exc"),
+        )
+        func_name = "<module>"
+        if self.current_func_def is not None:
+            func_name = self.current_func_def.name
+        func_ptr = self._pooled_cstr_ptr(func_name, ".tb.func")
+        file_ptr = self._pooled_cstr_ptr(span.file or "<unknown>", ".tb.file")
+        self.builder.call(
+            self.runtime["py_exc_append_frame_indexed"],
+            [
+                exc,
+                func_ptr,
+                file_ptr,
+                self.builder.bitcast(
+                    self._tb_lines_global,
+                    _CSTR,
+                    name=self._fresh("err.frame.lines"),
+                ),
+                self.builder.bitcast(
+                    self._tb_sources_global,
+                    _CSTR,
+                    name=self._fresh("err.frame.sources"),
+                ),
+                index_value,
+            ],
+        )
+        self.builder.branch(err_target)
+        self.builder.position_at_end(save_block)
+        self.builder._pos = save_pos
+        IRBuilder_declare_inline_error_landing(self.builder, landing_bb, slot)
+        return (landing_bb, slot, payload)
+
+    def _finalize_traceback_index_tables(self) -> None:
+        """Give the module traceback tables their final size and contents."""
+        lines_global = self._tb_lines_global
+        if lines_global is None:
+            return
+        count = len(self._tb_index_lines)
+        lines_type = ir.ArrayType(_I32, count)
+        lines_global.value_type = lines_type
+        lines_global.type = ir.PointerType(lines_type)
+        lines_global.initializer = ir.Constant(
+            lines_type,
+            [ir.Constant(_I32, value) for value in self._tb_index_lines],
+        )
+        sources_global = self._tb_sources_global
+        sources_type = ir.ArrayType(_CSTR, count)
+        sources_global.value_type = sources_type
+        sources_global.type = ir.PointerType(sources_type)
+        sources_global.initializer = ir.Constant(
+            sources_type,
+            [
+                ir.Constant(_CSTR, source_global)
+                for source_global in self._tb_index_sources
+            ],
+        )
+
+    def _emit_exception_frame(
+        self,
+        exc: ir.Value,
+        span: Optional[SourceSpan],
+    ) -> None:
+        if span is None:
+            return
+        func_name = "<module>"
+        if self.current_func_def is not None:
+            func_name = self.current_func_def.name
+        func_ptr = self._pooled_cstr_ptr(func_name, ".tb.func")
+        file_name = span.file or "<unknown>"
+        file_ptr = self._pooled_cstr_ptr(file_name, ".tb.file")
+        source_ptr = self._pooled_cstr_ptr(
+            self._traceback_source_text(span), ".tb.source"
+        )
         self.builder.call(
             self.runtime["py_exc_append_frame_source"],
             [
@@ -1034,6 +1190,81 @@ class ExceptionLoweringMixin:
                 ir.Constant(_I32, int(span.line)),
             ],
         )
+
+    def _emit_non_iterable_scalar_guard(
+        self,
+        src_obj: ir.Value,
+        builtin_name: str,
+        release_first: tuple[ir.Value, ...] = (),
+    ) -> None:
+        """Fail closed when a dyn-held source is a scalar that a positional
+        walk would silently treat as empty.
+
+        ``py_obj_len`` returns 0 WITHOUT raising for non-sized objects
+        (py_obj_ops_dispatch.c), so ``any(x)`` / ``zip(t, x)`` over a
+        dyn-held int/float/bool/None silently answered False / [] where
+        CPython raises TypeError.  The guard rejects only tags that are
+        never iterable; instances (which may implement __len__/__getitem__)
+        and every container tag pass through untouched.
+        """
+        from .freestanding_abi_constants import (
+            PY_TYPE_BOOL,
+            PY_TYPE_FLOAT,
+            PY_TYPE_INT,
+            PY_TYPE_NONE,
+        )
+
+        fn = self.current_function
+        tag = self.builder.call(
+            self.runtime["py_obj_type_tag"],
+            [src_obj],
+            name=self._fresh(f"{builtin_name}.src.tag"),
+        )
+        scalar = ir.Constant(ir.IntType(1), 0)
+        for tag_value in (
+            PY_TYPE_INT,
+            PY_TYPE_FLOAT,
+            PY_TYPE_BOOL,
+            PY_TYPE_NONE,
+        ):
+            is_tag = self.builder.icmp_signed(
+                "==",
+                tag,
+                ir.Constant(_I64, tag_value),
+                name=self._fresh(f"{builtin_name}.tag.eq"),
+            )
+            scalar = self.builder.or_(
+                scalar,
+                is_tag,
+                name=self._fresh(f"{builtin_name}.tag.scalar"),
+            )
+        bad_bb = fn.append_basic_block(
+            name=self._fresh(f"{builtin_name}.scalar.bad")
+        )
+        ok_bb = fn.append_basic_block(
+            name=self._fresh(f"{builtin_name}.scalar.ok")
+        )
+        self.builder.cbranch(scalar, bad_bb, ok_bb)
+        self.builder.position_at_end(bad_bb)
+        for owned in release_first:
+            self.builder.call(self.runtime["pcc_gc_release"], [owned])
+        message = self._ptr_to_cstr(
+            self._cstr_global(
+                builtin_name + "() argument is not iterable",
+                f".{builtin_name}.scalar.typeerror",
+            )
+        )
+        exc = self.builder.call(
+            self.runtime["py_exc_new"],
+            [ir.Constant(_I64, 3), message],
+            name=self._fresh(f"{builtin_name}.scalar.exc"),
+        )
+        self.builder.call(self.runtime["py_raise"], [exc])
+        err_target = (
+            self._current_try_err_block() or self._ensure_fn_err_exit()
+        )
+        self.builder.branch(err_target)
+        self.builder.position_at_end(ok_bb)
 
     def _emit_post_call_err_check(
         self,
@@ -1063,7 +1294,8 @@ class ExceptionLoweringMixin:
         if cur_fn is not None and cur_fn.name in self._c_abi_export_symbols:
             return
         err_target = self._current_try_err_block()
-        if err_target is None:
+        function_exit_edge = err_target is None
+        if function_exit_edge:
             err_target = self._ensure_fn_err_exit()
         err_fn = self.runtime.get("py_err_occurred")
         if err_fn is None:
@@ -1085,57 +1317,149 @@ class ExceptionLoweringMixin:
             ir.Constant(_I64, 0),
             name=self._fresh("err.cmp"),
         )
-        parent_fn = self.current_function
-        cont = parent_fn.append_basic_block(name=self._fresh("call.cont"))
-        error_dest = err_target
-        if span is not None:
-            error_dest = self._ensure_post_call_frame_block(err_target, span)
-        if (
+        needs_cleanup = bool(
             release_on_error
             or cpy_release_on_error
             or rooted_release_on_error
             or pinned_release_on_error
             or lifo_owned_root_slots_on_error
-        ):
+        )
+        parent_fn = self.current_function
+        # Direct/no-text self-backend functions publish the check as one
+        # inline exceptional edge: normal execution stays in the current
+        # logical block, so no ``call.cont`` block exists.  Every error
+        # destination reachable here (function exit, try handler, per-line
+        # frame block, explicit cleanup block) starts without PHIs, which is
+        # the edge target contract the verifier enforces.  The text/LLVM
+        # oracle keeps its historical block creation order below.
+        inline_edge = (
+            _DIRECT_INLINE_ERROR_EDGE_ENABLED
+            and IRBuilder_can_inline_error_edge(self.builder)
+        )
+        cont = None
+        if not inline_edge:
+            cont = parent_fn.append_basic_block(name=self._fresh("call.cont"))
+        error_dest = err_target
+        landing_slot = None
+        payload = -1
+        if span is not None:
+            if inline_edge:
+                error_dest, landing_slot, payload = self._direct_frame_landing(
+                    err_target, span
+                )
+            else:
+                error_dest = self._ensure_post_call_frame_block(err_target, span)
+        cleanup = None
+        if needs_cleanup:
             cleanup = parent_fn.append_basic_block(
                 name=self._fresh("call.err.cleanup")
             )
-            self.builder.cbranch(cmp, cleanup, cont)
+        edge_dest = error_dest if cleanup is None else cleanup
+        if inline_edge and IRBuilder_try_inline_error_edge(
+            self.builder,
+            cmp,
+            edge_dest,
+            0 if span is None else int(span.line),
+            0,
+            -1 if cleanup is not None else payload,
+        ):
+            if (
+                self._entry_inline_edge_anchor_function is not parent_fn
+                and self.builder._block is parent_fn.blocks[0]
+            ):
+                # Entry-hoisted root enters/initializers must precede the
+                # first exceptional edge out of the entry block; see
+                # ``_position_at_entry_hoist_point``.
+                self._entry_inline_edge_anchor_function = parent_fn
+                self._entry_inline_edge_anchor_record = cmp._instr
+            if cleanup is not None:
+                resume_block = self.builder._block
+                resume_pos = self.builder._pos
+                self.builder.position_at_end(cleanup)
+                self._emit_post_call_error_cleanup(
+                    error_dest,
+                    release_on_error=release_on_error,
+                    cpy_release_on_error=cpy_release_on_error,
+                    rooted_release_on_error=rooted_release_on_error,
+                    pinned_release_on_error=pinned_release_on_error,
+                    lifo_owned_root_slots_on_error=lifo_owned_root_slots_on_error,
+                    landing_slot=landing_slot,
+                    payload=payload,
+                )
+                self.builder.position_at_end(resume_block)
+                self.builder._pos = resume_pos
+            return
+        if cont is None:
+            cont = parent_fn.append_basic_block(name=self._fresh("call.cont"))
+        self.builder.cbranch(cmp, edge_dest, cont)
+        if cleanup is not None:
             self.builder.position_at_end(cleanup)
-            for value in cpy_release_on_error:
-                self.builder.call(self.runtime["py_cpy_decref"], [value])
-            for value, root_slot in rooted_release_on_error:
-                self._leave_container_temp_root(root_slot)
-                self.builder.call(self.runtime["pcc_gc_release"], [value])
-            for root_slot in lifo_owned_root_slots_on_error:
-                root_ptr = self._as_gc_ptr(
-                    root_slot,
-                    name=self._fresh("call.err.root.ptr"),
-                )
-                current = self.builder.call(
-                    self.runtime["pcc_gc_load_ptr"],
-                    [ir.Constant(_CSTR, None), root_ptr],
-                    name=self._fresh("call.err.root.current"),
-                )
-                self.builder.call(
-                    self.runtime["pcc_gc_store_root"],
-                    [root_ptr, ir.Constant(_CSTR, None)],
-                )
-                self._emit_gc_frame_leave_lifo_for_slot(root_slot)
-                # The slot owned one temporary retain in addition to the
-                # callee's returned owned reference. Clearing the slot drops
-                # the former; this drops the latter on the exceptional edge.
-                self.builder.call(self.runtime["pcc_gc_release"], [current])
-            for value, release_owned in pinned_release_on_error:
-                self._gc_unpin(value)
-                if release_owned:
-                    self.builder.call(self.runtime["pcc_gc_release"], [value])
-            for value in release_on_error:
-                self.builder.call(self.runtime["pcc_gc_release"], [value])
-            self.builder.branch(error_dest)
-        else:
-            self.builder.cbranch(cmp, error_dest, cont)
+            self._emit_post_call_error_cleanup(
+                error_dest,
+                release_on_error=release_on_error,
+                cpy_release_on_error=cpy_release_on_error,
+                rooted_release_on_error=rooted_release_on_error,
+                pinned_release_on_error=pinned_release_on_error,
+                lifo_owned_root_slots_on_error=lifo_owned_root_slots_on_error,
+            )
         self.builder.position_at_end(cont)
+
+    def _emit_post_call_error_cleanup(
+        self,
+        error_dest: ir.Block,
+        *,
+        release_on_error: tuple[ir.Value, ...],
+        cpy_release_on_error: tuple[ir.Value, ...],
+        rooted_release_on_error: tuple[tuple[ir.Value, ir.Value], ...],
+        pinned_release_on_error: tuple[tuple[ir.Value, bool], ...],
+        lifo_owned_root_slots_on_error: tuple[ir.Value, ...],
+        landing_slot=None,
+        payload: int = -1,
+    ) -> None:
+        """Fill the current ``call.err.cleanup`` block and branch on.
+
+        Release order is the historical one: foreign refs, rooted container
+        temporaries, LIFO owned root slots, pinned values, then plain owned
+        temporaries.  The block is reached either by the text oracle's
+        ``cbranch`` or by a direct inline error edge; its body is identical.
+        """
+        for value in cpy_release_on_error:
+            self.builder.call(self.runtime["py_cpy_decref"], [value])
+        for value, root_slot in rooted_release_on_error:
+            self._leave_container_temp_root(root_slot)
+            self.builder.call(self.runtime["pcc_gc_release"], [value])
+        for root_slot in lifo_owned_root_slots_on_error:
+            root_ptr = self._as_gc_ptr(
+                root_slot,
+                name=self._fresh("call.err.root.ptr"),
+            )
+            current = self.builder.call(
+                self.runtime["pcc_gc_load_ptr"],
+                [ir.Constant(_CSTR, None), root_ptr],
+                name=self._fresh("call.err.root.current"),
+            )
+            self.builder.call(
+                self.runtime["pcc_gc_store_root"],
+                [root_ptr, ir.Constant(_CSTR, None)],
+            )
+            self._emit_gc_frame_leave_lifo_for_slot(root_slot)
+            # The slot owned one temporary retain in addition to the
+            # callee's returned owned reference. Clearing the slot drops
+            # the former; this drops the latter on the exceptional edge.
+            self.builder.call(self.runtime["pcc_gc_release"], [current])
+        for value, release_owned in pinned_release_on_error:
+            self._gc_unpin(value)
+            if release_owned:
+                self.builder.call(self.runtime["pcc_gc_release"], [value])
+        for value in release_on_error:
+            self.builder.call(self.runtime["pcc_gc_release"], [value])
+        if landing_slot is not None and payload >= 0:
+            # The direct shared landing reads this site's traceback table
+            # index from its slot; an edge straight into the landing stores
+            # it from the emitter's cold stub, an explicit cleanup block
+            # stores it here.
+            self.builder.store(ir.Constant(_I32, payload), landing_slot)
+        self.builder.branch(error_dest)
 
     def _ensure_post_call_frame_block(
         self,

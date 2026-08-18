@@ -23,6 +23,9 @@ Private exception and method-flag values remain owned by this bridge:
   (3) = 3, (4) = 4
   PyFuncObject capi_method@16, capi_self@24
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_DICT,
     PY_TYPE_LIST,
@@ -75,6 +78,8 @@ py_func_new_named = extern("py_func_new_named", (c_ptr, c_ptr, c_ptr), c_ptr)
 py_incref = extern("py_incref", (c_ptr,), c_void)
 py_decref = extern("py_decref", (c_ptr,), c_void)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 py_err_occurred = extern("py_err_occurred", (), c_int64)
 py_runtime_error_if_unset = extern(
@@ -98,7 +103,7 @@ def _py_false() -> c_ptr:
 
 
 def _type_error(message) -> None:
-    py_raise(py_exc_new(3, message))  # PY_EXC_TYPEERROR
+    py_raise_owned(py_exc_new(3, message))  # PY_EXC_TYPEERROR
 
 
 def _method_require_result(result):

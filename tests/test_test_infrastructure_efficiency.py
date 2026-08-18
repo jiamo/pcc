@@ -92,13 +92,64 @@ def test_nested_pytest_invocations_are_finite_and_audited():
 
 
 def test_l1_codegen_static_method_table_matches_host_contract():
+    import inspect
+
     from pcc.py_frontend.codegen._l1_codegen_static_methods import (
         L1_CODEGEN_STATIC_METHODS,
     )
     from pcc.py_frontend.codegen.host_contract import L1_CODEGEN_HOST_METHODS
+    from pcc.py_frontend.codegen.layer1 import L1CodeGen
 
     generated_names = tuple(entry["name"] for entry in L1_CODEGEN_STATIC_METHODS)
     assert generated_names == L1_CODEGEN_HOST_METHODS
+    assert len(generated_names) == len(set(generated_names))
+
+    expected = []
+    for method_name in L1_CODEGEN_HOST_METHODS:
+        signature = inspect.signature(getattr(L1CodeGen, method_name))
+        call_sig = []
+        param_types = []
+        kw_only_emitted = False
+        for param in signature.parameters.values():
+            kind = "pos"
+            if param.kind is inspect.Parameter.VAR_POSITIONAL:
+                kind = "*args"
+            elif param.kind is inspect.Parameter.VAR_KEYWORD:
+                kind = "**kwargs"
+            elif param.kind is inspect.Parameter.KEYWORD_ONLY:
+                if not kw_only_emitted:
+                    call_sig.append(
+                        {
+                            "name": "",
+                            "kind": "kw_only",
+                            "annotation": ("dyn",),
+                            "default": None,
+                            "has_default": False,
+                        }
+                    )
+                    kw_only_emitted = True
+            call_sig.append(
+                {
+                    "name": param.name,
+                    "kind": kind,
+                    "annotation": ("dyn",),
+                    "default": None,
+                    "has_default": param.default is not inspect.Parameter.empty,
+                }
+            )
+            param_types.append(("dyn",))
+        expected.append(
+            {
+                "name": method_name,
+                "kind": "instance",
+                "return_ty": ("dyn",),
+                "param_types": tuple(param_types),
+                "call_sig": tuple(call_sig),
+                "box_int_abi": False,
+            }
+        )
+
+    assert L1_CODEGEN_STATIC_METHODS == tuple(expected)
 
 
 def test_runtime_source_copies_exclude_repository_build_products():
@@ -160,6 +211,9 @@ def test_tests_do_not_build_or_link_mutable_repository_c_runtime_archive():
     assert "def cached_c_runtime" in cache
     assert "def cached_threaded_c_runtime" in cache
     assert "def cached_pcc_python_runtime" in cache
+    assert cache.count('f"PCC_WITH_THREADS={1 if threaded else 0}"') == 2
+    assert '_PCC_RUNTIME_CACHE_MARKER_SCHEMA = "pcc.runtime-build-cache.v4"' in cache
+    assert '_C_RUNTIME_CACHE_KEY_SCHEMA = "pcc.c-runtime-build-cache.v2"' in cache
     assert "_runtime_archive_stale" not in fixtures
     assert "_PCC_PY_RUNTIME_ARCHIVE" not in fixtures
     assert "fcntl.flock" in cache

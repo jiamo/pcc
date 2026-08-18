@@ -8,6 +8,9 @@ Coercion: keys/values may be any py object; non-str gets routed
 through py_obj_str() to realize a PyStrObject before reading its
 UTF-8 bytes.
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_INT,
     PY_TYPE_STR,

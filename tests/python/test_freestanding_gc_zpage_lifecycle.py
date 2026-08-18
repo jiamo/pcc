@@ -26,8 +26,11 @@ OWNED_SYMBOLS = {
     "pcc_gc_backend4_zpage_cache",
     "pcc_gc_backend4_zpage_clear_reusable_state",
     "pcc_gc_backend4_zpage_destroy",
+    "pcc_gc_backend4_zpage_detach_for_relocation",
     "pcc_gc_backend4_zpage_find",
     "pcc_gc_backend4_zpage_find_owner_for_page",
+    "pcc_gc_backend4_zpage_free_detached_payload_spans",
+    "pcc_gc_backend4_zpage_finish_relocation_detach",
     "pcc_gc_backend4_zpage_page_head",
     "pcc_gc_backend4_zpage_recycle",
     "pcc_gc_backend4_zpage_remove",
@@ -56,6 +59,13 @@ RAW_GLOBAL_IMPORTS = {
     "pcc_gc_backend4_free_page_head",
     "pcc_gc_backend4_page_head",
     "pcc_gc_backend4_retained_page_head",
+    "pcc_gc_backend4_selector_page_cursor",
+    "pcc_gc_backend4_selector_page_seed",
+    "pcc_gc_backend4_selector_page_seed_pending",
+    "pcc_gc_backend4_selector_scan_best",
+    "pcc_gc_backend4_selector_scan_best_score",
+    "pcc_gc_backend4_selector_scan_cursor",
+    "pcc_gc_backend4_selector_scan_restart",
     "pcc_gc_backend4_zpage_head",
 }
 
@@ -90,7 +100,14 @@ def test_zpage_lifecycle_has_one_strict_source_owner() -> None:
     assert _exported_symbols(strict) == OWNED_SYMBOLS
     assert _exported_symbols(managed).isdisjoint(OWNED_SYMBOLS)
     assert "freestanding_gc_zpage_lifecycle" in makefile
-    for symbol in OWNED_SYMBOLS - {"pcc_gc_backend4_sweep_deferred_recycles"}:
+    cross_object_only = {
+        "pcc_gc_backend4_zpage_detach_for_relocation",
+        "pcc_gc_backend4_zpage_free_detached_payload_spans",
+        "pcc_gc_backend4_zpage_finish_relocation_detach",
+    }
+    for symbol in OWNED_SYMBOLS - {
+        "pcc_gc_backend4_sweep_deferred_recycles",
+    } - cross_object_only:
         assert f'"{symbol}"' in managed
         assert f'@c_abi_export("{symbol}")' not in managed
     assert '"pcc_gc_backend4_sweep_deferred_recycles"' in dealloc

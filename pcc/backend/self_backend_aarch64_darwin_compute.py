@@ -1,39 +1,99 @@
 from __future__ import annotations
 
 from . import BackendUnavailable
-from .self_backend_aarch64_darwin_abi import aggregate_fits_reg_abi, reg_name
-from .self_backend_aarch64_darwin_addr import emit_gep_offset
-from .self_backend_aarch64_darwin_calls import emit_call_instruction, emit_va_arg
+from .self_backend_aarch64_darwin_abi import (
+    aggregate_fits_reg_abi,
+    reg_name,
+    reg_name_indexed,
+)
+from .self_backend_aarch64_darwin_addr import (
+    emit_gep_offset,
+    emit_gep_offset_indexed,
+)
+from .self_backend_aarch64_darwin_calls import (
+    emit_call_instruction,
+    emit_call_instruction_indexed,
+    emit_va_arg,
+)
 from .self_backend_aarch64_darwin_materialize import (
     copy_large_aggregate_value_to_slot,
+    copy_large_aggregate_value_to_value_slot,
     materialize_aggregate_storage_address,
     materialize_pointer,
+    materialize_scalar_value_indexed,
     materialize_value,
     store_large_aggregate_literal_to_address,
+)
+from .self_backend_aarch64_darwin_mem import (
+    emitted_compare_immediate_line,
+    emitted_compare_register_line,
+    emitted_cset_line,
+    emitted_memory_instruction_line,
 )
 from .self_backend_aarch64_darwin_ops import (
     aarch64_cc,
     emit_aggregate_bitwise_binop,
     emit_binop,
+    emit_binop_indexed,
     emit_cast,
+    emit_cast_indexed,
     emit_fbinop,
     emit_fcmp_result,
     sign_extend_int_reg,
+    sign_extend_int_reg_indexed,
 )
 from .self_backend_aarch64_darwin_regs import emit_add_offset, emit_const_to_reg
-from .self_backend_aarch64_darwin_regalloc import commit_allocated_scalar_result
+from .self_backend_aarch64_darwin_regalloc import (
+    commit_allocated_scalar_result,
+    commit_allocated_scalar_result_indexed,
+)
 from .self_backend_aarch64_darwin_slots import (
     copy_address_to_address,
     copy_address_to_slot,
+    copy_address_to_value_slot,
     emit_slot_base_address,
+    emit_slot_base_address_parts,
+    emit_value_slot_base_address,
     load_value_from_address,
     store_reg_to_slot,
+    store_reg_to_slot_parts,
+    store_reg_to_value_slot,
     store_value_to_address,
     store_value_regs_to_slot,
+    store_value_regs_to_value_slot,
     zero_address,
     zero_slot,
+    zero_value_slot,
 )
-from .self_backend_ir import I1, ParsedFunction, TypeDesc
+from .self_backend_ir import (
+    I1,
+    PARSED_INSTRUCTION_KIND_BINOP,
+    PARSED_INSTRUCTION_KIND_CALL,
+    PARSED_INSTRUCTION_KIND_CAST,
+    PARSED_INSTRUCTION_KIND_EXTRACTELEMENT,
+    PARSED_INSTRUCTION_KIND_EXTRACTVALUE,
+    PARSED_INSTRUCTION_KIND_FBINOP,
+    PARSED_INSTRUCTION_KIND_FCMP,
+    PARSED_INSTRUCTION_KIND_FNEG,
+    PARSED_INSTRUCTION_KIND_FREEZE,
+    PARSED_INSTRUCTION_KIND_GEP,
+    PARSED_INSTRUCTION_KIND_ICMP,
+    PARSED_INSTRUCTION_KIND_INSERTELEMENT,
+    PARSED_INSTRUCTION_KIND_INSERTVALUE,
+    PARSED_INSTRUCTION_KIND_SELECT,
+    PARSED_INSTRUCTION_KIND_SHUFFLEVECTOR,
+    PARSED_INSTRUCTION_KIND_VA_ARG,
+    ParsedFunction,
+    TypeDesc,
+    parsed_function_has_alloca_slot,
+    parsed_function_has_value_slot,
+    parsed_function_alloca_slot_offset,
+    parsed_function_alloca_slot_type,
+    parsed_function_value_slot_id,
+    parsed_function_value_slot_offset,
+    parsed_function_value_slot_type,
+    _PARSED_INSTRUCTION_KIND_IDS,
+)
 from .self_backend_module_symbols import PreparedModuleSymbols
 from .self_backend_parse import (
     aggregate_literal_to_bytes,
@@ -47,6 +107,13 @@ from .self_backend_target_passes import (
     aarch64_madd_fusion_for_product,
     aarch64_madd_fusion_for_result,
 )
+from .self_backend_value_arena import CompilerInt4
+from .self_backend_kernel import (
+    TYPE_KIND_FP,
+    TYPE_KIND_INT,
+    TYPE_KIND_PTR,
+    IndexedFunctionKernel,
+)
 
 
 def _commit_or_spill_scalar_result(
@@ -54,13 +121,70 @@ def _commit_or_spill_scalar_result(
     dest: str,
     value_type: TypeDesc,
     source_reg: str,
+    dest_value_id: int = -1,
 ) -> list[str]:
     allocated_lines = commit_allocated_scalar_result(
         func, dest, value_type, source_reg
     )
     if allocated_lines is not None:
         return allocated_lines
-    return store_reg_to_slot(source_reg, func.value_slots[dest])
+    if func.indexed_slot_projection:
+        slot_id = (
+            parsed_function_value_slot_id(func, dest)
+            if dest_value_id < 0
+            else func.indexed_kernel.value_slot_id(dest_value_id)
+        )
+        if slot_id < 0:
+            raise BackendUnavailable(
+                f"indexed value slot is missing for {dest!r} in {func.name!r}"
+            )
+        kernel = func.indexed_kernel
+        return store_reg_to_slot_parts(
+            source_reg,
+            kernel.slot_offset(slot_id),
+            kernel.type_desc(kernel.slot_type_id(slot_id)),
+        )
+    return store_reg_to_value_slot(source_reg, func, dest)
+
+
+def _commit_or_spill_scalar_result_indexed(
+    func: ParsedFunction,
+    kernel: IndexedFunctionKernel,
+    dest_value_id: int,
+    type_id: int,
+    source_reg: str,
+) -> list[str]:
+    allocated_lines = commit_allocated_scalar_result_indexed(
+        func,
+        dest_value_id,
+        type_id,
+        source_reg,
+    )
+    if allocated_lines is not None:
+        return allocated_lines
+    slot_id = kernel.value_slot_id(dest_value_id)
+    if slot_id < 0:
+        raise BackendUnavailable(
+            "indexed value slot is missing for "
+            + repr(kernel.value_name(dest_value_id))
+            + " in "
+            + repr(func.name)
+        )
+    header: CompilerInt4 = kernel.type_header(type_id)
+    if header.first == TYPE_KIND_INT and header.second <= 8:
+        op = "sturb"
+    elif header.first == TYPE_KIND_INT and header.second <= 16:
+        op = "sturh"
+    else:
+        op = "stur"
+    offset = kernel.slot_offset(slot_id)
+    if offset > 255:
+        lines = emit_slot_base_address_parts(offset, "x15")
+        lines.append(emitted_memory_instruction_line(op, source_reg, "x15"))
+        return lines
+    return [
+        emitted_memory_instruction_line(op, source_reg, "x29", -offset)
+    ]
 
 
 def _vector_lane_stride(vector_type: TypeDesc) -> tuple[TypeDesc, int]:
@@ -90,24 +214,31 @@ def _emit_vector_storage_address(
     *,
     scratch_reg: str,
 ) -> list[str]:
-    if value in func.value_slots:
+    if parsed_function_has_value_slot(func, value):
         return emit_add_offset(
-            reg, "x29", -func.value_slots[value].offset, scratch_reg=scratch_reg
+            reg,
+            "x29",
+            -parsed_function_value_slot_offset(func, value),
+            scratch_reg=scratch_reg,
         )
     if (
-        value in func.alloca_slots
-        and func.alloca_slots[value].allocated_type.describe() == value_type.describe()
+        parsed_function_has_alloca_slot(func, value)
+        and parsed_function_alloca_slot_type(func, value).describe()
+        == value_type.describe()
     ):
         return emit_add_offset(
-            reg, "x29", -func.alloca_slots[value].offset, scratch_reg=scratch_reg
+            reg,
+            "x29",
+            -parsed_function_alloca_slot_offset(func, value),
+            scratch_reg=scratch_reg,
         )
     return materialize_aggregate_storage_address(func, value, value_type, reg)
 
 
 def _emit_slot_base_address_nonclobbering(
-    slot, reg: str, *, scratch_reg: str
+    offset: int, reg: str, *, scratch_reg: str
 ) -> list[str]:
-    return emit_add_offset(reg, "x29", -slot.offset, scratch_reg=scratch_reg)
+    return emit_add_offset(reg, "x29", -offset, scratch_reg=scratch_reg)
 
 
 def _emit_vector_int_binop(
@@ -120,18 +251,18 @@ def _emit_vector_int_binop(
     module_symbols: PreparedModuleSymbols,
 ) -> list[str]:
     lane_type, lane_stride = _vector_lane_stride(value_type)
-    dest_slot = func.value_slots[dest]
+    dest_offset = parsed_function_value_slot_offset(func, dest)
     lines: list[str] = []
     lhs_addr: str | None = None
     rhs_addr: str | None = None
-    if lhs in func.value_slots or lhs in func.alloca_slots:
+    if parsed_function_has_value_slot(func, lhs) or parsed_function_has_alloca_slot(func, lhs):
         lines.extend(
             _emit_vector_storage_address(
                 func, lhs, value_type, "x15", scratch_reg="x14"
             )
         )
         lhs_addr = "x15"
-    if rhs in func.value_slots or rhs in func.alloca_slots:
+    if parsed_function_has_value_slot(func, rhs) or parsed_function_has_alloca_slot(func, rhs):
         lines.extend(
             _emit_vector_storage_address(
                 func, rhs, value_type, "x16", scratch_reg="x14"
@@ -139,7 +270,7 @@ def _emit_vector_int_binop(
         )
         rhs_addr = "x16"
     lines.extend(
-        _emit_slot_base_address_nonclobbering(dest_slot, "x17", scratch_reg="x14")
+        _emit_slot_base_address_nonclobbering(dest_offset, "x17", scratch_reg="x14")
     )
     for lane_index in range(value_type.count):
         dst_addr = "x17"
@@ -256,19 +387,18 @@ def _emit_insertelement(
             f"self backend insertelement expects matching lane type in {func.name!r}: "
             f"{elem_type.describe()} into {vector_type.describe()}"
         )
-    if dest not in func.value_slots:
+    if not parsed_function_has_value_slot(func, dest):
         return []
     lane_index = int(index_value)
     if lane_index < 0 or lane_index >= vector_type.count:
         raise BackendUnavailable(
             f"self backend insertelement lane index out of range in {func.name!r}: {index_value}"
         )
-    dest_slot = func.value_slots[dest]
     if vector_value in {"poison", "zeroinitializer"}:
-        lines = zero_slot(dest_slot)
+        lines = zero_value_slot(func, dest)
     else:
-        lines = copy_large_aggregate_value_to_slot(
-            func, vector_value, vector_type, dest_slot, module_symbols=module_symbols
+        lines = copy_large_aggregate_value_to_value_slot(
+            func, vector_value, vector_type, dest, module_symbols=module_symbols
         )
     # Materialize the new element BEFORE computing the dest address.
     # ``materialize_value`` may pick ``x15`` as a scratch GPR via
@@ -278,7 +408,7 @@ def _emit_insertelement(
     # and the lane store ends up writing back into the *source* slot,
     # silently dropping the inserted element.
     lines.extend(materialize_value(func, elem_value, elem_type, 9, module_symbols))
-    lines.extend(emit_slot_base_address(dest_slot, "x15"))
+    lines.extend(emit_value_slot_base_address(func, dest, "x15"))
     if lane_index:
         lines.extend(emit_add_offset("x15", "x15", lane_index * lane_stride))
     lines.extend(store_value_to_address("x15", elem_type, 9))
@@ -304,14 +434,13 @@ def _emit_extractelement(
         raise BackendUnavailable(
             f"self backend extractelement lane index out of range in {func.name!r}: {index_value}"
         )
-    dest_slot = func.value_slots[dest]
     lines = materialize_aggregate_storage_address(
         func, vector_value, vector_type, "x15"
     )
     if lane_index:
         lines.extend(emit_add_offset("x15", "x15", lane_index * lane_stride))
     lines.extend(load_value_from_address("x15", elem_type, 10))
-    lines.extend(store_reg_to_slot(reg_name(elem_type, 10), dest_slot))
+    lines.extend(store_reg_to_value_slot(reg_name(elem_type, 10), func, dest))
     return lines
 
 
@@ -351,7 +480,7 @@ def _emit_shufflevector(
             raise BackendUnavailable(
                 f"self backend shufflevector rhs lane type/count mismatch in {func.name!r}: {rhs_type.describe()}"
             )
-        if rhs not in func.value_slots and rhs not in func.alloca_slots:
+        if not parsed_function_has_value_slot(func, rhs) and not parsed_function_has_alloca_slot(func, rhs):
             raise BackendUnavailable(
                 f"self backend shufflevector rhs form not translated yet in {func.name!r}: {rhs}"
             )
@@ -360,9 +489,9 @@ def _emit_shufflevector(
         raise BackendUnavailable(
             f"self backend shufflevector currently expects result lane count to match mask lane count in {func.name!r}"
         )
-    if dest not in func.value_slots:
+    if not parsed_function_has_value_slot(func, dest):
         return []
-    dest_slot = func.value_slots[dest]
+    dest_offset = parsed_function_value_slot_offset(func, dest)
     lines = _emit_vector_storage_address(
         func, lhs, source_type, "x15", scratch_reg="x14"
     )
@@ -374,7 +503,7 @@ def _emit_shufflevector(
             )
         )
     lines.extend(
-        _emit_slot_base_address_nonclobbering(dest_slot, "x17", scratch_reg="x14")
+        _emit_slot_base_address_nonclobbering(dest_offset, "x17", scratch_reg="x14")
     )
     if mask_value == "zeroinitializer":
         mask_indices = [0] * vector_type.count
@@ -450,12 +579,12 @@ def _emit_vector_cast(
             f"self backend vector cast currently requires same lane count in {func.name!r}: "
             f"{src_type.describe()} -> {dst_type.describe()}"
         )
-    dest_slot = func.value_slots[dest]
+    dest_offset = parsed_function_value_slot_offset(func, dest)
     lines = _emit_vector_storage_address(
         func, value, src_type, "x15", scratch_reg="x14"
     )
     lines.extend(
-        _emit_slot_base_address_nonclobbering(dest_slot, "x17", scratch_reg="x14")
+        _emit_slot_base_address_nonclobbering(dest_offset, "x17", scratch_reg="x14")
     )
     for lane_index in range(src_type.count):
         src_addr = "x15"
@@ -494,20 +623,20 @@ def _emit_vector_select(
             f"self backend vector select expects matching vector-i1 condition in {func.name!r}: {cond}"
         )
     cond_stride = _vector_lane_stride(cond_type)[1]
-    dest_slot = func.value_slots[dest]
+    dest_offset = parsed_function_value_slot_offset(func, dest)
     lines = _emit_vector_storage_address(
         func, cond, cond_type, "x15", scratch_reg="x12"
     )
     true_addr: str | None = None
     false_addr: str | None = None
-    if true_value in func.value_slots or true_value in func.alloca_slots:
+    if parsed_function_has_value_slot(func, true_value) or parsed_function_has_alloca_slot(func, true_value):
         lines.extend(
             _emit_vector_storage_address(
                 func, true_value, value_type, "x16", scratch_reg="x12"
             )
         )
         true_addr = "x16"
-    if false_value in func.value_slots or false_value in func.alloca_slots:
+    if parsed_function_has_value_slot(func, false_value) or parsed_function_has_alloca_slot(func, false_value):
         lines.extend(
             _emit_vector_storage_address(
                 func, false_value, value_type, "x17", scratch_reg="x12"
@@ -515,7 +644,7 @@ def _emit_vector_select(
         )
         false_addr = "x17"
     lines.extend(
-        _emit_slot_base_address_nonclobbering(dest_slot, "x14", scratch_reg="x12")
+        _emit_slot_base_address_nonclobbering(dest_offset, "x14", scratch_reg="x12")
     )
     for lane_index in range(value_type.count):
         cond_addr = "x15"
@@ -550,7 +679,7 @@ def _emit_vector_select(
                 module_symbols,
             )
         )
-        lines.append("  cmp w9, #0")
+        lines.append(emitted_compare_immediate_line("w9", 0))
         lines.append(
             f"  csel {reg_name(lane_type, 12)}, {reg_name(lane_type, 10)}, {reg_name(lane_type, 11)}, ne"
         )
@@ -567,7 +696,6 @@ def _emit_aggregate_select(
     false_value: str,
     module_symbols: PreparedModuleSymbols,
 ) -> list[str]:
-    dest_slot = func.value_slots[dest]
     cond_type = func.value_types.get(cond, I1)
     if not cond_type.is_int:
         raise BackendUnavailable(
@@ -580,8 +708,8 @@ def _emit_aggregate_select(
     lines.extend(
         materialize_aggregate_storage_address(func, false_value, value_type, "x11")
     )
-    lines.extend(emit_slot_base_address(dest_slot, "x12"))
-    lines.append("  cmp w9, #0")
+    lines.extend(emit_value_slot_base_address(func, dest, "x12"))
+    lines.append(emitted_compare_immediate_line("w9", 0))
     lines.append("  csel x13, x10, x11, ne")
     lines.extend(copy_address_to_address("x13", "x12", value_type.slot_size))
     return lines
@@ -612,14 +740,14 @@ def _emit_vector_icmp(
     lines: list[str] = []
     lhs_addr: str | None = None
     rhs_addr: str | None = None
-    if lhs in func.value_slots or lhs in func.alloca_slots:
+    if parsed_function_has_value_slot(func, lhs) or parsed_function_has_alloca_slot(func, lhs):
         lines.extend(
             _emit_vector_storage_address(
                 func, lhs, value_type, "x15", scratch_reg="x14"
             )
         )
         lhs_addr = "x15"
-    if rhs in func.value_slots or rhs in func.alloca_slots:
+    if parsed_function_has_value_slot(func, rhs) or parsed_function_has_alloca_slot(func, rhs):
         lines.extend(
             _emit_vector_storage_address(
                 func, rhs, value_type, "x16", scratch_reg="x14"
@@ -628,7 +756,9 @@ def _emit_vector_icmp(
         rhs_addr = "x16"
     lines.extend(
         _emit_slot_base_address_nonclobbering(
-            func.value_slots[dest], "x17", scratch_reg="x14"
+            parsed_function_value_slot_offset(func, dest),
+            "x17",
+            scratch_reg="x14",
         )
     )
     for lane_index in range(value_type.count):
@@ -663,8 +793,13 @@ def _emit_vector_icmp(
         if cond in {"slt", "sle", "sgt", "sge"}:
             lines.extend(sign_extend_int_reg(lane_type, reg_name(lane_type, 9)))
             lines.extend(sign_extend_int_reg(lane_type, reg_name(lane_type, 10)))
-        lines.append(f"  cmp {reg_name(lane_type, 9)}, {reg_name(lane_type, 10)}")
-        lines.append(f"  cset w11, {aarch64_cc(cond)}")
+        lines.append(
+            emitted_compare_register_line(
+                reg_name(lane_type, 9),
+                reg_name(lane_type, 10),
+            )
+        )
+        lines.append(emitted_cset_line("w11", aarch64_cc(cond)))
         lines.extend(store_value_to_address(dst_addr, I1, 11))
     return lines
 
@@ -698,14 +833,14 @@ def _emit_vector_fcmp(
     lines: list[str] = []
     lhs_addr: str | None = None
     rhs_addr: str | None = None
-    if lhs in func.value_slots or lhs in func.alloca_slots:
+    if parsed_function_has_value_slot(func, lhs) or parsed_function_has_alloca_slot(func, lhs):
         lines.extend(
             _emit_vector_storage_address(
                 func, lhs, value_type, "x15", scratch_reg="x14"
             )
         )
         lhs_addr = "x15"
-    if rhs in func.value_slots or rhs in func.alloca_slots:
+    if parsed_function_has_value_slot(func, rhs) or parsed_function_has_alloca_slot(func, rhs):
         lines.extend(
             _emit_vector_storage_address(
                 func, rhs, value_type, "x16", scratch_reg="x14"
@@ -714,7 +849,9 @@ def _emit_vector_fcmp(
         rhs_addr = "x16"
     lines.extend(
         _emit_slot_base_address_nonclobbering(
-            func.value_slots[dest], "x17", scratch_reg="x14"
+            parsed_function_value_slot_offset(func, dest),
+            "x17",
+            scratch_reg="x14",
         )
     )
     for lane_index in range(value_type.count):
@@ -762,16 +899,15 @@ def _emit_insertvalue(
     offset: int,
     module_symbols: PreparedModuleSymbols,
 ) -> list[str]:
-    dest_slot = func.value_slots[dest]
     if aggregate_value in {"zeroinitializer", "poison", "undef"}:
-        lines = zero_slot(dest_slot)
+        lines = zero_value_slot(func, dest)
     elif aggregate_fits_reg_abi(aggregate_type):
         lines = materialize_value(
             func, aggregate_value, aggregate_type, 9, module_symbols
         )
-        lines.extend(store_value_regs_to_slot(dest_slot, 9))
+        lines.extend(store_value_regs_to_value_slot(func, dest, 9))
     elif is_aggregate_literal_value(aggregate_value):
-        lines = emit_slot_base_address(dest_slot, "x15")
+        lines = emit_value_slot_base_address(func, dest, "x15")
         lines.extend(
             store_large_aggregate_literal_to_address(
                 aggregate_type,
@@ -781,15 +917,15 @@ def _emit_insertvalue(
             )
         )
     else:
-        lines = copy_large_aggregate_value_to_slot(
+        lines = copy_large_aggregate_value_to_value_slot(
             func,
             aggregate_value,
             aggregate_type,
-            dest_slot,
+            dest,
             module_symbols=module_symbols,
         )
     if elem_type.is_array or elem_type.is_struct:
-        lines.extend(emit_slot_base_address(dest_slot, "x15"))
+        lines.extend(emit_value_slot_base_address(func, dest, "x15"))
         if offset:
             lines.extend(emit_add_offset("x15", "x15", offset))
         if elem_value in {"zeroinitializer", "poison", "undef"}:
@@ -811,21 +947,170 @@ def _emit_insertvalue(
         lines.extend(copy_address_to_address("x16", "x15", elem_type.slot_size))
         return lines
     lines.extend(materialize_value(func, elem_value, elem_type, 9, module_symbols))
-    lines.extend(emit_slot_base_address(dest_slot, "x15"))
+    lines.extend(emit_value_slot_base_address(func, dest, "x15"))
     if offset:
         lines.extend(emit_add_offset("x15", "x15", offset))
     lines.extend(store_value_to_address("x15", elem_type, 9))
     return lines
 
 
-def emit_compute_instruction(
+def emit_compute_instruction_by_id(
     func: ParsedFunction,
-    kind: str,
+    kind_id: int,
     data: tuple,
     module_symbols: PreparedModuleSymbols,
+    *,
+    indexed_kernel: IndexedFunctionKernel | None = None,
+    block_id: int = -1,
+    instruction_index: int = -1,
+    indexed_dest_id: int = -1,
+    indexed_use_count: int = -1,
+    indexed_use0: int = -1,
+    indexed_use_tail: int = -1,
 ) -> list[str] | None:
-    if kind == "binop":
-        op, dest, value_type, lhs, rhs = data
+    if (
+        indexed_dest_id < 0
+        and indexed_kernel is not None
+        and block_id >= 0
+        and instruction_index >= 0
+    ):
+        indexed_dest_id = indexed_kernel.defined_value_id(
+            block_id, instruction_index
+        )
+    indexed_dest_has_slot = bool(
+        indexed_kernel is not None
+        and indexed_dest_id >= 0
+        and indexed_kernel.value_slot_id(indexed_dest_id) >= 0
+    )
+    if kind_id == PARSED_INSTRUCTION_KIND_BINOP:
+        if indexed_kernel is not None:
+            binop_record: CompilerInt4 = indexed_kernel.instruction_record(data)
+            op = indexed_kernel.call_texts[binop_record.first]
+            dest = indexed_kernel.value_name(indexed_dest_id)
+            value_type_id = binop_record.second
+            value_type_header: CompilerInt4 = indexed_kernel.type_header(
+                value_type_id
+            )
+            lhs = (
+                indexed_kernel.value_name(binop_record.third)
+                if binop_record.third >= 0
+                else indexed_kernel.call_texts[-binop_record.third - 1]
+            )
+            rhs = (
+                indexed_kernel.value_name(binop_record.fourth)
+                if binop_record.fourth >= 0
+                else indexed_kernel.call_texts[-binop_record.fourth - 1]
+            )
+            if value_type_header.first == TYPE_KIND_INT:
+                if (
+                    op == "mul"
+                    and value_type_header.second == 64
+                    and aarch64_madd_fusion_for_product(func, dest) is not None
+                ):
+                    return []
+                if not indexed_dest_has_slot:
+                    return []
+                fusion = None
+                if value_type_header.second == 64:
+                    fusion = aarch64_madd_fusion_for_result(func, dest)
+                if fusion is not None:
+                    lines = materialize_scalar_value_indexed(
+                        func,
+                        indexed_kernel,
+                        fusion.mul_lhs,
+                        value_type_id,
+                        9,
+                        module_symbols,
+                        value_id=indexed_kernel.value_id(fusion.mul_lhs),
+                    )
+                    lines.extend(
+                        materialize_scalar_value_indexed(
+                            func,
+                            indexed_kernel,
+                            fusion.mul_rhs,
+                            value_type_id,
+                            10,
+                            module_symbols,
+                            value_id=indexed_kernel.value_id(fusion.mul_rhs),
+                        )
+                    )
+                    lines.extend(
+                        materialize_scalar_value_indexed(
+                            func,
+                            indexed_kernel,
+                            fusion.accumulator,
+                            value_type_id,
+                            12,
+                            module_symbols,
+                            value_id=indexed_kernel.value_id(
+                                fusion.accumulator
+                            ),
+                        )
+                    )
+                    lines.append(
+                        f"  {fusion.mnemonic} x11, x9, x10, x12"
+                    )
+                    lines.extend(
+                        _commit_or_spill_scalar_result_indexed(
+                            func,
+                            indexed_kernel,
+                            indexed_dest_id,
+                            value_type_id,
+                            "x11",
+                        )
+                    )
+                    return lines
+                lines = materialize_scalar_value_indexed(
+                    func,
+                    indexed_kernel,
+                    lhs,
+                    value_type_id,
+                    9,
+                    module_symbols,
+                    value_id=binop_record.third,
+                )
+                lines.extend(
+                    materialize_scalar_value_indexed(
+                        func,
+                        indexed_kernel,
+                        rhs,
+                        value_type_id,
+                        10,
+                        module_symbols,
+                        value_id=binop_record.fourth,
+                    )
+                )
+                if op in {"sdiv", "srem", "ashr"}:
+                    lines.extend(
+                        sign_extend_int_reg_indexed(
+                            indexed_kernel,
+                            value_type_id,
+                            reg_name_indexed(indexed_kernel, value_type_id, 9),
+                        )
+                    )
+                    lines.extend(
+                        sign_extend_int_reg_indexed(
+                            indexed_kernel,
+                            value_type_id,
+                            reg_name_indexed(indexed_kernel, value_type_id, 10),
+                        )
+                    )
+                lines.extend(
+                    emit_binop_indexed(indexed_kernel, op, value_type_id)
+                )
+                lines.extend(
+                    _commit_or_spill_scalar_result_indexed(
+                        func,
+                        indexed_kernel,
+                        indexed_dest_id,
+                        value_type_id,
+                        reg_name_indexed(indexed_kernel, value_type_id, 11),
+                    )
+                )
+                return lines
+            value_type = indexed_kernel.type_desc(value_type_id)
+        else:
+            op, dest, value_type, lhs, rhs = data
         if (
             op == "mul"
             and value_type.is_int
@@ -834,7 +1119,7 @@ def emit_compute_instruction(
         ):
             # The single consumer emits the multiply and add/sub together.
             return []
-        if dest not in func.value_slots:
+        if not (indexed_dest_has_slot if indexed_kernel is not None else parsed_function_has_value_slot(func, dest)):
             return []
         fusion = None
         if value_type.is_int and value_type.width == 64:
@@ -855,7 +1140,9 @@ def emit_compute_instruction(
             )
             lines.append(f"  {fusion.mnemonic} x11, x9, x10, x12")
             lines.extend(
-                _commit_or_spill_scalar_result(func, dest, value_type, "x11")
+                _commit_or_spill_scalar_result(
+                    func, dest, value_type, "x11", indexed_dest_id
+                )
             )
             return lines
         if (
@@ -878,7 +1165,7 @@ def emit_compute_instruction(
                     dest_start=13,
                 )
             )
-            lines.extend(store_value_regs_to_slot(func.value_slots[dest], 13))
+            lines.extend(store_value_regs_to_value_slot(func, dest, 13))
             return lines
         lines = materialize_value(func, lhs, value_type, 9, module_symbols)
         lines.extend(materialize_value(func, rhs, value_type, 10, module_symbols))
@@ -888,37 +1175,120 @@ def emit_compute_instruction(
         lines.extend(emit_binop(op, value_type))
         lines.extend(
             _commit_or_spill_scalar_result(
-                func, dest, value_type, reg_name(value_type, 11)
+                func,
+                dest,
+                value_type,
+                reg_name(value_type, 11),
+                indexed_dest_id,
             )
         )
         return lines
 
-    if kind == "fbinop":
+    if kind_id == PARSED_INSTRUCTION_KIND_FBINOP:
         op, dest, value_type, lhs, rhs = data
-        if dest not in func.value_slots:
+        if not (indexed_dest_has_slot if indexed_kernel is not None else parsed_function_has_value_slot(func, dest)):
             return []
         lines = materialize_value(func, lhs, value_type, 9, module_symbols)
         lines.extend(materialize_value(func, rhs, value_type, 10, module_symbols))
         lines.extend(emit_fbinop(op, value_type))
         lines.extend(
-            store_reg_to_slot(reg_name(value_type, 11), func.value_slots[dest])
+            store_reg_to_value_slot(reg_name(value_type, 11), func, dest)
         )
         return lines
 
-    if kind == "fneg":
+    if kind_id == PARSED_INSTRUCTION_KIND_FNEG:
         dest, value_type, value = data
-        if dest not in func.value_slots:
+        if not (indexed_dest_has_slot if indexed_kernel is not None else parsed_function_has_value_slot(func, dest)):
             return []
         lines = materialize_value(func, value, value_type, 9, module_symbols)
         lines.append(f"  fneg {reg_name(value_type, 11)}, {reg_name(value_type, 9)}")
         lines.extend(
-            store_reg_to_slot(reg_name(value_type, 11), func.value_slots[dest])
+            store_reg_to_value_slot(reg_name(value_type, 11), func, dest)
         )
         return lines
 
-    if kind == "icmp":
-        cond, dest, value_type, lhs, rhs = data
-        if dest not in func.value_slots:
+    if kind_id == PARSED_INSTRUCTION_KIND_ICMP:
+        if indexed_kernel is not None:
+            icmp_record: CompilerInt4 = indexed_kernel.instruction_record(data)
+            cond = indexed_kernel.call_texts[icmp_record.first]
+            dest = indexed_kernel.value_name(indexed_dest_id)
+            value_type_id = icmp_record.second
+            value_type_header: CompilerInt4 = indexed_kernel.type_header(
+                value_type_id
+            )
+            lhs = (
+                indexed_kernel.value_name(icmp_record.third)
+                if icmp_record.third >= 0
+                else indexed_kernel.call_texts[-icmp_record.third - 1]
+            )
+            rhs = (
+                indexed_kernel.value_name(icmp_record.fourth)
+                if icmp_record.fourth >= 0
+                else indexed_kernel.call_texts[-icmp_record.fourth - 1]
+            )
+            if value_type_header.first in (TYPE_KIND_INT, TYPE_KIND_PTR):
+                if not indexed_dest_has_slot:
+                    return []
+                lines = materialize_scalar_value_indexed(
+                    func,
+                    indexed_kernel,
+                    lhs,
+                    value_type_id,
+                    9,
+                    module_symbols,
+                    value_id=icmp_record.third,
+                )
+                lines.extend(
+                    materialize_scalar_value_indexed(
+                        func,
+                        indexed_kernel,
+                        rhs,
+                        value_type_id,
+                        10,
+                        module_symbols,
+                        value_id=icmp_record.fourth,
+                    )
+                )
+                if (
+                    value_type_header.first == TYPE_KIND_INT
+                    and cond in {"slt", "sle", "sgt", "sge"}
+                ):
+                    lines.extend(
+                        sign_extend_int_reg_indexed(
+                            indexed_kernel,
+                            value_type_id,
+                            reg_name_indexed(indexed_kernel, value_type_id, 9),
+                        )
+                    )
+                    lines.extend(
+                        sign_extend_int_reg_indexed(
+                            indexed_kernel,
+                            value_type_id,
+                            reg_name_indexed(indexed_kernel, value_type_id, 10),
+                        )
+                    )
+                lines.append(
+                    emitted_compare_register_line(
+                        reg_name_indexed(indexed_kernel, value_type_id, 9),
+                        reg_name_indexed(indexed_kernel, value_type_id, 10),
+                    )
+                )
+                lines.append(emitted_cset_line("w11", aarch64_cc(cond)))
+                result_type_id = indexed_kernel.value_type_id(indexed_dest_id)
+                lines.extend(
+                    _commit_or_spill_scalar_result_indexed(
+                        func,
+                        indexed_kernel,
+                        indexed_dest_id,
+                        result_type_id,
+                        "w11",
+                    )
+                )
+                return lines
+            value_type = indexed_kernel.type_desc(value_type_id)
+        else:
+            cond, dest, value_type, lhs, rhs = data
+        if not (indexed_dest_has_slot if indexed_kernel is not None else parsed_function_has_value_slot(func, dest)):
             return []
         if (
             value_type.is_array
@@ -933,14 +1303,23 @@ def emit_compute_instruction(
         if value_type.is_int and cond in {"slt", "sle", "sgt", "sge"}:
             lines.extend(sign_extend_int_reg(value_type, reg_name(value_type, 9)))
             lines.extend(sign_extend_int_reg(value_type, reg_name(value_type, 10)))
-        lines.append(f"  cmp {reg_name(value_type, 9)}, {reg_name(value_type, 10)}")
-        lines.append(f"  cset w11, {aarch64_cc(cond)}")
-        lines.extend(_commit_or_spill_scalar_result(func, dest, I1, "w11"))
+        lines.append(
+            emitted_compare_register_line(
+                reg_name(value_type, 9),
+                reg_name(value_type, 10),
+            )
+        )
+        lines.append(emitted_cset_line("w11", aarch64_cc(cond)))
+        lines.extend(
+            _commit_or_spill_scalar_result(
+                func, dest, I1, "w11", indexed_dest_id
+            )
+        )
         return lines
 
-    if kind == "fcmp":
+    if kind_id == PARSED_INSTRUCTION_KIND_FCMP:
         cond, dest, value_type, lhs, rhs = data
-        if dest not in func.value_slots:
+        if not (indexed_dest_has_slot if indexed_kernel is not None else parsed_function_has_value_slot(func, dest)):
             return []
         if (
             value_type.is_array
@@ -954,12 +1333,62 @@ def emit_compute_instruction(
         lines.extend(materialize_value(func, rhs, value_type, 10, module_symbols))
         lines.append(f"  fcmp {reg_name(value_type, 9)}, {reg_name(value_type, 10)}")
         lines.extend(emit_fcmp_result(cond))
-        lines.extend(store_reg_to_slot("w11", func.value_slots[dest]))
+        lines.extend(store_reg_to_value_slot("w11", func, dest))
         return lines
 
-    if kind == "cast":
-        op, dest, src_type, value, dst_type = data
-        if dest not in func.value_slots:
+    if kind_id == PARSED_INSTRUCTION_KIND_CAST:
+        if indexed_kernel is not None:
+            cast_record: CompilerInt4 = indexed_kernel.instruction_record(data)
+            op = indexed_kernel.call_texts[cast_record.first]
+            dest = indexed_kernel.value_name(indexed_dest_id)
+            src_type_id = cast_record.second
+            value = (
+                indexed_kernel.value_name(cast_record.third)
+                if cast_record.third >= 0
+                else indexed_kernel.call_texts[-cast_record.third - 1]
+            )
+            dst_type_id = cast_record.fourth
+            src_header: CompilerInt4 = indexed_kernel.type_header(src_type_id)
+            dst_header: CompilerInt4 = indexed_kernel.type_header(dst_type_id)
+            if (
+                src_header.first in (TYPE_KIND_INT, TYPE_KIND_FP, TYPE_KIND_PTR)
+                and dst_header.first
+                in (TYPE_KIND_INT, TYPE_KIND_FP, TYPE_KIND_PTR)
+            ):
+                if not indexed_dest_has_slot:
+                    return []
+                lines = materialize_scalar_value_indexed(
+                    func,
+                    indexed_kernel,
+                    value,
+                    src_type_id,
+                    9,
+                    module_symbols,
+                    value_id=cast_record.third,
+                )
+                lines.extend(
+                    emit_cast_indexed(
+                        indexed_kernel,
+                        op,
+                        src_type_id,
+                        dst_type_id,
+                    )
+                )
+                lines.extend(
+                    _commit_or_spill_scalar_result_indexed(
+                        func,
+                        indexed_kernel,
+                        indexed_dest_id,
+                        dst_type_id,
+                        reg_name_indexed(indexed_kernel, dst_type_id, 10),
+                    )
+                )
+                return lines
+            src_type = indexed_kernel.type_desc(src_type_id)
+            dst_type = indexed_kernel.type_desc(dst_type_id)
+        else:
+            op, dest, src_type, value, dst_type = data
+        if not (indexed_dest_has_slot if indexed_kernel is not None else parsed_function_has_value_slot(func, dest)):
             return []
         if (
             src_type.is_array
@@ -976,14 +1405,107 @@ def emit_compute_instruction(
         lines.extend(emit_cast(op, src_type, dst_type))
         lines.extend(
             _commit_or_spill_scalar_result(
-                func, dest, dst_type, reg_name(dst_type, 10)
+                func,
+                dest,
+                dst_type,
+                reg_name(dst_type, 10),
+                indexed_dest_id,
             )
         )
         return lines
 
-    if kind == "select":
-        dest, value_type, cond, true_value, false_value = data
-        if dest not in func.value_slots:
+    if kind_id == PARSED_INSTRUCTION_KIND_SELECT:
+        if indexed_kernel is not None:
+            select_record: CompilerInt4 = indexed_kernel.instruction_record(data)
+            dest = indexed_kernel.value_name(indexed_dest_id)
+            value_type_id = select_record.first
+            value_type_header: CompilerInt4 = indexed_kernel.type_header(
+                value_type_id
+            )
+            cond = (
+                indexed_kernel.value_name(select_record.second)
+                if select_record.second >= 0
+                else indexed_kernel.call_texts[-select_record.second - 1]
+            )
+            true_value = (
+                indexed_kernel.value_name(select_record.third)
+                if select_record.third >= 0
+                else indexed_kernel.call_texts[-select_record.third - 1]
+            )
+            false_value = (
+                indexed_kernel.value_name(select_record.fourth)
+                if select_record.fourth >= 0
+                else indexed_kernel.call_texts[-select_record.fourth - 1]
+            )
+            if value_type_header.first in (
+                TYPE_KIND_INT,
+                TYPE_KIND_FP,
+                TYPE_KIND_PTR,
+            ):
+                if not indexed_dest_has_slot:
+                    return []
+                cond_type_id = (
+                    indexed_kernel.value_type_id(select_record.second)
+                    if select_record.second >= 0
+                    else indexed_kernel.intern_type(I1)
+                )
+                lines = materialize_scalar_value_indexed(
+                    func,
+                    indexed_kernel,
+                    true_value,
+                    value_type_id,
+                    10,
+                    module_symbols,
+                    value_id=select_record.third,
+                )
+                lines.extend(
+                    materialize_scalar_value_indexed(
+                        func,
+                        indexed_kernel,
+                        false_value,
+                        value_type_id,
+                        11,
+                        module_symbols,
+                        value_id=select_record.fourth,
+                    )
+                )
+                lines.extend(
+                    materialize_scalar_value_indexed(
+                        func,
+                        indexed_kernel,
+                        cond,
+                        cond_type_id,
+                        9,
+                        module_symbols,
+                        value_id=select_record.second,
+                    )
+                )
+                lines.append(emitted_compare_immediate_line("w9", 0))
+                mnemonic = (
+                    "fcsel"
+                    if value_type_header.first == TYPE_KIND_FP
+                    else "csel"
+                )
+                lines.append(
+                    f"  {mnemonic} "
+                    f"{reg_name_indexed(indexed_kernel, value_type_id, 12)}, "
+                    f"{reg_name_indexed(indexed_kernel, value_type_id, 10)}, "
+                    f"{reg_name_indexed(indexed_kernel, value_type_id, 11)}, ne"
+                )
+                lines.extend(
+                    _commit_or_spill_scalar_result_indexed(
+                        func,
+                        indexed_kernel,
+                        indexed_dest_id,
+                        value_type_id,
+                        reg_name_indexed(indexed_kernel, value_type_id, 12),
+                    )
+                )
+                return lines
+            value_type = indexed_kernel.type_desc(value_type_id)
+        else:
+            dest, value_type, cond, true_value, false_value = data
+        if not (indexed_dest_has_slot if indexed_kernel is not None else parsed_function_has_value_slot(func, dest)):
             return []
         cond_type = func.value_types.get(cond, I1)
         if (
@@ -1004,7 +1526,7 @@ def emit_compute_instruction(
             materialize_value(func, false_value, value_type, 11, module_symbols)
         )
         lines.extend(materialize_value(func, cond, I1, 9, module_symbols))
-        lines.append("  cmp w9, #0")
+        lines.append(emitted_compare_immediate_line("w9", 0))
         if value_type.is_fp:
             lines.append(
                 f"  fcsel {reg_name(value_type, 12)}, {reg_name(value_type, 10)}, {reg_name(value_type, 11)}, ne"
@@ -1015,14 +1537,18 @@ def emit_compute_instruction(
             )
         lines.extend(
             _commit_or_spill_scalar_result(
-                func, dest, value_type, reg_name(value_type, 12)
+                func,
+                dest,
+                value_type,
+                reg_name(value_type, 12),
+                indexed_dest_id,
             )
         )
         return lines
 
-    if kind == "freeze":
+    if kind_id == PARSED_INSTRUCTION_KIND_FREEZE:
         dest, value_type, value = data
-        if dest not in func.value_slots:
+        if not (indexed_dest_has_slot if indexed_kernel is not None else parsed_function_has_value_slot(func, dest)):
             return []
         if value_type.is_array or value_type.is_struct:
             raise BackendUnavailable(
@@ -1032,12 +1558,16 @@ def emit_compute_instruction(
         lines = materialize_value(func, value, value_type, 10, module_symbols)
         lines.extend(
             _commit_or_spill_scalar_result(
-                func, dest, value_type, reg_name(value_type, 10)
+                func,
+                dest,
+                value_type,
+                reg_name(value_type, 10),
+                indexed_dest_id,
             )
         )
         return lines
 
-    if kind == "insertelement":
+    if kind_id == PARSED_INSTRUCTION_KIND_INSERTELEMENT:
         dest, vector_type, vector_value, elem_type, elem_value, index_value = data
         return _emit_insertelement(
             func,
@@ -1050,23 +1580,23 @@ def emit_compute_instruction(
             module_symbols,
         )
 
-    if kind == "shufflevector":
+    if kind_id == PARSED_INSTRUCTION_KIND_SHUFFLEVECTOR:
         dest, vector_type, lhs, rhs, mask_type, mask_value = data
         return _emit_shufflevector(
             func, dest, vector_type, lhs, rhs, mask_type, mask_value
         )
 
-    if kind == "extractelement":
+    if kind_id == PARSED_INSTRUCTION_KIND_EXTRACTELEMENT:
         dest, vector_type, vector_value, index_value, elem_type = data
-        if dest not in func.value_slots:
+        if not (indexed_dest_has_slot if indexed_kernel is not None else parsed_function_has_value_slot(func, dest)):
             return []
         return _emit_extractelement(
             func, dest, vector_type, vector_value, index_value, elem_type
         )
 
-    if kind == "extractvalue":
+    if kind_id == PARSED_INSTRUCTION_KIND_EXTRACTVALUE:
         dest, aggregate_type, value, _indices, result_type, offset = data
-        if dest not in func.value_slots:
+        if not (indexed_dest_has_slot if indexed_kernel is not None else parsed_function_has_value_slot(func, dest)):
             return []
         if is_aggregate_literal_value(value):
             literal_bytes = aggregate_literal_to_bytes(aggregate_type, value)
@@ -1075,24 +1605,23 @@ def emit_compute_instruction(
             lines = materialize_value(
                 func, field_value, result_type, 10, module_symbols
             )
-            lines.extend(store_value_regs_to_slot(func.value_slots[dest], 10))
+            lines.extend(store_value_regs_to_value_slot(func, dest, 10))
             return lines
-        source_slot = func.value_slots.get(value)
-        if source_slot is None:
+        if not parsed_function_has_value_slot(func, value):
             raise BackendUnavailable(
                 f"self backend extractvalue source not materialized in {func.name!r}: {value}"
             )
-        lines = emit_slot_base_address(source_slot, "x12")
+        lines = emit_value_slot_base_address(func, value, "x12")
         if offset:
             lines.extend(emit_add_offset("x12", "x12", offset))
         if result_type.is_array or result_type.is_struct:
-            lines.extend(copy_address_to_slot("x12", func.value_slots[dest]))
+            lines.extend(copy_address_to_value_slot("x12", func, dest))
             return lines
         lines.extend(load_value_from_address("x12", result_type, 10))
-        lines.extend(store_value_regs_to_slot(func.value_slots[dest], 10))
+        lines.extend(store_value_regs_to_value_slot(func, dest, 10))
         return lines
 
-    if kind == "insertvalue":
+    if kind_id == PARSED_INSTRUCTION_KIND_INSERTVALUE:
         (
             dest,
             aggregate_type,
@@ -1102,7 +1631,7 @@ def emit_compute_instruction(
             _indices,
             offset,
         ) = data
-        if dest not in func.value_slots:
+        if not (indexed_dest_has_slot if indexed_kernel is not None else parsed_function_has_value_slot(func, dest)):
             return []
         return _emit_insertvalue(
             func,
@@ -1115,24 +1644,86 @@ def emit_compute_instruction(
             module_symbols,
         )
 
-    if kind == "va_arg":
+    if kind_id == PARSED_INSTRUCTION_KIND_VA_ARG:
         dest, ap_type, ap, value_type = data
         return emit_va_arg(func, dest, ap_type, ap, value_type, module_symbols)
 
-    if kind == "gep":
-        dest, base_type, _ptr_type, ptr_value, indices = data
-        if dest not in func.value_slots:
+    if kind_id == PARSED_INSTRUCTION_KIND_GEP:
+        if indexed_kernel is not None:
+            gep_header: CompilerInt4 = indexed_kernel.gep_header(data)
+            gep_span: CompilerInt4 = indexed_kernel.gep_span(data)
+            dest = indexed_kernel.value_name(gep_span.third)
+            ptr_value = (
+                indexed_kernel.value_name(gep_header.third)
+                if gep_header.third >= 0
+                else indexed_kernel.call_texts[-gep_header.third - 1]
+            )
+        else:
+            dest, base_type, _ptr_type, ptr_value, indices = data
+        if not (indexed_dest_has_slot if indexed_kernel is not None else parsed_function_has_value_slot(func, dest)):
             return []
-        lines = materialize_pointer(func, ptr_value, 9, module_symbols)
-        lines.extend(emit_gep_offset(func, base_type, indices, module_symbols))
+        if indexed_kernel is not None:
+            lines = materialize_scalar_value_indexed(
+                func,
+                indexed_kernel,
+                ptr_value,
+                gep_header.second,
+                9,
+                module_symbols,
+                value_id=gep_header.third,
+            )
+            lines.extend(
+                emit_gep_offset_indexed(
+                    func,
+                    indexed_kernel,
+                    data,
+                    module_symbols,
+                )
+            )
+            lines.extend(
+                _commit_or_spill_scalar_result_indexed(
+                    func,
+                    indexed_kernel,
+                    indexed_dest_id,
+                    gep_span.second,
+                    "x11",
+                )
+            )
+            return lines
+        else:
+            lines = materialize_pointer(func, ptr_value, 9, module_symbols)
+            lines.extend(emit_gep_offset(func, base_type, indices, module_symbols))
         lines.extend(
             _commit_or_spill_scalar_result(
-                func, dest, func.value_slots[dest].type, "x11"
+                func,
+                dest,
+                (
+                    indexed_kernel.type_desc(
+                        indexed_kernel.value_slot_type_id(indexed_dest_id)
+                    )
+                    if indexed_dest_id >= 0
+                    else parsed_function_value_slot_type(func, dest)
+                ),
+                "x11",
+                indexed_dest_id,
             )
         )
         return lines
 
-    if kind == "call":
+    if kind_id == PARSED_INSTRUCTION_KIND_CALL:
+        if indexed_kernel is not None:
+            call_header: CompilerInt4 = indexed_kernel.call_header(data)
+            indexed_callee = indexed_kernel.call_texts[call_header.second]
+            if (call_header.third & 1) or not indexed_callee.startswith(
+                "llvm."
+            ):
+                return emit_call_instruction_indexed(
+                    func,
+                    indexed_kernel,
+                    data,
+                    module_symbols,
+                )
+            data = indexed_kernel.diagnostic_call_data(data)
         (
             dest,
             ret_type,
@@ -1154,6 +1745,43 @@ def emit_compute_instruction(
             is_vararg_call,
             arg_alignments,
             module_symbols,
+            dest_value_id=indexed_dest_id,
+            indexed_use_count=indexed_use_count,
+            indexed_use0=indexed_use0,
+            indexed_use_tail=indexed_use_tail,
         )
 
     return None
+
+
+def emit_compute_instruction(
+    func: ParsedFunction,
+    kind: str,
+    data: tuple,
+    module_symbols: PreparedModuleSymbols,
+    *,
+    indexed_kernel: IndexedFunctionKernel | None = None,
+    block_id: int = -1,
+    instruction_index: int = -1,
+    indexed_dest_id: int = -1,
+    indexed_use_count: int = -1,
+    indexed_use0: int = -1,
+    indexed_use_tail: int = -1,
+) -> list[str] | None:
+    """Legacy/text API; indexed consumers call the integer-ID entry."""
+    kind_id = _PARSED_INSTRUCTION_KIND_IDS.get(kind)
+    if kind_id is None:
+        return None
+    return emit_compute_instruction_by_id(
+        func,
+        kind_id,
+        data,
+        module_symbols,
+        indexed_kernel=indexed_kernel,
+        block_id=block_id,
+        instruction_index=instruction_index,
+        indexed_dest_id=indexed_dest_id,
+        indexed_use_count=indexed_use_count,
+        indexed_use0=indexed_use0,
+        indexed_use_tail=indexed_use_tail,
+    )

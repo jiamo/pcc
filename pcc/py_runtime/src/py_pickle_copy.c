@@ -226,7 +226,7 @@ static PyObject *copy_call_method_with_args(
         py_decref(a2);
         return out;
     }
-    py_raise(py_exc_new(PY_EXC_TYPEERROR, "too many native method args"));
+    py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "too many native method args"));
     return NULL;
 }
 
@@ -621,7 +621,7 @@ static PyObject *pickle_clone_from_reduce(PyObject *o) {
         || py_tuple_len(reduced) < 2
     ) {
         py_decref(reduced);
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "invalid __reduce__ result"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "invalid __reduce__ result"));
         return NULL;
     }
     PyObject *callable = py_tuple_get(reduced, 0);
@@ -634,7 +634,7 @@ static PyObject *pickle_clone_from_reduce(PyObject *o) {
         if (callable != NULL) py_decref(callable);
         if (args != NULL) py_decref(args);
         py_decref(reduced);
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "invalid __reduce__ args"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "invalid __reduce__ args"));
         return NULL;
     }
     PyObject *out = pickle_call_class(callable, args);
@@ -696,7 +696,7 @@ PyObject *py_pickle_dumps(PyObject *o, PyObject *protocol) {
     int64_t id = pickle_store_payload(payload);
     py_decref(payload);
     if (id == 0) {
-        py_raise(py_exc_new(PY_EXC_RUNTIMEERROR, "pickle registry allocation failed"));
+        py_raise_owned(py_exc_new(PY_EXC_RUNTIMEERROR, "pickle registry allocation failed"));
         return NULL;
     }
     const char *prefix = "PCCPICKLE:";
@@ -741,12 +741,12 @@ static int pickle_parse_id(PyObject *data, int64_t *id_out) {
 PyObject *py_pickle_loads(PyObject *data) {
     int64_t id = 0;
     if (pickle_parse_id(data, &id) != 0) {
-        py_raise(py_exc_new(PY_EXC_VALUEERROR, "unsupported pickle payload"));
+        py_raise_owned(py_exc_new(PY_EXC_VALUEERROR, "unsupported pickle payload"));
         return NULL;
     }
     PccPickleEntry *entry = pickle_find_payload(id);
     if (entry == NULL || entry->payload == NULL) {
-        py_raise(py_exc_new(PY_EXC_VALUEERROR, "unknown pickle payload"));
+        py_raise_owned(py_exc_new(PY_EXC_VALUEERROR, "unknown pickle payload"));
         return NULL;
     }
     return py_copy_deepcopy(entry->payload);

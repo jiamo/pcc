@@ -4,6 +4,9 @@ String-to-int parsing for int(str) / int(str, base). The arithmetic core
 stays in py_int.c for now; this module only parses an int64 payload and
 delegates canonical tagged-vs-heap construction to py_int_from_i64.
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.extern import extern, c_abi_export, c_ptr, c_int64, c_void, c_double
 from pcc.unsafe import cstr, load_i8, store_i8, malloc, free, strlen, null, ptr_is_null
 
@@ -18,6 +21,8 @@ py_float_to_f64  = extern("py_float_to_f64",  (c_ptr,),         c_double)
 py_obj_truthy    = extern("py_obj_truthy",    (c_ptr,),         c_int64)
 py_incref        = extern("py_incref",        (c_ptr,),         c_void)
 py_raise        = extern("py_raise",        (c_ptr,),         c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_exc_new      = extern("py_exc_new",      (c_int64, c_ptr), c_ptr)
 
 
@@ -349,7 +354,7 @@ def py_int_from_cstr_or_raise(s, base: int):
     # CPython-accurate repr of the whole original string.
     if base != 0:
         if base < 2 or base > 36:
-            py_raise(py_exc_new(2, cstr("int() base must be >= 2 and <= 36, or 0")))
+            py_raise_owned(py_exc_new(2, cstr("int() base must be >= 2 and <= 36, or 0")))
             return null()
     v = py_int_from_cstr(s, base)
     if ptr_is_null(v) == 0:
@@ -359,10 +364,10 @@ def py_int_from_cstr_or_raise(s, base: int):
         src = cstr("")
     msg = _build_bad_literal_message(src, base)
     if ptr_is_null(msg) == 0:
-        py_raise(py_exc_new(2, msg))  # PY_EXC_VALUEERROR
+        py_raise_owned(py_exc_new(2, msg))  # PY_EXC_VALUEERROR
         free(msg)
     else:
-        py_raise(py_exc_new(2, cstr("invalid literal for int()")))
+        py_raise_owned(py_exc_new(2, cstr("invalid literal for int()")))
     return null()
 
 

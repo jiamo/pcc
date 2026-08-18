@@ -3,6 +3,9 @@
 This module is used by the pcc-Python runtime archive. It also defines
 the argv globals consumed by the optional py_libpython bridge archive.
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.extern import extern, c_abi_export, c_int, c_int32, c_ptr, c_void
 from pcc.unsafe import (
     call_void_ptr0,

@@ -4,6 +4,9 @@ This owns the production ABI mirrored by ``src/py_protocol.c``: user dunder
 dispatch, generic floor/in-place operators, and inherited dict-subclass
 storage/methods.  The C source remains a host-C oracle.
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     C_POINTER_SIZE,
     PYCLASSOBJECT_N_FIELDS_OFFSET,
@@ -353,7 +356,7 @@ def py_user_bool_dispatch(obj, handled) -> int:
 @c_abi_export("py_obj_index_i64")
 def py_obj_index_i64(obj) -> int:
     if ptr_is_null(obj) != 0:
-        py_raise(py_exc_new(3, cstr("object cannot be interpreted as an integer")))
+        py_raise_owned(py_exc_new(3, cstr("object cannot be interpreted as an integer")))
         return 0
     if is_tagged_int(obj) != 0:
         return py_int_value_i64(obj)
@@ -366,7 +369,7 @@ def py_obj_index_i64(obj) -> int:
         return 0
     method = _lookup_dunder(obj, cstr("__index__"))
     if ptr_is_null(method) != 0:
-        py_raise(py_exc_new(3, cstr("object cannot be interpreted as an integer")))
+        py_raise_owned(py_exc_new(3, cstr("object cannot be interpreted as an integer")))
         return 0
     result = _call_unary(method, obj)
     if ptr_is_null(result) != 0:
@@ -380,7 +383,7 @@ def py_obj_index_i64(obj) -> int:
             return value
     else:
         py_decref(result)
-    py_raise(py_exc_new(3, cstr("__index__ returned non-int")))
+    py_raise_owned(py_exc_new(3, cstr("__index__ returned non-int")))
     return 0
 
 
@@ -408,15 +411,31 @@ def py_user_contains_dispatch(obj, item, handled) -> int:
 
 @c_abi_export("py_user_eq_dispatch")
 def py_user_eq_dispatch(a, b) -> int:
-    method = _lookup_dunder(a, cstr("__eq__"))
-    if ptr_is_null(method) != 0:
-        return -1
     depth_addr = global_addr("pcc_py_protocol_eq_depth")
     depth: int = load_i32(depth_addr, 0)
     if depth >= 64:
         return -1
+    method = _lookup_dunder(a, cstr("__eq__"))
+    if ptr_is_null(method) == 0:
+        store_i32(depth_addr, 0, depth + 1)
+        result = _call_binary(method, a, b)
+        store_i32(depth_addr, 0, depth)
+        if ptr_is_null(result) != 0:
+            return 0
+        if ptr_eq(result, global_load_ptr("py_NotImplemented")) == 0:
+            truth: int = py_obj_truthy(result)
+            py_decref(result)
+            if truth != 0:
+                return 1
+            return 0
+        py_decref(result)
+    if _type_of(a) == _type_of(b):
+        return -1
+    method = _lookup_dunder(b, cstr("__eq__"))
+    if ptr_is_null(method) != 0:
+        return -1
     store_i32(depth_addr, 0, depth + 1)
-    result = _call_binary(method, a, b)
+    result = _call_binary(method, b, a)
     store_i32(depth_addr, 0, depth)
     if ptr_is_null(result) != 0:
         return 0
@@ -454,7 +473,7 @@ def py_user_matmul_dispatch(a, b):
         if ptr_eq(result, global_load_ptr("py_NotImplemented")) == 0:
             return result
         py_decref(result)
-    py_raise(py_exc_new(3, cstr("unsupported operand type(s) for @")))
+    py_raise_owned(py_exc_new(3, cstr("unsupported operand type(s) for @")))
     return null()
 
 
@@ -472,14 +491,14 @@ def py_user_binop_dispatch(a, b, name, rname, type_err_msg):
         if ptr_eq(result, global_load_ptr("py_NotImplemented")) == 0:
             return result
         py_decref(result)
-    py_raise(py_exc_new(3, type_err_msg))
+    py_raise_owned(py_exc_new(3, type_err_msg))
     return null()
 
 
 @c_abi_export("py_obj_floordiv")
 def py_obj_floordiv(a, b):
     if ptr_is_null(a) != 0 or ptr_is_null(b) != 0:
-        py_raise(py_exc_new(3, cstr("unsupported operand type(s) for //")))
+        py_raise_owned(py_exc_new(3, cstr("unsupported operand type(s) for //")))
         return null()
     at: int = _type_of(a)
     bt: int = _type_of(b)
@@ -490,7 +509,7 @@ def py_obj_floordiv(a, b):
     if a_numeric != 0 and b_numeric != 0:
         divisor: float = py_float_to_f64(b)
         if divisor == 0.0:
-            py_raise(py_exc_new(9, cstr("float floor division by zero")))
+            py_raise_owned(py_exc_new(9, cstr("float floor division by zero")))
             return null()
         return py_float_from_f64(floor_c(py_float_to_f64(a) / divisor))
     if (
@@ -506,7 +525,7 @@ def py_obj_floordiv(a, b):
             cstr("__rfloordiv__"),
             cstr("unsupported operand type(s) for //"),
         )
-    py_raise(py_exc_new(3, cstr("unsupported operand type(s) for //")))
+    py_raise_owned(py_exc_new(3, cstr("unsupported operand type(s) for //")))
     return null()
 
 
@@ -556,7 +575,7 @@ def py_obj_inplace_op(a, b, op_code: int):
         return py_obj_floordiv(a, b)
     if op_code == 5:
         return py_obj_mod(a, b)
-    py_raise(py_exc_new(3, cstr("unsupported in-place operand")))
+    py_raise_owned(py_exc_new(3, cstr("unsupported in-place operand")))
     return null()
 
 

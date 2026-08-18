@@ -12,6 +12,8 @@ against a runnable oracle. Keep it in sync with the C file.
 """
 from __future__ import annotations
 
+__pcc_runtime_port__ = True
+
 import math
 
 

@@ -106,38 +106,35 @@ def _box_stmts(stmts, boxed):
             idx=IntLit(span=span, ty=int_ty, value=0),
         )
 
+    def box_target(target):
+        if isinstance(target, Name) and target.ident in boxed:
+            return make_sub(target.ident, target.span, target.ty)
+        return _box_expr(target, boxed)
+
     out = []
     for stmt in stmts:
-        if isinstance(stmt, Assign) and len(stmt.targets) == 1:
-            target = stmt.targets[0]
+        if isinstance(stmt, Assign):
             new_value = _box_expr(stmt.value, boxed)
-            if isinstance(target, Name) and target.ident in boxed:
-                out.append(
-                    _replace(
-                        stmt,
-                        targets=(make_sub(target.ident, target.span, target.ty),),
-                        value=new_value,
-                    )
+            new_targets = []
+            for target in stmt.targets:
+                new_targets.append(box_target(target))
+            out.append(
+                _replace(
+                    stmt,
+                    targets=tuple(new_targets),
+                    value=new_value,
                 )
-                continue
-            out.append(_replace(stmt, value=new_value))
+            )
             continue
         if isinstance(stmt, AugAssign):
             new_value = _box_expr(stmt.value, boxed)
-            if isinstance(stmt.target, Name) and stmt.target.ident in boxed:
-                out.append(
-                    _replace(
-                        stmt,
-                        target=make_sub(
-                            stmt.target.ident,
-                            stmt.target.span,
-                            stmt.target.ty,
-                        ),
-                        value=new_value,
-                    )
+            out.append(
+                _replace(
+                    stmt,
+                    target=box_target(stmt.target),
+                    value=new_value,
                 )
-                continue
-            out.append(_replace(stmt, value=new_value))
+            )
             continue
         if isinstance(stmt, If):
             out.append(
@@ -163,6 +160,7 @@ def _box_stmts(stmts, boxed):
             out.append(
                 _replace(
                     stmt,
+                    target=box_target(stmt.target),
                     iter=_box_expr(stmt.iter, boxed),
                     body=_box_stmts(stmt.body, boxed),
                     else_body=_box_stmts(stmt.else_body, boxed),

@@ -16,6 +16,8 @@ Owned surface (stable C ABI names):
   pcc_iobuf_free_count, pcc_iobuf_bucket_used
 """
 
+__pcc_runtime_port__ = True
+
 from pcc.extern import c_abi_typed_export, c_int64, c_ptr, c_void, extern
 from pcc.unsafe import (
     load_ptr,

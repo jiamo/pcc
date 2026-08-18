@@ -8,7 +8,10 @@ from pathlib import Path
 import pytest
 
 from pcc.py_frontend import pipeline
-from pcc.py_frontend.codegen.runtime_abi import FREESTANDING_GC_RUNTIME_GLOBALS
+from pcc.py_frontend.codegen.runtime_abi import (
+    FREESTANDING_GC_CROSS_OBJECT_SIGNATURES,
+    FREESTANDING_GC_RUNTIME_GLOBALS,
+)
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -51,6 +54,7 @@ RAW_FUNCTION_IMPORTS = {
     "pcc_gc_object_node_unlink",
     "pcc_gc_object_set_list_head",
     "pcc_gc_relocate_copy_payload",
+    "pcc_cpy_handle_move_owned_ref",
     "py_decref",
 }
 RAW_GLOBAL_IMPORTS = {
@@ -190,6 +194,39 @@ def test_generational_oldification_preserves_registration_and_rollback_order() -
     assert oldify.index("pcc_gc_backend3_young_unlink") < oldify.index(
         "pcc_gc_generational_mark_forwarded_source_inactive(from_obj)"
     )
+
+
+def test_generational_cpy_handle_oldification_moves_one_foreign_owner() -> None:
+    strict = STRICT_SOURCE.read_text(encoding="utf-8")
+    c_source = (RUNTIME_DIR / "src" / "py_gc_backend.c").read_text(
+        encoding="utf-8"
+    )
+    strict_oldify = _export_body(strict, "pcc_gc_generational_oldify_copy")
+    c_oldify = c_source.split(
+        "static PyObject *pcc_gc_generational_oldify_copy", 1
+    )[1].split("static void pcc_gc_promote_owner_referents", 1)[0]
+
+    assert "PY_TYPE_CPY_HANDLE" in strict
+    assert FREESTANDING_GC_CROSS_OBJECT_SIGNATURES[
+        "pcc_cpy_handle_move_owned_ref"
+    ] == (("c_ptr", "c_ptr"), "c_void")
+    for body, forward_move, rollback_move in (
+        (
+            strict_oldify,
+            "pcc_cpy_handle_move_owned_ref(from_obj, to_obj)",
+            "pcc_cpy_handle_move_owned_ref(to_obj, from_obj)",
+        ),
+        (
+            c_oldify,
+            "pcc_cpy_handle_move_owned_ref(from, to)",
+            "pcc_cpy_handle_move_owned_ref(to, from)",
+        ),
+    ):
+        payload = body.index("pcc_gc_relocate_copy_payload")
+        forward = body.index(forward_move)
+        install = body.index("pcc_gc_install_forwarding_unlocked")
+        rollback = body.index(rollback_move)
+        assert payload < forward < install < rollback
 
 
 def test_production_archive_has_one_generational_oldification_owner(

@@ -66,18 +66,20 @@ def _runtime_sources() -> list[Path]:
     )
 
 
-@pytest.mark.parametrize(
-    "src",
-    _runtime_sources(),
-    ids=lambda p: p.name,
-)
-def test_pcc_emits_object_for_runtime_source(tmp_path, src):
+def _emit_runtime_object(
+    tmp_path: Path,
+    src: Path,
+    *,
+    cpp_args: tuple[str, ...] = (),
+) -> Path:
     pcc_bin = _PCC_BIN
+    assert pcc_bin is not None, "pcc CLI is required by the module gate"
     obj_path = tmp_path / (src.stem + ".o")
     cmd = [
         pcc_bin,
         f"--cpp-arg=-I{RUNTIME_INC}",
         f"--cpp-arg=-I{RUNTIME_SRC}",
+        *(f"--cpp-arg={arg}" for arg in cpp_args),
         "--emit-obj",
         str(obj_path),
         str(src),
@@ -99,6 +101,97 @@ def test_pcc_emits_object_for_runtime_source(tmp_path, src):
     )
     assert obj_path.is_file(), f"missing object file {obj_path}"
     assert obj_path.stat().st_size > 0, f"empty object file {obj_path}"
+    return obj_path
+
+
+@pytest.mark.parametrize(
+    "src",
+    _runtime_sources(),
+    ids=lambda p: p.name,
+)
+def test_pcc_emits_object_for_runtime_source(tmp_path, src):
+    _emit_runtime_object(tmp_path, src)
+
+
+def test_pcc_c_thread_transition_tu_links_host_libc_abort(
+    tmp_path: Path,
+    c_runtime_archive: Path,
+):
+    """Prove only the host pcc-C transition TU and host-libc abort edge."""
+    threads_obj = _emit_runtime_object(
+        tmp_path,
+        RUNTIME_SRC / "pcc_threads.c",
+        cpp_args=("-DPCC_WITH_THREADS=0",),
+    )
+
+    nm_bin = shutil.which("nm")
+    assert nm_bin is not None, "nm is required for the transition-TU boundary gate"
+    undefined_result = subprocess.run(
+        [nm_bin, "-u", str(threads_obj)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert undefined_result.returncode == 0, (
+        undefined_result.stdout + undefined_result.stderr
+    )
+    undefined = {
+        name[1:] if name.startswith("_") else name
+        for line in undefined_result.stdout.splitlines()
+        if line.strip()
+        for name in [line.split()[-1]]
+    }
+    assert "abort" in undefined
+    assert "pcc_platform_abort" not in undefined
+
+    probe_src = tmp_path / "pcc_c_thread_transition_probe.c"
+    probe_exe = tmp_path / "pcc_c_thread_transition_probe.out"
+    probe_src.write_text(
+        """#include "py_runtime.h"
+
+int main(void) {
+    if (pcc_threads_enabled() != 0) return 1;
+    if (pcc_thread_no_park_depth() != 0) return 2;
+    pcc_thread_no_park_enter();
+    if (pcc_thread_no_park_depth() != 1) return 3;
+    pcc_thread_no_park_exit();
+    if (pcc_thread_no_park_depth() != 0) return 4;
+    return 0;
+}
+""",
+        encoding="utf-8",
+    )
+    env = dict(os.environ)
+    env.pop("LC_ALL", None)
+    link_result = subprocess.run(
+        [
+            os.environ.get("CC", "cc"),
+            "-std=c11",
+            f"-I{RUNTIME_INC}",
+            str(probe_src),
+            # Keep the pcc-emitted owner before the host-C dependency archive.
+            str(threads_obj),
+            str(c_runtime_archive),
+            "-lm",
+            "-o",
+            str(probe_exe),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        cwd=str(REPO_ROOT),
+        env=env,
+    )
+    assert link_result.returncode == 0, link_result.stdout + link_result.stderr
+    run_result = subprocess.run(
+        [str(probe_exe)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        cwd=str(REPO_ROOT),
+        env=env,
+    )
+    assert run_result.returncode == 0, run_result.stdout + run_result.stderr
 
 
 def test_runtime_source_inventory_has_expected_files():

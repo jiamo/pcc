@@ -44,6 +44,8 @@ preserves the same observable semantics the C poll fallback guarantees:
   * one-shot delivery: a delivered / timed-out fd is unregistered.
 """
 
+__pcc_runtime_port__ = True
+
 # POSIX poll event bits, matching pcc_vthread_fd_ready's use of poll(2) and the
 # oracle's constants. Inlined at use sites where needed (pcc-Python module-level
 # int constants can be zeroed in stripped library .o builds).

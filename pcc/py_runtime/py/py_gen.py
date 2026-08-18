@@ -1,4 +1,7 @@
 """pcc-Python port of py_gen.c."""
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_COROUTINE,
     PY_TYPE_GEN,
@@ -28,12 +31,18 @@ py_decref   = extern("py_decref",   (c_ptr,),         c_void)
 py_exc_new  = extern("py_exc_new",  (c_int64, c_ptr), c_ptr)
 py_exc_new_with_value = extern("py_exc_new_with_value", (c_int64, c_ptr), c_ptr)
 py_raise    = extern("py_raise",    (c_ptr,),         c_void)
+# py_raise increfs the exception it stores, so a caller that created it still
+# owns a reference.  py_raise_owned raises and releases that reference.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_coroutine_run = extern("py_coroutine_run", (c_ptr,), c_ptr)
 py_current_exception = extern("py_current_exception", (), c_ptr)
 py_clear_exception   = extern("py_clear_exception",   (), c_void)
 py_exc_builtin_class = extern("py_exc_builtin_class", (c_int64,), c_ptr)
 py_exc_matches       = extern("py_exc_matches",       (c_ptr, c_ptr), c_int64)
 py_gc_track          = extern("py_gc_track",          (c_ptr,),         c_void)
+pcc_gc_publish_initialized = extern(
+    "pcc_gc_publish_initialized", (c_ptr,), c_void
+)
 pcc_gc_alloc         = extern("pcc_gc_alloc",         (c_int64, c_int32, c_int32), c_ptr)
 pcc_gc_load_ptr      = extern("pcc_gc_load_ptr",      (c_ptr, c_ptr), c_ptr)
 pcc_gc_store_ptr     = extern("pcc_gc_store_ptr",     (c_ptr, c_ptr, c_ptr), c_void)
@@ -80,6 +89,7 @@ def py_gen_new(resume, frame):
     pcc_gc_store_ptr(g, ptr_add(g, 24), frame)
     pcc_gc_store_ptr(g, ptr_add(g, 48), global_load_ptr("py_None"))
     py_gc_track(g)
+    pcc_gc_publish_initialized(g)
     return g
 
 
@@ -97,15 +107,15 @@ def py_dealloc_gen(o) -> None:
 def _checked_gen(gen):
     if ptr_is_null(gen):
         exc = py_exc_new(3, null())
-        py_raise(exc)
+        py_raise_owned(exc)
         return null()
     if is_tagged_int(gen):
         exc = py_exc_new(3, null())
-        py_raise(exc)
+        py_raise_owned(exc)
         return null()
     if load_i32(gen, 8) != PY_TYPE_GEN:
         exc = py_exc_new(3, null())
-        py_raise(exc)
+        py_raise_owned(exc)
         return null()
     return gen
 
@@ -194,13 +204,13 @@ def py_gen_next(gen):
         return null()
     if load_i64(gen, 40) != 0:
         exc = py_exc_new(8, null())
-        py_raise(exc)
+        py_raise_owned(exc)
         return null()
     resume = load_ptr(gen, 16)
     frame = pcc_gc_load_ptr(gen, ptr_add(gen, 24))
     if ptr_is_null(resume):
         exc = py_exc_new(8, null())
-        py_raise(exc)
+        py_raise_owned(exc)
         return null()
     _set_send_value(gen, global_load_ptr("py_None"))
     return _require_result(
@@ -219,7 +229,7 @@ def py_gen_send(gen, value):
                 if not ptr_is_null(value):
                     if ptr_eq(value, none) == 0:
                         exc = py_exc_new(3, null())
-                        py_raise(exc)
+                        py_raise_owned(exc)
                         return null()
                 return _require_result(
                     py_coroutine_run(gen),
@@ -231,19 +241,19 @@ def py_gen_send(gen, value):
         return null()
     if load_i64(gen, 40) != 0:
         exc = py_exc_new(8, null())
-        py_raise(exc)
+        py_raise_owned(exc)
         return null()
     resume = load_ptr(gen, 16)
     frame = pcc_gc_load_ptr(gen, ptr_add(gen, 24))
     if ptr_is_null(resume):
         exc = py_exc_new(8, null())
-        py_raise(exc)
+        py_raise_owned(exc)
         return null()
     none = global_load_ptr("py_None")
     if load_i64(gen, 32) == 0 and not ptr_is_null(value):
         if ptr_eq(value, none) == 0:
             exc = py_exc_new(3, null())
-            py_raise(exc)
+            py_raise_owned(exc)
             return null()
     _set_send_value(gen, value)
     return _require_result(
@@ -260,13 +270,13 @@ def py_gen_throw(gen, exc):
         return null()
     if load_i64(gen, 40) != 0:
         stop = py_exc_new(8, null())
-        py_raise(stop)
+        py_raise_owned(stop)
         return null()
     resume = load_ptr(gen, 16)
     frame = pcc_gc_load_ptr(gen, ptr_add(gen, 24))
     if ptr_is_null(resume):
         stop = py_exc_new(8, null())
-        py_raise(stop)
+        py_raise_owned(stop)
         return null()
     _set_send_value(gen, global_load_ptr("py_None"))
     py_raise(exc)

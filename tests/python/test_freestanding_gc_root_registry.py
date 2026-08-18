@@ -29,6 +29,7 @@ PUBLIC_SYMBOLS = {
 }
 INTERNAL_SYMBOLS = {
     "pcc_gc_cycle_requested_store_release",
+    "pcc_gc_root_registry_note_mutation_locked",
     "pcc_gc_scheduler_root_link_locked",
     "pcc_gc_scheduler_root_unlink_locked",
     "pcc_gc_root_slot_count_from_map",
@@ -43,9 +44,14 @@ RAW_FUNCTION_IMPORTS = {
     "pcc_py_gc_minor_graph_unlock",
 }
 RAW_GLOBAL_IMPORTS = {
+    "pcc_gc_backend3_continuation_root_scan_cursor",
+    "pcc_gc_backend3_frame_root_scan_slot",
+    "pcc_gc_backend3_scheduler_root_scan_cursor",
+    "pcc_gc_backend3_scheduler_root_scan_slot",
     "pcc_gc_cycle_requested",
     "pcc_gc_scheduler_root_head",
     "pcc_gc_continuation_root_head",
+    "pcc_gc_root_registry_revision",
 }
 
 
@@ -99,6 +105,49 @@ def test_root_registry_has_one_strict_source_owner_and_one_lock_contract():
         assert "gc_backend_current()" in body or name in {
             "pcc_gc_scheduler_root_register",
         }
+
+
+def test_continuation_unregister_frees_only_after_graph_unlock():
+    strict = REGISTRY_SOURCE.read_text(encoding="utf-8")
+    strict_body = strict.split("def pcc_gc_unregister_continuation_root", 1)[
+        1
+    ].split("\n\n@", 1)[0]
+    assert "dead = null()" in strict_body
+    assert strict_body.rindex("pcc_py_gc_minor_graph_unlock()") < (
+        strict_body.rindex("free(dead)")
+    )
+
+    oracle = ORACLE_SOURCE.read_text(encoding="utf-8")
+    oracle_body = oracle.split("void pcc_gc_unregister_continuation_root", 1)[
+        1
+    ].split("\n}\n", 1)[0]
+    assert "PccGcContinuationRootNode *dead = NULL;" in oracle_body
+    assert oracle_body.rindex("pcc_gc_graph_unlock();") < oracle_body.rindex(
+        "free(dead);"
+    )
+
+
+def test_scheduler_root_link_tripwire_reports_only_after_graph_unlock():
+    oracle = ORACLE_SOURCE.read_text(encoding="utf-8")
+    link = oracle.split(
+        "static int32_t pcc_gc_scheduler_root_link_locked", 1
+    )[1].split("static void pcc_gc_scheduler_root_unlink_locked", 1)[0]
+    assert "PCC_RT_TRIPWIRE" not in link
+    assert "return link_error;" in link
+
+    register = oracle.split(
+        "void *pcc_gc_scheduler_root_register_handle", 1
+    )[1].split("void pcc_gc_scheduler_root_register(", 1)[0]
+    assert register.index("pcc_gc_graph_unlock();") < register.index(
+        "pcc_gc_scheduler_root_link_tripwire_fail(link_error);"
+    )
+
+    queue_push = oracle.split("int64_t pcc_gc_scheduler_queue_push(", 1)[
+        1
+    ].split("int64_t pcc_gc_scheduler_queue_pop_into", 1)[0]
+    assert queue_push.index("pcc_gc_graph_unlock();") < queue_push.index(
+        "pcc_gc_scheduler_root_link_tripwire_fail(link_error);"
+    )
 
 
 @pytest.mark.parametrize("emitter", ["llvm", "self"])

@@ -267,12 +267,17 @@ def test_no_libpython_pcc_python_archive_staleness_ignores_libpython_bridge(tmp_
             "_runtime_archive_compiler_sources_newer_than",
             return_value=False,
         ):
-            with mock.patch.object(
-                pipeline,
-                "_runtime_archive_provenance_valid",
-                return_value=True,
-            ):
-                assert pipeline._runtime_archive_stale(str(archive)) is False
+                with mock.patch.object(
+                    pipeline,
+                    "_runtime_archive_provenance_valid",
+                    return_value=True,
+                ):
+                    with mock.patch.object(
+                        pipeline,
+                        "_runtime_archive_codegen_stale",
+                        return_value=False,
+                    ):
+                        assert pipeline._runtime_archive_stale(str(archive)) is False
 
 
 def test_pcc_python_archive_staleness_ignores_replaced_c_source(tmp_path):
@@ -330,9 +335,14 @@ def test_pcc_python_archive_staleness_ignores_replaced_c_source(tmp_path):
                 "_runtime_archive_provenance_valid",
                 return_value=True,
             ):
-                assert pipeline._runtime_archive_stale(str(archive)) is False
-                os.utime(active_c, (newer, newer))
-                assert pipeline._runtime_archive_stale(str(archive)) is True
+                with mock.patch.object(
+                    pipeline,
+                    "_runtime_archive_codegen_stale",
+                    return_value=False,
+                ):
+                    assert pipeline._runtime_archive_stale(str(archive)) is False
+                    os.utime(active_c, (newer, newer))
+                    assert pipeline._runtime_archive_stale(str(archive)) is True
 
 
 def test_pcc_python_archive_requires_valid_provenance_before_wheel_shortcut(tmp_path):
@@ -451,6 +461,156 @@ def test_pcc_emitted_archive_staleness_tracks_compiler_sources(tmp_path):
     with mock.patch.object(pipeline, "_PY_RUNTIME_DIR", str(runtime_dir)):
         with mock.patch.object(pipeline, "_PCC_DIR", str(pcc_dir)):
             assert pipeline._runtime_archive_stale(str(archive)) is True
+
+
+def test_pcc_python_codegen_checksum_staleness_forces_full_rebuild(tmp_path):
+    from pcc.py_frontend import pipeline
+
+    runtime_dir = tmp_path / "py_runtime"
+    runtime_dir.mkdir()
+    archive = runtime_dir / "libpy_runtime_pcc_py.a"
+    archive.write_bytes(b"archive")
+    Path(str(archive) + ".provenance.json").write_text("{}\n", encoding="utf-8")
+    (runtime_dir / "Makefile").write_text("all:\n", encoding="utf-8")
+    calls: list[list[str]] = []
+    freshness = {"stale": True}
+
+    def fake_runtime_make(make_cmd, *, verbose):
+        calls.append(list(make_cmd))
+        freshness["stale"] = False
+
+    with mock.patch.dict(
+        os.environ,
+        {"PCC_RUNTIME_CC": "pcc", "PCC_RUNTIME_HIGH": "py"},
+        clear=True,
+    ):
+        with mock.patch.object(pipeline, "_PY_RUNTIME_DIR", str(runtime_dir)):
+            with mock.patch.object(
+                pipeline,
+                "_PY_RUNTIME_ARCHIVE_PCC_PY",
+                str(archive),
+            ):
+                with mock.patch.object(
+                    pipeline,
+                    "_runtime_archive_provenance_valid",
+                    return_value=True,
+                ):
+                    with mock.patch.object(
+                        pipeline,
+                        "_runtime_archive_codegen_stale",
+                        side_effect=lambda _archive: freshness["stale"],
+                    ):
+                        with mock.patch.object(
+                            pipeline,
+                            "_runtime_archive_target_matches",
+                            return_value=True,
+                        ):
+                            with mock.patch.object(
+                                pipeline,
+                                "_runtime_archive_compiler_sources_newer_than",
+                                return_value=False,
+                            ):
+                                with mock.patch.object(
+                                    pipeline,
+                                    "_run_runtime_make",
+                                    side_effect=fake_runtime_make,
+                                ):
+                                    selected = pipeline._ensure_runtime(
+                                        False,
+                                        needs_libpython=False,
+                                    )
+
+    assert selected == str(archive)
+    assert calls
+    assert "-B" in calls[0]
+    assert any(part.startswith("-j") for part in calls[0])
+
+
+def test_pcc_python_rebuild_fails_if_codegen_freshness_remains_unprovable(
+    tmp_path,
+):
+    from pcc.py_frontend import pipeline
+
+    runtime_dir = tmp_path / "py_runtime"
+    runtime_dir.mkdir()
+    archive = runtime_dir / "libpy_runtime_pcc_py.a"
+    archive.write_bytes(b"archive")
+    Path(str(archive) + ".provenance.json").write_text("{}\n", encoding="utf-8")
+    (runtime_dir / "Makefile").write_text("all:\n", encoding="utf-8")
+
+    with mock.patch.dict(
+        os.environ,
+        {"PCC_RUNTIME_CC": "pcc", "PCC_RUNTIME_HIGH": "py"},
+        clear=True,
+    ):
+        with mock.patch.object(pipeline, "_PY_RUNTIME_DIR", str(runtime_dir)):
+            with mock.patch.object(
+                pipeline,
+                "_PY_RUNTIME_ARCHIVE_PCC_PY",
+                str(archive),
+            ):
+                with mock.patch.object(
+                    pipeline,
+                    "_runtime_archive_provenance_valid",
+                    return_value=True,
+                ):
+                    with mock.patch.object(
+                        pipeline,
+                        "_runtime_archive_codegen_stale",
+                        return_value=True,
+                    ):
+                        with mock.patch.object(
+                            pipeline,
+                            "_runtime_archive_target_matches",
+                            return_value=True,
+                        ):
+                            with mock.patch.object(
+                                pipeline,
+                                "_runtime_archive_compiler_sources_newer_than",
+                                return_value=False,
+                            ):
+                                with mock.patch.object(pipeline, "_run_runtime_make"):
+                                    with mock.patch.object(
+                                        pipeline,
+                                        "_write_runtime_archive_target_stamp",
+                                    ) as write_stamp:
+                                        with pytest.raises(
+                                            pipeline.PyPipelineError,
+                                            match="stale codegen provenance",
+                                        ):
+                                            pipeline._ensure_runtime(
+                                                False,
+                                                needs_libpython=False,
+                                            )
+
+    write_stamp.assert_not_called()
+
+
+def test_explicit_pcc_python_archive_does_not_compare_current_codegen(tmp_path):
+    from pcc.py_frontend import pipeline
+
+    archive = tmp_path / "libpy_runtime_pcc_py.a"
+    archive.write_bytes(b"archive")
+    Path(str(archive) + ".provenance.json").write_text("{}\n", encoding="utf-8")
+
+    with mock.patch.dict(
+        os.environ,
+        {"PCC_RUNTIME_ARCHIVE": str(archive)},
+        clear=True,
+    ):
+        with mock.patch.object(
+            pipeline,
+            "_runtime_archive_provenance_valid",
+            return_value=True,
+        ):
+            with mock.patch.object(
+                pipeline,
+                "_runtime_archive_codegen_stale",
+                side_effect=AssertionError("explicit archive must not compare checkout"),
+            ):
+                selected = pipeline._ensure_runtime(False, needs_libpython=False)
+
+    assert selected == str(archive)
 
 
 def test_pcc_c_source_staleness_uses_incremental_runtime_rebuild(tmp_path):

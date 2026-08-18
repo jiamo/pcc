@@ -210,9 +210,25 @@ class ModuleLifecycleLoweringMixin:
 
         self.builder.position_at_end(body_bb)
         self.builder.store(ir.Constant(_I32, 1), guard)
+        self._emit_static_literal_init_call()
         self._emit_module_root_enters()
         self._emit_module_docstring_binding()
 
+        # ``@main`` and ``_pcc_py_module_top_*`` are IR functions like any other,
+        # so they need the same per-function reset the user-function prologue
+        # does.  Without it, module-level statements inherit whatever
+        # ``_try_err_block`` / ``_active_handler_excs`` the LAST lowered
+        # function left behind -- and the user-function prologue documents why
+        # that is invalid: "an exception handler cannot span a Python function
+        # boundary ... a retained IR value from an outer/nested emission is
+        # invalid in fn".  A module-level ``try`` then branched into another
+        # function's blocks, which is why pcc1 could not compile a nine-line
+        # module-level try/except while the same construct inside a function was
+        # fine.  It also explains the host/pcc1 split: whether the carried-over
+        # block happened to be None depended on which function was lowered last.
+        self._try_err_block = None
+        self._cpy_operand_cleanup_block = None
+        self._active_handler_excs = []
         self._emit_stmts(tuple(body))
 
         if not self._builder_block_is_terminated():
@@ -398,6 +414,7 @@ class ModuleLifecycleLoweringMixin:
         # Sibling top-level code runs when an import statement reaches it.
         # Eager dependency-first execution cannot preserve a package's partial
         # state across cycles (parent setup; import child; child reads parent).
+        self._emit_static_literal_init_call()
         self._emit_module_root_enters()
         self._emit_module_docstring_binding()
         user_body = list(body)
@@ -408,6 +425,21 @@ class ModuleLifecycleLoweringMixin:
             and self._is_user_main_call_stmt(user_body[-1])
         ):
             trailing_main_stmt = user_body.pop()
+        # ``@main`` and ``_pcc_py_module_top_*`` are IR functions like any other,
+        # so they need the same per-function reset the user-function prologue
+        # does.  Without it, module-level statements inherit whatever
+        # ``_try_err_block`` / ``_active_handler_excs`` the LAST lowered
+        # function left behind -- and the user-function prologue documents why
+        # that is invalid: "an exception handler cannot span a Python function
+        # boundary ... a retained IR value from an outer/nested emission is
+        # invalid in fn".  A module-level ``try`` then branched into another
+        # function's blocks, which is why pcc1 could not compile a nine-line
+        # module-level try/except while the same construct inside a function was
+        # fine.  It also explains the host/pcc1 split: whether the carried-over
+        # block happened to be None depended on which function was lowered last.
+        self._try_err_block = None
+        self._cpy_operand_cleanup_block = None
+        self._active_handler_excs = []
         self._emit_stmts(tuple(user_body))
 
         if not self._builder_block_is_terminated():

@@ -154,11 +154,16 @@ static void pcc_runtime_log_init_once(void) {
 }
 
 int pcc_runtime_log_enabled(const char *category) {
+    /* First-time registration may wait for an active stopped-world epoch.
+     * Do it before log initialization can acquire or wait on any runtime
+     * resource. */
+    (void)pcc_current_thread_id();
     pcc_runtime_log_init_once();
     return (pcc_log_mask & pcc_log_category_mask(category)) != 0;
 }
 
 static int pcc_runtime_log_code_enabled(int32_t category) {
+    (void)pcc_current_thread_id();
     pcc_runtime_log_init_once();
     switch (category) {
         case 1: return (pcc_log_mask & PCC_LOG_ALLOC) != 0;
@@ -192,8 +197,11 @@ void pcc_runtime_log_event(const char *category,
                            int64_t value1,
                            const void *ptr) {
     if (!pcc_runtime_log_enabled(category)) return;
-    long long ts = (long long)(pcc_runtime_now_us() / 1000000LL);
+    /* pcc_runtime_log_enabled registered this thread before any stream/stdio
+     * lock can be acquired.  Keep identity lookup on that side of the stream
+     * open and write operations as well. */
     long long tid = (long long)pcc_current_thread_id();
+    long long ts = (long long)(pcc_runtime_now_us() / 1000000LL);
     int should_close = 0;
     FILE *out = pcc_runtime_log_open_stream(&should_close);
     if (pcc_log_json) {

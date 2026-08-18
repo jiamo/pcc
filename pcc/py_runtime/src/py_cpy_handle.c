@@ -52,6 +52,36 @@ void *py_cpy_handle_get(PyObject *o) {
     return ((PyCpyHandleObject *)o)->cpy_ref;
 }
 
+/* pcc_cpy_handle_move_owned_ref runs inside GC3 oldification while the
+ * caller owns the GC graph lock, so every check routes through
+ * PCC_GC_OWNER_TRIPWIRE: an unlocked caller still aborts immediately, and a
+ * lock owner records the violation and returns BEFORE the move.  Proceeding
+ * would overwrite to_box->cpy_ref and drop an owned foreign reference on the
+ * exact path the check exists to reject; bailing leaves both boxes intact
+ * until the outer unlock reports.  Unarmed builds compile the checks out. */
+void pcc_cpy_handle_move_owned_ref(PyObject *from, PyObject *to) {
+    PCC_GC_OWNER_TRIPWIRE(
+        from != NULL && to != NULL && from != to
+            && !PY_IS_TAGGED_INT(from) && !PY_IS_TAGGED_INT(to)
+            && py_type_of(from) == PY_TYPE_CPY_HANDLE
+            && py_type_of(to) == PY_TYPE_CPY_HANDLE,
+        "pcc_cpy_handle_move_owned_ref: invalid native-handle move"
+    );
+    PyCpyHandleObject *from_box = (PyCpyHandleObject *)from;
+    PyCpyHandleObject *to_box = (PyCpyHandleObject *)to;
+    void *owned = from_box->cpy_ref;
+    PCC_GC_OWNER_TRIPWIRE(
+        owned != NULL,
+        "pcc_cpy_handle_move_owned_ref: source has no owned foreign reference"
+    );
+    PCC_GC_OWNER_TRIPWIRE(
+        to_box->cpy_ref == NULL || to_box->cpy_ref == owned,
+        "pcc_cpy_handle_move_owned_ref: destination owns a different foreign reference"
+    );
+    from_box->cpy_ref = NULL;
+    to_box->cpy_ref = owned;
+}
+
 void py_dealloc_cpy_handle(PyObject *o) {
     PyCpyHandleObject *box = (PyCpyHandleObject *)o;
     PCC_RT_TRIPWIRE(

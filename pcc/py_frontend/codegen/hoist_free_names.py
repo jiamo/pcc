@@ -76,14 +76,14 @@ def compute_free_names(
         outer_scope_names,
         (own_name or "",),
     )
-    cached = cache.get(cache_key)
-    if cached is not None:
+    cached_entry = cache.get(cache_key)
+    if cached_entry is not None and cached_entry[1] is fd:
         hoist_stat_inc(
             profile_enabled,
             stats,
             "compute_free_names_cache_hits",
         )
-        return cached
+        return cached_entry[0]
     hoist_stat_inc(
         profile_enabled,
         stats,
@@ -271,6 +271,17 @@ def compute_free_names(
     extend_names_once(local_scope, module_names)
     extend_names_once(local_scope, sentinel_ns)
     builtins_ns = _PY_BUILTINS_NS
+    # Membership index for the walk.  The scope and builtin sets are fixed for
+    # the whole body walk, and the compiled per-Name ``name_in`` list scan over
+    # hundreds of module-scope names was measured at the top of a class_gen
+    # worker profile (each loop iteration pays the pointer-load barrier and
+    # refcount protocol).  Idents are short, so dict hashing is cheap.
+    # ``bound`` stays a list: comprehension clauses rebind it mid-walk.
+    resolved_scope = {}
+    for scope_name in local_scope:
+        resolved_scope[scope_name] = True
+    for scope_name in builtins_ns:
+        resolved_scope[scope_name] = True
     free = []
 
     def _collect_target_names(t, acc):
@@ -278,6 +289,11 @@ def compute_free_names(
             append_name_once(acc, t.ident)
             return
         for slot in _dataclass_field_names(t):
+            # span/ty are metadata records (SourceSpan / structural types);
+            # they can never contain a Name and their generic traversal costs
+            # several dynamic lookups per scalar field.
+            if slot == "span" or slot == "ty":
+                continue
             v = _dataclass_field_value(t, slot, None)
             if isinstance(v, tuple):
                 for it in v:
@@ -356,6 +372,14 @@ def compute_free_names(
         return None
 
     def walk(x, bound=None):
+        # Fast bail for the metadata scalars the generic field loop still
+        # yields (None, strings, numbers): each would otherwise pay the full
+        # isinstance/call-shape gauntlet below just to reach the empty
+        # reflection guard.
+        if x is None:
+            return
+        if isinstance(x, (str, int, float, bool, bytes)):
+            return
         if bound is None:
             bound = ()
         if isinstance(x, (_FuncDef, _ClassDef)):
@@ -372,10 +396,8 @@ def compute_free_names(
                 walk(it, bound)
             return
         if isinstance(x, _Name):
-            if (
-                not name_in(local_scope, x.ident)
-                and not name_in(builtins_ns, x.ident)
-                and not name_in(bound, x.ident)
+            if resolved_scope.get(x.ident) is None and not name_in(
+                bound, x.ident
             ):
                 append_name_once(free, x.ident)
             return
@@ -397,6 +419,8 @@ def compute_free_names(
                         break
             if fname is None:
                 for slot in _dataclass_field_names(x):
+                    if slot == "span" or slot == "ty":
+                        continue
                     v = _dataclass_field_value(x, slot, None)
                     if isinstance(v, tuple):
                         for it in v:
@@ -488,6 +512,8 @@ def compute_free_names(
             walk(x.body, lambda_bound)
             return
         for slot in _dataclass_field_names(x):
+            if slot == "span" or slot == "ty":
+                continue
             v = _dataclass_field_value(x, slot, None)
             if isinstance(v, tuple):
                 for it in v:
@@ -499,5 +525,9 @@ def compute_free_names(
         walk(s)
     extend_names_once(free, nonlocal_names)
     result = filter_capture_names(tuple(sorted(free)))
-    cache[cache_key] = result
+    # The cache key contains ``id(fd)`` because frontend AST records are not
+    # hashable.  Retain the exact owner with the result: otherwise a rewritten
+    # FuncDef can be released, its address can be reused, and an unrelated
+    # nested function can inherit the stale capture set.
+    cache[cache_key] = (result, fd)
     return result

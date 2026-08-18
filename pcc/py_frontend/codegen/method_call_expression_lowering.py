@@ -1076,6 +1076,22 @@ class MethodCallExpressionLoweringMixin:
                         expr.kwargs,
                         expr.span,
                     )
+                receiver_info = self.class_lowering.classes.get(
+                    receiver_class_name
+                )
+                if (
+                    receiver_info is not None
+                    and self.class_lowering.method_overridden_by_subclass(
+                        receiver_info, attr.name
+                    )
+                ):
+                    return self._emit_callable_attribute_call(
+                        attr.obj,
+                        attr.name,
+                        expr.args,
+                        expr.kwargs,
+                        expr.span,
+                    )
                 kind = method_info.method_kinds.get(attr.name, "instance")
                 if kind == "static":
                     # ``self.static_method(args)`` — Python lets you
@@ -1150,6 +1166,16 @@ class MethodCallExpressionLoweringMixin:
         ):
             method_info = self._resolve_method_mro(current_class.name, attr.name)
             if method_info is not None:
+                if self.class_lowering.method_overridden_by_subclass(
+                    current_class, attr.name
+                ):
+                    return self._emit_callable_attribute_call(
+                        attr.obj,
+                        attr.name,
+                        expr.args,
+                        expr.kwargs,
+                        expr.span,
+                    )
                 kind = method_info.method_kinds.get(attr.name, "instance")
                 if kind == "instance":
                     cls_ptr = self.builder.load(
@@ -1439,6 +1465,20 @@ class MethodCallExpressionLoweringMixin:
                             expr.kwargs,
                             expr.span,
                         )
+                    receiver_info = self.class_lowering.classes.get(hint)
+                    if (
+                        receiver_info is not None
+                        and self.class_lowering.method_overridden_by_subclass(
+                            receiver_info, attr.name
+                        )
+                    ):
+                        return self._emit_callable_attribute_call(
+                            attr.obj,
+                            attr.name,
+                            expr.args,
+                            expr.kwargs,
+                            expr.span,
+                        )
                     kind = info.method_kinds.get(attr.name, "instance")
                     if kind == "static":
                         method_fn = info.methods[attr.name]
@@ -1482,6 +1522,20 @@ class MethodCallExpressionLoweringMixin:
             info = self._resolve_method_mro(receiver_hint, attr.name)
             if info is not None:
                 if attr.name not in info.methods:
+                    return self._emit_callable_attribute_call(
+                        attr.obj,
+                        attr.name,
+                        expr.args,
+                        expr.kwargs,
+                        expr.span,
+                    )
+                receiver_info = self.class_lowering.classes.get(receiver_hint)
+                if (
+                    receiver_info is not None
+                    and self.class_lowering.method_overridden_by_subclass(
+                        receiver_info, attr.name
+                    )
+                ):
                     return self._emit_callable_attribute_call(
                         attr.obj,
                         attr.name,
@@ -1914,6 +1968,15 @@ class MethodCallExpressionLoweringMixin:
                 [recv, encoding, errors],
                 name=self._fresh("bytes.decode"),
             )
+        if (
+            isinstance(obj_ty, (BytesType, ByteArrayType))
+            and attr.name == "join"
+            and len(expr.args) == 1
+            and not expr.kwargs
+        ):
+            # b"sep".join(list_or_tuple_of_bytes) -> one O(n) allocation.
+            recv = self._emit_expr(attr.obj)
+            return self._emit_native_bytes_join(recv, expr.args[0], "bytes")
         if (
             isinstance(obj_ty, (BytesType, ByteArrayType))
             and attr.name == "hex"

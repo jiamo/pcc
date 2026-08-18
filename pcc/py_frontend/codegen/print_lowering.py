@@ -199,6 +199,13 @@ class PrintLoweringMixin:
                 self.builder, self.module, self.runtime, value, arg_ty
             )
         self.builder.call(self.runtime["py_print"], [obj])
+        # py_print borrows (py_print_fmt.c: format + newline, no refcount
+        # traffic), so an argument that produced a fresh reference is still
+        # owned here.  `print(a[0])` leaked one reference per call for exactly
+        # this reason.  A borrowed argument -- a rooted local, an immortal
+        # singleton -- must not be released, which is what the classifier
+        # decides.
+        self._gc_release_if_owned(obj, arg)
 
     def _emit_print_float_value(self, value: ir.Value) -> None:
         # Box the raw double and route through the runtime py_print, which

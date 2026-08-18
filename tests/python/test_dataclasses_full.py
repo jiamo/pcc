@@ -64,6 +64,30 @@ def test_dataclass_init_repr_eq(tmp_path):
     assert out[3] == "False"
 
 
+def test_dataclass_eq_rejects_other_dataclass_shape(tmp_path):
+    """Generated __eq__ must not read fields from an unrelated dataclass."""
+    result = _compile_and_run(tmp_path, """
+        from dataclasses import dataclass
+
+        @dataclass
+        class HasObj:
+            obj: int
+
+        @dataclass
+        class HasValue:
+            value: int
+
+        def main() -> None:
+            print(HasObj(1) == HasValue(1))
+            print(HasValue(1) == HasObj(1))
+
+        if __name__ == "__main__":
+            main()
+        """)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().splitlines() == ["False", "False"]
+
+
 # ---------------------------------------------------------------------------
 # Defaults / default_factory
 # ---------------------------------------------------------------------------
@@ -195,6 +219,31 @@ def test_dataclass_inheritance(tmp_path):
     out = result.stdout.strip().split("\n")
     assert out[0] == "1 2"
     assert "a=1" in out[1] and "b=2" in out[1]
+
+
+def test_dataclass_inheritance_calls_inherited_post_init(tmp_path):
+    result = _compile_and_run(tmp_path, """
+        from dataclasses import dataclass
+
+        @dataclass
+        class Base:
+            x: int
+            def __post_init__(self):
+                print("post", self.x)
+
+        @dataclass
+        class Child(Base):
+            y: int
+
+        def main() -> None:
+            child = Child(7, 9)
+            print(child.y)
+
+        if __name__ == "__main__":
+            main()
+        """)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip().splitlines() == ["post 7", "9"]
 
 
 # ---------------------------------------------------------------------------

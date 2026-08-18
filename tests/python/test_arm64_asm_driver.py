@@ -26,7 +26,7 @@ from pathlib import Path
 import pytest
 
 from pcc.backend import macho_obj, macho_spec as spec
-from pcc.backend.arm64_asm_driver import assemble_file
+from pcc.backend.arm64_asm_driver import assemble_file, assemble_lines
 from pcc.backend.arm64_encode import EncodeError
 
 _CC = shutil.which(os.environ.get("CC", "cc"))
@@ -34,6 +34,60 @@ _IS_ARM64_DARWIN = os.uname().sysname == "Darwin" and os.uname().machine == "arm
 _GATE = None if (_CC and _IS_ARM64_DARWIN) else "needs cc and Darwin arm64"
 
 pytestmark = pytest.mark.pcc_gate(unavailable=_GATE)
+
+
+def test_incremental_module_builder_matches_complete_driver():
+    from pcc.backend.arm64_asm_driver import AArch64ModuleBuilder
+
+    expected = assemble_file(REAL_SHAPE)
+    builder = AArch64ModuleBuilder()
+    for line in REAL_SHAPE.splitlines():
+        builder.append_chunk(line)
+    assert builder.finish() == expected
+    assert builder.closed
+
+
+def test_incremental_module_builder_uses_final_text_layout_and_closes_on_error():
+    from pcc.backend.arm64_asm_driver import AArch64ModuleBuilder
+
+    builder = AArch64ModuleBuilder(["L_done"])
+    builder.append_chunk(".section __TEXT,__text,regular,pure_instructions\n_probe:")
+    builder.append_encoded(0x14000000, -26, 0)
+    builder.append_encoded(0xD503201F, 0, -1)
+    builder.append_chunk("L_done:")
+    builder.append_encoded(0xD65F03C0, 0, -1)
+    assert builder.text_label_offsets() == {"_probe": 0, "L_done": 8}
+    assert builder.text_size() == 12
+    assert builder.finish() == assemble_file(
+        ".section __TEXT,__text,regular,pure_instructions\n_probe:\n"
+        " b L_done\n nop\nL_done:\n ret\n"
+    )
+    failed = AArch64ModuleBuilder()
+    failed.append_chunk(".section __TEXT,__text,regular,pure_instructions\n_probe:")
+    failed.append_encoded(0xD65F03C0, 0, -1)
+    with pytest.raises(EncodeError, match="directive '.bad' not proven"):
+        failed.append_chunk(".bad")
+    assert failed.closed
+    for buffer in failed.buffers.values():
+        assert buffer.text_builder is None or buffer.text_builder.closed
+
+
+def test_incremental_module_builder_closes_after_encoded_allocation_failure(monkeypatch):
+    from pcc.backend.arm64_asm_driver import AArch64ModuleBuilder
+    from pcc.backend.arm64_encode import PackedAArch64TextBuilder
+
+    builder = AArch64ModuleBuilder()
+    builder.append_chunk(".section __TEXT,__text,regular,pure_instructions")
+    builder.append_encoded(0xD503201F, 0, -1)
+
+    def fail_allocation(*args):
+        raise MemoryError("injected encoded allocation failure")
+
+    monkeypatch.setattr(PackedAArch64TextBuilder, "append_encoded", fail_allocation)
+    with pytest.raises(MemoryError, match="injected encoded allocation failure"):
+        builder.append_encoded(0xD65F03C0, 0, -1)
+    assert builder.closed
+    assert builder.current.text_builder.closed
 
 
 def _run(cmd, **kw):
@@ -119,6 +173,71 @@ def _pcc_object(tmp_path: Path) -> Path:
     obj = tmp_path / "shape_pcc.o"
     obj.write_bytes(macho_obj.emit_object(sections, undefined=undefined))
     return obj
+
+
+def test_line_input_api_matches_full_string_projection() -> None:
+    # Emitter entries are chunks, not guaranteed physical lines: globals and
+    # constant tables deliberately publish several directives in one string.
+    line_sections, line_undefined = assemble_lines([REAL_SHAPE])
+    text_sections, text_undefined = assemble_file(REAL_SHAPE)
+    assert line_sections == text_sections
+    assert line_undefined == text_undefined
+
+
+def test_line_input_merges_structured_sections_in_macho_order() -> None:
+    structured = macho_obj.Section(
+        sectname="__pcc_stackmaps",
+        segname="__DATA",
+        data=b"stack-map",
+        align_log2=3,
+        flags=macho_obj.PCC_STACKMAP_SECTION_FLAGS,
+        relocations=(
+            macho_obj.Relocation(
+                0,
+                "_entry_fn",
+                spec.ARM64_RELOC_UNSIGNED,
+                pcrel=False,
+                length=3,
+            ),
+            macho_obj.Relocation(
+                0,
+                "_external_stackmap_target",
+                spec.ARM64_RELOC_UNSIGNED,
+                pcrel=False,
+                length=3,
+            ),
+        ),
+    )
+    trailing = macho_obj.Section(
+        sectname="__compact_unwind",
+        segname="__LD",
+        data=b"",
+        flags=macho_obj.COMPACT_UNWIND_SECTION_FLAGS,
+    )
+    sections, undefined = assemble_lines(
+        REAL_SHAPE.splitlines(),
+        (trailing, structured),
+    )
+
+    keys = [(section.segname, section.sectname) for section in sections]
+    assert keys.index(("__DATA", "__pcc_stackmaps")) < keys.index(
+        ("__LD", "__compact_unwind")
+    )
+    assert sections[keys.index(("__DATA", "__pcc_stackmaps"))] is structured
+    assert "_entry_fn" not in undefined
+    assert "_external_stackmap_target" in undefined
+
+
+def test_line_input_rejects_duplicate_or_untyped_structured_sections() -> None:
+    duplicate = macho_obj.Section(
+        sectname="__data",
+        segname="__DATA",
+        data=b"",
+    )
+    with pytest.raises(EncodeError, match="duplicates section"):
+        assemble_lines(REAL_SHAPE.splitlines(), (duplicate,))
+    with pytest.raises(EncodeError, match="is not a Section"):
+        assemble_lines(REAL_SHAPE.splitlines(), (object(),))
 
 
 def _as_object(tmp_path: Path) -> Path:

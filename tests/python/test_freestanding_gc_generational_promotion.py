@@ -13,9 +13,17 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNTIME_DIR = REPO_ROOT / "pcc" / "py_runtime"
 STRICT_SOURCE = RUNTIME_DIR / "py" / "freestanding_gc_generational_promotion.py"
 MANAGED_SOURCE = RUNTIME_DIR / "py" / "py_gc_backend.py"
+C_SOURCE = RUNTIME_DIR / "src" / "py_gc_backend.c"
 MAKEFILE = RUNTIME_DIR / "Makefile"
 
 OWNED_SYMBOLS = {
+    "pcc_gc_backend3_drain_promotion_worklist",
+    "pcc_gc_backend3_enqueue_promotion_owner",
+    "pcc_gc_backend3_promote_cext_owner_referents",
+    "pcc_gc_backend3_promote_cext_slot_transaction",
+    "pcc_gc_backend3_promotion_probe_config",
+    "pcc_gc_backend3_promotion_probe_state",
+    "pcc_gc_backend3_promotion_worklist_unlink",
     "pcc_gc_generational_promote_borrowed_slot_mode",
     "pcc_gc_generational_promote_owned_slot_mode",
     "pcc_gc_generational_promote_shallow_slot",
@@ -28,6 +36,11 @@ OWNED_SYMBOLS = {
     "pcc_gc_trace_referents_for_promotion_mode",
 }
 RAW_FUNCTION_IMPORTS = {
+    "pcc_gc_backend3_promotion_revision",
+    "pcc_gc_backend3_promotion_head",
+    "pcc_gc_backend3_promotion_probe_pause",
+    "pcc_gc_backend3_promotion_probe_state_value",
+    "pcc_gc_backend3_promotion_tail",
     "pcc_gc_backend3_young_unlink",
     "pcc_gc_backend4_zpage_note_owner_promoted",
     "pcc_gc_config_ensure",
@@ -35,8 +48,15 @@ RAW_FUNCTION_IMPORTS = {
     "pcc_gc_generational_oldify_copy",
     "pcc_gc_memoryview_refresh_owned_buffer",
     "pcc_gc_object_index_find",
+    "pcc_gc_object_list_revision",
+    "pcc_gc_object_node_is_active",
     "pcc_gc_object_is_known_no_lock",
+    "pcc_gc_pointer_is_managed",
     "pcc_gc_visit_object_slots",
+    "pcc_gc_visit_object_slots_slice",
+    "pcc_py_gc_minor_graph_lock",
+    "pcc_py_gc_minor_graph_unlock",
+    "pcc_thread_safepoint",
     "py_decref",
     "py_incref",
 }
@@ -153,6 +173,28 @@ def test_generational_promotion_preserves_owned_borrowed_and_stable_root_contrac
     assert "pcc_gc_visit_object_slots(" in trace
     assert "tag ==" not in trace
     assert "pcc_gc_backend4_zpage_note_owner_promoted(obj)" in promote
+    backend4 = promote.split(
+        "if backend == 4 and (promoted_flags & 256) == 0:", 1
+    )[1].split("store_i32(obj, 12", 1)[0]
+    assert 'atomic_rmw_i32("add", obj, 12, 128, "acq_rel")' in backend4
+    assert promote.index("pcc_gc_backend3_young_unlink") < promote.index(
+        'atomic_rmw_i32("add", obj, 12, 128, "acq_rel")'
+    )
+    assert backend4.index(
+        'atomic_rmw_i32("add", obj, 12, 128, "acq_rel")'
+    ) < backend4.index("pcc_gc_backend4_zpage_note_owner_promoted(obj)")
+
+    c_source = C_SOURCE.read_text(encoding="utf-8")
+    c_promote = c_source.split(
+        "static void pcc_gc_promote_young_object(PyObject *o)", 1
+    )[1].split("static void pcc_gc_promote_young_slot_with_mode", 1)[0]
+    c_atomic = c_promote.index("__atomic_add_fetch(")
+    assert c_promote.index("pcc_gc_backend3_young_unlink(") < c_atomic
+    assert c_atomic < c_promote.index(
+        "pcc_gc_backend4_zpage_note_owner_promoted_unlocked(o);"
+    )
+    assert "PY_FLAG_GC_YOUNG," in c_promote[c_atomic:]
+    assert "__ATOMIC_ACQ_REL" in c_promote[c_atomic:]
 
     stale_guard = cached.split("if ptr_is_null(stable_base) == 0:", 1)[1].split(
         "if borrowed != 0:", 1

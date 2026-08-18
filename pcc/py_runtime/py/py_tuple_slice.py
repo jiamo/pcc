@@ -4,6 +4,9 @@ Keep ``py_tuple_slice`` in its own archive member so ordinary tuple
 construction, indexing, len, concat, and compare paths do not force tuple
 slicing into user-runtime executables.
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_TUPLE,
 )

@@ -1,6 +1,8 @@
 from pcc.llvm_capi.compat import ir
 from pcc.py_frontend import py_ast as pa
 from pcc.py_frontend.codegen.expr_helper_lowering import ExprHelperLoweringMixin
+from pcc.py_frontend.codegen.core_helpers import CoreHelperMixin
+from pcc.py_frontend.codegen.method_call_lowering import _method_abi_type_matches
 
 
 class _NoSextBuilder:
@@ -39,3 +41,26 @@ def test_emit_expr_as_i64_accepts_shape_equal_i64_type():
 
     assert isinstance(out.type, ir.IntType)
     assert out.type.width == 64
+
+
+def test_method_abi_matches_distinct_literal_aggregate_types():
+    host = CoreHelperMixin()
+    actual = ir.LiteralStructType([ir.IntType(64), ir.IntType(64)])
+    expected = ir.LiteralStructType([ir.IntType(64), ir.IntType(64)])
+    assert actual is not expected
+    assert _method_abi_type_matches(host, actual, expected)
+
+
+def test_method_aggregate_abi_preserves_layout_and_address_space_boundaries():
+    host = CoreHelperMixin()
+    def aggregate(width=64, packed=False, addrspace=0, count=2):
+        return ir.LiteralStructType([
+            ir.ArrayType(ir.IntType(width), count),
+            ir.IntType(8).as_pointer(addrspace),
+        ], packed=packed)
+    assert _method_abi_type_matches(host, aggregate(), aggregate())
+    for incompatible in (aggregate(width=32), aggregate(packed=True),
+                         aggregate(addrspace=1), aggregate(count=3)):
+        assert not _method_abi_type_matches(host, aggregate(), incompatible)
+    reverse = ir.LiteralStructType([ir.IntType(8).as_pointer(), ir.ArrayType(ir.IntType(64), 2)])
+    assert not _method_abi_type_matches(host, aggregate(), reverse)

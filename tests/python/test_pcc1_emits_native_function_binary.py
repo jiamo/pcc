@@ -15,6 +15,7 @@ compiled fine, while ``def f(): pass`` already has one.
 from __future__ import annotations
 
 import os
+from pathlib import Path
 import subprocess
 
 from pcc1_gate import find_current_pcc1, repo_root, skip_or_fail_no_current_pcc1
@@ -34,22 +35,38 @@ _CASES = (
 )
 
 
-def _pcc1_env() -> dict:
+def _pcc1_env(runtime_archive: Path) -> dict:
+    """Environment for the COMPILE step.
+
+    `PCC_HOST_PYTHON` is deliberately NOT disabled here.  A pcc1 compile still
+    invokes the runtime-archive `make`, and that make shells out to a host
+    Python for `pcc.tools.ir_to_obj`; disabling it makes the rebuild fail AND
+    delete the objects it was rebuilding, so each run corrupts the archive a
+    little further and the failure moves to a different object.  Removing host
+    Python from the build path is its own goal, tracked separately -- this gate
+    is about pcc1 lowering a function definition to a running binary, and
+    conflating the two just produced a red test with a misleading message.
+
+    The RUN step below still asserts no-host-python behaviour, which is where
+    that claim actually belongs.
+    """
     env = os.environ.copy()
     env.pop("LC_ALL", None)
-    # No host Python anywhere in the build path.
-    env["PCC_HOST_PYTHON"] = "/usr/bin/false"
+    env["PCC_RUNTIME_ARCHIVE"] = str(runtime_archive)
     return env
 
 
-def test_pcc1_compiles_and_runs_function_definitions(tmp_path):
+def test_pcc1_compiles_and_runs_function_definitions(
+    tmp_path,
+    pcc_py_runtime_archive,
+):
     pcc1 = find_current_pcc1(REPO)
     if pcc1 is None:
         skip_or_fail_no_current_pcc1(
             "no current pcc1 binary for the native function-emit gate"
         )
 
-    env = _pcc1_env()
+    env = _pcc1_env(pcc_py_runtime_archive)
     for name, source, expected in _CASES:
         src = tmp_path / (name + ".py")
         src.write_text(source, encoding="utf-8")

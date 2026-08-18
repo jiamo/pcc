@@ -70,6 +70,22 @@ int64_t pcc_refcount_strategy(void) {
  * non-threaded runtime archives. */
 int32_t pcc_thread_stop_requested = 0;
 
+int64_t pcc_thread_stop_requested_acquire(void) {
+#if PCC_WITH_THREADS
+    return __atomic_load_n(
+        &pcc_thread_stop_requested, __ATOMIC_ACQUIRE
+    ) != 0 ? 1 : 0;
+#else
+    return 0;
+#endif
+}
+
+/* A no-park region is a small, bounded native critical section whose caller
+ * may retain an owner-derived raw pointer.  The depth is TLS in both the
+ * pthread and single-threaded variants: single-threaded builds still need to
+ * reject recursive collector entry from the current native stack. */
+static _Thread_local int64_t pcc_tls_no_park_depth = 0;
+
 /* Native-thread identity must stay distinct even in PCC_WITH_THREADS=0
  * archives: C extensions and embedding hosts may still call lock-protected
  * runtime ABIs from raw pthreads.  The address of one C11 TLS byte is a
@@ -120,7 +136,11 @@ static void pcc_refmeta_unlock(void) {
     __atomic_clear(&pcc_refmeta_lock_word, __ATOMIC_RELEASE);
 }
 
-static PccRefcountMeta *pcc_refmeta_find_locked(int64_t *slot, int create) {
+static PccRefcountMeta *pcc_refmeta_find_locked(
+    int64_t *slot,
+    int create,
+    int64_t owner_tid
+) {
     for (PccRefcountMeta *m = pcc_refmeta_head; m != NULL; m = m->next) {
         if (m->slot == slot) return m;
     }
@@ -128,7 +148,7 @@ static PccRefcountMeta *pcc_refmeta_find_locked(int64_t *slot, int create) {
     PccRefcountMeta *m = (PccRefcountMeta *)calloc(1, sizeof(PccRefcountMeta));
     if (m == NULL) return NULL;
     m->slot = slot;
-    m->owner_tid = pcc_current_thread_id();
+    m->owner_tid = owner_tid;
     m->local = __atomic_load_n(slot, __ATOMIC_ACQUIRE);
     m->shared = 0;
     m->pending = 0;
@@ -150,13 +170,15 @@ static int64_t pcc_refmeta_sync_locked(PccRefcountMeta *m) {
 
 static int64_t pcc_refcount_biased_delta(int64_t *slot, int64_t delta) {
     if (slot == NULL) return 0;
+    /* Registration may wait for an active stopped-world epoch.  It must not
+     * do so while holding the refcount metadata lock. */
+    int64_t self = pcc_current_thread_id();
     pcc_refmeta_lock();
-    PccRefcountMeta *m = pcc_refmeta_find_locked(slot, 1);
+    PccRefcountMeta *m = pcc_refmeta_find_locked(slot, 1, self);
     if (m == NULL) {
         pcc_refmeta_unlock();
         return __atomic_add_fetch(slot, delta, __ATOMIC_ACQ_REL);
     }
-    int64_t self = pcc_current_thread_id();
     if (m->owner_tid == 0) m->owner_tid = self;
     if (m->owner_tid == self) {
         m->local += delta;
@@ -170,8 +192,11 @@ static int64_t pcc_refcount_biased_delta(int64_t *slot, int64_t delta) {
 
 static int64_t pcc_refcount_deferred_delta(int64_t *slot, int64_t delta) {
     if (slot == NULL) return 0;
+    /* See pcc_refcount_biased_delta: never wait for newcomer admission while
+     * owning the metadata lock. */
+    int64_t self = pcc_current_thread_id();
     pcc_refmeta_lock();
-    PccRefcountMeta *m = pcc_refmeta_find_locked(slot, 1);
+    PccRefcountMeta *m = pcc_refmeta_find_locked(slot, 1, self);
     if (m == NULL) {
         pcc_refmeta_unlock();
         return __atomic_add_fetch(slot, delta, __ATOMIC_ACQ_REL);
@@ -288,13 +313,42 @@ static int64_t pcc_parked_thread_count = 0;
 static int64_t pcc_stop_owner_thread_id = 0;
 static int64_t pcc_stop_epoch = 0;
 static int64_t pcc_stop_depth = 0;
+static int64_t pcc_registration_waiter_count = 0;
 static _Thread_local int64_t pcc_tls_thread_id = 0;
 static _Thread_local int32_t pcc_tls_thread_parked = 0;
 static _Thread_local int64_t pcc_tls_parked_epoch = 0;
+static _Thread_local int32_t pcc_tls_unregister_in_progress = 0;
 
-static void pcc_thread_unregister_current(void) {
+void pcc_thread_unregister_current(void) {
+    if (pcc_tls_no_park_depth != 0) {
+        abort();
+        return;
+    }
+    if (pcc_tls_unregister_in_progress) {
+        abort();
+        return;
+    }
+    if (pcc_tls_thread_id == 0) return;
+    /* An STW owner must resume the epoch before it can leave the live set.
+     * Check before buffer cleanup: cleanup can release references and reenter
+     * runtime code, while clearing the owner would strand stop_requested. */
+    if (pcc_thread_owns_stopped_world()) {
+        abort();
+        return;
+    }
+    pcc_tls_unregister_in_progress = 1;
     pcc_gc_thread_unregister_buffers();
     pthread_mutex_lock(&pcc_world_lock);
+    /* Cleanup can decref and reenter.  Revalidate the teardown lease while
+     * holding the same lock that protects stop ownership and live counts. */
+    if (pcc_tls_no_park_depth != 0
+        || (pcc_tls_thread_id != 0
+            && pcc_thread_stop_requested
+            && pcc_stop_owner_thread_id == pcc_tls_thread_id)) {
+        pthread_mutex_unlock(&pcc_world_lock);
+        abort();
+        return;
+    }
     if (pcc_tls_thread_id != 0) {
         if (pcc_tls_thread_parked) {
             pcc_tls_thread_parked = 0;
@@ -309,11 +363,27 @@ static void pcc_thread_unregister_current(void) {
         pthread_cond_broadcast(&pcc_world_cond);
     }
     pthread_mutex_unlock(&pcc_world_lock);
+    pcc_tls_unregister_in_progress = 0;
 }
 
 int64_t pcc_current_thread_id(void) {
     if (pcc_tls_thread_id != 0) return pcc_tls_thread_id;
     pthread_mutex_lock(&pcc_world_lock);
+    /* A first-time raw/extension pthread is not part of the stopped epoch's
+     * live count.  Admit it only after the owner resumes the world; otherwise
+     * it could return into user code after the owner had already observed all
+     * pre-existing live threads parked. */
+    int waiting_for_admission = 0;
+    while (pcc_tls_thread_id == 0 && pcc_thread_stop_requested) {
+        if (!waiting_for_admission) {
+            pcc_registration_waiter_count++;
+            waiting_for_admission = 1;
+        }
+        pthread_cond_wait(&pcc_world_cond, &pcc_world_lock);
+    }
+    if (waiting_for_admission) {
+        pcc_registration_waiter_count--;
+    }
     if (pcc_tls_thread_id == 0) {
         pcc_tls_thread_id = pcc_next_thread_id++;
         pcc_live_thread_count++;
@@ -325,6 +395,7 @@ int64_t pcc_current_thread_id(void) {
 }
 
 void pcc_thread_safepoint(void) {
+    if (pcc_tls_no_park_depth != 0) return;
     int64_t self = pcc_current_thread_id();
     pthread_mutex_lock(&pcc_world_lock);
     while (pcc_thread_stop_requested && pcc_stop_owner_thread_id != self) {
@@ -373,7 +444,9 @@ int64_t pcc_stop_the_world(void) {
         pthread_mutex_unlock(&pcc_world_lock);
         return 0;
     }
-    pcc_thread_stop_requested = 1;
+    __atomic_store_n(
+        &pcc_thread_stop_requested, 1, __ATOMIC_RELEASE
+    );
     pcc_stop_owner_thread_id = self;
     pcc_stop_depth = 1;
     pcc_stop_epoch++;
@@ -404,13 +477,51 @@ int64_t pcc_resume_world(void) {
         pthread_mutex_unlock(&pcc_world_lock);
         return 0;
     }
-    pcc_thread_stop_requested = 0;
+    __atomic_store_n(
+        &pcc_thread_stop_requested, 0, __ATOMIC_RELEASE
+    );
     pcc_stop_owner_thread_id = 0;
     pcc_stop_depth = 0;
     pcc_parked_thread_count = 0;
     pthread_cond_broadcast(&pcc_world_cond);
     pthread_mutex_unlock(&pcc_world_lock);
     return 0;
+}
+
+int64_t pcc_thread_owns_stopped_world(void) {
+    int64_t self = pcc_tls_thread_id;
+    if (self == 0) return 0;
+    pthread_mutex_lock(&pcc_world_lock);
+    int64_t owns = pcc_thread_stop_requested
+        && pcc_stop_owner_thread_id == self;
+    pthread_mutex_unlock(&pcc_world_lock);
+    return owns;
+}
+
+int64_t pcc_thread_registration_waiter_count(void) {
+    /* The diagnostic is itself a runtime entry: an unregistered raw pthread
+     * must not use it to run through an active stopped-world epoch. */
+    (void)pcc_current_thread_id();
+    pthread_mutex_lock(&pcc_world_lock);
+    int64_t count = pcc_registration_waiter_count;
+    pthread_mutex_unlock(&pcc_world_lock);
+    return count;
+}
+
+/* Unlike the other handle users, the trampoline is part of thread teardown.
+ * It must remain registered until the handle commit is complete, while also
+ * staying able to park if another thread owns the handle lock. */
+static void pcc_thread_handle_state_lock_for_teardown(PccThreadHandle *handle) {
+    for (;;) {
+        int rc = pthread_mutex_trylock(&handle->state_lock);
+        if (rc == 0) return;
+        if (rc != EBUSY) {
+            abort();
+            return;
+        }
+        pcc_thread_safepoint();
+        sched_yield();
+    }
 }
 
 static void *pcc_thread_trampoline(void *opaque) {
@@ -423,17 +534,22 @@ static void *pcc_thread_trampoline(void *opaque) {
     (void)pcc_current_thread_id();
     pcc_thread_safepoint();
     void *result = entry(arg);
-    pcc_thread_unregister_current();
     int should_free = 0;
-    pthread_mutex_lock(&handle->state_lock);
+    pcc_thread_handle_state_lock_for_teardown(handle);
     handle->result = result;
     handle->done = 1;
     should_free = handle->detached;
-    pthread_mutex_unlock(&handle->state_lock);
+    if (pthread_mutex_unlock(&handle->state_lock) != 0) {
+        abort();
+        return result;
+    }
     if (should_free) {
         pthread_mutex_destroy(&handle->state_lock);
         free(handle);
     }
+    /* Keep this the final runtime action: any lock/safepoint after teardown
+     * could register the pthread again and leak it from the live count. */
+    pcc_thread_unregister_current();
     return result;
 }
 
@@ -605,6 +721,7 @@ int64_t pcc_current_thread_id(void) {
 }
 
 void pcc_thread_safepoint(void) {
+    if (pcc_tls_no_park_depth != 0) return;
 }
 
 int64_t pcc_stop_the_world(void) {
@@ -613,6 +730,21 @@ int64_t pcc_stop_the_world(void) {
 
 int64_t pcc_resume_world(void) {
     return 0;
+}
+
+int64_t pcc_thread_owns_stopped_world(void) {
+    return 1;
+}
+
+int64_t pcc_thread_registration_waiter_count(void) {
+    return 0;
+}
+
+void pcc_thread_unregister_current(void) {
+    if (pcc_tls_no_park_depth != 0) {
+        abort();
+        return;
+    }
 }
 
 int64_t pcc_thread_start(
@@ -663,6 +795,45 @@ int64_t pcc_cond_signal(PccCond *cond) { (void)cond; return 0; }
 int64_t pcc_cond_broadcast(PccCond *cond) { (void)cond; return 0; }
 
 #endif  /* PCC_WITH_THREADS */
+
+void pcc_thread_no_park_enter(void) {
+    /* Registration is defensive and must happen before publishing the TLS
+     * lease.  A raw newcomer must register before acquiring any managed
+     * owner/slot (see the public header); this call cannot repair a pointer
+     * acquired before registration.  For an already-registered live caller,
+     * deliberately do not safepoint here: it may have canonicalized the owner
+     * immediately before entering, and live/unparked accounting makes an STW
+     * owner wait for the bounded region to reach its outer exit. */
+    if (pcc_tls_no_park_depth < 0
+        || pcc_tls_no_park_depth == INT64_MAX) {
+        abort();
+        return;
+    }
+    if (pcc_tls_no_park_depth != 0) {
+        pcc_tls_no_park_depth++;
+        return;
+    }
+    (void)pcc_current_thread_id();
+    pcc_tls_no_park_depth++;
+}
+
+void pcc_thread_no_park_exit(void) {
+    if (pcc_tls_no_park_depth <= 0) {
+        abort();
+        return;
+    }
+    pcc_tls_no_park_depth--;
+    if (pcc_tls_no_park_depth == 0) {
+        /* Always take the real safepoint path.  Besides avoiding a racy plain
+         * stop-flag poll, this makes the live thread either park in the active
+         * epoch or prove that no stop is currently pending. */
+        pcc_thread_safepoint();
+    }
+}
+
+int64_t pcc_thread_no_park_depth(void) {
+    return pcc_tls_no_park_depth;
+}
 
 enum {
     PCC_VTHREAD_NEW = 0,
@@ -925,12 +1096,12 @@ void pcc_vthread_waiter_pool_note_cached(int64_t count) {
 
 static PyVirtualThreadObject *checked_vthread(PyObject *vthread) {
     if (vthread == NULL || PY_IS_TAGGED_INT(vthread)) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "object is not a virtual thread"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "object is not a virtual thread"));
         return NULL;
     }
     vthread = pcc_gc_note_relocation_read(vthread);
     if (py_type_of(vthread) != PY_TYPE_VIRTUAL_THREAD) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "object is not a virtual thread"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "object is not a virtual thread"));
         return NULL;
     }
     return (PyVirtualThreadObject *)vthread;
@@ -2372,7 +2543,7 @@ int64_t py_virtual_thread_io_resource_register(int64_t fd) {
 
 int64_t py_virtual_thread_io_resource_generation(int64_t fd) {
     if (fd < 0 || pcc_vthread_scheduler_init() != 0) {
-        py_raise(py_exc_new(PY_EXC_OSERROR, "TCP descriptor is not open"));
+        py_raise_owned(py_exc_new(PY_EXC_OSERROR, "TCP descriptor is not open"));
         return -1;
     }
     if (pcc_mutex_lock(pcc_vthread_lock) != 0) return -1;
@@ -2381,7 +2552,7 @@ int64_t py_virtual_thread_io_resource_generation(int64_t fd) {
     int64_t generation = resource == NULL ? -1 : resource->generation;
     (void)pcc_mutex_unlock(pcc_vthread_lock);
     if (generation < 0) {
-        py_raise(py_exc_new(PY_EXC_OSERROR, "TCP descriptor is not open"));
+        py_raise_owned(py_exc_new(PY_EXC_OSERROR, "TCP descriptor is not open"));
     }
     return generation;
 }
@@ -2391,7 +2562,7 @@ int64_t py_virtual_thread_io_resource_operation_begin(
     int64_t generation
 ) {
     if (fd < 0 || generation <= 0 || pcc_vthread_scheduler_init() != 0) {
-        py_raise(py_exc_new(PY_EXC_OSERROR, "TCP descriptor was closed"));
+        py_raise_owned(py_exc_new(PY_EXC_OSERROR, "TCP descriptor was closed"));
         return -1;
     }
     if (pcc_mutex_lock(pcc_vthread_lock) != 0) return -1;
@@ -2399,7 +2570,7 @@ int64_t py_virtual_thread_io_resource_operation_begin(
         pcc_vthread_io_resource_find_locked(fd, NULL);
     if (resource == NULL || resource->generation != generation) {
         (void)pcc_mutex_unlock(pcc_vthread_lock);
-        py_raise(py_exc_new(PY_EXC_OSERROR, "TCP descriptor was closed"));
+        py_raise_owned(py_exc_new(PY_EXC_OSERROR, "TCP descriptor was closed"));
         return -1;
     }
     /* Success deliberately returns with pcc_vthread_lock held. */
@@ -2448,7 +2619,7 @@ int64_t py_virtual_thread_block_on_fd_generation(
         pcc_vthread_io_resource_find_locked(fd, NULL);
     if (resource == NULL || resource->generation != generation) {
         (void)pcc_mutex_unlock(pcc_vthread_lock);
-        py_raise(py_exc_new(PY_EXC_OSERROR, "TCP descriptor was closed"));
+        py_raise_owned(py_exc_new(PY_EXC_OSERROR, "TCP descriptor was closed"));
         return -1;
     }
     if (

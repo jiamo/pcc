@@ -263,6 +263,43 @@ def resolve_python_config_command() -> str:
     return "python3-config"
 
 
+def _ensure_interpreter_libdir_flag(flags: list[str]) -> list[str]:
+    """Repair python-config output that names libpython without its LIBDIR."""
+    needs_search_path = False
+    for flag in flags:
+        if flag.startswith("-lpython"):
+            needs_search_path = True
+            break
+    if not needs_search_path:
+        return flags
+    try:
+        import sysconfig as _sysconfig
+
+        libdir = str(_sysconfig.get_config_var("LIBDIR") or "").strip()
+        ldlibrary = str(_sysconfig.get_config_var("LDLIBRARY") or "").strip()
+    except Exception:
+        return flags
+    if not libdir or not ldlibrary:
+        return flags
+    if not os.path.isfile(os.path.join(libdir, ldlibrary)):
+        return flags
+
+    expected = os.path.realpath(libdir)
+    index = 0
+    while index < len(flags):
+        flag = flags[index]
+        candidate = ""
+        if flag == "-L" and index + 1 < len(flags):
+            candidate = flags[index + 1]
+            index += 1
+        elif flag.startswith("-L") and len(flag) > 2:
+            candidate = flag[2:]
+        if candidate and os.path.realpath(candidate) == expected:
+            return flags
+        index += 1
+    return ["-L" + libdir, *flags]
+
+
 def link_flags() -> list[str]:
     """Return explicit or interpreter-owned embed linker flags."""
     ldflags_env = str(os.environ.get("PCC_PYTHON_LDFLAGS", "")).strip()
@@ -280,7 +317,7 @@ def link_flags() -> list[str]:
         raise LibpythonLinkConfigError(
             f"{config_cmd} required for import-using programs: {exc}"
         ) from exc
-    return output.split()
+    return _ensure_interpreter_libdir_flag(output.split())
 
 
 def ir_needs_libpython(ir_text: str) -> bool:

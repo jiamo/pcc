@@ -23,6 +23,9 @@ _PROGRAM = textwrap.dedent(
         print((0).to_bytes(0, "big"))
         print(int.from_bytes(b"\\x01\\x00", "big"))
         print(int.from_bytes(b"\\x01\\x00", "little"))
+        mutable = bytearray(b"\\x01\\x00")
+        print(int.from_bytes(mutable, "big"))
+        print(int.from_bytes(memoryview(mutable), "little"))
         rt = int.from_bytes((2 ** 100).to_bytes(16, "big"), "big")
         print(rt == 2 ** 100)
         try:
@@ -53,6 +56,8 @@ _EXPECTED = [
     "b'\\x00\\x10\\x00\\x00'",
     "b'\\x00\\x00\\x00\\x10\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00\\x00'",
     "b''",
+    "256",
+    "1",
     "256",
     "1",
     "True",

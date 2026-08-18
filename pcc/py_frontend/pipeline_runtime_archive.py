@@ -11,6 +11,14 @@ from typing import Optional
 from .pipeline_paths import join_strings
 
 
+RUNTIME_PYTHON_IR_PASSES_ENV = "PCC_RUNTIME_PYTHON_IR_PASSES"
+
+
+def runtime_python_ir_pass_mode() -> str:
+    value = str(os.environ.get(RUNTIME_PYTHON_IR_PASSES_ENV, "") or "").strip()
+    return value or "default"
+
+
 class RuntimeArchiveError(RuntimeError):
     """Runtime archive selection or construction failed closed."""
 
@@ -271,6 +279,56 @@ def provenance_valid(
     return True
 
 
+def provenance_codegen_stale(
+    archive: str,
+    *,
+    pcc_source_root,
+    host_python_command,
+) -> bool:
+    """Check an automatic local archive against the current compiler source.
+
+    This intentionally crosses the existing host-Python boundary instead of
+    importing host-only source identity code into the pcc1 closure.  Failure to
+    spawn, import, read, or prove a checksum is stale for an automatically
+    managed archive.
+    """
+
+    manifest = provenance_manifest(archive)
+    if not os.path.isfile(manifest):
+        return True
+    host_code = (
+        "import json\n"
+        "import os\n"
+        "import sys\n"
+        "pcc_source_root = sys.argv[1]\n"
+        "if pcc_source_root and pcc_source_root not in sys.path:\n"
+        "    sys.path.insert(0, pcc_source_root)\n"
+        "if pcc_source_root:\n"
+        "    os.environ.setdefault('PCC_SOURCE_ROOT', pcc_source_root)\n"
+        "    os.environ.setdefault('PCC_REPO_ROOT', pcc_source_root)\n"
+        "from pcc.tools.runtime_archive_provenance import manifest_is_stale_for_current_codegen\n"
+        "with open(sys.argv[2], 'r', encoding='utf-8') as stream:\n"
+        "    manifest = json.load(stream)\n"
+        "raise SystemExit(1 if manifest_is_stale_for_current_codegen(manifest) else 0)\n"
+    )
+    try:
+        result = subprocess.run(
+            [
+                host_python_command(),
+                "-c",
+                host_code,
+                pcc_source_root(),
+                manifest,
+            ],
+            check=False,
+            capture_output=True,
+            timeout=90,
+        )
+    except Exception:
+        return True
+    return result.returncode != 0
+
+
 def target_matches(archive: str, expected_target_id: str) -> bool:
     stamp = target_stamp(archive)
     if not os.path.isfile(stamp):
@@ -420,10 +478,16 @@ def run_runtime_make(runtime_dir: str, make_cmd, *, verbose: bool) -> None:
         "trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM; "
         '"$@"'
     )
+    # The runtime archive is a build dependency, not the user's program: a
+    # `-g` on the command line must not make the runtime ports compile with
+    # debug info, which changes the archive every user build toggles the flag.
+    build_env = dict(os.environ)
+    build_env.pop("PCC_PY_DEBUG_INFO", None)
     subprocess.run(
         ["sh", "-c", lock_script, "sh", lock_dir, *make_cmd],
         check=True,
         capture_output=False,
+        env=build_env,
     )
 
 
@@ -465,6 +529,7 @@ def archive_stale(
     target_matches,
     archive_requires_provenance,
     archive_provenance_valid,
+    archive_codegen_stale,
     wheel_matches,
     compiler_sources_newer,
     replaced_c_modules,
@@ -478,6 +543,8 @@ def archive_stale(
         if wheel_matches(archive):
             return False
         if not archive_provenance_valid(archive):
+            return True
+        if archive_codegen_stale(archive):
             return True
     archive_mtime = os.path.getmtime(archive)
     if compiler_sources_newer(archive_base, archive_mtime):
@@ -544,6 +611,7 @@ def ensure_runtime(
     c_bundle_valid,
     archive_requires_provenance,
     archive_provenance_valid,
+    archive_codegen_stale,
     wheel_matches,
     archive_manifest,
     archive_target_matches,
@@ -653,13 +721,23 @@ def ensure_runtime(
             or str(os.environ.get("PCC_REFCOUNT_KIND", "")).strip()
         )
         archive_mtime = os.path.getmtime(archive) if os.path.isfile(archive) else 0.0
-        provenance_forces_rebuild = (
-            archive_requires_provenance(archive)
-            and not archive_provenance_valid(archive, runtime_root=runtime_dir)
+        managed_local_archive = archive_requires_provenance(
+            archive
+        ) and not wheel_matches(archive)
+        provenance_is_valid = not managed_local_archive or archive_provenance_valid(
+            archive,
+            runtime_root=runtime_dir,
+        )
+        provenance_forces_rebuild = managed_local_archive and not provenance_is_valid
+        codegen_forces_rebuild = (
+            managed_local_archive
+            and provenance_is_valid
+            and archive_codegen_stale(archive)
         )
         full_rebuild = (
             runtime_config_forces_rebuild
             or provenance_forces_rebuild
+            or codegen_forces_rebuild
             or not archive_target_matches(archive)
             or compiler_sources_newer(os.path.basename(archive), archive_mtime)
         )
@@ -700,6 +778,9 @@ def ensure_runtime(
             if pcc_binary and high == "py":
                 make_cmd.append(f"PCC={pcc_binary}")
                 make_cmd.append(f"PYTHON={runtime_host_python()}")
+                make_cmd.append(
+                    "PCC_PYTHON_IR_PASSES=" + runtime_python_ir_pass_mode()
+                )
         elif needs_libpython:
             make_cmd.extend(
                 [
@@ -731,6 +812,11 @@ def ensure_runtime(
                         "pcc-Python runtime archive has invalid provenance: "
                         + manifest
                     )
+                if archive_codegen_stale(archive):
+                    raise RuntimeArchiveError(
+                        "pcc-Python runtime archive has stale codegen provenance: "
+                        + manifest
+                    )
             if not c_bundle_valid(archive):
                 raise RuntimeArchiveError(
                     "runtime build published an invalid archive/inventory bundle: "
@@ -749,6 +835,11 @@ def ensure_runtime(
         if not archive_provenance_valid(archive, runtime_root=runtime_dir):
             raise RuntimeArchiveError(
                 "pcc-Python runtime archive has invalid provenance: " + manifest
+            )
+        if archive_codegen_stale(archive):
+            raise RuntimeArchiveError(
+                "pcc-Python runtime archive has stale codegen provenance: "
+                + manifest
             )
     raise RuntimeArchiveError(
         "required Python runtime archive was not produced: " + archive

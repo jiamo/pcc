@@ -387,17 +387,8 @@ def generator_may_park_child_slot(host, expr: Call, callee_name: str):
     # with the cast in one retry arm and uses in another).  Materialize the
     # stable frame-slot address in the function entry, before its terminator,
     # just like the entry GC-frame registration helpers do.
-    entry = host.current_function.blocks[0]
     saved_block = host.builder._block
-    terminator = None
-    for instr in reversed(entry._instrs):
-        if host._instruction_is_terminator(instr):
-            terminator = instr
-            break
-    if terminator is not None:
-        host.builder.position_before(terminator)
-    else:
-        host.builder.position_at_end(entry)
+    host._position_at_entry_hoist_point()
     root_ptr = host._as_gc_ptr(
         child_slot,
         name=host._fresh("vthread.delegate.child.root"),

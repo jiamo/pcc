@@ -16,6 +16,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNTIME_DIR = REPO_ROOT / "pcc" / "py_runtime"
 STRICT_SOURCE = RUNTIME_DIR / "py" / "freestanding_gc_relocation_drain.py"
 MANAGED_SOURCE = RUNTIME_DIR / "py" / "py_gc_backend.py"
+C_SOURCE = RUNTIME_DIR / "src" / "py_gc_backend.c"
 MAKEFILE = RUNTIME_DIR / "Makefile"
 
 OWNED_SYMBOLS = {
@@ -24,15 +25,13 @@ OWNED_SYMBOLS = {
     "pcc_gc_relocation_drain_evacuation_page_head",
     "pcc_gc_relocation_drain_note_incomplete_batch",
     "pcc_gc_relocation_drain_relocation_set_head",
-    "pcc_gc_relocation_drain_remap_if_drained_unlocked",
     "pcc_gc_relocation_drain_selected",
     "pcc_gc_relocation_drain_selected_page",
 }
 RAW_FUNCTION_IMPORTS = {
     "pcc_gc_backend",
-    "pcc_gc_backend4_relocate_copy_unlocked",
-    "pcc_gc_backend4_remap_and_retire_unlocked",
-    "pcc_gc_backend4_zpage_page_for_owner",
+    "pcc_gc_backend4_remap_and_retire_stopped_world",
+    "pcc_gc_backend4_zpage_find",
     "pcc_gc_config_ensure",
     "pcc_gc_object_known_size",
     "pcc_gc_relocate_copy",
@@ -44,6 +43,7 @@ RAW_FUNCTION_IMPORTS = {
 RAW_GLOBAL_IMPORTS = {
     "pcc_gc_backend4_evacuation_incomplete_batches_count",
     "pcc_gc_backend4_evacuation_page_head",
+    "pcc_gc_backend4_remap_active",
     "pcc_gc_relocation_set_head",
     "pcc_gc_forwarding_population",
 }
@@ -143,15 +143,120 @@ def test_relocation_drain_has_exact_strict_object_closure(
 def test_relocation_drain_preserves_budget_lock_and_handoff_contract() -> None:
     strict = STRICT_SOURCE.read_text(encoding="utf-8")
 
-    assert "while ptr_is_null(node) == 0 and moved < budget:" in strict
-    assert "if (moved & 15) == 0:" in strict
-    assert "pcc_gc_backend4_relocate_copy_unlocked(" in strict
-    assert "pcc_gc_backend4_zpage_page_for_owner(obj)" in strict
+    object_body = strict.split("def _relocate_selected(budget: i64)", 1)[1].split(
+        '@c_abi_export("pcc_gc_backend4_evacuation_drain")', 1
+    )[0]
+    assert "sources = stack_alloc(128)" in object_body
+    assert "while moved < budget and stalled == 0:" in object_body
+    assert "capacity: i64 = budget - moved" in object_body
+    assert "if capacity > 16:" in object_body
+    assert "capacity = 16" in object_body
+    assert "while ptr_is_null(node) == 0 and captured < capacity:" in object_body
+    assert "store_ptr(sources, captured * 8, load_ptr(node, 0))" in object_body
+    assert "node = load_ptr(node, 8)" in object_body
+    snapshot_unlock = object_body.index("pcc_py_gc_minor_graph_unlock()")
+    public_copy = object_body.index("to_obj = pcc_gc_relocate_copy(")
+    tail_drop = object_body.index("py_decref(to_obj)", public_copy)
+    tail_poll = object_body.index("pcc_thread_safepoint()", tail_drop)
+    assert snapshot_unlock < public_copy < tail_drop < tail_poll
+    assert "nxt = load_ptr(node, 8)" not in object_body
+    assert object_body.count("pcc_py_gc_minor_graph_lock()") == 2
+    assert object_body.count("pcc_py_gc_minor_graph_unlock()") == 2
+    final_lock = object_body.rindex("pcc_py_gc_minor_graph_lock()")
+    note_incomplete = object_body.index("_note_incomplete_batch(moved)")
+    final_unlock = object_body.rindex("pcc_py_gc_minor_graph_unlock()")
+    remap = object_body.index(
+        "pcc_gc_backend4_remap_and_retire_stopped_world()", final_unlock
+    )
+    assert tail_poll < final_lock < note_incomplete < final_unlock < remap
+
+    assert "sources = stack_alloc(128)" in strict
+    assert "and examined < 16" in strict
+    assert "and captured < 16" in strict
+    assert "store_ptr(sources, captured * 8, obj)" in strict
+    assert "znode = pcc_gc_backend4_zpage_find(obj)" in strict
+    assert "ptr_eq(load_ptr(znode, 8), page)" in strict
+    assert "pcc_gc_backend4_zpage_page_for_owner" not in strict
+    page_body = strict.split("def _relocate_selected_page(page)", 1)[1].split(
+        '@c_abi_export("pcc_gc_backend4_evacuation_page_drain")', 1
+    )[0]
+    snapshot_unlock = page_body.index("pcc_py_gc_minor_graph_unlock()")
+    copy_call = page_body.index("to_obj = pcc_gc_relocate_copy(")
+    tail_drop = page_body.index("py_decref(to_obj)")
+    tail_poll = page_body.index("pcc_thread_safepoint()")
+    assert snapshot_unlock < copy_call < tail_drop < tail_poll
     assert "while pages < page_budget:" in strict
     assert "pcc_py_gc_minor_graph_lock()" in strict
     assert "pcc_py_gc_minor_graph_unlock()" in strict
-    assert "pcc_gc_backend4_remap_and_retire_unlocked()" in strict
+    assert "pcc_gc_backend4_remap_and_retire_stopped_world()" in strict
     assert "pcc_gc_backend4_evacuation_incomplete_batches_count" in strict
+
+    c_src = C_SOURCE.read_text(encoding="utf-8")
+    c_object_snapshot = c_src.split(
+        "static int64_t pcc_gc_backend4_snapshot_relocation_batch_unlocked(",
+        1,
+    )[1].split("static int64_t pcc_gc_relocate_selected(", 1)[0]
+    assert "captured < source_capacity" in c_object_snapshot
+    assert "sources[captured] = n->obj;" in c_object_snapshot
+    for forbidden in (
+        "pcc_gc_alloc(",
+        "pcc_gc_relocate_copy(",
+        "py_decref(",
+        "pcc_thread_safepoint(",
+        "malloc(",
+        "free(",
+    ):
+        assert forbidden not in c_object_snapshot
+    c_object = c_src.split(
+        "static int64_t pcc_gc_relocate_selected(int64_t budget)", 1
+    )[1].split(
+        "int64_t pcc_gc_backend4_evacuation_drain(int64_t budget)", 1
+    )[0]
+    snapshot_unlock = c_object.index("pcc_gc_graph_unlock();")
+    public_copy = c_object.index("pcc_gc_relocate_copy(sources[i], size)")
+    tail_drop = c_object.index("py_decref(to)", public_copy)
+    tail_poll = c_object.index("pcc_thread_safepoint();", tail_drop)
+    assert snapshot_unlock < public_copy < tail_drop < tail_poll
+    assert "pcc_gc_relocate_copy_unlocked(" not in c_object
+    final_lock = c_object.rindex("pcc_gc_graph_lock();")
+    note_incomplete = c_object.index(
+        "pcc_gc_backend4_evacuation_incomplete_batches_count"
+    )
+    final_unlock = c_object.rindex("pcc_gc_graph_unlock();")
+    remap = c_object.index(
+        "pcc_gc_backend4_remap_and_retire_stopped_world()", final_unlock
+    )
+    assert tail_poll < final_lock < note_incomplete < final_unlock < remap
+
+    c_snapshot = c_src.split(
+        "static int64_t pcc_gc_backend4_snapshot_selected_page_batch_unlocked(",
+        1,
+    )[1].split(
+        "int64_t pcc_gc_backend4_evacuation_page_drain(", 1
+    )[0]
+    assert "examined < PCC_GC_SAFEPOINT_BATCH" in c_snapshot
+    assert "captured < source_capacity" in c_snapshot
+    for forbidden in (
+        "pcc_gc_alloc(",
+        "pcc_gc_relocate_copy(",
+        "py_decref(",
+        "pcc_thread_safepoint(",
+        "malloc(",
+        "free(",
+    ):
+        assert forbidden not in c_snapshot
+    c_page = c_src.split(
+        "int64_t pcc_gc_backend4_evacuation_page_drain(int64_t page_budget)",
+        1,
+    )[1].split(
+        "static int64_t pcc_gc_install_forwarding_unlocked", 1
+    )[0]
+    snapshot_unlock = c_page.index("pcc_gc_graph_unlock();")
+    public_copy = c_page.index("pcc_gc_relocate_copy(sources[i], size)")
+    tail_drop = c_page.index("py_decref(to)", public_copy)
+    tail_poll = c_page.index("pcc_thread_safepoint();", tail_drop)
+    assert snapshot_unlock < public_copy < tail_drop < tail_poll
+    assert "pcc_gc_relocate_copy_unlocked(" not in c_page
 
 
 def test_production_archive_has_one_relocation_drain_owner(
@@ -188,6 +293,9 @@ def _link_drain_probe(tmp_path: Path, name: str, archive: Path) -> Path:
 
             enum { PY_FLAG_GC_OLD = 0x100 };
 
+            /* Runtime-internal: not in the public header. */
+            extern void pcc_gc_publish_initialized(PyObject *obj);
+
             int main(int argc, char **argv) {
                 if (pcc_gc_set_backend(PCC_GC_KIND_COLORED_RELOCATING) != 0) {
                     return 2;
@@ -195,6 +303,14 @@ def _link_drain_probe(tmp_path: Path, name: str, archive: Path) -> Path:
                 PyObject *a = pcc_gc_alloc(128, PY_TYPE_LIST, PY_FLAG_GC_OLD);
                 PyObject *b = pcc_gc_alloc(128, PY_TYPE_LIST, PY_FLAG_GC_OLD);
                 if (a == 0 || b == 0) return 3;
+                /* pcc_gc_alloc sets PY_FLAG_GC_FRESH_ALLOC for container tags
+                 * and pcc_gc_relocation_set_add_preallocated refuses to
+                 * relocate an object that still carries it -- moving a
+                 * half-initialized object is not safe.  Real constructors clear
+                 * it by publishing once initialization completes, so a raw
+                 * allocation must do the same or it can never be selected. */
+                pcc_gc_publish_initialized(a);
+                pcc_gc_publish_initialized(b);
                 pcc_gc_telemetry_reset();
                 if (pcc_gc_select_relocation_set(8) != 2) return 4;
 

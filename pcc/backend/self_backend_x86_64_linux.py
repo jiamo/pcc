@@ -26,6 +26,7 @@ from . import BackendUnavailable
 from .code_profile import apply_function_order_profile
 from .self_backend_emit import emit_function_blocks
 from .self_backend_instruction_dispatch import emit_instruction_dispatch
+from .self_backend_kernel import get_indexed_function_kernel
 from .self_backend_aarch64_darwin_symbols import sanitize_label
 from .self_backend_ir import (
     GlobalDef,
@@ -51,6 +52,7 @@ from .self_backend_precise_stackmaps import (
 from .self_backend_target_passes import run_self_target_memory_pass_pipeline
 from .self_backend_target_match import is_x86_64_linux_triple
 from .self_backend_terminator_dispatch import emit_terminator_dispatch
+from .self_backend_value_arena import CompilerInt2
 from .self_backend_x86_64_linux_data import (
     emit_globals,
     validate_x86_tls_global,
@@ -2831,6 +2833,20 @@ def _emit_function(
 ) -> list[str]:
     symbol = _asm_symbol(func.name)
     lines = _emit_prologue(func)
+    kernel = get_indexed_function_kernel(func)
+    kernel.materialize_legacy_blocks(func)
+    for block_id, block in enumerate(func.blocks):
+        if block.phis:
+            continue
+        phi_fact: CompilerInt2 = kernel.block_phi_fact(block_id)
+        if phi_fact.second == 0:
+            continue
+        projected = []
+        phi_index = 0
+        while phi_index < phi_fact.second:
+            projected.append(kernel.diagnostic_phi(block_id, phi_index))
+            phi_index += 1
+        block.phis = tuple(projected)
     lines.extend(
         emit_function_blocks(
             func,
@@ -2838,6 +2854,7 @@ def _emit_function(
             emit_instruction=_emit_instruction,
             emit_terminator=_emit_terminator,
             stack_map_plan=stack_map_plan,
+            indexed_kernel=kernel,
         )
     )
     lines.append(stack_map_plan.end_label + ":")
@@ -2909,5 +2926,7 @@ def emit_x86_64_linux_asm(ir_text: str) -> str:
             function_symbol=_asm_symbol,
             block_label=_block_label,
         ))
+        for func in functions:
+            get_indexed_function_kernel(func).close_native_tables()
     lines.append('.section .note.GNU-stack,"",@progbits')
     return "\n".join(lines) + "\n"

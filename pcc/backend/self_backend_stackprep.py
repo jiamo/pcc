@@ -4,63 +4,146 @@ from __future__ import annotations
 
 from typing import Callable
 
-from .self_backend_analysis import (
-    collect_block_local_last_uses,
-    collect_used_values,
-    instruction_used_values,
+from . import BackendUnavailable
+from .self_backend_kernel import (
+    TYPE_KIND_ARRAY,
+    TYPE_KIND_STRUCT,
+    get_indexed_function_kernel,
 )
 from .self_backend_ir import (
     AllocaInfo,
     I1,
+    PARSED_INSTRUCTION_KIND_ALLOCA,
+    PARSED_INSTRUCTION_KIND_ATOMICRMW,
+    PARSED_INSTRUCTION_KIND_CALL,
+    PARSED_INSTRUCTION_KIND_CMPXCHG,
+    PARSED_INSTRUCTION_KIND_EXTRACTELEMENT,
+    PARSED_INSTRUCTION_KIND_EXTRACTVALUE,
+    PARSED_INSTRUCTION_KIND_FBINOP,
+    PARSED_INSTRUCTION_KIND_FCMP,
+    PARSED_INSTRUCTION_KIND_FNEG,
+    PARSED_INSTRUCTION_KIND_FREEZE,
+    PARSED_INSTRUCTION_KIND_INSERTELEMENT,
+    PARSED_INSTRUCTION_KIND_INSERTVALUE,
+    PARSED_INSTRUCTION_KIND_LOAD_ATOMIC,
+    PARSED_INSTRUCTION_KIND_SHUFFLEVECTOR,
+    PARSED_INSTRUCTION_KIND_SYSCALL6,
+    PARSED_INSTRUCTION_KIND_VA_ARG,
+    PARSED_INSTRUCTION_KINDS,
     ParsedFunction,
     SlotInfo,
     TypeDesc,
-    _dot_numeric_text_key_id,
     _align_to,
+    parsed_function_publish_alloca_slot,
+    parsed_function_publish_value_slot,
 )
-from .self_backend_parse import gep_result_type
+from .self_backend_value_arena import CompilerInt4
 
 
-def _stable_value_name_key(text: str) -> int:
-    """Return a deterministic integer bucket key for an SSA value name."""
-    modulus = 1099511627776
-    value = 0
-    index = 0
-    while index < len(text):
-        value = (value * 131 + ord(text[index])) % modulus
-        index += 1
-    return value
+def _legacy_instruction_result_type(kind_id: int, data) -> TypeDesc | None:
+    if kind_id == PARSED_INSTRUCTION_KIND_LOAD_ATOMIC:
+        return data[1]
+    if kind_id == PARSED_INSTRUCTION_KIND_ATOMICRMW:
+        return data[4]
+    if kind_id == PARSED_INSTRUCTION_KIND_CMPXCHG:
+        return data[1]
+    if kind_id == PARSED_INSTRUCTION_KIND_SYSCALL6:
+        return TypeDesc("int", 64)
+    if kind_id == PARSED_INSTRUCTION_KIND_FBINOP:
+        return data[2]
+    if kind_id == PARSED_INSTRUCTION_KIND_FNEG:
+        return data[1]
+    if kind_id == PARSED_INSTRUCTION_KIND_FCMP:
+        value_type = data[2]
+        return (
+            TypeDesc("array", count=value_type.count, elem=I1)
+            if value_type.is_array and value_type.elem is not None
+            else I1
+        )
+    if kind_id in (
+        PARSED_INSTRUCTION_KIND_FREEZE,
+        PARSED_INSTRUCTION_KIND_INSERTELEMENT,
+        PARSED_INSTRUCTION_KIND_SHUFFLEVECTOR,
+        PARSED_INSTRUCTION_KIND_INSERTVALUE,
+    ):
+        return data[1]
+    if (
+        kind_id == PARSED_INSTRUCTION_KIND_EXTRACTELEMENT
+        or kind_id == PARSED_INSTRUCTION_KIND_EXTRACTVALUE
+    ):
+        return data[4]
+    if kind_id == PARSED_INSTRUCTION_KIND_VA_ARG:
+        return data[3]
+    return None
 
 
 def assign_stack_slots(
     func: ParsedFunction,
     *,
     aggregate_returned_indirect: Callable[[TypeDesc], bool],
+    aggregate_returned_indirect_indexed=None,
+    materialize_legacy_slots: bool = True,
 ) -> None:
     offset = 0
-    func.used_values = collect_used_values(func)
-    block_local_last_uses = collect_block_local_last_uses(func)
-    free_slots: list[SlotInfo] = []
-    active_local_values: set[str] = set()
-    used_dot_numeric_ids: set[int] = set()
-    used_value_indices_by_key: dict[int, list[int]] = {}
-    for used_index, used_value in enumerate(func.used_values):
-        used_id = _dot_numeric_text_key_id(used_value)
-        if used_id >= 0:
-            used_dot_numeric_ids.add(used_id)
-            continue
-        key = _stable_value_name_key(used_value)
-        used_value_indices_by_key.setdefault(key, []).append(used_index)
+    kernel = get_indexed_function_kernel(func)
+    func.indexed_slot_projection = not materialize_legacy_slots
+    # Block-local slot reuse.  Free slots are bucketed by type so an
+    # allocation takes the earliest freed slot of its type without scanning
+    # every free slot, and ``active_position`` maps a value ID to its index in
+    # the active lists so a use never scans them: the direct inline error
+    # plane makes blocks several times longer, and both scans were quadratic
+    # in block length (cProfile: maybe_free_local_value +4.4x calls, value_id
+    # +27x, assign_stack_slots +0.25s on class_gen).  Reuse order is unchanged.
+    free_slot_ids_by_type: dict[int, list[int]] = {}
+    active_local_value_ids: list[int] = []
+    active_local_slot_ids: list[int] = []
+    active_position: list[int] = [-1] * len(kernel.value_names)
+    legacy_slot_infos_by_id: list[SlotInfo] = []
 
-    def value_is_used(value_name: str) -> bool:
-        value_id = _dot_numeric_text_key_id(value_name)
-        if value_id >= 0:
-            return value_id in used_dot_numeric_ids
-        key = _stable_value_name_key(value_name)
-        for used_index in used_value_indices_by_key.get(key, []):
-            if func.used_values[used_index] == value_name:
-                return True
-        return False
+    def intern_slot_id(slot_offset: int, type_id: int) -> int:
+        return kernel.intern_slot_type_id(slot_offset, type_id)
+
+    def legacy_slot_info(slot_id: int) -> SlotInfo:
+        if slot_id < len(legacy_slot_infos_by_id):
+            return legacy_slot_infos_by_id[slot_id]
+        if slot_id != len(legacy_slot_infos_by_id):
+            raise BackendUnavailable("indexed slot table is not dense")
+        result = SlotInfo(
+            kernel.slot_offset(slot_id),
+            kernel.type_desc(kernel.slot_type_id(slot_id)),
+        )
+        legacy_slot_infos_by_id.append(result)
+        return result
+
+    def publish_value_slot(value_id: int, value_name: str, slot_id: int) -> None:
+        kernel.publish_value_slot_id(value_id, slot_id)
+        if materialize_legacy_slots:
+            parsed_function_publish_value_slot(
+                func,
+                value_name,
+                legacy_slot_info(slot_id),
+            )
+
+    def publish_alloca(
+        value_id: int,
+        value_name: str,
+        slot_offset: int,
+        allocated_type_id: int,
+    ) -> None:
+        kernel.publish_alloca_type_id(
+            value_id,
+            slot_offset,
+            allocated_type_id,
+        )
+        if materialize_legacy_slots:
+            parsed_function_publish_alloca_slot(
+                func,
+                value_name,
+                AllocaInfo(
+                    slot_offset,
+                    kernel.type_desc(allocated_type_id),
+                ),
+            )
 
     def alloc(size: int, align: int) -> int:
         nonlocal offset
@@ -68,255 +151,218 @@ def assign_stack_slots(
         offset += size
         return offset
 
-    def alloc_value_slot(value_name: str, value_type: TypeDesc) -> SlotInfo:
-        last_uses = block_local_last_uses.get(current_block, {})
-        if value_name not in last_uses:
-            return SlotInfo(
-                alloc(value_type.value_slot_size, value_type.value_align), value_type
+    def alloc_value_slot(
+        value_id: int,
+        value_type_id: int,
+    ) -> int:
+        value_layout: CompilerInt4 = kernel.type_layout(value_type_id)
+        if kernel.last_use(current_block_id, value_id) is None:
+            return intern_slot_id(
+                alloc(value_layout.first, value_layout.second),
+                value_type_id,
             )
-        for index, slot in enumerate(free_slots):
-            if (
-                slot.type.value_slot_size >= value_type.value_slot_size
-                and slot.type.value_align >= value_type.value_align
-                and slot.type.describe() == value_type.describe()
-            ):
-                free_slots.pop(index)
-                active_local_values.add(value_name)
-                return SlotInfo(slot.offset, value_type)
-        active_local_values.add(value_name)
-        return SlotInfo(
-            alloc(value_type.value_slot_size, value_type.value_align), value_type
-        )
+        bucket = free_slot_ids_by_type.get(value_type_id)
+        if bucket:
+            slot_id = bucket.pop(0)
+        else:
+            slot_id = intern_slot_id(
+                alloc(value_layout.first, value_layout.second),
+                value_type_id,
+            )
+        active_position[value_id] = len(active_local_value_ids)
+        active_local_value_ids.append(value_id)
+        active_local_slot_ids.append(slot_id)
+        return slot_id
 
-    def maybe_free_local_value(value_name: str, position: int) -> None:
-        last_uses = block_local_last_uses.get(current_block, {})
-        if value_name not in active_local_values:
+    def returned_indirect(type_id: int) -> bool:
+        if (
+            not materialize_legacy_slots
+            and aggregate_returned_indirect_indexed is not None
+        ):
+            return aggregate_returned_indirect_indexed(kernel, type_id)
+        return aggregate_returned_indirect(kernel.types[type_id])
+
+    def publish_object_type_if_required(value_name: str, type_id: int) -> None:
+        # This compatibility side table remains authoritative for emit helpers
+        # that have not migrated to type IDs yet.  Keep it complete until every
+        # reader is converted, then delete it atomically; partially clearing it
+        # changes register/peephole decisions and therefore assembly shape.
+        func.value_types[value_name] = kernel.types[type_id]
+
+    def maybe_free_local_value(value_id: int, position: int) -> None:
+        if value_id < 0 or value_id >= len(active_position):
             return
-        if last_uses.get(value_name) != position:
+        active_index = active_position[value_id]
+        if active_index < 0:
             return
-        free_slots.append(func.value_slots[value_name])
-        active_local_values.remove(value_name)
+        if kernel.last_use(current_block_id, value_id) != position:
+            return
+        slot_id = active_local_slot_ids[active_index]
+        slot_type_id = kernel.slot_type_id(slot_id)
+        bucket = free_slot_ids_by_type.get(slot_type_id)
+        if bucket is None:
+            bucket = []
+            free_slot_ids_by_type[slot_type_id] = bucket
+        bucket.append(slot_id)
+        last_index = len(active_local_value_ids) - 1
+        if active_index != last_index:
+            moved_value_id = active_local_value_ids[last_index]
+            active_local_value_ids[active_index] = moved_value_id
+            active_local_slot_ids[active_index] = active_local_slot_ids[last_index]
+            active_position[moved_value_id] = active_index
+        active_local_value_ids.pop()
+        active_local_slot_ids.pop()
+        active_position[value_id] = -1
 
     for arg in func.args:
-        if arg.type.is_void or not value_is_used(arg.name):
+        arg_value_id = kernel.value_id(arg.name)
+        if (
+            arg.type.is_void
+            or arg_value_id < 0
+            or not kernel.value_is_used(arg_value_id)
+        ):
             continue
-        func.value_slots[arg.name] = SlotInfo(
-            alloc(arg.type.value_slot_size, arg.type.value_align),
-            arg.type,
+        arg_type_id = kernel.intern_type(arg.type)
+        publish_object_type_if_required(arg.name, arg_type_id)
+        arg_layout: CompilerInt4 = kernel.type_layout(arg_type_id)
+        publish_value_slot(
+            arg_value_id,
+            arg.name,
+            intern_slot_id(
+                alloc(arg_layout.first, arg_layout.second),
+                arg_type_id,
+            ),
         )
 
-    if aggregate_returned_indirect(func.ret_type):
-        func.hidden_sret_slot = SlotInfo(
-            alloc(8, 8), TypeDesc("ptr", pointee=TypeDesc("void"))
+    return_type_id = kernel.intern_type(func.ret_type)
+    if returned_indirect(return_type_id):
+        hidden_sret_type_id = kernel.intern_type(
+            TypeDesc("ptr", pointee=TypeDesc("void"))
         )
+        kernel.hidden_sret_slot_id = intern_slot_id(
+            alloc(8, 8),
+            hidden_sret_type_id,
+        )
+        if materialize_legacy_slots:
+            func.hidden_sret_slot = legacy_slot_info(
+                kernel.hidden_sret_slot_id
+            )
 
-    for block in func.blocks:
-        current_block = block.name
-        for phi in block.phis:
-            func.value_types[phi.dest] = phi.type
-            if value_is_used(phi.dest):
-                func.value_slots.setdefault(
-                    phi.dest, alloc_value_slot(phi.dest, phi.type)
+    current_block_id = 0
+    while current_block_id < len(kernel.block_names):
+        phi_fact = kernel.block_phi_fact(current_block_id)
+        phi_index = 0
+        while phi_index < phi_fact.second:
+            phi = kernel.phi_record(phi_fact.first + phi_index)
+            phi_value_id = phi.first
+            phi_name = kernel.value_name(phi_value_id)
+            if phi_value_id < 0:
+                raise BackendUnavailable(
+                    f"indexed kernel is missing phi value {phi_name!r}"
                 )
-        for index, instr in enumerate(block.instructions):
-            kind = instr.kind
-            data = instr.data
-            if kind == "alloca":
-                name, allocated_type = data
-                func.value_types[name] = allocated_type.ptr()
-                if value_is_used(name):
-                    func.alloca_slots.setdefault(
-                        name,
-                        AllocaInfo(
-                            alloc(allocated_type.slot_size, allocated_type.align),
-                            allocated_type,
+            phi_type_id = phi.second
+            kernel.publish_value_type_id(phi_value_id, phi_type_id)
+            publish_object_type_if_required(phi_name, phi_type_id)
+            if kernel.value_is_used(phi_value_id):
+                publish_value_slot(
+                    phi_value_id,
+                    phi_name,
+                    alloc_value_slot(phi_value_id, phi_type_id),
+                )
+            phi_index += 1
+        block_fact: CompilerInt4 = kernel.block_fact(current_block_id)
+        instruction_index = 0
+        instruction_count = block_fact.second
+        while instruction_index < instruction_count:
+            kind_id = kernel.instruction_kind_id_by_id(
+                block_fact.first + instruction_index
+            )
+            if not 0 <= kind_id < len(PARSED_INSTRUCTION_KINDS):
+                raise BackendUnavailable(
+                    f"corrupt parsed-instruction kind id {kind_id}"
+                )
+            dest_value_id = kernel.defined_value_id(
+                current_block_id,
+                instruction_index,
+            )
+            if dest_value_id >= 0:
+                dest = kernel.value_name(dest_value_id)
+                result_type_id = kernel.value_type_id(dest_value_id)
+                if result_type_id < 0:
+                    legacy_type = _legacy_instruction_result_type(
+                        kind_id,
+                        kernel.instruction_data(
+                            current_block_id,
+                            instruction_index,
                         ),
                     )
-            elif kind == "load":
-                dest, value_type, _ptr_type, _ptr = data
-                func.value_types[dest] = value_type
-                if value_is_used(dest):
-                    func.value_slots.setdefault(
-                        dest, alloc_value_slot(dest, value_type)
-                    )
-            elif kind == "load_atomic":
-                dest, value_type, _ptr_type, _ptr, _ordering = data
-                func.value_types[dest] = value_type
-                if value_is_used(dest):
-                    func.value_slots.setdefault(
-                        dest, alloc_value_slot(dest, value_type)
-                    )
-            elif kind == "atomicrmw":
-                dest, _op, _ptr_type, _ptr, value_type, _value, _ordering = data
-                func.value_types[dest] = value_type
-                if value_is_used(dest):
-                    func.value_slots.setdefault(
-                        dest, alloc_value_slot(dest, value_type)
-                    )
-            elif kind == "cmpxchg":
-                dest = data[0]
-                pair_type = data[1]
-                func.value_types[dest] = pair_type
-                if value_is_used(dest):
-                    func.value_slots.setdefault(
-                        dest, alloc_value_slot(dest, pair_type)
-                    )
-            elif kind == "syscall6":
-                dest = data[0]
-                i64_type = TypeDesc("int", 64)
-                func.value_types[dest] = i64_type
-                if value_is_used(dest):
-                    func.value_slots.setdefault(
-                        dest, alloc_value_slot(dest, i64_type)
-                    )
-            elif kind == "binop":
-                _op, dest, value_type, _lhs, _rhs = data
-                func.value_types[dest] = value_type
-                if value_is_used(dest):
-                    func.value_slots.setdefault(
-                        dest, alloc_value_slot(dest, value_type)
-                    )
-            elif kind == "fbinop":
-                _op, dest, value_type, _lhs, _rhs = data
-                func.value_types[dest] = value_type
-                if value_is_used(dest):
-                    func.value_slots.setdefault(
-                        dest, alloc_value_slot(dest, value_type)
-                    )
-            elif kind == "fneg":
-                dest, value_type, _value = data
-                func.value_types[dest] = value_type
-                if value_is_used(dest):
-                    func.value_slots.setdefault(
-                        dest, alloc_value_slot(dest, value_type)
-                    )
-            elif kind == "icmp":
-                _cond, dest, _value_type, _lhs, _rhs = data
-                result_type = (
-                    TypeDesc("array", count=_value_type.count, elem=I1)
-                    if _value_type.is_array and _value_type.elem is not None
-                    else I1
-                )
-                func.value_types[dest] = result_type
-                if value_is_used(dest):
-                    func.value_slots.setdefault(
-                        dest, alloc_value_slot(dest, result_type)
-                    )
-            elif kind == "fcmp":
-                _cond, dest, _value_type, _lhs, _rhs = data
-                result_type = (
-                    TypeDesc("array", count=_value_type.count, elem=I1)
-                    if _value_type.is_array and _value_type.elem is not None
-                    else I1
-                )
-                func.value_types[dest] = result_type
-                if value_is_used(dest):
-                    func.value_slots.setdefault(
-                        dest, alloc_value_slot(dest, result_type)
-                    )
-            elif kind == "cast":
-                _op, dest, _src_type, _value, dst_type = data
-                func.value_types[dest] = dst_type
-                if value_is_used(dest):
-                    func.value_slots.setdefault(dest, alloc_value_slot(dest, dst_type))
-            elif kind == "select":
-                dest, value_type, _cond, _true_value, _false_value = data
-                func.value_types[dest] = value_type
-                if value_is_used(dest):
-                    func.value_slots.setdefault(
-                        dest, alloc_value_slot(dest, value_type)
-                    )
-            elif kind == "freeze":
-                dest, value_type, _value = data
-                func.value_types[dest] = value_type
-                if value_is_used(dest):
-                    func.value_slots.setdefault(
-                        dest, alloc_value_slot(dest, value_type)
-                    )
-            elif kind == "insertelement":
-                (
-                    dest,
-                    vector_type,
-                    _vector_value,
-                    _elem_type,
-                    _elem_value,
-                    _index_value,
-                ) = data
-                func.value_types[dest] = vector_type
-                if value_is_used(dest):
-                    func.value_slots.setdefault(
-                        dest, alloc_value_slot(dest, vector_type)
-                    )
-            elif kind == "extractelement":
-                dest, _vector_type, _vector_value, _index_value, elem_type = data
-                func.value_types[dest] = elem_type
-                if value_is_used(dest):
-                    func.value_slots.setdefault(dest, alloc_value_slot(dest, elem_type))
-            elif kind == "shufflevector":
-                dest, vector_type, _lhs, _rhs, _mask_type, _mask_value = data
-                func.value_types[dest] = vector_type
-                if value_is_used(dest):
-                    func.value_slots.setdefault(
-                        dest, alloc_value_slot(dest, vector_type)
-                    )
-            elif kind == "extractvalue":
-                dest, _aggregate_type, _value, _indices, result_type, _offset = data
-                func.value_types[dest] = result_type
-                if value_is_used(dest):
-                    func.value_slots.setdefault(
-                        dest, alloc_value_slot(dest, result_type)
-                    )
-            elif kind == "insertvalue":
-                (
-                    dest,
-                    aggregate_type,
-                    _aggregate_value,
-                    _elem_type,
-                    _elem_value,
-                    _indices,
-                    _offset,
-                ) = data
-                func.value_types[dest] = aggregate_type
-                if value_is_used(dest):
-                    func.value_slots.setdefault(
-                        dest, alloc_value_slot(dest, aggregate_type)
-                    )
-            elif kind == "va_arg":
-                dest, _ap_type, _ap, value_type = data
-                func.value_types[dest] = value_type
-                if value_is_used(dest):
-                    func.value_slots.setdefault(
-                        dest, alloc_value_slot(dest, value_type)
-                    )
-            elif kind == "gep":
-                dest, base_type, _ptr_type, _ptr, indices = data
-                result_type = gep_result_type(base_type, indices)
-                func.value_types[dest] = result_type
-                if value_is_used(dest):
-                    func.value_slots.setdefault(
-                        dest, alloc_value_slot(dest, result_type)
-                    )
-            elif kind == "call":
-                (
-                    dest,
-                    ret_type,
-                    _callee,
-                    _is_indirect,
-                    _args,
-                    _fixed_arg_count,
-                    _is_vararg_call,
-                    _arg_alignments,
-                ) = data
-                if dest is not None:
-                    func.value_types[dest] = ret_type
-                    if value_is_used(dest) or aggregate_returned_indirect(ret_type):
-                        func.value_slots.setdefault(
-                            dest, alloc_value_slot(dest, ret_type)
+                    if legacy_type is None:
+                        raise BackendUnavailable(
+                            f"indexed kernel is missing result type for {dest!r}"
                         )
-            for value in instruction_used_values(instr):
-                maybe_free_local_value(value, index)
-        term_pos = len(block.instructions)
-        for value in sorted(active_local_values):
-            maybe_free_local_value(value, term_pos)
+                    result_type_id = kernel.publish_value_type(
+                        dest_value_id,
+                        legacy_type,
+                    )
+                publish_object_type_if_required(dest, result_type_id)
+                if kind_id == PARSED_INSTRUCTION_KIND_ALLOCA:
+                    allocated_type_id = kernel.alloca_type_id(dest_value_id)
+                    if kernel.value_is_used(dest_value_id):
+                        allocated_layout: CompilerInt4 = kernel.type_span(
+                            allocated_type_id
+                        )
+                        publish_alloca(
+                            dest_value_id,
+                            dest,
+                            alloc(
+                                allocated_layout.third,
+                                allocated_layout.fourth,
+                            ),
+                            allocated_type_id,
+                        )
+                elif kernel.value_is_used(dest_value_id) or (
+                    kind_id == PARSED_INSTRUCTION_KIND_CALL
+                    and returned_indirect(result_type_id)
+                ):
+                    publish_value_slot(
+                        dest_value_id,
+                        dest,
+                        alloc_value_slot(
+                            dest_value_id,
+                            result_type_id,
+                        ),
+                    )
+            use_index = 0
+            use_count = kernel.instruction_use_count(
+                current_block_id, instruction_index
+            )
+            while use_index < use_count:
+                maybe_free_local_value(
+                    kernel.instruction_use_id(
+                        current_block_id, instruction_index, use_index
+                    ),
+                    instruction_index,
+                )
+                use_index += 1
+            instruction_index += 1
+        term_pos = instruction_count
+        # Same order as before (by value name); the IDs are already at hand,
+        # so no name -> ID re-lookup.
+        remaining_values: list[str] = []
+        remaining_ids_by_name: dict[str, int] = {}
+        for active_value_id in active_local_value_ids:
+            remaining_name = kernel.value_name(active_value_id)
+            remaining_values.append(remaining_name)
+            remaining_ids_by_name[remaining_name] = active_value_id
+        remaining_values.sort()
+        for remaining_value in remaining_values:
+            maybe_free_local_value(remaining_ids_by_name[remaining_value], term_pos)
+        current_block_id += 1
 
     func.frame_size = _align_to(offset, 16)
+    kernel.finish_slot_interning()
+    if not materialize_legacy_slots:
+        if kernel.supported_object_projection_is_closed(func):
+            func.value_types.clear()
+            func.block_map.clear()
+            kernel.release_block_projections(func)

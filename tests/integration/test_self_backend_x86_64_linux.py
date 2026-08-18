@@ -435,7 +435,7 @@ printf 'RUNTIME_CACHE=%s\n' "$runtime_cache_state"
 cat >"$app_src" <<'PYEOF'
 import gc
 
-from pcc.extern import c_abi_typed_export, c_int32, c_int64, c_ptr, extern
+from pcc.extern import c_abi_typed_export, c_int32, c_int64, c_ptr, extern, c_obj, c_rawptr
 from pcc.unsafe import cstr, load_ptr, ptr_diff, stack_alloc, store_ptr, write
 
 
@@ -821,6 +821,8 @@ from pcc.extern import (
     c_ptr,
     c_void,
     extern,
+    c_obj,
+    c_rawptr,
 )
 from pcc.unsafe import (
     cstr,
@@ -842,7 +844,7 @@ pcc_runtime_log_event_code = extern(
 pcc_gc_alloc = extern(
     "pcc_gc_alloc",
     (c_int64, c_int32, c_int32),
-    c_ptr,
+    c_obj,
 )
 pcc_gc_backend4_zpage_register_owner_payload_span = extern(
     "pcc_gc_backend4_zpage_register_owner_payload_span",
@@ -853,7 +855,7 @@ pcc_threads_enabled = extern("pcc_threads_enabled", (), c_int64)
 pcc_current_native_thread_token = extern(
     "pcc_current_native_thread_token",
     (),
-    c_ptr,
+    c_rawptr,
 )
 
 

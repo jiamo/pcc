@@ -18,6 +18,12 @@ def _source() -> str:
                 return 4
             return "a"
 
+        def parse_int(token: str) -> int | None:
+            return int(token, 0)
+
+        def opaque(value):
+            return value
+
         def main():
             x = pick(True)
             y = pick(True)
@@ -26,6 +32,20 @@ def _source() -> str:
             print(x * y)
             s = pick(False)
             print(s + "b")
+            wide = parse_int("2891786578161389964")
+            width = opaque(8)
+            if wide is not None:
+                encoded = (wide & ((1 << (width * 8)) - 1)).to_bytes(
+                    width, "little"
+                )
+                print(int.from_bytes(encoded, "little"))
+            left = opaque({1, 2})
+            right = opaque({2, 3})
+            print(sorted(left & right))
+            print(sorted(left | right))
+            print(sorted(left ^ right))
+            merged = opaque({"a": 1}) | opaque({"b": 2})
+            print(merged["a"], merged["b"])
 
         main()
         """
@@ -47,7 +67,17 @@ def test_dyn_tagged_int_binop_preserves_object_semantics(tmp_path):
     run = subprocess.run([str(exe)], capture_output=True, text=True, timeout=20)
 
     assert run.returncode == 0, run.stderr
-    assert run.stdout.splitlines() == ["8", "0", "16", "ab"]
+    assert run.stdout.splitlines() == [
+        "8",
+        "0",
+        "16",
+        "ab",
+        "2891786578161389964",
+        "[2]",
+        "[1, 2, 3]",
+        "[1, 3]",
+        "1 2",
+    ]
 
 
 def test_dyn_tagged_int_binop_emits_fast_path(tmp_path):
@@ -67,6 +97,10 @@ def test_dyn_tagged_int_binop_emits_fast_path(tmp_path):
 
     assert "int.tag.fast" in ir_text
     assert "call ptr @py_obj_add" in ir_text
+    assert "call ptr @py_obj_and" in ir_text
+    assert "call ptr @py_obj_or" in ir_text
+    assert "call ptr @py_obj_xor" in ir_text
+    assert "@py_obj_lshift" in ir_text
 
 
 def _string_constants(fn) -> set[str]:
@@ -81,13 +115,25 @@ def _string_constants(fn) -> set[str]:
 def test_dyn_tagged_int_binop_has_one_wrapper_owner():
     helper = BinaryOpLoweringMixin._emit_dyn_tagged_int_object_binop
     helper_source = inspect.getsource(helper)
-    caller = BinaryOpLoweringMixin._emit_binop_value
+    # ``_emit_binop_value`` is the pin-deferring wrapper; the routing body
+    # that owns the four DynType call sites is ``_emit_binop_value_routed``.
+    caller = BinaryOpLoweringMixin._emit_binop_value_routed
     caller_source = inspect.getsource(caller)
 
-    assert {"py_obj_add", "py_obj_sub", "py_obj_mul"} <= _string_constants(helper)
-    assert not ({"py_obj_add", "py_obj_sub", "py_obj_mul"} & _string_constants(caller))
-    assert caller_source.count("self._emit_dyn_tagged_int_object_binop(") == 3
+    runtime_owners = {
+        "py_obj_add",
+        "py_obj_sub",
+        "py_obj_mul",
+        "py_obj_and",
+        "py_obj_or",
+        "py_obj_xor",
+        "py_obj_lshift",
+        "py_obj_rshift",
+    }
+    assert runtime_owners <= _string_constants(helper)
+    assert not (runtime_owners & _string_constants(caller))
+    assert caller_source.count("self._emit_dyn_tagged_int_object_binop(") == 4
     assert helper_source.count("marshal.marshal_to_object(") == 2
     assert "self._emit_inline_tagged_int_binop_or_call(" in helper_source
-    assert "self._emit_post_call_err_check(None)" in helper_source
+    assert "self._emit_post_call_err_check(" in helper_source
     assert "_emit_dyn_tagged_int_object_binop" in L1_CODEGEN_HOST_METHODS

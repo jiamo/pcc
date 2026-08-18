@@ -77,3 +77,24 @@ def test_comprehension_over_generator_no_libpython(tmp_path):
         "[10, 20, 30]",
         "['a', 'b', 'c']",
     ], out
+
+
+def test_dict_comprehension_enumerate_set_uses_iterator_protocol(tmp_path):
+    out = _run_pcc_program(
+        tmp_path,
+        "def main():\n"
+        "    names = set()\n"
+        "    names.add('_pcc_gc_pin')\n"
+        "    names.add('_py_int_add')\n"
+        "    names.add('_user_main')\n"
+        "    known = {name: index for index, name in enumerate(names)}\n"
+        "    print(len(known))\n"
+        "    print('_pcc_gc_pin' in known)\n"
+        "    print(sorted(known))\n"
+        "main()\n",
+    )
+    assert out.splitlines() == [
+        "3",
+        "True",
+        "['_pcc_gc_pin', '_py_int_add', '_user_main']",
+    ]

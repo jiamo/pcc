@@ -129,3 +129,31 @@ def test_hoist_exception_handlers_use_stage_safe_field_access():
                 and node.attr in {"body", "exc_type", "name"}
             }
             assert not direct_handler_fields, (name, direct_handler_fields)
+
+
+def test_free_name_analysis_does_not_pass_analyzer_callbacks():
+    tree = _tree("hoist_free_names.py")
+    top_functions = {
+        node.name: node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef)
+    }
+    compute = top_functions["compute_free_names"]
+    analyzer_names = {
+        node.name
+        for node in ast.walk(compute)
+        if isinstance(node, ast.FunctionDef) and node is not compute
+    }
+    analyzer_names.update(
+        node.name
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name.startswith("_walk_")
+    )
+    for call in (node for node in ast.walk(tree) if isinstance(node, ast.Call)):
+        passed_names = {
+            node.id
+            for arg in call.args
+            for node in ast.walk(arg)
+            if isinstance(node, ast.Name)
+        }
+        assert passed_names.isdisjoint(analyzer_names)

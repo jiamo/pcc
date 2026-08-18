@@ -247,6 +247,7 @@ def _assert_backend_four_task_and_scheduler_queue_follow_forwarding(
             #include <stdint.h>
             #include <stdio.h>
             #include <stdlib.h>
+            extern void pcc_gc_publish_initialized(PyObject *obj);
 
             typedef struct {
                 PyObjectHeader h;
@@ -263,6 +264,10 @@ def _assert_backend_four_task_and_scheduler_queue_follow_forwarding(
                 obj->length = 0;
                 obj->capacity = 0;
                 obj->items = 0;
+                /* pcc_gc_alloc sets PY_FLAG_GC_FRESH_ALLOC for container tags
+                 * and the relocation-set add refuses anything carrying it, so
+                 * a raw payload that never publishes can never be forwarded. */
+                pcc_gc_publish_initialized((PyObject *)obj);
                 return (PyObject *)obj;
             }
 
@@ -1160,6 +1165,7 @@ def _assert_backend_four_targets_wait_for_phase_reset(
             #include <stdint.h>
             #include <stdio.h>
             #include <stdlib.h>
+            extern void pcc_gc_publish_initialized(PyObject *obj);
 
             typedef struct {
                 PyObjectHeader h;
@@ -1176,6 +1182,10 @@ def _assert_backend_four_targets_wait_for_phase_reset(
                 obj->length = 0;
                 obj->capacity = 0;
                 obj->items = 0;
+                /* pcc_gc_alloc sets PY_FLAG_GC_FRESH_ALLOC for container tags
+                 * and the relocation-set add refuses anything carrying it, so
+                 * a raw payload that never publishes can never be forwarded. */
+                pcc_gc_publish_initialized((PyObject *)obj);
                 return (PyObject *)obj;
             }
 
@@ -1426,12 +1436,12 @@ def test_colored_relocating_load_barrier_follows_forwarding_entry(tmp_path):
     exe = _compile_probe(
         tmp_path,
         """
-        from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void
+        from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void, c_obj
         from pcc.unsafe import free, malloc, null, ptr_eq, store_ptr
 
-        pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
+        pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_obj)
         pcc_gc_release = extern("pcc_gc_release", (c_ptr,), c_void)
-        pcc_gc_load_ptr = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_ptr)
+        pcc_gc_load_ptr = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_obj)
         pcc_gc_store_ptr = extern("pcc_gc_store_ptr", (c_ptr, c_ptr, c_ptr), c_void)
         pcc_gc_install_forwarding = extern("pcc_gc_install_forwarding", (c_ptr, c_ptr), c_int64)
         pcc_gc_telemetry = extern("pcc_gc_telemetry", (c_int64,), c_int64)
@@ -1467,9 +1477,9 @@ def test_colored_relocating_rejects_forwarding_for_pinned_objects(tmp_path):
     exe = _compile_probe(
         tmp_path,
         """
-        from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void
+        from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void, c_obj
 
-        pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
+        pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_obj)
         pcc_gc_release = extern("pcc_gc_release", (c_ptr,), c_void)
         pcc_gc_pin = extern("pcc_gc_pin", (c_ptr,), c_void)
         pcc_gc_unpin = extern("pcc_gc_unpin", (c_ptr,), c_void)
@@ -1501,12 +1511,12 @@ def test_colored_relocating_stable_id_survives_forwarding(tmp_path):
     exe = _compile_probe(
         tmp_path,
         """
-        from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void
+        from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void, c_obj
         from pcc.unsafe import free, malloc, null, ptr_eq, store_ptr
 
-        pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
+        pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_obj)
         pcc_gc_release = extern("pcc_gc_release", (c_ptr,), c_void)
-        pcc_gc_load_ptr = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_ptr)
+        pcc_gc_load_ptr = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_obj)
         pcc_gc_store_ptr = extern("pcc_gc_store_ptr", (c_ptr, c_ptr, c_ptr), c_void)
         pcc_gc_install_forwarding = extern("pcc_gc_install_forwarding", (c_ptr, c_ptr), c_int64)
         pcc_gc_object_id = extern("pcc_gc_object_id", (c_ptr,), c_int64)
@@ -1550,9 +1560,9 @@ def test_colored_relocating_selects_unpinned_relocation_set(tmp_path):
     exe = _compile_probe(
         tmp_path,
         """
-        from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void
+        from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void, c_obj
 
-        pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
+        pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_obj)
         pcc_gc_release = extern("pcc_gc_release", (c_ptr,), c_void)
         pcc_gc_pin = extern("pcc_gc_pin", (c_ptr,), c_void)
         pcc_gc_unpin = extern("pcc_gc_unpin", (c_ptr,), c_void)
@@ -1610,17 +1620,17 @@ def test_colored_relocating_copy_forwards_selected_payload_object(tmp_path):
     exe = _compile_probe(
         tmp_path,
         """
-        from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void
+        from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void, c_obj
         from pcc.unsafe import malloc, null, ptr_eq, ptr_is_null, store_ptr, free
 
-        pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
+        pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_obj)
         pcc_gc_release = extern("pcc_gc_release", (c_ptr,), c_void)
-        pcc_gc_load_ptr = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_ptr)
+        pcc_gc_load_ptr = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_obj)
         pcc_gc_store_ptr = extern("pcc_gc_store_ptr", (c_ptr, c_ptr, c_ptr), c_void)
         pcc_gc_object_id = extern("pcc_gc_object_id", (c_ptr,), c_int64)
         pcc_gc_reset_relocation_set = extern("pcc_gc_reset_relocation_set", (), c_void)
         pcc_gc_select_relocation_set = extern("pcc_gc_select_relocation_set", (c_int64,), c_int64)
-        pcc_gc_relocate_copy = extern("pcc_gc_relocate_copy", (c_ptr, c_int64), c_ptr)
+        pcc_gc_relocate_copy = extern("pcc_gc_relocate_copy", (c_ptr, c_int64), c_obj)
 
         def main() -> None:
             old = pcc_gc_alloc(64, 5, 0)
@@ -1662,15 +1672,15 @@ def test_colored_relocating_copy_consumes_relocation_entry(tmp_path):
     exe = _compile_probe(
         tmp_path,
         """
-        from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void
+        from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void, c_obj
         from pcc.unsafe import ptr_is_null
 
-        pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
+        pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_obj)
         pcc_gc_release = extern("pcc_gc_release", (c_ptr,), c_void)
         pcc_gc_reset_relocation_set = extern("pcc_gc_reset_relocation_set", (), c_void)
         pcc_gc_select_relocation_set = extern("pcc_gc_select_relocation_set", (c_int64,), c_int64)
         pcc_gc_relocation_set_contains = extern("pcc_gc_relocation_set_contains", (c_ptr,), c_int64)
-        pcc_gc_relocate_copy = extern("pcc_gc_relocate_copy", (c_ptr, c_int64), c_ptr)
+        pcc_gc_relocate_copy = extern("pcc_gc_relocate_copy", (c_ptr, c_int64), c_obj)
 
         def main() -> None:
             old = pcc_gc_alloc(64, 5, 0)
@@ -1699,12 +1709,12 @@ def test_colored_relocating_step_forwards_selected_payload_object(tmp_path):
     exe = _compile_probe(
         tmp_path,
         """
-        from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void
+        from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void, c_obj
         from pcc.unsafe import free, load_ptr, malloc, null, ptr_eq, store_ptr
 
-        pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
+        pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_obj)
         pcc_gc_release = extern("pcc_gc_release", (c_ptr,), c_void)
-        pcc_gc_load_ptr = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_ptr)
+        pcc_gc_load_ptr = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_obj)
         pcc_gc_store_ptr = extern("pcc_gc_store_ptr", (c_ptr, c_ptr, c_ptr), c_void)
         pcc_gc_object_id = extern("pcc_gc_object_id", (c_ptr,), c_int64)
         pcc_gc_reset_relocation_set = extern("pcc_gc_reset_relocation_set", (), c_void)

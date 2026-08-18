@@ -120,8 +120,10 @@ class CoreHelperMixin:
         if self._builder_block_is_terminated():
             return
         flag_gv = declare_runtime_global(self.module, "pcc_thread_stop_requested")
-        flag = self.builder.load(
+        flag = self.builder.load_atomic(
             flag_gv,
+            "acquire",
+            4,
             name=self._fresh("thread.safepoint.flag"),
         )
         need_slow = self.builder.icmp_unsigned(

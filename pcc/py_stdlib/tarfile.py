@@ -15,11 +15,11 @@ import io
 import lzma
 import os
 
-from pcc.extern import c_int32, c_ptr, extern
+from pcc.extern import c_int32, c_ptr, extern, c_rawptr
 from pcc.unsafe import free, malloc, ptr_is_null, store_i64
 
 
-_py_str_utf8: "extern" = extern("py_str_utf8", (c_ptr,), c_ptr)
+_py_str_utf8: "extern" = extern("py_str_utf8", (c_ptr,), c_rawptr)
 _chmod: "extern" = extern("chmod", (c_ptr, c_int32), c_int32)
 _utime: "extern" = extern("utime", (c_ptr, c_ptr), c_int32)
 

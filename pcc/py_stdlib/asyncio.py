@@ -8,28 +8,28 @@ serve simple stream workloads without falling back to CPython.
 """
 from __future__ import annotations
 
-from pcc.extern import extern, c_int64, c_ptr
+from pcc.extern import extern, c_int64, c_ptr, c_obj
 from pcc.unsafe import is_tagged_int, load_i32, ptr_is_null
 
 
-_py_await: "extern" = extern("py_await", (c_ptr,), c_ptr)
-_py_asyncio_sleep: "extern" = extern("py_asyncio_sleep", (c_ptr,), c_ptr)
-_py_coroutine_args: "extern" = extern("py_coroutine_get_args", (c_ptr,), c_ptr)
-_py_task_new: "extern" = extern("py_task_new", (c_ptr,), c_ptr)
-_py_task_step: "extern" = extern("py_task_step", (c_ptr,), c_ptr)
-_tcp_listen: "extern" = extern("py_asyncio_tcp_listen", (c_ptr, c_ptr, c_int64), c_ptr)
-_tcp_accept: "extern" = extern("py_asyncio_tcp_accept", (c_ptr,), c_ptr)
-_tcp_connect: "extern" = extern("py_asyncio_tcp_connect", (c_ptr, c_ptr), c_ptr)
-_fd_recv: "extern" = extern("py_asyncio_fd_recv", (c_ptr, c_int64), c_ptr)
+_py_await: "extern" = extern("py_await", (c_ptr,), c_obj)
+_py_asyncio_sleep: "extern" = extern("py_asyncio_sleep", (c_ptr,), c_obj)
+_py_coroutine_args: "extern" = extern("py_coroutine_get_args", (c_ptr,), c_obj)
+_py_task_new: "extern" = extern("py_task_new", (c_ptr,), c_obj)
+_py_task_step: "extern" = extern("py_task_step", (c_ptr,), c_obj)
+_tcp_listen: "extern" = extern("py_asyncio_tcp_listen", (c_ptr, c_ptr, c_int64), c_obj)
+_tcp_accept: "extern" = extern("py_asyncio_tcp_accept", (c_ptr,), c_obj)
+_tcp_connect: "extern" = extern("py_asyncio_tcp_connect", (c_ptr, c_ptr), c_obj)
+_fd_recv: "extern" = extern("py_asyncio_fd_recv", (c_ptr, c_int64), c_obj)
 _fd_send_all: "extern" = extern("py_asyncio_fd_send_all", (c_ptr, c_ptr), c_int64)
 _fd_relay: "extern" = extern("py_asyncio_fd_relay", (c_ptr, c_ptr, c_ptr, c_ptr), c_int64)
-_fd_relay_step: "extern" = extern("py_asyncio_fd_relay_step", (c_ptr, c_ptr, c_ptr, c_ptr, c_ptr), c_ptr)
-_fd_relay_step_last_progress: "extern" = extern("py_asyncio_fd_relay_step_last_progress", (), c_ptr)
+_fd_relay_step: "extern" = extern("py_asyncio_fd_relay_step", (c_ptr, c_ptr, c_ptr, c_ptr, c_ptr), c_obj)
+_fd_relay_step_last_progress: "extern" = extern("py_asyncio_fd_relay_step_last_progress", (), c_obj)
 _fd_close: "extern" = extern("py_asyncio_fd_close", (c_ptr,), c_int64)
-_fd_sockname: "extern" = extern("py_asyncio_fd_sockname", (c_ptr,), c_ptr)
-_fd_peername: "extern" = extern("py_asyncio_fd_peername", (c_ptr,), c_ptr)
+_fd_sockname: "extern" = extern("py_asyncio_fd_sockname", (c_ptr,), c_obj)
+_fd_peername: "extern" = extern("py_asyncio_fd_peername", (c_ptr,), c_obj)
 _io_waitset_backend: "extern" = extern(
-    "py_asyncio_io_waitset_backend", (), c_ptr
+    "py_asyncio_io_waitset_backend", (), c_obj
 )
 _usleep: "extern" = extern("usleep", (c_int64,), c_int64)
 

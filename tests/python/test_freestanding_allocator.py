@@ -25,6 +25,8 @@ ALLOCATOR_SYMBOLS = (
     "pcc_allocator_live_usable_bytes",
     "pcc_os_heap_in_use_bytes",
     "pcc_os_heap_capacity_bytes",
+    "pcc_allocator_reclaimable_slab_bytes",
+    "pcc_allocator_trim",
 )
 
 
@@ -489,3 +491,83 @@ def test_default_pcc_python_runtime_uses_allocator_under_all_gc_backends(
             f"PCC_GC_BACKEND={backend}\n" + run.stdout + run.stderr
         )
         assert run.stdout == "257\n256:owned\n"
+
+
+def test_freestanding_allocator_tracks_reclaimable_empty_slabs(tmp_path):
+    """Per-slab free counter, explicit trim, and auto-trim on refill.
+
+    Phase 1: fill two 16-byte-class slabs, free every cell; the reclaimable
+    gauge reports fully-free slabs; taking one cell back drops it and freeing
+    it restores it; an explicit pcc_allocator_trim() munmaps the fully-free
+    slabs (mapped bytes fall, gauge -> 0) and retires their granule keys, so a
+    following malloc -- whose fresh slab may land on the just-unmapped address
+    -- re-registers cleanly (tombstone reuse path).
+    Phase 2: five fully-free 16-class slabs sit idle; a refill of a DIFFERENT
+    class must return them before mmapping (the self-limiting high-water).
+    """
+    obj = _build_allocator_object(tmp_path)
+    harness = tmp_path / "reclaim_harness.c"
+    executable = tmp_path / "reclaim_harness"
+    harness.write_text(
+        r"""
+#include <stddef.h>
+void *malloc(size_t size);
+void free(void *ptr);
+long pcc_allocator_reclaimable_slab_bytes(void);
+long pcc_allocator_mapped_bytes(void);
+long pcc_allocator_trim(void);
+
+int main(void) {
+    static void *p[5000];
+    /* Phase 1: one 16-byte class slab holds 1024 cells; 1500 spans two. */
+    for (int i = 0; i < 1500; i++) {
+        p[i] = malloc(16);
+        if (!p[i]) return 1;
+    }
+    if (pcc_allocator_reclaimable_slab_bytes() != 0) return 2;
+    for (int i = 0; i < 1500; i++) free(p[i]);
+    long r = pcc_allocator_reclaimable_slab_bytes();
+    if (r < 65536) return 3;
+    void *q = malloc(16);
+    if (!q) return 4;
+    if (pcc_allocator_reclaimable_slab_bytes() >= r) return 5;
+    free(q);
+    if (pcc_allocator_reclaimable_slab_bytes() != r) return 6;
+    long mapped_before = pcc_allocator_mapped_bytes();
+    if (pcc_allocator_trim() < 1) return 7;
+    if (pcc_allocator_mapped_bytes() > mapped_before - 65536) return 8;
+    if (pcc_allocator_reclaimable_slab_bytes() != 0) return 9;
+    /* Re-registration after munmap (address may be reused) must work. */
+    void *s = malloc(16);
+    if (!s) return 10;
+    free(s);
+    /* Phase 2: five fully-free 16-class slabs, then a refill of another
+       class must trim them before it mmaps. */
+    for (int i = 0; i < 5000; i++) {
+        p[i] = malloc(16);
+        if (!p[i]) return 11;
+    }
+    for (int i = 0; i < 5000; i++) free(p[i]);
+    if (pcc_allocator_reclaimable_slab_bytes() < 4 * 65536) return 12;
+    long mapped_pre = pcc_allocator_mapped_bytes();
+    void *big = malloc(1000); /* 1024-class: empty list -> refill -> trim */
+    if (!big) return 13;
+    if (pcc_allocator_reclaimable_slab_bytes() != 0) return 14;
+    if (pcc_allocator_mapped_bytes() >= mapped_pre) return 15;
+    free(big);
+    return 0;
+}
+""",
+        encoding="utf-8",
+    )
+    link = subprocess.run(
+        ["clang", "-fno-builtin", str(harness), str(obj), "-o", str(executable)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert link.returncode == 0, link.stdout + link.stderr
+    run = subprocess.run(
+        [str(executable)], capture_output=True, text=True, timeout=30
+    )
+    assert run.returncode == 0, f"exit={run.returncode}\n{run.stdout}{run.stderr}"

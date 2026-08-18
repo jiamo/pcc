@@ -60,6 +60,12 @@ def test_the_two_copies_of_the_contract_are_identical():
     )
 
 
+def test_layout_and_wire_tables_use_the_same_semantic_fields():
+    assert not hasattr(pipeline_ast_wire, "_PY_AST_WIRE_FIELD_NAME_OVERRIDES")
+    for field_names in PY_AST_FIELD_NAME_OVERRIDES.values():
+        assert "kind_id" not in field_names
+
+
 def test_every_pinned_order_matches_the_real_dataclass():
     classes = _ast_dataclasses()
     mismatches = []

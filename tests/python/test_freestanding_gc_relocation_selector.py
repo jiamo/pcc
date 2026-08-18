@@ -18,27 +18,37 @@ MANAGED_SOURCE = RUNTIME_DIR / "py" / "py_gc_backend.py"
 MAKEFILE = RUNTIME_DIR / "Makefile"
 
 OWNED_SYMBOLS = {
+    "pcc_gc_backend4_candidate_fresh_skips_count",
+    "pcc_gc_backend4_relocation_add_refusals_count",
     "pcc_gc_backend4_select_relocation_pages",
     "pcc_gc_relocation_selector_add_candidate_node",
+    "pcc_gc_relocation_selector_best_page_batch",
     "pcc_gc_relocation_selector_candidate_score",
     "pcc_gc_relocation_selector_evacuation_policy_accept",
     "pcc_gc_relocation_selector_evacuation_policy_defer_large",
     "pcc_gc_relocation_selector_large_page_policy_accept",
     "pcc_gc_relocation_selector_note_page_candidate",
+    "pcc_gc_relocation_selector_page_scan_begin",
+    "pcc_gc_relocation_selector_page_scan_reset",
+    "pcc_gc_relocation_selector_scan_reset",
     "pcc_gc_relocation_selector_select_page_objects",
+    "pcc_gc_relocation_selector_select_page_objects_batch",
     "pcc_gc_relocation_selector_zpage_head",
     "pcc_gc_select_relocation_set",
 }
+OWNED_GLOBALS = {
+    "pcc_gc_backend4_candidate_fresh_skips_g",
+    "pcc_gc_backend4_relocation_add_refusals_g",
+}
 RAW_FUNCTION_IMPORTS = {
-    "pcc_gc_backend",
-    "pcc_gc_backend4_evacuation_page_add",
-    "pcc_gc_backend4_evacuation_page_find",
-    "pcc_gc_backend4_owner_remembered_slots",
+    "free",
+    "malloc",
+    "pcc_current_thread_id",
     "pcc_gc_backend4_relocate_copy_supported_tag",
-    "pcc_gc_backend4_relocation_set_add",
-    "pcc_gc_backend4_relocation_set_find",
+    "pcc_gc_backend4_zpage_clear_active_page",
     "pcc_gc_config_ensure",
-    "pcc_gc_object_known_size",
+    "pcc_gc_forwarding_find",
+    "pcc_gc_forwarding_target_exists",
     "pcc_py_gc_minor_graph_lock",
     "pcc_py_gc_minor_graph_unlock",
     "pcc_thread_safepoint",
@@ -55,6 +65,26 @@ RAW_GLOBAL_IMPORTS = {
     "pcc_gc_backend4_small_page_candidate_bytes_count",
     "pcc_gc_backend4_small_page_candidate_zpage_bytes_count",
     "pcc_gc_backend4_small_page_candidates",
+    "pcc_gc_backend4_evacuation_page_head",
+    "pcc_gc_backend4_relocation_reset_owner",
+    "pcc_gc_backend4_reseed_commit_owner",
+    "pcc_gc_backend4_reseed_page_revision",
+    "pcc_gc_backend4_reseed_relocation_revision",
+    "pcc_gc_backend4_selector_page",
+    "pcc_gc_backend4_selector_page_allow_large",
+    "pcc_gc_backend4_selector_page_cursor",
+    "pcc_gc_backend4_selector_page_owner",
+    "pcc_gc_backend4_selector_page_seed",
+    "pcc_gc_backend4_selector_page_seed_pending",
+    "pcc_gc_backend4_selector_scan_allow_large",
+    "pcc_gc_backend4_selector_scan_best",
+    "pcc_gc_backend4_selector_scan_best_score",
+    "pcc_gc_backend4_selector_scan_cursor",
+    "pcc_gc_backend4_selector_scan_owner",
+    "pcc_gc_backend4_selector_scan_page",
+    "pcc_gc_backend4_selector_scan_require_unselected",
+    "pcc_gc_backend4_selector_scan_restart",
+    "pcc_gc_relocation_set_head",
     "pcc_gc_backend4_zpage_head",
 }
 
@@ -76,7 +106,7 @@ def _literal_global_imports() -> set[str]:
         value = node.args[0]
         if isinstance(value, ast.Constant) and isinstance(value.value, str):
             globals_.add(value.value)
-    return globals_
+    return globals_ - OWNED_GLOBALS
 
 
 def test_relocation_selector_has_one_strict_source_owner() -> None:
@@ -125,6 +155,7 @@ def test_relocation_selector_has_exact_strict_object_closure(
     assert result.returncode == 0, result.stdout + result.stderr
     assert _literal_global_imports() == RAW_GLOBAL_IMPORTS
     assert RAW_GLOBAL_IMPORTS <= FREESTANDING_GC_RUNTIME_GLOBALS
+    assert OWNED_GLOBALS <= FREESTANDING_GC_RUNTIME_GLOBALS
 
     undefined_result = subprocess.run(
         ["nm", "-u", str(obj)], capture_output=True, text=True, timeout=30
@@ -148,7 +179,7 @@ def test_relocation_selector_has_exact_strict_object_closure(
         for line in symbols_result.stdout.splitlines()
         if line.strip() and " U " not in line
     }
-    assert defined == OWNED_SYMBOLS
+    assert defined == OWNED_SYMBOLS | OWNED_GLOBALS
 
 
 def test_relocation_selector_preserves_page_policy_contract() -> None:
@@ -161,11 +192,43 @@ def test_relocation_selector_preserves_page_policy_contract() -> None:
     assert "capacity - page_used" in strict
     assert "load_i64(page, 40)" in strict
     assert "load_i64(page, 48)" in strict
-    assert "pcc_gc_backend4_owner_remembered_slots(obj)" in strict
-    assert "flags | 32768" in strict
-    assert "while pass_no < 2 and selected < budget:" in strict
+    assert 'global_load_ptr("pcc_gc_backend4_remembered_slots_head")' not in strict
+    assert "owner_remembered" not in strict
+    assert "score = score + load_i64(node, 72)" in strict
+    assert strict.count("size: i64 = load_i64(node, 32)") == 2
+    assert "size: i64 = load_i64(node, 24)" not in strict
+    assert 'atomic_rmw_i32("or", obj, 12, 32768, "acq_rel")' in strict
+    assert "while ptr_is_null(cursor) == 0 and examined < 16:" in strict
+    assert "and examined < 16" in strict
     assert "pcc_thread_safepoint()" in strict
-    assert "object_budget: int = load_i64(best_page, 32)" in strict
+    assert "object_budget = load_i64(page_token, 32)" in strict
+    assert "if load_i64(page, 88) > 0:" in strict
+    object_selector = strict.split("def pcc_gc_select_relocation_set(", 1)[
+        1
+    ].split('@c_abi_export("pcc_gc_backend4_select_relocation_pages")', 1)[0]
+    assert object_selector.index("relocation_node = malloc(16)") < (
+        object_selector.index("pcc_py_gc_minor_graph_lock()")
+    )
+    assert "_best_relocation_page_batch(" in object_selector
+    assert "_select_page_objects_batch(" in object_selector
+    assert object_selector.index("pcc_py_gc_minor_graph_unlock()") < (
+        object_selector.index("pcc_thread_safepoint()")
+    )
+    page_selector = strict.split(
+        "def pcc_gc_backend4_select_relocation_pages(", 1
+    )[1]
+    assert "if pcc_gc_config_ensure() != 4" in page_selector
+    assert "if allocated != object_budget:" in page_selector
+    assert "if batch_budget > 16:" in page_selector
+    assert "_best_relocation_page_batch(" in page_selector
+    assert "_select_page_objects_batch(" in page_selector
+    for forbidden in (
+        "pcc_gc_backend()",
+        "pcc_gc_backend4_evacuation_page_add(",
+        "pcc_gc_backend4_evacuation_page_find(",
+        "pcc_gc_backend4_relocation_set_add(",
+    ):
+        assert forbidden not in strict
 
 
 def test_production_archive_has_one_relocation_selector_owner(

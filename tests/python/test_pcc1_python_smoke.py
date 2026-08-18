@@ -22,6 +22,7 @@ from __future__ import annotations
 import os
 import json
 import subprocess
+import sys
 import textwrap
 from pathlib import Path
 
@@ -154,6 +155,102 @@ def _compile_and_run(
         f"stdout:\n{run_proc.stdout}\nstderr:\n{run_proc.stderr}"
     )
     return run_proc.stdout
+
+
+def test_pcc1_mixed_oversized_asm_and_safe_pco_handoff(tmp_path: Path):
+    package = tmp_path / "mixed_handoff"
+    package.mkdir()
+    (package / "__init__.py").write_text("", encoding="utf-8")
+    (package / "lib.py").write_text(
+        "def add(left: int, right: int) -> int:\n"
+        "    return left + right\n",
+        encoding="utf-8",
+    )
+    (package / "__main__.py").write_text(
+        "from mixed_handoff.lib import add\n"
+        "print(add(20, 22))\n"
+        + ("# oversized scheduling input\n" * 8000),
+        encoding="utf-8",
+    )
+    environment = os.environ.copy()
+    environment.update(
+        {
+            "PYTHONPATH": str(tmp_path),
+            "PCC_DIRECT_INDEXED_KERNEL_CAPTURE": "1",
+            "PCC_DIRECT_INDEXED_KERNEL_EMIT": "1",
+            "PCC_DIRECT_INDEXED_KERNEL_REQUIRE_ZERO_FALLBACK": "1",
+            "PCC_DIRECT_INDEXED_KERNEL_FUSE_USES": "1",
+            "PCC_DIRECT_INDEXED_KERNEL_RELEASE_FRONTEND": "1",
+            "PCC_DIRECT_INDEXED_NATIVE_OBJECT": "1",
+            "PCC_PY_FRONTEND_JOBS": "auto",
+            "PCC_SELF_BACKEND_JOBS": "2",
+            "PCC_MACHO_LINK_JOBS": "2",
+            "PCC_DISABLE_PY_RUN_CACHE": "1",
+        }
+    )
+    profile_path = tmp_path / "mixed-profile.json"
+    output_path = tmp_path / "mixed.out"
+    plan_path = tmp_path / "mixed.out.pcc-link-plan"
+    codegen_plan = tmp_path / "mixed.out.pcc-codegen-plan"
+    environment["PCC_DEFER_SELF_LINK_PLAN"] = str(plan_path)
+    environment["PCC_DEFER_FRONTEND_CODEGEN_PLAN"] = str(codegen_plan)
+    environment["PCC_DEFER_FRONTEND_OUTPUT"] = str(output_path)
+    deferred_helper = REPO / "scripts" / "run_pcc_deferred_link.py"
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(deferred_helper),
+            "--timeout",
+            "120",
+            "--codegen-plan",
+            str(codegen_plan),
+            str(plan_path),
+            "--",
+            str(PCC1),
+            "--profile-json",
+            str(profile_path),
+            "--backend",
+            "self",
+            "--python-libpython",
+            "off",
+            "--ir-scaffold",
+            "on",
+            str(package / "__main__.py"),
+            "-o",
+            str(output_path),
+        ],
+        cwd=REPO,
+        env=environment,
+        capture_output=True,
+        text=True,
+        timeout=120.0,
+    )
+
+    assert result.returncode == 0, result.stderr[-3000:]
+    executed = subprocess.run(
+        [str(output_path)],
+        capture_output=True,
+        text=True,
+        timeout=30.0,
+    )
+    assert executed.returncode == 0, executed.stderr
+    assert executed.stdout.strip() == "42"
+    profile = json.loads(profile_path.read_text(encoding="utf-8"))
+    counters = profile["counters"]
+    assert counters["multi_frontend_codegen_deferred"] == 1
+    assert counters["multi_frontend_codegen_oversized_assembly_handoff"] >= 1
+    codegen_receipt = json.loads(
+        Path(str(codegen_plan) + ".result.json").read_text(encoding="utf-8")
+    )
+    assert codegen_receipt["worker_count"] >= 2
+    assert codegen_receipt["oversized_count"] >= 1
+    internal_lines = Path(
+        str(codegen_plan) + ".internal-inputs"
+    ).read_text(encoding="utf-8").splitlines()[2:]
+    assert any(line.startswith("ASM\t") for line in internal_lines)
+    assert any(line.startswith("ASM\t") for line in internal_lines)
+    assert any(line.startswith("PCO\t") for line in internal_lines)
 
 
 def test_pcc1_help_lists_bootstrap_cli_options():
@@ -1449,6 +1546,45 @@ def test_pcc1_smoke_integer_bitwise_and_shifts(tmp_path):
         """,
     )
     assert out.strip().splitlines() == ["True", "True", "233", "128512"]
+
+
+def test_pcc1_bigint_mask_to_bytes_preserves_quad_value(tmp_path):
+    """The compiler-owned assembler's scalar-data expression stays exact.
+
+    Disable direct ``.pco`` publication only to isolate the expression from
+    the assembler path that consumes it.  The ordinary function-bearing pcc1
+    gate exercises direct publication end to end.
+    """
+    out = _compile_and_run(
+        tmp_path,
+        """
+        def parse_int(token: str) -> int | None:
+            text = token.strip()
+            try:
+                return int(text, 0)
+            except ValueError:
+                return None
+
+
+        def opaque(value):
+            return value
+
+
+        def main() -> None:
+            value = parse_int("2891786578161389964")
+            width = opaque(8)
+            if value is not None:
+                encoded = (value & ((1 << (width * 8)) - 1)).to_bytes(
+                    width, "little"
+                )
+                print(int.from_bytes(encoded, "little"))
+
+        if __name__ == "__main__":
+            main()
+        """,
+        compile_env={"PCC_DIRECT_INDEXED_NATIVE_OBJECT": "0"},
+    )
+    assert out.strip() == "2891786578161389964"
 
 
 def test_pcc1_smoke_fstring_ascii_conversion(tmp_path):

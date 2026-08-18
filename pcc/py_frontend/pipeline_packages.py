@@ -5,14 +5,30 @@ from __future__ import annotations
 import os
 from typing import Optional
 
+from ..package_environment import (
+    package_environment_fingerprint as environment_fingerprint,
+)
 from ..package_environment import package_site_roots as environment_site_roots
 from .pipeline_paths import resolve_module_src
 
 NATIVE_EXTENSION_SUFFIXES = (".so", ".dylib", ".pyd", ".dll")
 
 
+# Environment RESOLUTION is cached per fingerprint (the coordinator calls
+# resolve_pcc_native_extension_path once per import edge, and every call was
+# re-running the 13-env-var resolution plus an environment.json open/read/
+# parse: 34% of a profiled stage2 coordinator window).  Filesystem PROBES
+# (isdir here, isfile/listdir below) deliberately stay per-call so packages
+# installed mid-process are still found.
+_SITE_ROOTS_CACHE: dict = {}
+
+
 def package_site_roots() -> list[str]:
-    roots = environment_site_roots()
+    fingerprint = environment_fingerprint()
+    roots = _SITE_ROOTS_CACHE.get(fingerprint)
+    if roots is None:
+        roots = tuple(environment_site_roots())
+        _SITE_ROOTS_CACHE[fingerprint] = roots
     out: list[str] = []
     seen: set[str] = set()
     for root in roots:

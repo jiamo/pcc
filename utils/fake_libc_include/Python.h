@@ -1066,10 +1066,11 @@ int PyUnicodeWriter_WriteSubstring(
  * READ_CHAR route through a helper that decodes the requested codepoint, rather
  * than treating a UTF-8 byte offset as a character index. */
 extern const char *py_str_utf8(PyObject *s);
-#define PyUnicode_1BYTE_DATA(op) ((Py_UCS1 *)py_str_utf8(op))
-#define PyUnicode_2BYTE_DATA(op) ((Py_UCS2 *)py_str_utf8(op))
-#define PyUnicode_4BYTE_DATA(op) ((Py_UCS4 *)py_str_utf8(op))
-#define PyUnicode_DATA(op) ((void *)py_str_utf8(op))
+extern const char *pcc_capi_str_utf8_pinned(PyObject *s);
+#define PyUnicode_1BYTE_DATA(op) ((Py_UCS1 *)pcc_capi_str_utf8_pinned(op))
+#define PyUnicode_2BYTE_DATA(op) ((Py_UCS2 *)pcc_capi_str_utf8_pinned(op))
+#define PyUnicode_4BYTE_DATA(op) ((Py_UCS4 *)pcc_capi_str_utf8_pinned(op))
+#define PyUnicode_DATA(op) ((void *)pcc_capi_str_utf8_pinned(op))
 Py_UCS4 pcc_capi_unicode_read(int kind, const void *data, Py_ssize_t index);
 #define PyUnicode_READ(kind, data, index) pcc_capi_unicode_read((kind), (data), (index))
 #define PyUnicode_READ_CHAR(op, i) \

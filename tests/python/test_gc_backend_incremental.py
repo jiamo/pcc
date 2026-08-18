@@ -58,10 +58,10 @@ def _run_with_backend_one(exe, *, tuned: bool = True):
 
 def _explicit_collect_sweep_probe() -> str:
     return """
-        from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void
+        from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void, c_obj
         from pcc.unsafe import free, malloc, store_i32, store_ptr
 
-        pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
+        pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_obj)
         pcc_gc_collect = extern("pcc_gc_collect", (c_int32,), c_int64)
         pcc_gc_frame_enter = extern("pcc_gc_frame_enter", (c_ptr, c_ptr), c_void)
         pcc_gc_frame_leave = extern("pcc_gc_frame_leave", (c_ptr,), c_void)
@@ -94,9 +94,9 @@ def test_incremental_backend_env_selects_default_and_small_alloc_is_not_a_step(
     exe = _compile_probe(
         tmp_path,
         """
-        from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void
+        from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void, c_obj
 
-        pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
+        pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_obj)
         pcc_gc_release = extern("pcc_gc_release", (c_ptr,), c_void)
         pcc_gc_backend = extern("pcc_gc_backend", (), c_int64)
         pcc_gc_telemetry = extern("pcc_gc_telemetry", (c_int64,), c_int64)
@@ -124,9 +124,9 @@ def test_incremental_backend_debt_threshold_triggers_bounded_real_steps(tmp_path
     exe = _compile_probe(
         tmp_path,
         """
-        from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void
+        from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void, c_obj
 
-        pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
+        pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_obj)
         pcc_gc_release = extern("pcc_gc_release", (c_ptr,), c_void)
         pcc_gc_telemetry = extern("pcc_gc_telemetry", (c_int64,), c_int64)
         pcc_gc_telemetry_reset = extern("pcc_gc_telemetry_reset", (), c_void)

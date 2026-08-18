@@ -33,7 +33,9 @@ from .native_object import (
     NativeObject,
     NativeObjectError,
     NativeObjectView,
+    PackedNativeObject,
     decode_native_object,
+    decode_packed_native_object,
     encode_native_object,
 )
 from .self_backend_cache_identity import macho_linker_source_identity
@@ -159,6 +161,68 @@ def _hash_native_shape(digest, native: NativeObject) -> None:
             _feed_integer(digest, b"data-in-code-kind", region.kind)
 
 
+def _hash_packed_native_shape(
+    digest,
+    native: PackedNativeObject,
+) -> None:
+    """Packed equivalent of ``_hash_native_shape`` without materialization."""
+
+    _feed_integer(digest, b"section-count", len(native.sections))
+    _feed_integer(digest, b"symbol-count", len(native.symbols))
+    for symbol in native.symbols:
+        _feed_text(digest, b"symbol-name", symbol.name)
+        _feed_integer(digest, b"symbol-section", symbol.section_index)
+        _feed_integer(digest, b"symbol-offset", symbol.offset)
+        _feed(digest, b"symbol-external", b"1" if symbol.external else b"0")
+        _feed(
+            digest,
+            b"symbol-private-external",
+            b"1" if symbol.private_external else b"0",
+        )
+    for section_index, section in enumerate(native.sections):
+        _feed_text(digest, b"segment-name", section.segname)
+        _feed_text(digest, b"section-name", section.sectname)
+        _feed_integer(digest, b"section-flags", section.flags)
+        _feed_integer(digest, b"section-align", section.align_log2)
+        _feed_integer(digest, b"section-data-size", section.data_size)
+        _feed_integer(digest, b"section-zerofill", section.zerofill_size)
+        _feed_integer(
+            digest, b"relocation-count", section.relocation_count,
+        )
+        for relocation in native.decoded_relocations(section_index):
+            (
+                offset,
+                symbol_index,
+                relocation_type,
+                pcrel,
+                length,
+                addend,
+                target_section_index,
+                minuend_index,
+                target_offset,
+            ) = relocation
+            _feed_integer(digest, b"relocation-offset", offset)
+            _feed_integer(digest, b"relocation-symbol", symbol_index)
+            _feed_integer(digest, b"relocation-type", relocation_type)
+            _feed(digest, b"relocation-pcrel", b"1" if pcrel else b"0")
+            _feed_integer(digest, b"relocation-length", length)
+            _feed_integer(digest, b"relocation-addend", addend)
+            _feed_integer(
+                digest, b"relocation-target-section", target_section_index,
+            )
+            _feed_integer(digest, b"relocation-minuend", minuend_index)
+            _feed_integer(
+                digest, b"relocation-target-offset", target_offset,
+            )
+        _feed_integer(
+            digest, b"data-in-code-count", len(section.data_in_code),
+        )
+        for offset, length, kind in section.data_in_code:
+            _feed_integer(digest, b"data-in-code-offset", offset)
+            _feed_integer(digest, b"data-in-code-length", length)
+            _feed_integer(digest, b"data-in-code-kind", kind)
+
+
 def _native_shape_is_patchable(native: NativeObject) -> bool:
     # ``link_relocatable_native`` rewrites a section-target field while
     # normalizing it.  Blindly copying the source bytes over that normalized
@@ -167,6 +231,14 @@ def _native_shape_is_patchable(native: NativeObject) -> bool:
         relocation.target_section_index is None
         for section in native.sections
         for relocation in section.relocations
+    )
+
+
+def _packed_native_shape_is_patchable(native: PackedNativeObject) -> bool:
+    return all(
+        relocation[6] is None
+        for section_index, _section in enumerate(native.sections)
+        for relocation in native.decoded_relocations(section_index)
     )
 
 
@@ -203,6 +275,9 @@ def _link_image_key(
     _feed_text(digest, b"source-identity", source_identity)
     _feed_integer(digest, b"object-count", len(objects))
     for value in objects:
+        if isinstance(value, PackedNativeObject):
+            _feed(digest, b"native-object", value.encoded)
+            continue
         native = _native_input(value)
         if native is not None:
             _feed(digest, b"native-object", encode_native_object(native))
@@ -243,6 +318,14 @@ def _merged_layout_key(
     saw_native = False
     saw_external = False
     for value in objects:
+        if isinstance(value, PackedNativeObject):
+            if saw_external or not _packed_native_shape_is_patchable(value):
+                return None
+            saw_native = True
+            _feed(digest, b"native-shape-begin", b"")
+            _hash_packed_native_shape(digest, value)
+            _feed(digest, b"native-shape-end", b"")
+            continue
         native = _native_input(value)
         if native is not None:
             # Prefix-only is what lets payload offsets be reconstructed without
@@ -292,14 +375,26 @@ def _patch_merged_payloads(
     saw_external = False
     saw_native = False
     for value in objects:
-        native = _native_input(value)
-        if native is None:
+        packed = value if isinstance(value, PackedNativeObject) else None
+        native = None if packed is not None else _native_input(value)
+        if packed is not None:
+            if saw_external or not _packed_native_shape_is_patchable(packed):
+                raise IncrementalLinkError(
+                    "native input is outside patchable prefix"
+                )
+            saw_native = True
+            source_sections = packed.sections
+        elif native is not None:
+            if saw_external or not _native_shape_is_patchable(native):
+                raise IncrementalLinkError(
+                    "native input is outside patchable prefix"
+                )
+            saw_native = True
+            source_sections = native.sections
+        else:
             saw_external = True
             continue
-        if saw_external or not _native_shape_is_patchable(native):
-            raise IncrementalLinkError("native input is outside patchable prefix")
-        saw_native = True
-        for section in native.sections:
+        for section_index, section in enumerate(source_sections):
             key = (section.segname, section.sectname)
             index = section_indices.get(key)
             if index is None:
@@ -319,7 +414,11 @@ def _patch_merged_payloads(
                     raise IncrementalLinkError(
                         f"cached content section {key!r} is too small"
                     )
-                payloads[index][base:end] = section.data
+                source_data = (
+                    packed.section_data(section_index)
+                    if packed is not None else section.data
+                )
+                payloads[index][base:end] = source_data
             cursors[key] = end
     if not saw_native:
         raise IncrementalLinkError("incremental merge has no native prefix")
@@ -452,7 +551,9 @@ class IncrementalMachOLinker:
     def probe_assembly_cache(
         self,
         assembly: str,
-    ) -> tuple[Path, NativeObject | None, bool]:
+        *,
+        packed: bool = False,
+    ) -> tuple[Path, NativeObject | PackedNativeObject | None, bool]:
         """(cache path, cached object or None, replace-corrupt-entry flag).
 
         Split out of ``native_object_from_assembly`` so a driver can probe
@@ -471,7 +572,10 @@ class IncrementalMachOLinker:
         payload = _checked_cache_read(path)
         if payload is not None:
             try:
-                native = decode_native_object(payload)
+                native = (
+                    decode_packed_native_object(payload)
+                    if packed else decode_native_object(payload)
+                )
             except NativeObjectError:
                 return path, None, True
             else:
@@ -482,14 +586,18 @@ class IncrementalMachOLinker:
     def store_assembled_native_object(
         self,
         path: Path,
-        native: NativeObject,
+        native: NativeObject | PackedNativeObject,
         *,
         replace_valid: bool = False,
         encoded: bytes | None = None,
     ) -> None:
         self.stats.assembly_misses += 1
         if encoded is None:
-            encoded = encode_native_object(native)
+            encoded = (
+                native.encoded
+                if isinstance(native, PackedNativeObject)
+                else encode_native_object(native)
+            )
         self._store_exact(path, encoded, replace_valid=replace_valid)
 
     def native_object_from_assembly(

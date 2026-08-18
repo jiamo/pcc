@@ -48,6 +48,7 @@ PyExceptionObject *py_exc_alloc(PyClassObject *cls, const char *msg) {
         6, 1,
         cls != NULL ? cls->type_tag_alloc : -1, msg != NULL ? 1 : 0, e
     );
+    pcc_gc_publish_initialized((PyObject *)e);
     return e;
 }
 

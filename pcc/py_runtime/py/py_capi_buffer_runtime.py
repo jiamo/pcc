@@ -27,6 +27,9 @@ Private buffer flags remain owned here:
   PyBUF_WRITABLE 0x0001, PyBUF_FORMAT 0x0004, PyBUF_ND 0x0008,
   PyBUF_STRIDES 0x0018, PyBUF_WRITE 0x0200
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_BYTEARRAY,
     PY_TYPE_BYTES,
@@ -38,6 +41,9 @@ from pcc.unsafe import (
     atomic_cas_i64,
     atomic_load_i64,
     cstr,
+    define_global_ptr_null,
+    global_load_ptr,
+    global_store_ptr,
     int_to_ptr,
     is_tagged_int,
     load_i32,
@@ -46,6 +52,7 @@ from pcc.unsafe import (
     memcpy,
     null,
     ptr_add,
+    ptr_eq,
     ptr_is_null,
     ptr_to_int,
     stack_alloc,
@@ -61,11 +68,16 @@ py_memoryview_new = extern("py_memoryview_new", (c_ptr,), c_ptr)
 py_incref = extern("py_incref", (c_ptr,), c_void)
 py_decref = extern("py_decref", (c_ptr,), c_void)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 PyMem_Malloc = extern("PyMem_Malloc", (c_int64,), c_ptr)
 PyMem_Free = extern("PyMem_Free", (c_ptr,), c_void)
 pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
 pcc_gc_load_ptr = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_ptr)
+pcc_gc_pin = extern("pcc_gc_pin", (c_ptr,), c_void)
+pcc_py_gc_minor_graph_lock = extern("pcc_py_gc_minor_graph_lock", (), c_void)
+pcc_py_gc_minor_graph_unlock = extern("pcc_py_gc_minor_graph_unlock", (), c_void)
 pcc_gc_memoryview_initialize_owned_buffer = extern(
     "pcc_gc_memoryview_initialize_owned_buffer", (c_ptr, c_ptr), c_int64
 )
@@ -73,17 +85,19 @@ pcc_gc_memoryview_refresh_owned_buffer = extern(
     "pcc_gc_memoryview_refresh_owned_buffer", (c_ptr,), c_int64
 )
 
+define_global_ptr_null("pcc_capi_buffer_lease_head")
+
 
 def _type_error(message) -> None:
-    py_raise(py_exc_new(3, message))  # PY_EXC_TYPEERROR
+    py_raise_owned(py_exc_new(3, message))  # PY_EXC_TYPEERROR
 
 
 def _runtime_error(message) -> None:
-    py_raise(py_exc_new(7, message))  # PY_EXC_RUNTIMEERROR
+    py_raise_owned(py_exc_new(7, message))  # PY_EXC_RUNTIMEERROR
 
 
 def _value_error(message) -> None:
-    py_raise(py_exc_new(2, message))  # PY_EXC_VALUEERROR
+    py_raise_owned(py_exc_new(2, message))  # PY_EXC_VALUEERROR
 
 
 def _buffer_data(obj, buf_ptr, len_ptr, ro_ptr) -> int:
@@ -106,6 +120,18 @@ def _buffer_data(obj, buf_ptr, len_ptr, ro_ptr) -> int:
         )  # view->base
         return _buffer_data(base, buf_ptr, len_ptr, ro_ptr)
     return -1
+
+
+def _buffer_lease_owner(obj):
+    depth: int = 0
+    while depth < 16:
+        if ptr_is_null(obj) or is_tagged_int(obj):
+            return null()
+        if load_i32(obj, 8) != PY_TYPE_MEMORYVIEW:
+            return obj
+        obj = pcc_gc_load_ptr(obj, ptr_add(obj, 16))
+        depth = depth + 1
+    return null()
 
 
 def _bytearray_from_memory(data, length: int) -> c_ptr:
@@ -160,14 +186,34 @@ def PyObject_GetBuffer(obj, view, flags: int) -> int:
     if (flags & 0x0001) != 0 and readonly != 0:  # PyBUF_WRITABLE
         _type_error(cstr("object is not writable"))
         return -1
-    meta = null()
-    if (flags & 0x0008) != 0:  # PyBUF_ND
-        meta = PyMem_Malloc(16)
-        if ptr_is_null(meta):
-            _runtime_error(cstr("out of memory creating buffer view"))
-            return -1
-        store_i64(meta, 0, length)  # shape
-        store_i64(meta, 8, 1)  # strides
+    lease_owner = _buffer_lease_owner(obj)
+    meta = PyMem_Malloc(40)
+    if ptr_is_null(lease_owner) or ptr_is_null(meta):
+        if not ptr_is_null(meta):
+            PyMem_Free(meta)
+        _runtime_error(cstr("out of memory creating buffer view"))
+        return -1
+    store_i64(meta, 0, length)  # shape
+    store_i64(meta, 8, 1)  # strides
+    store_ptr(meta, 16, lease_owner)
+    store_ptr(meta, 24, obj)
+    pcc_py_gc_minor_graph_lock()
+    scan = global_load_ptr("pcc_capi_buffer_lease_head")
+    owner_already_leased: int = 0
+    view_already_leased: int = 0
+    while not ptr_is_null(scan):
+        if ptr_eq(load_ptr(scan, 16), lease_owner) or ptr_eq(load_ptr(scan, 24), lease_owner):
+            owner_already_leased = 1
+        if ptr_eq(load_ptr(scan, 16), obj) or ptr_eq(load_ptr(scan, 24), obj):
+            view_already_leased = 1
+        scan = load_ptr(scan, 32)
+    store_ptr(meta, 32, global_load_ptr("pcc_capi_buffer_lease_head"))
+    global_store_ptr("pcc_capi_buffer_lease_head", meta)
+    if owner_already_leased == 0:
+        pcc_gc_pin(lease_owner)
+    if ptr_eq(obj, lease_owner) == 0 and view_already_leased == 0:
+        pcc_gc_pin(obj)
+    pcc_py_gc_minor_graph_unlock()
     store_ptr(view, 0, buf)  # buf
     store_ptr(view, 8, obj)  # obj
     store_i64(view, 16, length)  # len
@@ -181,7 +227,7 @@ def PyObject_GetBuffer(obj, view, flags: int) -> int:
         store_ptr(view, 40, cstr("B"))
     else:
         store_ptr(view, 40, null())
-    if not ptr_is_null(meta):
+    if (flags & 0x0008) != 0:
         store_ptr(view, 48, meta)  # shape
         if (flags & 0x0018) != 0:  # PyBUF_STRIDES
             store_ptr(view, 56, ptr_add(meta, 8))  # strides

@@ -162,7 +162,27 @@ class TypeAbiLoweringMixin:
         if c_abi_sym is not None:
             return False
         if not self._should_box_python_ints():
-            return False
+            # ADMISSION DEMOTION (INT-P0-PROJ, slice 1).
+            #
+            # `_should_box_python_ints()` is False for every `pcc.*` module, so
+            # `int` there silently means a raw machine integer.  The project
+            # contract says the opposite: `int` is arbitrary-precision, the i64
+            # lane is legitimate only as a PROVEN-in-range optimization, and a
+            # value-lane overflow must promote rather than wrap.  A module name
+            # is an assumption, not a proof.
+            #
+            # A constructor parameter carries a declared field's value, and a
+            # field annotated `int` has no range proof at all -- a machine
+            # integer there would have to be spelled `pcc.i64`.  So `__init__`
+            # keeps the object projection even in a raw-int-scaffold module.
+            # Everything else stays in the i64 lane, so this does not disturb
+            # the hot paths.
+            #
+            # This is what made pcc1 lower every source literal above 2**63-1
+            # to 0: the parser builds `pa.IntLit(span, ty, int(e.text, 0))`, and
+            # the bignum died on the `value: int` parameter -- the field itself
+            # already stores a pointer.
+            return fd.name == "__init__"
         return not self._funcdef_uses_unboxed_typed_int_abi(fd)
 
     def _map_type(self, ty: Type) -> ir.Type:

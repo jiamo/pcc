@@ -416,12 +416,20 @@ class UnaryCallLoweringMixin:
         if (
             isinstance(param_ir_ty, ir.PointerType)
             and isinstance(coerced.type, ir.PointerType)
-            and not isinstance(v.type, ir.PointerType)
         ):
-            # Native -> object coercion creates a call-owned temporary.  The
-            # method/function lowering path pins it across later operands and
-            # must release it on both the success and exception edges.
-            self._last_call_arg_owned_temp = True
+            if not isinstance(v.type, ir.PointerType):
+                # Native -> object coercion creates a call-owned temporary.
+                # The method/function lowering path pins it across later
+                # operands and must release it on both the success and
+                # exception edges.
+                self._last_call_arg_owned_temp = True
+            elif self._pcc_pointer_source_is_owned(ast_arg):
+                # The argument expression itself produced a fresh reference --
+                # ``f(T())``, ``f([T()])``.  Nothing else owns it, so the call
+                # boundary consumes it.  A borrowed argument such as a plain
+                # name is left alone by the same classifier the IntType branch
+                # above already relies on.
+                self._last_call_arg_owned_temp = True
         return coerced
 
     def _emit_arg_for_abi_param_with_cleanup(

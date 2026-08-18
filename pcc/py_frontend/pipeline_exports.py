@@ -17,6 +17,8 @@ from .pipeline_modes import PyPipelineError
 
 _py_ast_field_value = _pipeline_ast_wire._py_ast_field_value
 _find_substring = _pipeline_ir_text.find_substring
+_NATIVE_EXPORT_WIRE_SCHEMA = "pcc.py_frontend.native_exports.v1"
+_NATIVE_EXPORT_INDEXED_SCHEMA = "pcc.py_frontend.native_exports.indexed.v1"
 
 
 def _export_param_types(args):
@@ -136,6 +138,37 @@ def _closed_world_is_node(node, expected_types) -> bool:
         return True
     expected_kind = _closed_world_expected_kind(expected_types)
     return expected_kind != "" and _closed_world_node_kind(node) == expected_kind
+
+
+def instance_field_assignment_statements(body):
+    """One source-ordered field-write walk for inference, exports and layout.
+
+    Nested function/class bodies are separate scopes and are not entered.
+    The explicit stack preserves the layout collector's established ordering.
+    """
+    from .py_ast import Assign, AugAssign, If, While, For, With, Try
+
+    result = []
+    pending = list(reversed(body))
+    while pending:
+        stmt = pending.pop()
+        if _closed_world_is_node(stmt, (Assign, AugAssign)):
+            result.append(stmt)
+            continue
+        if _closed_world_is_node(stmt, (If, While, For)):
+            pending.extend(reversed(stmt.else_body))
+            pending.extend(reversed(stmt.body))
+            continue
+        if _closed_world_is_node(stmt, With):
+            pending.extend(reversed(stmt.body))
+            continue
+        if _closed_world_is_node(stmt, Try):
+            pending.extend(reversed(stmt.finally_body))
+            pending.extend(reversed(stmt.else_body))
+            for handler in reversed(stmt.handlers):
+                pending.extend(reversed(handler.body))
+            pending.extend(reversed(stmt.body))
+    return result
 
 
 def _export_default_is_native_typed_int_shape(expr) -> bool:
@@ -557,6 +590,190 @@ def _class_is_dataclass(cd) -> bool:
     return False
 
 
+def _class_is_valueclass(cd) -> bool:
+    for dec in _py_ast_field_value(cd, "decorators", ()):
+        name = _decorator_name(dec)
+        if name in ("valueclass", "pcc.valueclass"):
+            return True
+    return False
+
+
+def _expand_local_valueclass_type_descriptor(
+    desc,
+    module_name: str,
+    exports: dict,
+):
+    if not isinstance(desc, tuple) or not desc:
+        return desc
+    tag = desc[0]
+    if tag == "class" and len(desc) >= 3:
+        class_name = desc[1]
+        info = exports.get(class_name)
+        if not (
+            isinstance(info, dict)
+            and info.get("kind") == "class"
+            and bool(info.get("valueclass", False))
+        ):
+            return desc
+        owning_module = desc[2]
+        export_owner = info.get("owning_module", module_name)
+        if not export_owner:
+            export_owner = module_name
+        if owning_module not in ("", module_name, export_owner):
+            return desc
+        fields = tuple(
+            (
+                field_name,
+                _expand_local_valueclass_type_descriptor(
+                    field_type,
+                    module_name,
+                    exports,
+                ),
+            )
+            for field_name, field_type in info.get("field_types", ())
+        )
+        return (
+            "valueclass",
+            info.get("class_name", class_name),
+            export_owner,
+            fields,
+            (),
+            (),
+            True,
+            False,
+        )
+    if tag in ("list", "set", "frozenset") and len(desc) >= 2:
+        return (
+            tag,
+            _expand_local_valueclass_type_descriptor(
+                desc[1], module_name, exports
+            ),
+        )
+    if tag == "dict" and len(desc) >= 3:
+        return (
+            "dict",
+            _expand_local_valueclass_type_descriptor(
+                desc[1], module_name, exports
+            ),
+            _expand_local_valueclass_type_descriptor(
+                desc[2], module_name, exports
+            ),
+        )
+    if tag == "tuple" and len(desc) >= 2:
+        return (
+            "tuple",
+            tuple(
+                _expand_local_valueclass_type_descriptor(
+                    item, module_name, exports
+                )
+                for item in desc[1]
+            ),
+        )
+    if tag == "func" and len(desc) >= 3:
+        return (
+            "func",
+            tuple(
+                _expand_local_valueclass_type_descriptor(
+                    item, module_name, exports
+                )
+                for item in desc[1]
+            ),
+            _expand_local_valueclass_type_descriptor(
+                desc[2], module_name, exports
+            ),
+        )
+    return desc
+
+
+def _expand_local_valueclass_export_refs(
+    module_name: str,
+    exports: dict,
+) -> None:
+    for info in exports.values():
+        if not isinstance(info, dict):
+            continue
+        if "return_ty" in info:
+            info["return_ty"] = _expand_local_valueclass_type_descriptor(
+                info["return_ty"], module_name, exports
+            )
+        if "param_types" in info:
+            info["param_types"] = tuple(
+                _expand_local_valueclass_type_descriptor(
+                    item, module_name, exports
+                )
+                for item in info["param_types"]
+            )
+        call_sig = info.get("call_sig")
+        if call_sig is not None:
+            for arg in call_sig:
+                annotation = arg.get("annotation")
+                if annotation is not None:
+                    arg["annotation"] = _expand_local_valueclass_type_descriptor(
+                        annotation, module_name, exports
+                    )
+        if info.get("kind") != "class":
+            continue
+        info["field_types"] = tuple(
+            (
+                field_name,
+                _expand_local_valueclass_type_descriptor(
+                    field_type, module_name, exports
+                ),
+            )
+            for field_name, field_type in info.get("field_types", ())
+        )
+        valueclass_receiver = None
+        if bool(info.get("valueclass", False)):
+            class_name = info.get("class_name", "")
+            export_owner = info.get("owning_module", module_name)
+            valueclass_receiver = (
+                "valueclass",
+                class_name,
+                export_owner,
+                info["field_types"],
+                (),
+                (),
+                True,
+                False,
+            )
+        for method in info.get("methods", ()):
+            method["return_ty"] = _expand_local_valueclass_type_descriptor(
+                method["return_ty"], module_name, exports
+            )
+            method["param_types"] = tuple(
+                _expand_local_valueclass_type_descriptor(
+                    item, module_name, exports
+                )
+                for item in method["param_types"]
+            )
+            if (
+                valueclass_receiver is not None
+                and method.get("kind") != "static"
+                and method["param_types"]
+            ):
+                method["param_types"] = (
+                    valueclass_receiver,
+                ) + method["param_types"][1:]
+            call_sig = method.get("call_sig")
+            if call_sig is None:
+                continue
+            for arg in call_sig:
+                annotation = arg.get("annotation")
+                if annotation is None:
+                    continue
+                arg["annotation"] = _expand_local_valueclass_type_descriptor(
+                    annotation,
+                    module_name,
+                    exports,
+                )
+            if (
+                valueclass_receiver is not None
+                and method.get("kind") != "static"
+                and call_sig
+            ):
+                call_sig[0]["annotation"] = valueclass_receiver
+
+
 def _export_default_native_func_ref(expr, owning_module, top_level_func_names):
     if expr is None or not owning_module:
         return None
@@ -899,16 +1116,376 @@ def _native_export_from_wire(value):
     return value
 
 
+def _native_export_wire_module_references(value, known_modules, out) -> None:
+    """Collect conservative module-name references from one decoded shard."""
+
+    pending = [value]
+    while pending:
+        current = pending.pop()
+        if isinstance(current, dict):
+            for key, item in current.items():
+                if isinstance(key, str) and key in known_modules:
+                    if key not in out:
+                        out.append(key)
+                pending.append(item)
+            continue
+        if isinstance(current, (list, tuple)):
+            for item in current:
+                pending.append(item)
+            continue
+        if isinstance(current, str) and current in known_modules:
+            if current not in out:
+                out.append(current)
+
+
+def _native_export_indexed_module_name(value) -> str:
+    if not isinstance(value, str) or not value:
+        raise ValueError("invalid indexed frontend export module")
+    if "\t" in value or "\n" in value or "\r" in value or "\x00" in value:
+        raise ValueError("invalid indexed frontend export module")
+    return value
+
+
+def _write_indexed_native_exports_wire(
+    path: str,
+    native_exports,
+    derived_class_map,
+    function_object_uses,
+    module_dependencies,
+    unique_class_preload_index,
+    contextual_modules,
+    contextual_host_exports,
+) -> None:
+    """Write one dependency-indexed file without a per-module file graph."""
+
+    dependencies = {}
+    known_modules = list(native_exports)
+    for module_name in native_exports:
+        clean_name = _native_export_indexed_module_name(module_name)
+        clean_dependencies = []
+        for dependency in module_dependencies.get(module_name, ()):
+            dependency_name = str(dependency)
+            if (
+                dependency_name in known_modules
+                and dependency_name != clean_name
+                and dependency_name not in clean_dependencies
+            ):
+                clean_dependencies.append(dependency_name)
+        dependencies[clean_name] = tuple(clean_dependencies)
+
+    if not isinstance(unique_class_preload_index, dict):
+        raise ValueError("invalid indexed external class preload index")
+    preload_types = unique_class_preload_index.get("types")
+    preload_base_keys = unique_class_preload_index.get("base_keys")
+    preload_roots = unique_class_preload_index.get("roots")
+    if (
+        not isinstance(preload_types, tuple)
+        or not isinstance(preload_base_keys, tuple)
+        or not isinstance(preload_roots, dict)
+    ):
+        raise ValueError("invalid indexed external class preload index")
+
+    metadata_rows = (
+        ("D", _native_export_to_wire(derived_class_map)),
+        ("F", _native_export_to_wire(function_object_uses)),
+        ("P", _native_export_to_wire(dependencies)),
+        ("T", _native_export_to_wire(preload_types)),
+        ("G", _native_export_to_wire(preload_base_keys)),
+        ("C", _native_export_to_wire(contextual_modules)),
+        ("H", _native_export_to_wire(contextual_host_exports)),
+    )
+    with open(path, "w", encoding="utf-8") as stream:
+        stream.write(_NATIVE_EXPORT_INDEXED_SCHEMA + "\n")
+        for tag, value in metadata_rows:
+            stream.write(tag + "\t" + json.dumps(value) + "\n")
+        for module_name in native_exports:
+            clean_name = _native_export_indexed_module_name(module_name)
+            root_delta = preload_roots.get(module_name)
+            if not isinstance(root_delta, tuple) or len(root_delta) != 2:
+                raise ValueError(
+                    "indexed external class preload is missing a module"
+                )
+            stream.write(
+                "U\t"
+                + clean_name
+                + "\t"
+                + json.dumps(_native_export_to_wire(root_delta))
+                + "\n"
+            )
+        for module_name, exports in native_exports.items():
+            clean_name = _native_export_indexed_module_name(module_name)
+            stream.write(
+                "M\t"
+                + clean_name
+                + "\t"
+                + json.dumps(_native_export_to_wire(exports))
+                + "\n"
+            )
+
+
+def _indexed_native_export_rows(text: str):
+    """Index line payloads without repeated whole-string UTF-8 slicing."""
+
+    lines = text.splitlines()
+    if not lines or lines[0] != _NATIVE_EXPORT_INDEXED_SCHEMA:
+        raise ValueError("invalid indexed frontend native exports file")
+    metadata = {}
+    preload_payloads = {}
+    module_payloads = {}
+    module_order = []
+    for line in lines[1:]:
+        if not line:
+            continue
+        first_tab = line.find("\t")
+        if first_tab < 0:
+            raise ValueError("invalid indexed frontend native export row")
+        tag = line[:first_tab]
+        if tag == "M" or tag == "U":
+            second_tab = line.find("\t", first_tab + 1)
+            if second_tab < 0:
+                raise ValueError(
+                    "invalid indexed frontend native export module row"
+                )
+            module_name = _native_export_indexed_module_name(
+                line[first_tab + 1 : second_tab]
+            )
+            target_payloads = (
+                module_payloads if tag == "M" else preload_payloads
+            )
+            if module_name in target_payloads:
+                raise ValueError(
+                    "duplicate indexed frontend native export module"
+                )
+            target_payloads[module_name] = line[second_tab + 1 :]
+            if tag == "M":
+                module_order.append(module_name)
+        elif tag in ("D", "F", "P", "T", "G", "C", "H"):
+            if tag in metadata:
+                raise ValueError(
+                    "duplicate indexed frontend native export metadata"
+                )
+            metadata[tag] = line[first_tab + 1 :]
+        else:
+            raise ValueError("invalid indexed frontend native export row")
+    for required in ("D", "F", "P", "T", "G"):
+        if required not in metadata:
+            raise ValueError(
+                "missing indexed frontend native export metadata"
+            )
+    if not module_order:
+        raise ValueError("indexed frontend native exports contain no modules")
+    if len(preload_payloads) != len(module_payloads):
+        raise ValueError("indexed external class preload/module mismatch")
+    for module_name in module_payloads:
+        if module_name not in preload_payloads:
+            raise ValueError("indexed external class preload/module mismatch")
+    return metadata, preload_payloads, module_payloads, tuple(module_order)
+
+
+def _indexed_native_export_metadata(metadata, tag: str):
+    try:
+        return _native_export_from_wire(json.loads(metadata[tag]))
+    except Exception as exc:
+        raise ValueError(
+            "invalid indexed frontend native export metadata"
+        ) from exc
+
+
+def _read_indexed_native_exports_wire(text: str, root_module: str = ""):
+    metadata, preload_payloads, module_payloads, module_order = (
+        _indexed_native_export_rows(text)
+    )
+    derived_class_map = _indexed_native_export_metadata(metadata, "D")
+    function_object_uses = _indexed_native_export_metadata(metadata, "F")
+    module_dependencies = _indexed_native_export_metadata(metadata, "P")
+    preload_types = _indexed_native_export_metadata(metadata, "T")
+    preload_base_keys = _indexed_native_export_metadata(metadata, "G")
+    contextual_modules = ()
+    if "C" in metadata:
+        contextual_modules = _indexed_native_export_metadata(metadata, "C")
+    if not isinstance(derived_class_map, dict) or not isinstance(
+        module_dependencies, dict
+    ):
+        raise ValueError("invalid indexed frontend native export metadata")
+    if (
+        not isinstance(function_object_uses, tuple)
+        or not isinstance(preload_types, tuple)
+        or not isinstance(preload_base_keys, tuple)
+        or not isinstance(contextual_modules, tuple)
+    ):
+        raise ValueError("invalid indexed frontend native export metadata")
+
+    if not root_module:
+        selected = list(module_order)
+    else:
+        root_module = _native_export_indexed_module_name(root_module)
+        if root_module not in module_payloads:
+            raise ValueError(
+                "indexed frontend native exports missing root module"
+            )
+        selected = []
+
+    contextual_host_exports = {}
+    if root_module and root_module in contextual_modules:
+        if "H" not in metadata:
+            raise ValueError("indexed contextual host exports are missing")
+        contextual_host_exports = _indexed_native_export_metadata(metadata, "H")
+        if not isinstance(contextual_host_exports, dict):
+            raise ValueError("invalid indexed contextual host exports")
+
+    pending = []
+    if root_module:
+        pending.append(root_module)
+
+    decoded = {}
+    known_modules = list(module_order)
+    while pending:
+        module_name = pending.pop()
+        if module_name in selected:
+            continue
+        payload = module_payloads.get(module_name)
+        if payload is None:
+            raise ValueError(
+                "indexed frontend native exports reference missing module"
+            )
+        try:
+            module_exports = _native_export_from_wire(
+                json.loads(payload)
+            )
+        except Exception as exc:
+            raise ValueError(
+                "invalid indexed frontend native export module payload"
+            ) from exc
+        if not isinstance(module_exports, dict):
+            raise ValueError(
+                "invalid indexed frontend native export module payload"
+            )
+        decoded[module_name] = module_exports
+        selected.append(module_name)
+        dependencies = module_dependencies.get(module_name, ())
+        if not isinstance(dependencies, tuple):
+            raise ValueError(
+                "invalid indexed frontend native export dependencies"
+            )
+        for dependency in dependencies:
+            if not isinstance(dependency, str) or dependency not in known_modules:
+                raise ValueError(
+                    "invalid indexed frontend native export dependency"
+                )
+            if dependency not in selected:
+                pending.append(dependency)
+        referenced = []
+        _native_export_wire_module_references(
+            module_exports,
+            known_modules,
+            referenced,
+        )
+        for export_name, info in module_exports.items():
+            if not isinstance(info, dict) or info.get("kind") != "class":
+                continue
+            derived = derived_class_map.get(export_name)
+            if (
+                isinstance(derived, tuple)
+                and len(derived) == 2
+                and isinstance(derived[0], str)
+                and derived[0] in known_modules
+            ):
+                if derived[0] not in referenced:
+                    referenced.append(derived[0])
+        for referenced_name in referenced:
+            if referenced_name not in selected:
+                pending.append(referenced_name)
+
+    native_exports = {}
+    for module_name in module_order:
+        selected_module = module_name in selected
+        contextual_module = (
+            bool(root_module)
+            and root_module in contextual_modules
+            and module_name in contextual_host_exports
+        )
+        if not selected_module and not contextual_module:
+            continue
+        module_exports = decoded.get(module_name) if selected_module else None
+        if module_exports is None and selected_module:
+            try:
+                module_exports = _native_export_from_wire(
+                    json.loads(module_payloads[module_name])
+                )
+            except Exception as exc:
+                raise ValueError(
+                    "invalid indexed frontend native export module payload"
+                ) from exc
+            if not isinstance(module_exports, dict):
+                raise ValueError(
+                    "invalid indexed frontend native export module payload"
+                )
+        if contextual_module:
+            surface_exports = contextual_host_exports.get(module_name)
+            if not isinstance(surface_exports, dict):
+                raise ValueError("invalid indexed contextual host exports")
+            if module_exports is None:
+                module_exports = surface_exports
+            else:
+                for export_name, info in surface_exports.items():
+                    if export_name not in module_exports:
+                        module_exports[export_name] = info
+        if not isinstance(module_exports, dict):
+            raise ValueError("invalid indexed contextual host exports")
+        native_exports[module_name] = module_exports
+
+    unique_class_preload = None
+    if root_module:
+        try:
+            root_delta = _native_export_from_wire(
+                json.loads(preload_payloads[root_module])
+            )
+        except Exception as exc:
+            raise ValueError(
+                "invalid indexed external class preload"
+            ) from exc
+        if not isinstance(root_delta, tuple) or len(root_delta) != 2:
+            raise ValueError("invalid indexed external class preload")
+        unique_class_preload = {
+            "types": preload_types,
+            "base_keys": preload_base_keys,
+            "drop_keys": root_delta[0],
+            "set_keys": root_delta[1],
+        }
+    return (
+        native_exports,
+        derived_class_map,
+        function_object_uses,
+        unique_class_preload,
+    )
+
+
 def _write_native_exports_wire(
     path: str,
     native_exports,
     derived_class_map,
     function_object_uses=(),
+    module_dependencies=None,
+    unique_class_preload_index=None,
+    contextual_modules=(),
+    contextual_host_exports=None,
 ) -> None:
+    if module_dependencies is not None:
+        _write_indexed_native_exports_wire(
+            path,
+            native_exports,
+            derived_class_map,
+            function_object_uses,
+            module_dependencies,
+            unique_class_preload_index,
+            contextual_modules,
+            contextual_host_exports or {},
+        )
+        return
     native_exports_wire = _native_export_to_wire(native_exports)
     derived_class_map_wire = _native_export_to_wire(derived_class_map)
     payload = {
-        "schema": "pcc.py_frontend.native_exports.v1",
+        "schema": _NATIVE_EXPORT_WIRE_SCHEMA,
         "native_exports": native_exports_wire,
         "derived_class_map": derived_class_map_wire,
         "function_object_uses": _native_export_to_wire(function_object_uses),
@@ -920,9 +1497,17 @@ def _write_native_exports_wire(
 
 def _read_native_exports_wire(path: str, include_function_object_uses: bool = False):
     with open(path, "r", encoding="utf-8") as f:
-        payload = json.loads(f.read())
-    if payload.get("schema") != "pcc.py_frontend.native_exports.v1":
-        raise PyPipelineError("invalid frontend native exports file")
+        text = f.read()
+    if text.startswith(_NATIVE_EXPORT_INDEXED_SCHEMA + "\n"):
+        native_exports, derived_class_map, function_object_uses, _preload = (
+            _read_indexed_native_exports_wire(text)
+        )
+        if include_function_object_uses:
+            return native_exports, derived_class_map, function_object_uses
+        return native_exports, derived_class_map
+    payload = json.loads(text)
+    if payload.get("schema") != _NATIVE_EXPORT_WIRE_SCHEMA:
+        raise ValueError("invalid frontend native exports file")
     native_exports = _native_export_from_wire(payload.get("native_exports", {}))
     derived_class_map = _native_export_from_wire(payload.get("derived_class_map", {}))
     if include_function_object_uses:
@@ -931,6 +1516,61 @@ def _read_native_exports_wire(path: str, include_function_object_uses: bool = Fa
         )
         return native_exports, derived_class_map, function_object_uses
     return native_exports, derived_class_map
+
+
+def _read_native_exports_wire_for_module(path: str, module_name: str):
+    """Read the indexed dependency closure for one native codegen worker.
+
+    Legacy v1 inputs remain readable for replay tooling, but current native
+    publication always emits the indexed schema and therefore avoids the full
+    export graph on the supported normal path.
+    """
+
+    with open(path, "r", encoding="utf-8") as stream:
+        text = stream.read()
+    if text.startswith(_NATIVE_EXPORT_INDEXED_SCHEMA + "\n"):
+        native_exports, derived_class_map, _uses, unique_class_preload = (
+            _read_indexed_native_exports_wire(text, module_name)
+        )
+        return native_exports, derived_class_map, unique_class_preload, True
+    native_exports, derived_class_map = _read_native_exports_wire(path)
+    from .type_infer import build_unique_external_class_preload
+
+    external_for_root = {}
+    for owner_name, exports in native_exports.items():
+        if owner_name != module_name:
+            external_for_root[owner_name] = exports
+    unique_class_preload = build_unique_external_class_preload(
+        external_for_root
+    )
+    return native_exports, derived_class_map, unique_class_preload, False
+
+
+def _read_native_exports_wire_raw_modules(path: str):
+    """Return raw per-module wire dictionaries for action-key hashing."""
+
+    with open(path, "r", encoding="utf-8") as stream:
+        text = stream.read()
+    if text.startswith(_NATIVE_EXPORT_INDEXED_SCHEMA + "\n"):
+        _metadata, _preloads, module_payloads, module_order = (
+            _indexed_native_export_rows(text)
+        )
+        out = {}
+        for module_name in module_order:
+            value = json.loads(module_payloads[module_name])
+            if not isinstance(value, dict):
+                raise ValueError(
+                    "invalid indexed frontend native export module payload"
+                )
+            out[module_name] = value
+        return out
+    payload = json.loads(text)
+    if payload.get("schema") != _NATIVE_EXPORT_WIRE_SCHEMA:
+        raise ValueError("invalid frontend native exports file")
+    native_exports = payload.get("native_exports")
+    if not isinstance(native_exports, dict):
+        raise ValueError("invalid frontend native exports file")
+    return native_exports
 
 
 def _export_method_symbol(

@@ -76,7 +76,7 @@ PyObject *py_os_urandom(PyObject *n_obj) {
     int overflow = 0;
     int64_t n = py_int_to_i64(n_obj, &overflow);
     if (overflow || n < 0) {
-        py_raise(py_exc_new(PY_EXC_VALUEERROR, "negative argument not allowed"));
+        py_raise_owned(py_exc_new(PY_EXC_VALUEERROR, "negative argument not allowed"));
         return NULL;
     }
     PyObject *out = py_bytes_new(NULL, n);
@@ -89,7 +89,7 @@ PyObject *py_os_urandom(PyObject *n_obj) {
     int fd = open("/dev/urandom", O_RDONLY);
     if (fd < 0) {
         py_decref(out);
-        py_raise(py_exc_new(PY_EXC_OSERROR, "could not open /dev/urandom"));
+        py_raise_owned(py_exc_new(PY_EXC_OSERROR, "could not open /dev/urandom"));
         return NULL;
     }
     int64_t pos = 0;
@@ -98,7 +98,7 @@ PyObject *py_os_urandom(PyObject *n_obj) {
         if (got <= 0) {
             close(fd);
             py_decref(out);
-            py_raise(py_exc_new(PY_EXC_OSERROR, "could not read /dev/urandom"));
+            py_raise_owned(py_exc_new(PY_EXC_OSERROR, "could not read /dev/urandom"));
             return NULL;
         }
         pos += (int64_t)got;

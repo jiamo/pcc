@@ -53,6 +53,21 @@ void py_exc_append_frame(PyObject *exc,
 }
 
 
+/* Shared frame landing: the compiler stores one (line, source text) pair per
+ * raise site in two module tables and passes the site's index, so one landing
+ * block per function/target records the same frame the per-line blocks did.
+ * Mirrored by py_exc_traceback.py. */
+void py_exc_append_frame_indexed(PyObject *exc,
+                                 const char *func_name,
+                                 const char *filename,
+                                 const int32_t *lines,
+                                 const char *const *sources,
+                                 int32_t index) {
+    py_exc_append_frame_source(exc, func_name, filename, sources[index],
+                               lines[index]);
+}
+
+
 PyObject *py_runtime_error_if_unset(const char *helper_name,
                                     const char *message) {
     if (py_err_occurred()) return NULL;

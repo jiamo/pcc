@@ -1,4 +1,7 @@
 """pcc-Python replacement for py_runtime/src/py_int_bitwise.c."""
+
+__pcc_runtime_port__ = True
+
 from pcc.extern import extern, c_abi_export, c_int64, c_ptr
 from pcc.py_runtime.py.py_abi_constants import (
     PYINTOBJECT_DIGITS_OFFSET,

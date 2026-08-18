@@ -25,30 +25,49 @@ MAKEFILE = RUNTIME_DIR / "Makefile"
 OWNED_SYMBOLS = {
     "pcc_gc_cms_note_alloc",
     "pcc_gc_cms_stop_worker",
+    "pcc_gc_complete_claimed_tracing_cycle",
+    "pcc_gc_complete_mark_cycle_seed",
     "pcc_gc_incremental_concurrent_step",
+    "pcc_gc_drain_all_gray_stopped_world_py",
     "pcc_gc_incremental_maybe_auto_step",
     "pcc_gc_note_alloc",
     "pcc_gc_record_explicit_pause",
     "pcc_gc_tracing_budget_from_debt",
     "pcc_gc_tracing_debt_threshold",
     "pcc_gc_tracing_discharge_debt",
+    "pcc_gc_tracing_gray_final_extension_root",
+    "pcc_gc_tracing_gray_extension_root",
     "pcc_gc_tracing_record_pause",
     "pcc_gc_tracing_step_cycle",
+    "pcc_gc_trace_cext_complete_context",
 }
 RAW_FUNCTION_IMPORTS = {
+    "pcc_capi_is_cext_type_tag",
+    "pcc_capi_visit_extension_module_state_roots",
     "pcc_gc_begin_mark_cycle",
     "pcc_gc_config_ensure",
     "pcc_gc_finish_tracing_cycle",
+    "pcc_gc_drain_all_gray_locked_slice",
+    "pcc_gc_gray_current_roots",
     "pcc_gc_gray_count_decrement_acq_rel",
     "pcc_gc_gray_count_load_acquire",
-    "pcc_gc_gray_count_store_release",
     "pcc_gc_maybe_start_cms_worker",
+    "pcc_gc_seed_roots",
+    "pcc_gc_object_is_known_no_lock",
+    "pcc_gc_tracing_finish_claim_clear_unlocked",
+    "pcc_gc_trace_mark_gray_if_known",
+    "pcc_gc_trace_cext_referents_unlocked",
     "pcc_gc_trace_referents",
     "pcc_platform_monotonic_us",
     "pcc_py_gc_minor_graph_lock",
     "pcc_py_gc_minor_graph_unlock",
+    "pcc_resume_world",
+    "pcc_stop_the_world",
+    "pcc_thread_owns_stopped_world",
     "pcc_threads_enabled",
     "pcc_thread_join",
+    "py_decref",
+    "py_incref",
 }
 RAW_GLOBAL_IMPORTS = {
     "pcc_gc_backend_selected",
@@ -76,6 +95,15 @@ RAW_GLOBAL_IMPORTS = {
     "pcc_gc_pause",
     "pcc_gc_stepmul",
     "pcc_gc_trace_cursor",
+    "pcc_gc_trace_cext_pending_backend",
+    "pcc_gc_trace_cext_pending_epoch",
+    "pcc_gc_trace_cext_pending_obj",
+    "pcc_gc_trace_extension_roots_backend",
+    "pcc_gc_trace_extension_roots_epoch",
+    "pcc_gc_trace_extension_roots_pending",
+    "pcc_gc_tracing_cycle_epoch",
+    "pcc_gc_tracing_finish_claim_backend",
+    "pcc_gc_tracing_finish_claim_epoch",
 }
 
 
@@ -128,6 +156,88 @@ def test_incremental_concurrent_scheduler_has_one_strict_source_owner() -> None:
     assert '_step_tracing = extern("pcc_gc_tracing_step_cycle"' in managed
     assert "_step_incremental_concurrent = extern(" in managed
     assert '"pcc_gc_incremental_concurrent_step", (c_int64,), c_int64' in managed
+
+
+def test_initial_trace_extension_traversal_runs_outside_graph_lock_source() -> None:
+    c_source = (RUNTIME_DIR / "src" / "py_gc_backend.c").read_text(
+        encoding="utf-8"
+    )
+    c_gray = c_source.split("static void pcc_gc_gray_current_roots(", 1)[
+        1
+    ].split("static void pcc_gc_subtract_known_child_ref", 1)[0]
+    assert "pcc_capi_visit_extension_module_state_roots" not in c_gray
+
+    c_step = c_source.rsplit("static int64_t pcc_gc_step_trace_cycle(", 1)[
+        1
+    ].split("static int64_t pcc_gc_step_generational_promotion", 1)[0]
+    assert c_step.index("pcc_gc_graph_unlock();") < c_step.index(
+        "pcc_gc_trace_extension_roots_complete(&extension_ctx)"
+    )
+    assert "pcc_gc_trace_extension_roots_claim_unlocked" in c_step
+    c_unlocked = c_source.split(
+        "static int64_t pcc_gc_step_trace_cycle_unlocked(", 1
+    )[1].split("static int64_t pcc_gc_cms_worker_trace_cycle_unlocked", 1)[0]
+    assert "pcc_gc_trace_extension_roots_pending != 0" in c_unlocked
+    c_worker = c_source.split("static void *pcc_gc_cms_worker_main", 1)[
+        1
+    ].split("static void pcc_gc_cms_maybe_start_worker", 1)[0]
+    assert c_worker.index("pcc_gc_graph_unlock();") < c_worker.index(
+        "pcc_gc_step_trace_cycle(followup_budget)"
+    )
+    c_complete = c_source.split(
+        "static int pcc_gc_trace_extension_roots_complete(", 1
+    )[1].split("static void pcc_gc_gray_current_roots(", 1)[0]
+    assert c_complete.index(
+        "pcc_capi_visit_extension_module_state_roots("
+    ) < c_complete.index("pcc_gc_graph_lock();")
+
+    strict = STRICT_SOURCE.read_text(encoding="utf-8")
+    strict_step = _export_body(strict, "pcc_gc_tracing_step_cycle")
+    assert strict_step.index("pcc_py_gc_minor_graph_unlock()") < (
+        strict_step.index("pcc_capi_visit_extension_module_state_roots(")
+    )
+    assert "pcc_gc_trace_extension_roots_pending" in strict_step
+    assert (
+        '@c_abi_export("pcc_gc_tracing_gray_extension_root")' in strict
+    )
+
+
+def test_final_trace_extension_traversal_precedes_locked_cut_source() -> None:
+    c_source = (RUNTIME_DIR / "src" / "py_gc_backend.c").read_text(
+        encoding="utf-8"
+    )
+    c_finish = c_source.split("static int pcc_gc_finish_tracing_cycle(", 1)[
+        1
+    ].split("static int pcc_gc_complete_claimed_tracing_cycle", 1)[0]
+    assert "pcc_capi_visit_extension_module_state_roots(" not in c_finish
+    assert "pcc_gc_gray_current_roots();" not in c_finish
+    assert "pcc_gc_drain_all_gray" not in c_finish
+
+    c_complete = c_source.rsplit(
+        "static int pcc_gc_complete_claimed_tracing_cycle(", 1
+    )[1].split("static int64_t pcc_gc_step_trace_cycle_unlocked", 1)[0]
+    assert c_complete.index("pcc_gc_graph_unlock();") < c_complete.index(
+        "pcc_capi_visit_extension_module_state_roots("
+    )
+    assert c_complete.index(
+        "pcc_capi_visit_extension_module_state_roots("
+    ) < c_complete.index("pcc_gc_finish_tracing_cycle(")
+    assert "pcc_gc_trace_extension_roots_pending = 3" in c_complete
+
+    strict = STRICT_SOURCE.read_text(encoding="utf-8")
+    strict_complete = _export_body(
+        strict, "pcc_gc_complete_claimed_tracing_cycle"
+    )
+    assert strict_complete.index("pcc_py_gc_minor_graph_unlock()") < (
+        strict_complete.index("pcc_capi_visit_extension_module_state_roots(")
+    )
+    assert strict_complete.index(
+        "pcc_capi_visit_extension_module_state_roots("
+    ) < strict_complete.index("pcc_gc_finish_tracing_cycle(")
+    assert (
+        '@c_abi_export("pcc_gc_tracing_gray_final_extension_root")'
+        in strict
+    )
 
 
 @pytest.mark.parametrize("emitter", ["llvm", "self"])
@@ -226,6 +336,57 @@ def test_incremental_concurrent_scheduler_preserves_bounded_policy_order() -> No
     )
     assert "return pcc_gc_incremental_concurrent_step(budget)" in public_step
     assert "processed = processed + pcc_gc_tracing_step_cycle" in public_step
+
+
+def test_tracing_finisher_claim_stops_only_after_graph_unlock() -> None:
+    source = STRICT_SOURCE.read_text(encoding="utf-8")
+    complete = _export_body(source, "pcc_gc_complete_claimed_tracing_cycle")
+    complete_signature = complete.split(") -> i64:", 1)[0]
+    assert "claim_epoch: i64" in complete_signature
+    assert "claim_backend: i64" in complete_signature
+    assert complete.index("pcc_thread_owns_stopped_world()") < complete.index(
+        "if owns_stopped_world == 0:"
+    ) < complete.index("pcc_stop_the_world()")
+    stop_failure = complete.split("if pcc_stop_the_world() != 0:", 1)[1].split(
+        "acquired_stopped_world = 1", 1
+    )[0]
+    assert stop_failure.index("pcc_py_gc_minor_graph_lock()") < (
+        stop_failure.index("pcc_gc_tracing_finish_claim_clear_unlocked(")
+    ) < stop_failure.index("pcc_py_gc_minor_graph_unlock()") < (
+        stop_failure.index("return 0")
+    )
+    for forbidden in (
+        "pcc_gc_finish_tracing_cycle",
+        "pcc_resume_world",
+        "pcc_gc_mark_active",
+        "pcc_gc_trace_cursor",
+        "pcc_gc_gray_count",
+    ):
+        assert forbidden not in stop_failure
+    finish_call = complete.index("pcc_gc_finish_tracing_cycle(")
+    assert "claim_epoch, claim_backend" in complete[finish_call : finish_call + 130]
+    assert complete.index("acquired_stopped_world = 1") < complete.index(
+        "pcc_py_gc_minor_graph_lock()",
+        complete.index("acquired_stopped_world = 1"),
+    ) < finish_call < complete.index(
+        "pcc_py_gc_minor_graph_unlock()",
+        finish_call,
+    ) < complete.index("pcc_resume_world()")
+
+    step = _export_body(source, "pcc_gc_tracing_step_cycle")
+    assert "pcc_stop_the_world" not in step
+    assert "pcc_resume_world" not in step
+    assert step.index(
+        'global_addr("pcc_gc_tracing_finish_claim_backend")'
+    ) < step.index(
+        'global_addr("pcc_gc_tracing_finish_claim_epoch")',
+        step.index('global_addr("pcc_gc_tracing_finish_claim_backend")'),
+    )
+    assert step.index("pcc_py_gc_minor_graph_unlock()", step.rindex("claim_epoch =")) < (
+        step.index(
+            "pcc_gc_complete_claimed_tracing_cycle(claim_epoch, claim_backend)"
+        )
+    )
 
 
 def test_production_archive_has_one_incremental_concurrent_scheduler_owner(

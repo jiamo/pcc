@@ -41,7 +41,7 @@ from .codegen.host_contract import (
     PROBE_POLICY_CONTEXTUAL_MIXIN,
     per_module_probe_policy,
 )
-from .export_meta import decode_type
+from .export_meta import decode_type, encode_type
 from .py_ast import (
     Arg,
     Assign,
@@ -106,6 +106,7 @@ from .py_ast import (
     Type,
     UnaryOp,
     ValueArrayType,
+    ValueClassType,
     While,
     With,
 )
@@ -129,6 +130,21 @@ TYPE_BYTES: BytesType = BytesType(name="bytes")
 TYPE_BYTEARRAY: ByteArrayType = ByteArrayType(name="bytearray")
 TYPE_MEMORYVIEW: MemoryViewType = MemoryViewType(name="memoryview")
 TYPE_DYN: DynType = DynType(name="dyn")
+TYPE_UNSAFE_I64X4: ValueClassType = ValueClassType(
+    name="UnsafeI64x4",
+    module="pcc.unsafe",
+    fields=(
+        ("first", TYPE_I64),
+        ("second", TYPE_I64),
+        ("third", TYPE_I64),
+        ("fourth", TYPE_I64),
+    ),
+    bases=(),
+    properties=(),
+    valueclass=True,
+    flattened=True,
+    nullable_fields=False,
+)
 TYPE_SET: SetType = SetType(name="set", elem=TYPE_DYN)
 TYPE_FROZENSET: SetType = SetType(name="frozenset", elem=TYPE_DYN)
 
@@ -603,6 +619,41 @@ _BUILTIN_TYPES: dict[str, Type] = {
     "__await__": FuncType(name="callable", params=(TYPE_DYN,), ret=TYPE_DYN),
 }
 
+# Pointer-producing intrinsics.  Outside runtime-port (freestanding) mode a
+# raw C address is typed as ``int``: it then rides the exact/tagged integer
+# lanes and can never reach the object refcount protocol as a pointer, which is
+# what lets the runtime stop probing pointer provenance on every incref/decref
+# (docs/investigations/pcc1-stage2-emit-throughput-and-memory.md, 2026-09-06).
+# ``tag_int`` is excluded: it produces an object representation on purpose.
+_POINTER_INTRINSICS: frozenset[str] = frozenset({
+    "malloc", "calloc", "realloc", "cstr", "global_addr", "function_addr",
+    "global_load_ptr", "ptr_add", "int_to_ptr", "null", "load_ptr", "memset",
+    "memcpy", "memmove", "getcwd", "stack_alloc", "dynamic_library_open",
+    "dynamic_library_open_global", "dynamic_library_symbol",
+    "darwin_libsystem_symbol", "page_alloc", "va_arg_ptr", "va_cursor",
+    "uname_field", "initial_environ", "call_ptr0", "call_ptr1", "call_ptr2",
+    "call_ptr3", "call_ptr4", "call_ptr_ptr_i64", "call_ptr_ptr_ptr_i32",
+    "call_ptr_ptr_ptr_i64_ptr", "call_ptr_i64_i64", "darwin_errno_location",
+    "dynamic_library_close", "getenv", "va_start",
+})
+
+
+def _unsafe_intrinsic_return_type(ctx: "_InferCtx", name: str) -> Optional[Type]:
+    """Table lookup plus the normal-mode raw-address-as-int projection."""
+    ret_ty = _UNSAFE_INTRINSIC_RETURN_TYPES.get(name)
+    if ret_ty is None:
+        if name in _POINTER_INTRINSICS and not ctx.pointer_lane:
+            return TYPE_INT
+        return None
+    if ctx.freestanding:
+        if type_eq(ret_ty, TYPE_INT):
+            return TYPE_I64
+        return ret_ty
+    if name in _POINTER_INTRINSICS and type_eq(ret_ty, TYPE_DYN) and not ctx.pointer_lane:
+        return TYPE_INT
+    return ret_ty
+
+
 _UNSAFE_INTRINSIC_RETURN_TYPES: dict[str, Type] = {
     "malloc": TYPE_DYN,
     "cstr": TYPE_DYN,
@@ -634,6 +685,7 @@ _UNSAFE_INTRINSIC_RETURN_TYPES: dict[str, Type] = {
     "ptr_to_int": TYPE_INT,
     "wrapping_mul_i64": TYPE_INT,
     "logical_shift_right_i64": TYPE_INT,
+    "logical_shift_left_i64": TYPE_INT,
     "unsigned_div_i64": TYPE_INT,
     "unsigned_rem_i64": TYPE_INT,
     "unsigned_greater_i64": TYPE_BOOL,
@@ -653,6 +705,8 @@ _UNSAFE_INTRINSIC_RETURN_TYPES: dict[str, Type] = {
     "tag_int": TYPE_DYN,
     "untag_int": TYPE_INT,
     "load_i64": TYPE_INT,
+    "load_i64x4": TYPE_UNSAFE_I64X4,
+    "load_i64x4_strided": TYPE_UNSAFE_I64X4,
     "load_i32": TYPE_INT,
     "load_i8": TYPE_INT,
     "load_ptr": TYPE_DYN,
@@ -847,6 +901,7 @@ class _InferCtx:
     func_types: dict[str, FuncType]
     external_exports: dict
     derived_class_map: dict
+    unique_external_class_preload: object
     contextual_host_params: dict
     dataclasses_replace_aliases: set[str]
     functools_module_aliases: set[str]
@@ -858,12 +913,15 @@ class _InferCtx:
     pcc_guarded_loop_counter_aliases: set[str]
     class_types: dict[str, ClassType]
     _l1_codegen_host_type: Optional[ClassType]
+    _preload_dependency_modules: list[str]
+    _record_preload_dependencies: bool
 
     def __init__(
         self,
         module: Module,
         external_exports: Optional[dict] = None,
         derived_class_map: Optional[dict] = None,
+        unique_external_class_preload=None,
         contextual_host_params: Optional[dict] = None,
     ) -> None:
         self.module = module
@@ -872,6 +930,7 @@ class _InferCtx:
         except AttributeError:
             self.module_name = ""
         self.freestanding = False
+        self.runtime_port = False
         for module_stmt in module.body:
             if not isinstance(module_stmt, Assign):
                 continue
@@ -880,6 +939,12 @@ class _InferCtx:
             for target in module_stmt.targets:
                 if isinstance(target, Name) and target.ident == "__pcc_freestanding__":
                     self.freestanding = True
+                if isinstance(target, Name) and target.ident == "__pcc_runtime_port__":
+                    self.runtime_port = True
+        # Pointer-lane modules (freestanding kernels and runtime ports) keep
+        # raw pointers as pointer values; application modules type raw
+        # addresses as ``int`` so they can never enter the object protocol.
+        self.pointer_lane = self.freestanding or self.runtime_port
         # Module-level globals (functions, top-level vars).
         self.globals: _Scope = _Scope(parent=None)
         # Map from function name to its (possibly refined) ``FuncType``.
@@ -900,6 +965,7 @@ class _InferCtx:
         # instead of C's empty one. Built once in the multi-file
         # pipeline and shared across every module's _InferCtx.
         self.derived_class_map = derived_class_map or {}
+        self.unique_external_class_preload = unique_external_class_preload
         self.contextual_host_params = contextual_host_params or {}
         # Module-level type aliases (``Instruction = dict[Engine, list]``,
         # ``Engine = Literal[...]``). An annotation naming one of these
@@ -947,6 +1013,8 @@ class _InferCtx:
         self.setdefault_none_widen_names: set = set()
         self.class_types: dict[str, ClassType] = {}
         self._l1_codegen_host_type: Optional[ClassType] = None
+        self._preload_dependency_modules = []
+        self._record_preload_dependencies = False
 
     # -- helpers -----------------------------------------------------------
 
@@ -1943,6 +2011,12 @@ def _infer_expr(ctx: _InferCtx, scope: _Scope, expr: Expr) -> Expr:
             recv_ty = ctx.resolve_type_refs(callee.obj.ty)
             method = callee.name
             inferred = _container_method_return_type(recv_ty, method)
+            if inferred is None and isinstance(recv_ty, ClassType):
+                inferred = _external_method_return_type(
+                    ctx,
+                    recv_ty,
+                    method,
+                )
             if (
                 inferred is not None
                 and isinstance(recv_ty, DictType)
@@ -2258,6 +2332,37 @@ def _call_result_type(ctx: _InferCtx, callee: Expr) -> Type:
     return TYPE_DYN
 
 
+def _external_method_return_type(
+    ctx: _InferCtx,
+    receiver: ClassType,
+    method_name: str,
+) -> Optional[Type]:
+    module_name = _class_type_module(receiver)
+    if not module_name:
+        return None
+    module_exports = ctx.external_exports.get(module_name)
+    if not module_exports:
+        return None
+    class_info = module_exports.get(receiver.name)
+    if not (
+        isinstance(class_info, dict)
+        and class_info.get("kind") == "class"
+    ):
+        return None
+    for method in class_info.get("methods", ()):
+        if method.get("name") != method_name:
+            continue
+        memo: dict[tuple[str, str], ClassType] = {}
+        return _resolve_export_type_refs(
+            ctx,
+            module_name,
+            module_exports,
+            memo,
+            _annotation_to_type(decode_type(method.get("return_ty"))),
+        )
+    return None
+
+
 def _extern_ctype_value_type(ctype_name: str) -> Type:
     """Return a pcc type only when the C and pcc IR lanes are compatible.
 
@@ -2273,6 +2378,10 @@ def _extern_ctype_value_type(ctype_name: str) -> Type:
         return TYPE_BOOL
     if ctype_name == "c_void":
         return TYPE_NONE
+    if ctype_name == "c_rawptr":
+        # A raw address result is an int outside runtime-port mode so it can
+        # never enter the object refcount protocol as a pointer.
+        return TYPE_INT
     return TYPE_DYN
 
 
@@ -2302,12 +2411,28 @@ def _extern_factory_call_type(
         for marker in argtypes_expr.elems:
             marker_name = _name_ident(marker) if isinstance(marker, Name) else None
             canonical = ctx.extern_ctype_aliases.get(marker_name or "", "")
+            if ctx.pointer_lane and canonical in ("c_obj", "c_rawptr"):
+                canonical = "c_ptr"
             params.append(_extern_ctype_value_type(canonical))
 
     restype_name = "c_void"
     if isinstance(restype_expr, Name):
         marker_name = _name_ident(restype_expr)
         restype_name = ctx.extern_ctype_aliases.get(marker_name or "", "")
+    if ctx.pointer_lane and restype_name in ("c_obj", "c_rawptr"):
+        # Pointer-lane modules keep every pointer result in the pointer lane;
+        # the object/raw split only exists for application modules.
+        restype_name = "c_ptr"
+    if not ctx.pointer_lane and restype_name in ("c_ptr", "c_str"):
+        # Fail closed: the frontend cannot tell a PyObject* result from raw
+        # memory, and a raw address typed as an object would defeat the
+        # provenance guarantee the runtime refcount paths rely on.
+        _raise_frontend_error(
+            callee.span,
+            "extern return type " + restype_name + " is ambiguous between a "
+            "Python object and a raw address",
+            "declare the return as c_obj (PyObject*) or c_rawptr (raw address)",
+        )
     ret_ty = _extern_ctype_value_type(restype_name)
     if ctx.freestanding:
         raw_params = []
@@ -2664,6 +2789,54 @@ def _typeconf_widen_if_join(
 # ---------------------------------------------------------------------------
 
 
+def _bind_for_tuple_target(
+    ctx: _InferCtx,
+    scope: _Scope,
+    target: TupleExpr,
+    elem_ty: Type,
+) -> Expr:
+    """Bind a for-loop tuple-unpack target's names into ``scope``.
+
+    Mirrors the single-name for-target rule: a name's type is its unpacked
+    slot type, joined to dyn when a pre-loop binding of a different type
+    exists (empty-iterable edge keeps the old value).  Nested tuples recurse;
+    non-name elements (subscripts, attributes) keep their inferred form and
+    bind nothing, exactly as before.
+    """
+    resolved = ctx.resolve_type_refs(elem_ty)
+    # Bind every element as DYN, deliberately NOT as its precise slot type.
+    # Before this fix these names were never bound at all and resolved through
+    # `lookup_name`'s TYPE_DYN fallback, so a DYN binding is observably
+    # identical for every non-shadowed name -- the entire behavior change is
+    # confined to the bug being fixed (a binding now exists, so it shadows
+    # the enclosing method's recursion seed).  Precise per-slot types were
+    # tried first: host-side gates all passed (51 green) but the stage1
+    # pcc1 could no longer compile even the two-line smoke -- a host-green/
+    # pcc1-red divergence typed-int lane changes are known to cause.  Slot
+    # precision is its own slice with its own stage gate, not a rider.
+    slot_types: tuple[Type, ...] = tuple(TYPE_DYN for _ in target.elems)
+    new_elems: list[Expr] = []
+    for element, slot_ty in zip(target.elems, slot_types):
+        if isinstance(element, Name):
+            element_ident = _name_ident(element)
+            if element_ident is not None:
+                pre_loop_ty = scope.lookup(element_ident)
+                bound_ty = slot_ty
+                if pre_loop_ty is not None and not type_eq(pre_loop_ty, slot_ty):
+                    bound_ty = TYPE_DYN
+                scope.update(element_ident, bound_ty)
+                new_elems.append(_with_ty(element, bound_ty))
+                continue
+            new_elems.append(_with_ty(element, slot_ty))
+        elif isinstance(element, TupleExpr):
+            new_elems.append(
+                _bind_for_tuple_target(ctx, scope, element, slot_ty)
+            )
+        else:
+            new_elems.append(_infer_expr(ctx, scope, element))
+    return replace(target, elems=tuple(new_elems), ty=resolved)
+
+
 def _infer_stmt(ctx: _InferCtx, scope: _Scope, stmt: Stmt) -> Stmt:
     if isinstance(stmt, FuncDef):
         return _infer_funcdef(ctx, scope, stmt)
@@ -2767,6 +2940,19 @@ def _infer_stmt(ctx: _InferCtx, scope: _Scope, stmt: Stmt) -> Stmt:
             else:
                 target_ty = elem_ty
             target = _with_ty(stmt.target, target_ty)
+        elif isinstance(stmt.target, TupleExpr):
+            # Tuple-unpack targets were never bound into the scope at all, so
+            # each element name resolved through the enclosing chain.  Mostly
+            # that fell through to dyn and accidentally worked -- but a method
+            # whose OWN name matches an element found the recursion seed
+            # (`param_scope.define(fn.name, ft)` in `_infer_funcdef`) and
+            # inferred 'callable', rejecting legal Python:
+            #     def value_id(self, name):
+            #         for existing, value_id in self.rows: return value_id
+            # Bind every element like the single-name branch above: per-slot
+            # types when the element type is a tuple of matching arity, dyn
+            # otherwise, with the same pre-loop representation join.
+            target = _bind_for_tuple_target(ctx, scope, stmt.target, elem_ty)
         body = tuple(_infer_stmt(ctx, scope, s) for s in stmt.body)
         else_body = tuple(_infer_stmt(ctx, scope, s) for s in stmt.else_body)
         return replace(
@@ -2987,11 +3173,9 @@ def _infer_stmt(ctx: _InferCtx, scope: _Scope, stmt: Stmt) -> Stmt:
                 ctx.func_types[local_name] = ft
         if resolved == "pcc.unsafe":
             for attr_name, as_name in stmt.names:
-                ret_ty = _UNSAFE_INTRINSIC_RETURN_TYPES.get(attr_name)
+                ret_ty = _unsafe_intrinsic_return_type(ctx, attr_name)
                 if ret_ty is None:
                     continue
-                if ctx.freestanding and type_eq(ret_ty, TYPE_INT):
-                    ret_ty = TYPE_I64
                 local_name = as_name or attr_name
                 ctx.unsafe_intrinsic_aliases.add(local_name)
                 ft = FuncType(
@@ -3804,6 +3988,8 @@ def _init_field_rhs_type(ctx: _InferCtx, scope: _Scope, value: Expr) -> Optional
 def _class_fields_from_def(
     ctx: _InferCtx, stmt: ClassDef
 ) -> tuple[tuple[str, Type], ...]:
+    from .pipeline_exports import instance_field_assignment_statements
+
     fields: list[tuple[str, Type]] = []
     for body_stmt in stmt.body:
         if isinstance(body_stmt, Assign):
@@ -3816,7 +4002,10 @@ def _class_fields_from_def(
                     target_ident = _name_ident(target)
                     if target_ident is not None:
                         _append_field(fields, target_ident, field_ty)
-        elif isinstance(body_stmt, FuncDef) and body_stmt.name == "__init__":
+        elif (
+            isinstance(body_stmt, FuncDef) and body_stmt.args
+            and body_stmt.args[0].name == "self"
+        ):
             arg_types = {
                 arg.name: ctx.resolve_annotation(_annotation_or_none(arg))
                 for arg in body_stmt.args
@@ -3825,14 +4014,16 @@ def _class_fields_from_def(
             init_scope = _Scope(parent=ctx.globals)
             for arg_name, arg_ty in arg_types.items():
                 init_scope.define(arg_name, arg_ty)
-            for init_stmt in body_stmt.body:
-                if not isinstance(init_stmt, Assign):
-                    continue
+            for init_stmt in instance_field_assignment_statements(body_stmt.body):
                 explicit_ty: Optional[Type] = None
                 init_annotation = _annotation_or_none(init_stmt)
                 if init_annotation is not None:
                     explicit_ty = ctx.resolve_annotation(init_annotation)
-                pending_targets = list(reversed(init_stmt.targets))
+                init_targets = (
+                    init_stmt.targets if isinstance(init_stmt, Assign)
+                    else (init_stmt.target,)
+                )
+                pending_targets = list(reversed(init_targets))
                 while pending_targets:
                     target = pending_targets.pop()
                     if isinstance(target, (TupleExpr, ListExpr)):
@@ -3844,6 +4035,17 @@ def _class_fields_from_def(
                         or _name_ident(target.obj) != "self"
                     ):
                         continue
+                    # Method writes contribute field order, but must not
+                    # replace constructor/declaration types with a cleanup
+                    # sentinel (e.g. an exhausted list replaced by ()).
+                    if body_stmt.name != "__init__":
+                        field_known = False
+                        for known_name, _known_ty in fields:
+                            if known_name == target.name:
+                                field_known = True
+                                break
+                        if field_known:
+                            continue
                     field_ty = explicit_ty
                     if field_ty is None and isinstance(init_stmt.value, Name):
                         field_ty = arg_types.get(_name_ident(init_stmt.value))
@@ -3852,7 +4054,15 @@ def _class_fields_from_def(
                             ctx, init_scope, init_stmt.value
                         )
                     if field_ty is None:
-                        continue
+                        # An unrecognized RHS (such as an if-expression or
+                        # adopted attribute) adds a missing field, but cannot
+                        # erase a declaration or earlier constructor type.
+                        for known_name, known_ty in fields:
+                            if known_name == target.name:
+                                field_ty = known_ty
+                                break
+                        if field_ty is None:
+                            field_ty = DynType(name="dyn")
                     _append_field(fields, target.name, field_ty)
     return tuple(fields)
 
@@ -3865,42 +4075,64 @@ def _class_type_from_export(
     memo: dict[tuple[str, str], ClassType],
 ) -> ClassType:
     class_name = info["class_name"]
-    key = (module_name, class_name)
+    owning_module = info.get("owning_module", module_name)
+    if not owning_module:
+        owning_module = module_name
+    if ctx._record_preload_dependencies:
+        if module_name not in ctx._preload_dependency_modules:
+            ctx._preload_dependency_modules.append(module_name)
+        if owning_module not in ctx._preload_dependency_modules:
+            ctx._preload_dependency_modules.append(owning_module)
+    owner_exports = module_exports
+    if owning_module != module_name:
+        maybe_owner_exports = ctx.external_exports.get(owning_module)
+        if maybe_owner_exports is not None:
+            owner_exports = maybe_owner_exports
+    key = (owning_module, class_name)
     cached = memo.get(key)
     if cached is not None:
         return cached
 
-    placeholder = _make_class_type(class_name, module_name, (), ())
+    is_valueclass = bool(info.get("valueclass", False))
+    placeholder = _make_class_type(
+        class_name,
+        owning_module,
+        (),
+        (),
+        valueclass=is_valueclass,
+    )
     memo[key] = placeholder
 
-    base_names = _py_ast_static_base_names_for_export(module_name, class_name)
+    base_names = _py_ast_static_base_names_for_export(owning_module, class_name)
     if not base_names:
         base_names = tuple(info.get("base_names", ()))
     bases: list[ClassType] = []
     for base_name in base_names:
-        base_info = module_exports.get(base_name)
+        base_info = owner_exports.get(base_name)
         if isinstance(base_info, dict) and base_info.get("kind") == "class":
             bases.append(
                 _class_type_from_export(
                     ctx,
-                    module_name,
+                    owning_module,
                     base_info,
-                    module_exports,
+                    owner_exports,
                     memo,
                 )
             )
         else:
-            bases.append(_make_class_type(base_name, module_name, (), ()))
+            bases.append(_make_class_type(base_name, owning_module, (), ()))
 
-    static_fields = _py_ast_static_fields_for_export(module_name, class_name)
+    static_fields = _py_ast_static_fields_for_export(owning_module, class_name)
     if not static_fields:
-        static_fields = _llvm_ir_static_fields_for_export(module_name, class_name)
+        static_fields = _llvm_ir_static_fields_for_export(
+            owning_module, class_name
+        )
     if static_fields:
         field_type_map = {
             fname: _resolve_export_type_refs(
                 ctx,
-                module_name,
-                module_exports,
+                owning_module,
+                owner_exports,
                 memo,
                 field_ty,
             )
@@ -3910,8 +4142,8 @@ def _class_type_from_export(
         field_type_map = {
             fname: _resolve_export_type_refs(
                 ctx,
-                module_name,
-                module_exports,
+                owning_module,
+                owner_exports,
                 memo,
                 _annotation_to_type(decode_type(field_ty)),
             )
@@ -3926,9 +4158,10 @@ def _class_type_from_export(
         fields = tuple(field_type_map.items())
     cls_ty = _make_class_type(
         class_name,
-        module_name,
+        owning_module,
         fields,
         tuple(bases),
+        valueclass=is_valueclass,
     )
     memo[key] = cls_ty
     ctx.register_class_type(class_name, cls_ty)
@@ -4517,13 +4750,23 @@ def _bind_external_import_exports(
                 )
                 for t in info["param_types"]
             )
-            ret_ty = _resolve_export_type_refs(
-                ctx,
-                resolved_module,
-                module_exports,
-                memo,
-                _annotation_to_type(decode_type(info["return_ty"])),
-            )
+            intrinsic_ret_ty = None
+            if resolved_module == "pcc.unsafe":
+                intrinsic_ret_ty = _unsafe_intrinsic_return_type(ctx, attr_name)
+            if intrinsic_ret_ty is not None:
+                # ``pcc.unsafe`` functions are CPython fail-loud stubs whose
+                # source annotations intentionally use ``Any``.  The compiler
+                # intrinsic table owns their real native projection; a
+                # closed-world export must not overwrite it with ``DynType``.
+                ret_ty = intrinsic_ret_ty
+            else:
+                ret_ty = _resolve_export_type_refs(
+                    ctx,
+                    resolved_module,
+                    module_exports,
+                    memo,
+                    _annotation_to_type(decode_type(info["return_ty"])),
+                )
             ft = _make_func_type(param_tys, ret_ty)
             scope.update(local_name, ft)
             ctx.func_types[local_name] = ft
@@ -4604,6 +4847,56 @@ def _bind_ir_compat_module_alias(
 
 
 def _preload_unique_external_classes(ctx: _InferCtx) -> None:
+    indexed_preload = ctx.unique_external_class_preload
+    if indexed_preload is not None:
+        if not isinstance(indexed_preload, dict):
+            raise ValueError("invalid indexed external class preload")
+        descriptors = indexed_preload.get("types")
+        key_rows = indexed_preload.get("keys")
+        base_key_rows = indexed_preload.get("base_keys")
+        drop_keys = indexed_preload.get("drop_keys", ())
+        set_key_rows = indexed_preload.get("set_keys", ())
+        if not isinstance(descriptors, tuple):
+            raise ValueError("invalid indexed external class preload")
+        if key_rows is None:
+            key_rows = base_key_rows
+        if (
+            not isinstance(key_rows, tuple)
+            or not isinstance(drop_keys, tuple)
+            or not isinstance(set_key_rows, tuple)
+        ):
+            raise ValueError("invalid indexed external class preload")
+        decoded_types = []
+        for descriptor in descriptors:
+            ty = decode_type(descriptor)
+            if not isinstance(ty, ClassType):
+                raise ValueError("indexed external class preload is not a class")
+            decoded_types.append(ty)
+        dropped = list(drop_keys)
+        for row in key_rows:
+            if (
+                not isinstance(row, tuple)
+                or len(row) != 2
+                or not isinstance(row[0], str)
+                or not isinstance(row[1], int)
+                or row[1] < 0
+                or row[1] >= len(decoded_types)
+            ):
+                raise ValueError("invalid indexed external class preload key")
+            if row[0] not in dropped:
+                ctx.class_types[row[0]] = decoded_types[row[1]]
+        for row in set_key_rows:
+            if (
+                not isinstance(row, tuple)
+                or len(row) != 2
+                or not isinstance(row[0], str)
+                or not isinstance(row[1], int)
+                or row[1] < 0
+                or row[1] >= len(decoded_types)
+            ):
+                raise ValueError("invalid indexed external class preload key")
+            ctx.class_types[row[0]] = decoded_types[row[1]]
+        return
     by_name: dict[str, list[tuple[str, dict, dict]]] = {}
     for module_name, module_exports in ctx.external_exports.items():
         for info in module_exports.values():
@@ -4625,6 +4918,110 @@ def _preload_unique_external_classes(ctx: _InferCtx) -> None:
             memo,
         )
         ctx.register_class_type(class_name, cls_ty)
+
+
+def build_unique_external_class_preload(external_exports):
+    """Freeze the repeated unique-class scan into dense type IDs once."""
+
+    ctx = _InferCtx(Module(name="", body=()), external_exports=external_exports)
+    ctx._record_preload_dependencies = True
+    _preload_unique_external_classes(ctx)
+    descriptors = []
+    descriptor_ids = {}
+    identity_ids = {}
+    key_rows = []
+    for key, ty in ctx.class_types.items():
+        identity = id(ty)
+        cached = identity_ids.get(identity)
+        if cached is not None and cached[0] is ty:
+            type_id = cached[1]
+        else:
+            descriptor = encode_type(ty)
+            type_id = descriptor_ids.get(descriptor)
+            if type_id is None:
+                type_id = len(descriptors)
+                descriptors.append(descriptor)
+                descriptor_ids[descriptor] = type_id
+            # Keep the keyed object alive; this memo lasts only for this
+            # frozen preload, never across root-dependent reconstruction.
+            identity_ids[identity] = (ty, type_id)
+        key_rows.append((key, type_id))
+    return {
+        "types": tuple(descriptors),
+        "keys": tuple(key_rows),
+        "dependencies": tuple(sorted(ctx._preload_dependency_modules)),
+    }
+
+
+def build_unique_external_class_preload_index(external_exports):
+    """Build a common preload plus sparse exact per-root deltas."""
+
+    global_preload = build_unique_external_class_preload(external_exports)
+    descriptors = list(global_preload["types"])
+    descriptor_ids = {}
+    for type_id, descriptor in enumerate(descriptors):
+        descriptor_ids[descriptor] = type_id
+    base_keys = tuple(global_preload["keys"])
+    global_by_key = {}
+    for key, type_id in base_keys:
+        global_by_key[key] = descriptors[type_id]
+
+    class_counts = {}
+    module_class_counts = {}
+    for module_name, module_exports in external_exports.items():
+        local_counts = {}
+        for info in module_exports.values():
+            if not isinstance(info, dict) or info.get("kind") != "class":
+                continue
+            class_name = info.get("class_name")
+            if not isinstance(class_name, str) or not class_name:
+                continue
+            class_counts[class_name] = class_counts.get(class_name, 0) + 1
+            local_counts[class_name] = local_counts.get(class_name, 0) + 1
+        module_class_counts[module_name] = local_counts
+    sensitive_modules = list(global_preload["dependencies"])
+    for module_name, local_counts in module_class_counts.items():
+        for class_name, removed_count in local_counts.items():
+            total_count = class_counts.get(class_name, 0)
+            if total_count == 1 or total_count - removed_count == 1:
+                if module_name not in sensitive_modules:
+                    sensitive_modules.append(module_name)
+                break
+
+    roots = {}
+    for root_module in external_exports:
+        if root_module not in sensitive_modules:
+            roots[root_module] = ((), ())
+            continue
+        external_for_root = {}
+        for module_name, module_exports in external_exports.items():
+            if module_name != root_module:
+                external_for_root[module_name] = module_exports
+        preload = build_unique_external_class_preload(external_for_root)
+        root_by_key = {}
+        for key, local_type_id in preload["keys"]:
+            root_by_key[key] = preload["types"][local_type_id]
+        drop_keys = []
+        for key in global_by_key:
+            if key not in root_by_key:
+                drop_keys.append(key)
+        set_key_rows = []
+        for key, local_type_id in preload["keys"]:
+            descriptor = preload["types"][local_type_id]
+            if global_by_key.get(key) == descriptor:
+                continue
+            type_id = descriptor_ids.get(descriptor)
+            if type_id is None:
+                type_id = len(descriptors)
+                descriptors.append(descriptor)
+                descriptor_ids[descriptor] = type_id
+            set_key_rows.append((key, type_id))
+        roots[root_module] = (tuple(drop_keys), tuple(set_key_rows))
+    return {
+        "types": tuple(descriptors),
+        "base_keys": base_keys,
+        "roots": roots,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -5873,6 +6270,7 @@ def infer_module(
     *,
     external_exports=None,
     derived_class_map=None,
+    unique_external_class_preload=None,
     contextual_host_params=None,
 ) -> Module:
     """Run type inference over an entire module and return a new ``Module``.
@@ -5907,6 +6305,7 @@ def infer_module(
         m,
         external_exports=external_exports,
         derived_class_map=derived_class_map,
+        unique_external_class_preload=unique_external_class_preload,
         contextual_host_params=contextual_host_params,
     )
     _prepopulate_module_scope(ctx, m)

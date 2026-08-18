@@ -8,15 +8,17 @@ stable non-null sentinels.  It does not claim pthread parallelism.
 """
 
 from pcc import i64
-from pcc.extern import c_abi_export
+from pcc.extern import c_abi_export, c_void, extern
 from pcc.unsafe import (
     define_global_i8,
     define_global_i32,
     define_thread_local_i32,
     global_addr,
+    load_i32,
     load_i64,
     null,
     ptr_is_null,
+    store_i32,
     store_i64,
     store_ptr,
 )
@@ -25,12 +27,21 @@ __pcc_freestanding__ = True
 
 define_global_i32("pcc_thread_stop_requested", 0)
 define_thread_local_i32("pcc_native_thread_identity_token", 0)
+define_thread_local_i32("pcc_tls_no_park_depth_py", 0)
 define_global_i8("pcc_mutex_stub", 0)
 define_global_i8("pcc_cond_stub", 0)
 
 
+pcc_platform_abort = extern("pcc_platform_abort", (), c_void)
+
+
 @c_abi_export("pcc_threads_enabled")
 def pcc_threads_enabled() -> i64:
+    return 0
+
+
+@c_abi_export("pcc_thread_stop_requested_acquire")
+def pcc_thread_stop_requested_acquire() -> i64:
     return 0
 
 
@@ -79,9 +90,60 @@ def pcc_current_thread_id() -> i64:
     return 1
 
 
+@c_abi_export("pcc_thread_no_park_enter")
+def pcc_thread_no_park_enter() -> None:
+    depth: i64 = load_i32(global_addr("pcc_tls_no_park_depth_py"), 0)
+    if depth < 0 or depth == 2147483647:
+        # The default kernel has no blocking or parallel execution, but depth
+        # remains real TLS state so recursive collector entry can fail closed.
+        pcc_platform_abort()
+        return
+    if depth != 0:
+        store_i32(global_addr("pcc_tls_no_park_depth_py"), 0, depth + 1)
+        return
+    pcc_current_thread_id()
+    store_i32(global_addr("pcc_tls_no_park_depth_py"), 0, depth + 1)
+
+
+@c_abi_export("pcc_thread_no_park_exit")
+def pcc_thread_no_park_exit() -> None:
+    depth: i64 = load_i32(global_addr("pcc_tls_no_park_depth_py"), 0)
+    if depth <= 0:
+        pcc_platform_abort()
+        return
+    depth = depth - 1
+    store_i32(global_addr("pcc_tls_no_park_depth_py"), 0, depth)
+    if depth == 0:
+        pcc_thread_safepoint()
+
+
+@c_abi_export("pcc_thread_no_park_depth")
+def pcc_thread_no_park_depth() -> i64:
+    return load_i32(global_addr("pcc_tls_no_park_depth_py"), 0)
+
+
 @c_abi_export("pcc_thread_safepoint")
 def pcc_thread_safepoint() -> None:
+    if pcc_thread_no_park_depth() != 0:
+        return
     return
+
+
+@c_abi_export("pcc_thread_owns_stopped_world")
+def pcc_thread_owns_stopped_world() -> i64:
+    return 1
+
+
+@c_abi_export("pcc_thread_registration_waiter_count")
+def pcc_thread_registration_waiter_count() -> i64:
+    return 0
+
+
+@c_abi_export("pcc_thread_unregister_current")
+def pcc_thread_unregister_current() -> None:
+    if pcc_thread_no_park_depth() != 0:
+        pcc_platform_abort()
+        return
 
 
 @c_abi_export("pcc_stop_the_world")

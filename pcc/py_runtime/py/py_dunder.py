@@ -1,4 +1,7 @@
 """pcc-Python port of py_dunder.c."""
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PYINSTANCEOBJECT_CLS_OFFSET,
     PYOBJECTHEADER_FLAGS_OFFSET,
@@ -17,6 +20,7 @@ from pcc.unsafe import (
     call_ptr1,
     cstr,
     free,
+    global_addr,
     global_load_ptr,
     is_tagged_int,
     load_i8,
@@ -49,6 +53,8 @@ py_runtime_error_if_unset = extern(
 py_int_to_i64 = extern("py_int_to_i64", (c_ptr, c_ptr), c_int64)
 py_incref = extern("py_incref", (c_ptr,), c_void)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_str_new = extern("py_str_new", (c_ptr, c_int64), c_ptr)
 py_decref = extern("py_decref", (c_ptr,), c_void)
 py_tuple_new = extern("py_tuple_new", (c_int64,), c_ptr)
@@ -542,7 +548,7 @@ def py_user_hash_dispatch(o, handled) -> int:
     if ptr_eq(func, global_load_ptr("py_None")) != 0:
         if ptr_is_null(handled) == 0:
             store_i64(handled, 0, 1)
-        py_raise(py_exc_new(3, cstr("unhashable type")))
+        py_raise_owned(py_exc_new(3, cstr("unhashable type")))
         return 0
     result = _call_user_unary_method(func, o)
     if ptr_is_null(handled) == 0:
@@ -611,6 +617,11 @@ def py_user_del_dispatch(o) -> None:
     if tag != PY_TYPE_INSTANCE and tag < PY_TYPE_USER_CLASS_START:
         return
     if pcc_capi_is_cext_type_tag(tag) != 0:
+        return
+    # No class in this process ever defined ``__del__``: the MRO lookup below
+    # (string hash + per-class dict probes) cannot find one.  This was the
+    # largest single cost of freeing a plain instance.
+    if load_i32(global_addr("pcc_class_del_defined_count"), 0) == 0:
         return
     flags: int = load_i32(o, PYOBJECTHEADER_FLAGS_OFFSET)
     if (flags & 4) != 0:

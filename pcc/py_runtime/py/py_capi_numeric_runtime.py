@@ -1,4 +1,7 @@
 """pcc-Python scalar-number owners for the no-libpython C-API surface."""
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_BOOL,
     PY_TYPE_FLOAT,
@@ -43,6 +46,8 @@ py_float_to_f64 = extern("py_float_to_f64", (c_ptr,), c_double)
 py_incref = extern("py_incref", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_int_from_i64 = extern("py_int_from_i64", (c_int64,), c_ptr)
 py_int_to_i64 = extern("py_int_to_i64", (c_ptr, c_ptr), c_int64)
 py_err_occurred = extern("py_err_occurred", (), c_int64)
@@ -50,7 +55,7 @@ py_bigint_alloc = extern("py_bigint_alloc", (c_int64,), c_ptr)
 
 
 def _raise_scalar(kind: int, message) -> None:
-    py_raise(py_exc_new(kind, message))
+    py_raise_owned(py_exc_new(kind, message))
 
 
 def _bool_scalar(obj) -> int:
@@ -165,12 +170,12 @@ def PyFloat_FromDouble(value: float):
 @c_abi_typed_export("PyFloat_AsDouble", "f64", ("ptr",))
 def PyFloat_AsDouble(obj) -> float:
     if ptr_is_null(obj):
-        py_raise(py_exc_new(3, cstr("expected float-compatible object")))
+        py_raise_owned(py_exc_new(3, cstr("expected float-compatible object")))
         return -1.0
     if not is_tagged_int(obj):
         type_tag: int = load_i32(obj, 8)
         if type_tag != PY_TYPE_FLOAT and type_tag != PY_TYPE_INT and type_tag != PY_TYPE_BOOL:
-            py_raise(py_exc_new(3, cstr("expected float-compatible object")))
+            py_raise_owned(py_exc_new(3, cstr("expected float-compatible object")))
             return -1.0
     return py_float_to_f64(obj)
 

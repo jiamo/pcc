@@ -221,6 +221,172 @@ def _two_pass_reference(ir_text: str) -> str:
     return one_pass(once, compiled_default_passes._sroa_function)
 
 
+def _mem2reg_all_candidates_reference(lines: list[str]) -> list[str]:
+    """`_mem2reg_function` with its historical every-line-x-every-candidate scan.
+
+    The classification loop used to visit every alloca candidate for every line
+    and ask `_contains_ssa_name`.  On one real emitted module that was 38.5M
+    (line, candidate) pairs against 252k lines -- a 152x amplification, and
+    under a self-hosted pcc1 each of those pairs is a dict lookup plus a
+    provenance-checked object touch.  The live version instead tokenizes each
+    line's maximal `%name` tokens and looks up only those.  That is only sound
+    while the two agree exactly, so the old shape stays here as an oracle.
+    """
+    m = compiled_default_passes
+    block_ids = m._block_ids(lines)
+    blocked = m._control_flow_blocks(lines, block_ids)
+    candidates: dict[str, dict[str, object]] = {}
+    for index, line in enumerate(lines):
+        parsed = m._parse_alloca(line)
+        if parsed is None:
+            continue
+        name, ty, _indent = parsed
+        if not m._is_scalar_type(ty):
+            continue
+        candidates[name] = {
+            "line": index,
+            "type": ty,
+            "block": block_ids[index],
+            "events": [],
+            "safe": block_ids[index] not in blocked,
+        }
+    if not candidates:
+        return lines
+
+    for index, line in enumerate(lines):
+        store = m._parse_store(line)
+        load = m._parse_load(line)
+        for name, candidate in candidates.items():
+            if not candidate["safe"]:
+                continue
+            if index == candidate["line"]:
+                continue
+            if not m._contains_ssa_name(line, name):
+                continue
+            if block_ids[index] != candidate["block"]:
+                candidate["safe"] = False
+                continue
+            if store is not None:
+                store_ty, value, pointer = store
+                if pointer == name and store_ty == candidate["type"]:
+                    if m._contains_ssa_name(value, name):
+                        candidate["safe"] = False
+                        continue
+                    candidate["events"].append((index, "store", value))
+                    continue
+            if load is not None:
+                result, load_ty, pointer = load
+                if pointer == name and load_ty == candidate["type"]:
+                    candidate["events"].append((index, "load", result))
+                    continue
+            candidate["safe"] = False
+
+    removed: set[int] = set()
+    removed_definitions: list[str] = []
+    replacements: dict[str, str] = {}
+    for _name, candidate in candidates.items():
+        if not candidate["safe"]:
+            continue
+        removed.add(int(candidate["line"]))
+        removed_definitions.append(str(_name))
+        current_value = "undef"
+        events = list(candidate["events"])
+        events.sort(key=lambda item: int(item[0]))
+        for index, kind, payload in events:
+            removed.add(int(index))
+            if kind == "store":
+                current_value = str(payload)
+            else:
+                replacements[str(payload)] = current_value
+                removed_definitions.append(str(payload))
+
+    if not removed:
+        return lines
+    replacements = m._resolved_replacements(replacements)
+    out: list[str] = []
+    for index, line in enumerate(lines):
+        if index in removed:
+            continue
+        out.append(m._replace_ssa_names(line, replacements))
+    if m._references_removed_definitions(out, removed_definitions):
+        return lines
+    return out
+
+
+def _many_alloca_function(slots: int, filler: int) -> str:
+    """A `define` shaped like real emitted IR: many scalar slots, interleaved
+    stores/loads, unrelated lines that mention other `%` names, plus the
+    shapes that must stay unpromoted (escape, cross-block, struct)."""
+    out = ["define i64 @wide(i64 %arg) {\n", "entry:\n"]
+    for i in range(slots):
+        out.append(f"  %s{i} = alloca i64, align 8\n")
+    out.append("  %agg = alloca { i64, ptr }, align 8\n")
+    for i in range(slots):
+        out.append(f"  store i64 %arg, ptr %s{i}, align 8\n")
+        for f in range(filler):
+            out.append(f"  %t{i}_{f} = add i64 %arg, {f}\n")
+        out.append(f"  %v{i} = load i64, ptr %s{i}, align 8\n")
+    # An escape and a cross-block use must survive the inversion unchanged.
+    out.append("  store ptr %s0, ptr %agg, align 8\n")
+    out.append("  br label %next\n")
+    out.append("next:\n")
+    out.append("  %late = load i64, ptr %s1, align 8\n")
+    out.append("  ret i64 %late\n")
+    out.append("}\n")
+    return "".join(out)
+
+
+def test_mem2reg_token_scan_matches_the_all_candidates_scan():
+    cases = [
+        _SCALAR_IR,
+        _STRUCT_IR,
+        # Cross-block use and alloca-address escape: both must stay unpromoted.
+        "define i64 @probe(i1 %cond, i64 %arg) {\nentry:\n"
+        "  %slot = alloca i64\n  store i64 %arg, ptr %slot\n"
+        "  br i1 %cond, label %read, label %read\nread:\n"
+        "  %value = load i64, ptr %slot\n  ret i64 %value\n}\n",
+        "define ptr @probe() {\nentry:\n  %slot = alloca ptr\n"
+        "  store ptr %slot, ptr %slot\n  %value = load ptr, ptr %slot\n"
+        "  ret ptr %value\n}\n",
+        _many_alloca_function(1, 0),
+        _many_alloca_function(6, 2),
+        _many_alloca_function(40, 3),
+        # Names that are prefixes of each other: %s1 vs %s10 vs %s100 is the
+        # exact case a naive substring scan gets wrong.
+        _many_alloca_function(120, 1),
+    ]
+    for text in cases:
+        lines = text.splitlines(keepends=True)
+        assert compiled_default_passes._mem2reg_function(lines) == (
+            _mem2reg_all_candidates_reference(lines)
+        ), text[:200]
+
+
+def test_ssa_name_tokens_agree_with_contains_ssa_name():
+    m = compiled_default_passes
+    lines = [
+        "  %v1 = load i64, ptr %s10, align 8\n",
+        "  store ptr %s0, ptr %agg, align 8\n",
+        "  %x = call i64 @f(ptr %y, i64 %z)\n",
+        "  br i1 %c, label %then, label %else\n",
+        "  ret void\n",
+        "  %% \n",
+        "%",
+        "",
+        "  %a.b.c = add i64 %a, 1\n",
+    ]
+    probes = ["v1", "s1", "s10", "s0", "s", "agg", "x", "y", "z", "c", "then",
+              "else", "a", "a.b.c", "b", ""]
+    for line in lines:
+        tokens = set(m._ssa_names_in(line))
+        for probe in probes:
+            if probe == "":
+                continue
+            assert (probe in tokens) == m._contains_ssa_name(line, probe), (
+                line, probe, sorted(tokens)
+            )
+
+
 def test_fused_traversal_matches_two_separate_passes():
     multi_function = _SCALAR_IR + "\n" + _STRUCT_IR + "\n" + _SCALAR_IR
     for text in (_SCALAR_IR, _STRUCT_IR, multi_function):

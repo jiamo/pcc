@@ -14,23 +14,26 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.13",
     "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Programming Language :: C",
     "Topic :: Software Development :: Compilers",
 ]
 dependencies = [
     "black>=26.3.1",
-    "llvmlite==0.46.0",
-    "mlx>=0.32.0",
+    "llvmlite==0.47.0",
 ]
 
+[project.optional-dependencies]
+mlx = ["mlx>=0.32.0"]
+
 [project.urls]
-Homepage = "https://github.com/jiamo/pcc"
+Homepage = "https://github.com/allstoalls/pcc"
 
 [project.scripts]
 pcc = "pcc.cli_launcher:main"
 
 [build-system]
-requires = ["hatchling", "llvmlite==0.46.0"]
+requires = ["hatchling", "llvmlite==0.47.0"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.sdist]
@@ -47,14 +50,6 @@ include = [
     "pcc/py_runtime/include/**",
     "pcc/py_runtime/py/**",
     "pcc/py_runtime/Makefile",
-    # The TLS provider is a source-build boundary.  Include only its reviewed
-    # inputs so a developer's native/build/*.so or *.dylib can never leak into
-    # an unrelated platform wheel through a recursive wildcard.
-    "pcc/gateway/include/pcc_tls_provider_v1.h",
-    "pcc/gateway/native/Makefile",
-    "pcc/gateway/native/README.md",
-    "pcc/gateway/native/openssl_provider.c",
-    "pcc/gateway/native/provider-manifest.json",
 ]
 
 # Wheel-build hook in hatch_build.py:

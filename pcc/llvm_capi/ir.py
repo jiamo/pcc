@@ -63,15 +63,18 @@ def _env_flag_enabled(name: str) -> bool:
 
 
 _DEBUG_IR_RENDER_ENABLED = _env_flag_enabled("PCC_DEBUG_IR_RENDER")
-_DEBUG_IR_CALL_ENABLED = _env_flag_enabled("PCC_DEBUG_IR_CALL")
+_DEBUG_IR_CALL_TRACE_ENABLED = _env_flag_enabled("PCC_DEBUG_IR_CALL")
+_DIRECT_INLINE_ERROR_EDGE_CAPTURE_ENABLED = _env_flag_enabled(
+    "PCC_DIRECT_INLINE_ERROR_EDGE_CAPTURE"
+)
 
 
 def _debug_ir_render_enabled() -> bool:
     return _DEBUG_IR_RENDER_ENABLED
 
 
-def _debug_ir_call_enabled() -> bool:
-    return _DEBUG_IR_CALL_ENABLED
+def _debug_ir_call_trace_enabled() -> bool:
+    return _DEBUG_IR_CALL_TRACE_ENABLED
 
 
 def _debug_ir_render_enabled_uncached() -> bool:
@@ -511,6 +514,8 @@ class Value:
         "_is_unsigned",
         "_pcc_unsigned_pointee",
         "_pcc_unsigned_return",
+        "_direct_value_id",
+        "_direct_name",
     )
 
     def __init__(self, ty: Type, ref: str) -> None:
@@ -527,6 +532,8 @@ class Value:
         self._is_unsigned = False
         self._pcc_unsigned_pointee = False
         self._pcc_unsigned_return = False
+        self._direct_value_id = -1
+        self._direct_name = ""
 
     def __str__(self) -> str:
         return self._ref
@@ -572,6 +579,14 @@ class Value:
         else:
             new = str(head) + str(op) + " " + str(tail)
         self._instr.block._replace_record_text(self._instr, new)
+        if self._instr._direct_record_id >= 0:
+            direct_builder = self._instr.block.parent._direct_indexed_builder
+            if direct_builder is not None:
+                DirectIndexedFunctionBuilder.set_arithmetic_flags(
+                    direct_builder,
+                    self._instr._direct_record_id,
+                    self._flags,
+                )
 
     def bitcast(self, target_ty: Type) -> "Value":
         if _same_tracked_type(self.type, target_ty):
@@ -618,6 +633,8 @@ class Constant(Value):
     def __init__(self, ty: Type, value) -> None:
         self.type = ty
         self.value = value
+        self._direct_value_id = -1
+        self._direct_name = ""
         self._ref = self._format(ty, value)
         self._instr = None
         self._flags: list[str] = []
@@ -958,6 +975,8 @@ class Argument(Value):
     def __init__(self, ty: Type, index: int) -> None:
         self.type = ty
         self.index = index
+        self._direct_value_id = -1
+        self._direct_name = "%." + str(index + 1)
         self._name = ""
         # Match llvmlite: args are ``%.1``, ``%.2``, ... (1-based)
         self._ref = "%." + str(index + 1)
@@ -970,6 +989,7 @@ class Argument(Value):
     def name(self, value: str) -> None:
         self._name = value
         self._ref = "%" + str(value) if value else "%." + str(self.index + 1)
+        self._direct_name = str(value) if value else "%." + str(self.index + 1)
 
 
 class InstructionRecord:
@@ -985,9 +1005,20 @@ class InstructionRecord:
         self.opname = opname
         self.block = block
         self._metadata: dict[str, _MetadataNode] = {}
+        # One compact-plane row ID on the existing record preserves final
+        # insertion order without allocating a parallel instruction object.
+        # -1 is the explicit text-fallback marker.
+        self._direct_record_id = -1
 
     def __str__(self) -> str:
-        return self.text
+        if self.text:
+            return self.text
+        # Direct-only workers need only the opname for the two placement and
+        # strict-fallback scans that stringify an instruction.  Reaching back
+        # through the dynamically typed builder plane here makes this method a
+        # libpython-only strict stub in pcc1; detailed projection remains an
+        # explicit cold API on DirectIndexedFunctionBuilder.
+        return self.opname
 
     def set_metadata(self, name: str, node: "_MetadataNode") -> None:
         """Attach instruction metadata using llvmlite's public API shape.
@@ -1315,6 +1346,9 @@ class Function(Value):
         self.attributes = FunctionAttributes()
         self.calling_convention = ""
         self._metadata: dict[str, _MetadataNode] = {}
+        self._direct_indexed_builder = None
+        self._direct_indexed_function_cache = None
+        self._direct_first_libpython_callee = ""
         # Mark external if no blocks ever appended — subset of llvmlite's
         # behavior (``declare`` vs ``define``).
         module._functions.append(self)
@@ -1571,6 +1605,14 @@ def _looks_like_function(value) -> bool:
     return name is not None and _looks_like_function_type(ftype)
 
 
+def _is_exact_function(value) -> bool:
+    # Keep this check in an untyped helper.  Writing ``type(fn) is Function``
+    # directly to the right of ``isinstance(fn, Function)`` lets the typed
+    # frontend fold the second predicate after narrowing, which would admit
+    # subclasses and bypass their dynamic attribute overrides.
+    return type(value) is Function
+
+
 def _looks_like_pointer_type(value) -> bool:
     if isinstance(value, PointerType):
         return True
@@ -1653,6 +1695,8 @@ class GlobalVariable(Value):
         self.align: Optional[int] = None
         self.unnamed_addr = False
         self._ref = "@" + stable_name
+        self._direct_value_id = -1
+        self._direct_name = ""
         stable_module._globals.append(self)
         stable_module.globals[stable_name] = self
 
@@ -1736,6 +1780,8 @@ class Module:
         self.metadata: list[_MetadataNode] = []
         self.context = context or global_context
         self._name_counters: dict[str, int] = {}
+        self._direct_indexed_supported_records = 0
+        self._direct_indexed_fallback_records = 0
 
     def get_unique_name(self, base: str) -> str:
         """Return a unique variant of ``base`` within this module's
@@ -1803,6 +1849,16 @@ class Module:
         )
         self.metadata.append(node)
         return node
+
+    def direct_indexed_module(self):
+        """Project this builder state into the self backend's final kernel.
+
+        The backend import is deliberately lazy: ordinary LLVM/text users do
+        not acquire a self-backend dependency merely by constructing a Module.
+        """
+        from .direct_indexed_kernel import build_direct_indexed_module
+
+        return build_direct_indexed_module(self)
 
     def __str__(self) -> str:
         parts: list[str] = []
@@ -1902,10 +1958,23 @@ class IRBuilder:
         # that name directly (marshal._stash_overflow_slot). Keep a
         # single private storage and expose via both names.
         self._block: Optional[Block] = block
+        # Current source location, llvmlite's ``debug_location`` shape.  When
+        # set, ``_emit`` stamps ``!dbg`` on every instruction it appends, so a
+        # frontend marks statement boundaries once instead of decorating each
+        # of the hundreds of emit sites individually.
+        self.debug_location: Optional["_MetadataNode"] = None
         # Insertion position within the block — int index. _END means
         # "append to end" (clamped by _emit before use).
         self._pos: int = self._END
         self._fn: Optional[Function] = block.parent if block else None
+        self._direct_indexed_capture = _env_flag_enabled(
+            "PCC_DIRECT_INDEXED_KERNEL_CAPTURE"
+        )
+        self._direct_indexed_no_text = (
+            self._direct_indexed_capture
+            and _env_flag_enabled("PCC_DIRECT_INDEXED_KERNEL_EMIT")
+            and not _env_flag_enabled("PCC_DIRECT_INDEXED_KERNEL_VALIDATE")
+        )
 
     @property
     def block(self) -> Optional[Block]:
@@ -1933,6 +2002,19 @@ class IRBuilder:
     def function(self) -> Optional["Function"]:
         """Current function — matches llvmlite's ``IRBuilder.function``."""
         return self._fn
+
+    def _direct_builder_plane(
+        self,
+    ):
+        if not self._direct_indexed_capture or self._fn is None:
+            return None
+        direct_builder = self._fn._direct_indexed_builder
+        if direct_builder is None:
+            from .direct_indexed_kernel import DirectIndexedFunctionBuilder
+
+            direct_builder = DirectIndexedFunctionBuilder(self._fn)
+            self._fn._direct_indexed_builder = direct_builder
+        return direct_builder
 
     # ------------- positioning -------------
 
@@ -2003,10 +2085,45 @@ class IRBuilder:
             blk.append(line)
             if self._pos != self._END:
                 self._pos = len(blk._instrs)
-            return blk._instrs[-1]
+            return self._stamp(blk._instrs[-1])
         blk.insert(self._pos, line)
         rec = blk._instrs[self._pos]
         self._pos += 1
+        return self._stamp(rec)
+
+    def _emit_direct(self, opname: str) -> "InstructionRecord":
+        """Append a compact-only record for a direct emit worker.
+
+        Canonical text is not needed by this worker.  The record still owns
+        final insertion order/opname, and the two narrow frontend diagnostics
+        project a minimal line from the compact plane on demand.
+        """
+        if self._block is None:
+            raise ValueError("IRBuilder has no current block")
+        block = self._block
+        record = InstructionRecord("", opname, block)
+        count = len(block._instrs)
+        if self._pos >= count:
+            block._instrs.append(record)
+            block._text_lines.append("")
+            if self._pos != self._END:
+                self._pos = len(block._instrs)
+            return record
+        block._instrs.insert(self._pos, record)
+        block._text_lines.insert(self._pos, "")
+        self._pos += 1
+        return record
+
+    def _stamp(self, rec: "InstructionRecord") -> "InstructionRecord":
+        """Attach the current debug location, if one is set.
+
+        Terminators and instructions that already carry ``!dbg`` are left
+        alone: re-stamping would rewrite text that ``set_metadata`` expects to
+        end with the previous suffix.
+        """
+        loc = self.debug_location
+        if loc is not None and "dbg" not in rec._metadata:
+            rec.set_metadata("dbg", loc)
         return rec
 
     def _next_name(self, name: str) -> str:
@@ -2028,46 +2145,120 @@ class IRBuilder:
             raise ValueError("IRBuilder has no current function")
         fn._name_counter += 1
         counter_text = str(fn._name_counter)
+        # Direct concatenation, not _join_text: the list existed only to be
+        # joined with an empty separator, so it was one list allocation per
+        # emitted instruction for nothing.  This removes an allocation and adds
+        # nothing -- unlike a cache, which pays a probe and a pinned key (two
+        # such caches measured 3.8% and 4.7% SLOWER here).  Kept to few operands:
+        # for the 9-part binop text a join still beats 8 intermediate strings.
         if name == "":
-            ref = _join_text(["%.", counter_text], "")
+            ref = "%." + counter_text
         else:
-            ref = _join_text(["%", name, ".", counter_text], "")
-        return Value(ty, ref)
+            ref = "%" + name + "." + counter_text
+        value = Value(ty, ref)
+        value._direct_name = ref if name == "" else ref[1:]
+        return value
 
     # ------------- return / branch / terminator -------------
 
     def ret(self, value: Value) -> Value:
-        self._emit("ret " + str(value.type) + " " + str(value))
+        direct_builder = self._direct_builder_plane()
+        if self._direct_indexed_no_text and direct_builder is not None:
+            rec = self._emit_direct("ret")
+        else:
+            rec = self._emit("ret " + str(value.type) + " " + str(value))
+        if direct_builder is not None:
+            rec._direct_record_id = DirectIndexedFunctionBuilder.publish_terminator(
+                direct_builder,
+                "ret",
+                value.type,
+                value,
+            )
         if self._block is not None:
             self._block._terminated = True
         return Value(VoidType(), "")
 
     def ret_void(self) -> Value:
-        self._emit("ret void")
+        direct_builder = self._direct_builder_plane()
+        if self._direct_indexed_no_text and direct_builder is not None:
+            rec = self._emit_direct("ret void")
+        else:
+            rec = self._emit("ret void")
+        if direct_builder is not None:
+            rec._direct_record_id = DirectIndexedFunctionBuilder.publish_terminator(
+                direct_builder,
+                "ret_void",
+            )
         if self._block is not None:
             self._block._terminated = True
         return Value(VoidType(), "")
 
     def branch(self, target: Block) -> Value:
-        self._emit("br label %" + str(target.name))
+        direct_builder = self._direct_builder_plane()
+        if self._direct_indexed_no_text and direct_builder is not None:
+            rec = self._emit_direct("br")
+        else:
+            rec = self._emit("br label %" + str(target.name))
+        if direct_builder is not None:
+            rec._direct_record_id = DirectIndexedFunctionBuilder.publish_terminator(
+                direct_builder,
+                "br",
+                target0=str(target.name),
+            )
         if self._block is not None:
             self._block._terminated = True
         return Value(VoidType(), "")
 
     def cbranch(self, cond: Value, t: Block, f: Block) -> Value:
-        line = "br i1 "
-        line = line + str(cond)
-        line = line + ", label %"
-        line = line + str(t.name)
-        line = line + ", label %"
-        line = line + str(f.name)
-        self._emit(line)
+        direct_builder = self._direct_builder_plane()
+        if self._direct_indexed_no_text and direct_builder is not None:
+            rec = self._emit_direct("br")
+        else:
+            line = "br i1 "
+            line = line + str(cond)
+            line = line + ", label %"
+            line = line + str(t.name)
+            line = line + ", label %"
+            line = line + str(f.name)
+            rec = self._emit(line)
+        if direct_builder is not None:
+            cond_ref = _value_ref(cond)
+            if cond_ref in ("1", "true"):
+                rec._direct_record_id = DirectIndexedFunctionBuilder.publish_terminator(
+                    direct_builder,
+                    "br",
+                    target0=str(t.name),
+                )
+            elif cond_ref in ("0", "false", "undef", "poison"):
+                rec._direct_record_id = DirectIndexedFunctionBuilder.publish_terminator(
+                    direct_builder,
+                    "br",
+                    target0=str(f.name),
+                )
+            else:
+                rec._direct_record_id = DirectIndexedFunctionBuilder.publish_terminator(
+                    direct_builder,
+                    "br_cond",
+                    None,
+                    cond,
+                    str(t.name),
+                    str(f.name),
+                )
         if self._block is not None:
             self._block._terminated = True
         return Value(VoidType(), "")
 
     def unreachable(self) -> Value:
-        self._emit("unreachable")
+        direct_builder = self._direct_builder_plane()
+        if self._direct_indexed_no_text and direct_builder is not None:
+            rec = self._emit_direct("unreachable")
+        else:
+            rec = self._emit("unreachable")
+        if direct_builder is not None:
+            rec._direct_record_id = DirectIndexedFunctionBuilder.publish_terminator(
+                direct_builder,
+                "unreachable"
+            )
         if self._block is not None:
             self._block._terminated = True
         return Value(VoidType(), "")
@@ -2076,7 +2267,19 @@ class IRBuilder:
         """Emit a ``switch`` terminator. Returns a ``SwitchInstr`` that
         the caller extends via ``add_case(int_value, target_block)``."""
         sw = SwitchInstr(self, value, default_block)
-        sw._instr = self._emit(sw._render())
+        direct_builder = self._direct_builder_plane()
+        if self._direct_indexed_no_text and direct_builder is not None:
+            sw._instr = self._emit_direct("switch")
+        else:
+            sw._instr = self._emit(sw._render())
+        if direct_builder is not None:
+            sw._instr._direct_record_id = DirectIndexedFunctionBuilder.publish_terminator(
+                direct_builder,
+                "switch",
+                value.type,
+                value,
+                str(default_block.name),
+            )
         if self._block is not None:
             self._block._terminated = True
         return sw
@@ -2085,44 +2288,78 @@ class IRBuilder:
 
     def alloca(self, ty: Type, size: Optional[Value] = None, name: str = "") -> Value:
         v = self._next(name, PointerType(ty))
-        size_text = ""
-        if size is not None:
-            size_text = ", " + str(size.type) + " " + str(size)
-        self._emit(str(v) + " = alloca " + str(ty) + size_text)
+        direct_builder = self._direct_builder_plane()
+        if self._direct_indexed_no_text and direct_builder is not None:
+            rec = self._emit_direct("alloca")
+        else:
+            size_text = ""
+            if size is not None:
+                size_text = ", " + str(size.type) + " " + str(size)
+            rec = self._emit(str(v) + " = alloca " + str(ty) + size_text)
+        if direct_builder is not None:
+            rec._direct_record_id = DirectIndexedFunctionBuilder.publish_alloca(
+                direct_builder,
+                v,
+                ty,
+            )
         return v
 
     def load(self, ptr: Value, name: str = "", align: Optional[int] = None) -> Value:
         pointee = ptr.type.pointee if isinstance(ptr.type, PointerType) else ptr.type
         v = self._next(name, pointee)
-        align_text = ", align " + str(align) if align else ""
-        line = str(v)
-        line = line + " = load "
-        line = line + str(pointee)
-        line = line + ", "
-        line = line + str(ptr.type)
-        line = line + " "
-        line = line + str(ptr)
-        line = line + align_text
-        self._emit(line)
+        direct_builder = self._direct_builder_plane()
+        if self._direct_indexed_no_text and direct_builder is not None:
+            rec = self._emit_direct("load")
+        else:
+            align_text = ", align " + str(align) if align else ""
+            line = str(v)
+            line = line + " = load "
+            line = line + str(pointee)
+            line = line + ", "
+            line = line + str(ptr.type)
+            line = line + " "
+            line = line + str(ptr)
+            line = line + align_text
+            rec = self._emit(line)
+        if direct_builder is not None:
+            rec._direct_record_id = DirectIndexedFunctionBuilder.publish_load(
+                direct_builder,
+                v,
+                pointee,
+                ptr.type,
+                ptr,
+            )
         return v
 
     def store(self, value: Value, ptr: Value, align: Optional[int] = None) -> Value:
-        align_text = ", align " + str(align) if align else ""
         stored_ty = (
             ptr.type.pointee if isinstance(ptr.type, PointerType) else value.type
         )
-        parts = [
-            "store ",
-            str(stored_ty),
-            " ",
-            _value_ref(value),
-            ", ",
-            str(ptr.type),
-            " ",
-            _value_ref(ptr),
-            align_text,
-        ]
-        self._emit(_join_text(parts, ""))
+        direct_builder = self._direct_builder_plane()
+        if self._direct_indexed_no_text and direct_builder is not None:
+            rec = self._emit_direct("store")
+        else:
+            align_text = ", align " + str(align) if align else ""
+            parts = [
+                "store ",
+                str(stored_ty),
+                " ",
+                _value_ref(value),
+                ", ",
+                str(ptr.type),
+                " ",
+                _value_ref(ptr),
+                align_text,
+            ]
+            rec = self._emit(_join_text(parts, ""))
+        if direct_builder is not None:
+            rec._direct_record_id = DirectIndexedFunctionBuilder.publish_store(
+                direct_builder,
+                stored_ty,
+                value,
+                ptr.type,
+                ptr,
+            )
         return Value(VoidType(), "")
 
     def load_atomic(
@@ -2198,22 +2435,35 @@ class IRBuilder:
         # GEP result is a pointer to the drilled type
         result_ptr_ty = PointerType(result_pointee)
         v = self._next(name, result_ptr_ty)
-        idx_parts = []
-        for i in indices_list:
-            idx_parts.append(str(i.type) + " " + str(i))
-        idx_text = _join_text(idx_parts, ", ")
-        inb = "inbounds " if inbounds else ""
-        line = str(v)
-        line = line + " = getelementptr "
-        line = line + inb
-        line = line + str(base_ty)
-        line = line + ", "
-        line = line + str(ptr.type)
-        line = line + " "
-        line = line + str(ptr)
-        line = line + ", "
-        line = line + idx_text
-        self._emit(line)
+        direct_builder = self._direct_builder_plane()
+        if self._direct_indexed_no_text and direct_builder is not None:
+            rec = self._emit_direct("getelementptr")
+        else:
+            idx_parts = []
+            for i in indices_list:
+                idx_parts.append(str(i.type) + " " + str(i))
+            idx_text = _join_text(idx_parts, ", ")
+            inb = "inbounds " if inbounds else ""
+            line = str(v)
+            line = line + " = getelementptr "
+            line = line + inb
+            line = line + str(base_ty)
+            line = line + ", "
+            line = line + str(ptr.type)
+            line = line + " "
+            line = line + str(ptr)
+            line = line + ", "
+            line = line + idx_text
+            rec = self._emit(line)
+        if direct_builder is not None:
+            rec._direct_record_id = DirectIndexedFunctionBuilder.publish_gep(
+                direct_builder,
+                v,
+                base_ty,
+                ptr.type,
+                ptr,
+                indices_list,
+            )
         return v
 
     # ------------- casts -------------
@@ -2234,47 +2484,75 @@ class IRBuilder:
         if _same_tracked_type(value_ty, ty):
             return value
         v = self._next(name, ty)
-        self._emit(
-            str(v)
-            + " = bitcast "
-            + str(value_ty)
-            + " "
-            + str(value_ref)
-            + " to "
-            + str(ty)
-        )
+        direct_builder = self._direct_builder_plane()
+        if self._direct_indexed_no_text and direct_builder is not None:
+            rec = self._emit_direct("bitcast")
+        else:
+            rec = self._emit(
+                str(v)
+                + " = bitcast "
+                + str(value_ty)
+                + " "
+                + str(value_ref)
+                + " to "
+                + str(ty)
+            )
+        if direct_builder is not None:
+            rec._direct_record_id = DirectIndexedFunctionBuilder.publish_cast(
+                direct_builder,
+                "bitcast",
+                v,
+                value_ty,
+                value,
+                ty,
+            )
         return v
 
     def sext(self, value: Value, ty: Type, name: str = "") -> Value:
         if _same_llvm_text_type(value.type, ty):
             return value
         v = self._next(name, ty)
-        self._emit(
+        rec = self._emit(
             str(v) + " = sext " + str(value.type) + " " + str(value) + " to " + str(ty)
         )
+        direct_builder = self._direct_builder_plane()
+        if direct_builder is not None:
+            rec._direct_record_id = DirectIndexedFunctionBuilder.publish_cast(
+                direct_builder, "sext", v, value.type, value, ty
+            )
         return v
 
     def zext(self, value: Value, ty: Type, name: str = "") -> Value:
         if _same_llvm_text_type(value.type, ty):
             return value
         v = self._next(name, ty)
-        self._emit(
+        rec = self._emit(
             str(v) + " = zext " + str(value.type) + " " + str(value) + " to " + str(ty)
         )
+        direct_builder = self._direct_builder_plane()
+        if direct_builder is not None:
+            rec._direct_record_id = DirectIndexedFunctionBuilder.publish_cast(
+                direct_builder, "zext", v, value.type, value, ty
+            )
         return v
 
     def trunc(self, value: Value, ty: Type, name: str = "") -> Value:
         if _same_llvm_text_type(value.type, ty):
             return value
         v = self._next(name, ty)
-        self._emit(
+        rec = self._emit(
             str(v) + " = trunc " + str(value.type) + " " + str(value) + " to " + str(ty)
         )
+        direct_builder = self._direct_builder_plane()
+        if direct_builder is not None:
+            rec._direct_record_id = DirectIndexedFunctionBuilder.publish_cast(
+                direct_builder, "trunc", v, value.type, value, ty
+            )
         return v
 
     def ptrtoint(self, value: Value, ty: Type, name: str = "") -> Value:
         v = self._next(name, ty)
-        self._emit(
+        rec = self._emit(
             str(v)
             + " = ptrtoint "
             + str(value.type)
@@ -2283,11 +2561,16 @@ class IRBuilder:
             + " to "
             + str(ty)
         )
+        direct_builder = self._direct_builder_plane()
+        if direct_builder is not None:
+            rec._direct_record_id = DirectIndexedFunctionBuilder.publish_cast(
+                direct_builder, "ptrtoint", v, value.type, value, ty
+            )
         return v
 
     def inttoptr(self, value: Value, ty: Type, name: str = "") -> Value:
         v = self._next(name, ty)
-        self._emit(
+        rec = self._emit(
             str(v)
             + " = inttoptr "
             + str(value.type)
@@ -2296,11 +2579,16 @@ class IRBuilder:
             + " to "
             + str(ty)
         )
+        direct_builder = self._direct_builder_plane()
+        if direct_builder is not None:
+            rec._direct_record_id = DirectIndexedFunctionBuilder.publish_cast(
+                direct_builder, "inttoptr", v, value.type, value, ty
+            )
         return v
 
     def sitofp(self, value: Value, ty: Type, name: str = "") -> Value:
         v = self._next(name, ty)
-        self._emit(
+        rec = self._emit(
             str(v)
             + " = sitofp "
             + str(value.type)
@@ -2309,11 +2597,16 @@ class IRBuilder:
             + " to "
             + str(ty)
         )
+        direct_builder = self._direct_builder_plane()
+        if direct_builder is not None:
+            rec._direct_record_id = DirectIndexedFunctionBuilder.publish_cast(
+                direct_builder, "sitofp", v, value.type, value, ty
+            )
         return v
 
     def uitofp(self, value: Value, ty: Type, name: str = "") -> Value:
         v = self._next(name, ty)
-        self._emit(
+        rec = self._emit(
             str(v)
             + " = uitofp "
             + str(value.type)
@@ -2322,11 +2615,16 @@ class IRBuilder:
             + " to "
             + str(ty)
         )
+        direct_builder = self._direct_builder_plane()
+        if direct_builder is not None:
+            rec._direct_record_id = DirectIndexedFunctionBuilder.publish_cast(
+                direct_builder, "uitofp", v, value.type, value, ty
+            )
         return v
 
     def fptosi(self, value: Value, ty: Type, name: str = "") -> Value:
         v = self._next(name, ty)
-        self._emit(
+        rec = self._emit(
             str(v)
             + " = fptosi "
             + str(value.type)
@@ -2335,11 +2633,16 @@ class IRBuilder:
             + " to "
             + str(ty)
         )
+        direct_builder = self._direct_builder_plane()
+        if direct_builder is not None:
+            rec._direct_record_id = DirectIndexedFunctionBuilder.publish_cast(
+                direct_builder, "fptosi", v, value.type, value, ty
+            )
         return v
 
     def fptoui(self, value: Value, ty: Type, name: str = "") -> Value:
         v = self._next(name, ty)
-        self._emit(
+        rec = self._emit(
             str(v)
             + " = fptoui "
             + str(value.type)
@@ -2348,22 +2651,32 @@ class IRBuilder:
             + " to "
             + str(ty)
         )
+        direct_builder = self._direct_builder_plane()
+        if direct_builder is not None:
+            rec._direct_record_id = DirectIndexedFunctionBuilder.publish_cast(
+                direct_builder, "fptoui", v, value.type, value, ty
+            )
         return v
 
     def fpext(self, value: Value, ty: Type, name: str = "") -> Value:
         if _same_llvm_text_type(value.type, ty):
             return value
         v = self._next(name, ty)
-        self._emit(
+        rec = self._emit(
             str(v) + " = fpext " + str(value.type) + " " + str(value) + " to " + str(ty)
         )
+        direct_builder = self._direct_builder_plane()
+        if direct_builder is not None:
+            rec._direct_record_id = DirectIndexedFunctionBuilder.publish_cast(
+                direct_builder, "fpext", v, value.type, value, ty
+            )
         return v
 
     def fptrunc(self, value: Value, ty: Type, name: str = "") -> Value:
         if _same_llvm_text_type(value.type, ty):
             return value
         v = self._next(name, ty)
-        self._emit(
+        rec = self._emit(
             str(v)
             + " = fptrunc "
             + str(value.type)
@@ -2372,6 +2685,11 @@ class IRBuilder:
             + " to "
             + str(ty)
         )
+        direct_builder = self._direct_builder_plane()
+        if direct_builder is not None:
+            rec._direct_record_id = DirectIndexedFunctionBuilder.publish_cast(
+                direct_builder, "fptrunc", v, value.type, value, ty
+            )
         return v
 
     # ------------- integer arithmetic -------------
@@ -2385,18 +2703,31 @@ class IRBuilder:
             else:
                 lhs_ty = IntType(64)
         v = self._next(name, lhs_ty)
-        parts = [
-            str(v),
-            " = ",
-            str(op),
-            " ",
-            str(lhs_ty),
-            " ",
-            _value_ref(lhs),
-            ", ",
-            _value_ref(rhs),
-        ]
-        self._emit(_join_text(parts, ""))
+        direct_builder = self._direct_builder_plane()
+        if self._direct_indexed_no_text and direct_builder is not None:
+            rec = self._emit_direct(str(op))
+        else:
+            parts = [
+                str(v),
+                " = ",
+                str(op),
+                " ",
+                str(lhs_ty),
+                " ",
+                _value_ref(lhs),
+                ", ",
+                _value_ref(rhs),
+            ]
+            rec = self._emit(_join_text(parts, ""))
+        if direct_builder is not None:
+            rec._direct_record_id = DirectIndexedFunctionBuilder.publish_binop(
+                direct_builder,
+                op,
+                v,
+                lhs_ty,
+                lhs,
+                rhs,
+            )
         return v
 
     def add(self, a: Value, b: Value, name: str = "") -> Value:
@@ -2457,17 +2788,30 @@ class IRBuilder:
 
     def _fp_binop(self, op: str, lhs: Value, rhs: Value, name: str) -> Value:
         v = self._next(name, lhs.type)
-        rec = self._emit(
-            str(v)
-            + " = "
-            + str(op)
-            + " "
-            + str(lhs.type)
-            + " "
-            + str(lhs)
-            + ", "
-            + str(rhs)
-        )
+        direct_builder = self._direct_builder_plane()
+        if self._direct_indexed_no_text and direct_builder is not None:
+            rec = self._emit_direct(str(op))
+        else:
+            rec = self._emit(
+                str(v)
+                + " = "
+                + str(op)
+                + " "
+                + str(lhs.type)
+                + " "
+                + str(lhs)
+                + ", "
+                + str(rhs)
+            )
+        if direct_builder is not None:
+            rec._direct_record_id = DirectIndexedFunctionBuilder.publish_fbinop(
+                direct_builder,
+                op,
+                v,
+                lhs.type,
+                lhs,
+                rhs,
+            )
         # Attach the emitted record so flags (fast-math contract etc.)
         # can be added retroactively via ``v.flags = [...]``.
         v._instr = rec
@@ -2490,7 +2834,20 @@ class IRBuilder:
 
     def fneg(self, value: Value, name: str = "") -> Value:
         v = self._next(name, value.type)
-        rec = self._emit(str(v) + " = fneg " + str(value.type) + " " + str(value))
+        direct_builder = self._direct_builder_plane()
+        if self._direct_indexed_no_text and direct_builder is not None:
+            rec = self._emit_direct("fneg")
+        else:
+            rec = self._emit(
+                str(v) + " = fneg " + str(value.type) + " " + str(value)
+            )
+        if direct_builder is not None:
+            rec._direct_record_id = DirectIndexedFunctionBuilder.publish_fneg(
+                direct_builder,
+                v,
+                value.type,
+                value,
+            )
         v._instr = rec
         return v
 
@@ -2507,16 +2864,32 @@ class IRBuilder:
         }
         pred = pred_map.get(op, op)
         v = self._next(name, IntType(1))
-        line = str(v)
-        line = line + " = icmp "
-        line = line + str(pred)
-        line = line + " "
-        line = line + str(a.type)
-        line = line + " "
-        line = line + str(a)
-        line = line + ", "
-        line = line + str(b)
-        self._emit(line)
+        direct_builder = self._direct_builder_plane()
+        if self._direct_indexed_no_text and direct_builder is not None:
+            rec = self._emit_direct("icmp")
+        else:
+            line = str(v)
+            line = line + " = icmp "
+            line = line + str(pred)
+            line = line + " "
+            line = line + str(a.type)
+            line = line + " "
+            line = line + str(a)
+            line = line + ", "
+            line = line + str(b)
+            rec = self._emit(line)
+        if direct_builder is not None:
+            rec._direct_record_id = DirectIndexedFunctionBuilder.publish_icmp(
+                direct_builder,
+                pred,
+                v,
+                a.type,
+                a,
+                b,
+            )
+        # Attach the record: an inline error edge anchors entry hoists on
+        # the condition's own defining instruction.
+        v._instr = rec
         return v
 
     def icmp_unsigned(self, op: str, a: Value, b: Value, name: str = "") -> Value:
@@ -2530,16 +2903,32 @@ class IRBuilder:
         }
         pred = pred_map.get(op, op)
         v = self._next(name, IntType(1))
-        line = str(v)
-        line = line + " = icmp "
-        line = line + str(pred)
-        line = line + " "
-        line = line + str(a.type)
-        line = line + " "
-        line = line + str(a)
-        line = line + ", "
-        line = line + str(b)
-        self._emit(line)
+        direct_builder = self._direct_builder_plane()
+        if self._direct_indexed_no_text and direct_builder is not None:
+            rec = self._emit_direct("icmp")
+        else:
+            line = str(v)
+            line = line + " = icmp "
+            line = line + str(pred)
+            line = line + " "
+            line = line + str(a.type)
+            line = line + " "
+            line = line + str(a)
+            line = line + ", "
+            line = line + str(b)
+            rec = self._emit(line)
+        if direct_builder is not None:
+            rec._direct_record_id = DirectIndexedFunctionBuilder.publish_icmp(
+                direct_builder,
+                pred,
+                v,
+                a.type,
+                a,
+                b,
+            )
+        # Attach the record: an inline error edge anchors entry hoists on
+        # the condition's own defining instruction.
+        v._instr = rec
         return v
 
     def fcmp_ordered(self, op: str, a: Value, b: Value, name: str = "") -> Value:
@@ -2553,17 +2942,30 @@ class IRBuilder:
         }
         pred = pred_map.get(op, op)
         v = self._next(name, IntType(1))
-        self._emit(
-            str(v)
-            + " = fcmp "
-            + str(pred)
-            + " "
-            + str(a.type)
-            + " "
-            + str(a)
-            + ", "
-            + str(b)
-        )
+        direct_builder = self._direct_builder_plane()
+        if self._direct_indexed_no_text and direct_builder is not None:
+            rec = self._emit_direct("fcmp")
+        else:
+            rec = self._emit(
+                str(v)
+                + " = fcmp "
+                + str(pred)
+                + " "
+                + str(a.type)
+                + " "
+                + str(a)
+                + ", "
+                + str(b)
+            )
+        if direct_builder is not None:
+            rec._direct_record_id = DirectIndexedFunctionBuilder.publish_fcmp(
+                direct_builder,
+                pred,
+                v,
+                a.type,
+                a,
+                b,
+            )
         return v
 
     def fcmp_unordered(self, op: str, a: Value, b: Value, name: str = "") -> Value:
@@ -2577,17 +2979,30 @@ class IRBuilder:
         }
         pred = pred_map.get(op, op)
         v = self._next(name, IntType(1))
-        self._emit(
-            str(v)
-            + " = fcmp "
-            + str(pred)
-            + " "
-            + str(a.type)
-            + " "
-            + str(a)
-            + ", "
-            + str(b)
-        )
+        direct_builder = self._direct_builder_plane()
+        if self._direct_indexed_no_text and direct_builder is not None:
+            rec = self._emit_direct("fcmp")
+        else:
+            rec = self._emit(
+                str(v)
+                + " = fcmp "
+                + str(pred)
+                + " "
+                + str(a.type)
+                + " "
+                + str(a)
+                + ", "
+                + str(b)
+            )
+        if direct_builder is not None:
+            rec._direct_record_id = DirectIndexedFunctionBuilder.publish_fcmp(
+                direct_builder,
+                pred,
+                v,
+                a.type,
+                a,
+                b,
+            )
         return v
 
     # ------------- call -------------
@@ -2633,27 +3048,51 @@ class IRBuilder:
         name: str = "",
     ) -> Value:
         v = self._next(name, then_v.type)
-        self._emit(
-            str(v)
-            + " = select "
-            + str(cond.type)
-            + " "
-            + str(cond)
-            + ", "
-            + str(then_v.type)
-            + " "
-            + str(then_v)
-            + ", "
-            + str(else_v.type)
-            + " "
-            + str(else_v)
-        )
+        direct_builder = self._direct_builder_plane()
+        if self._direct_indexed_no_text and direct_builder is not None:
+            rec = self._emit_direct("select")
+        else:
+            rec = self._emit(
+                str(v)
+                + " = select "
+                + str(cond.type)
+                + " "
+                + str(cond)
+                + ", "
+                + str(then_v.type)
+                + " "
+                + str(then_v)
+                + ", "
+                + str(else_v.type)
+                + " "
+                + str(else_v)
+            )
+        if direct_builder is not None:
+            rec._direct_record_id = DirectIndexedFunctionBuilder.publish_select(
+                direct_builder,
+                v,
+                then_v.type,
+                cond,
+                then_v,
+                else_v,
+            )
         return v
 
     def phi(self, ty: Type, name: str = "") -> "PhiInstr":
         phi_name = self._next_name(name)
         v = PhiInstr(self, ty, phi_name)
-        self._emit(v._placeholder_line)
+        direct_builder = self._direct_builder_plane()
+        if self._direct_indexed_no_text and direct_builder is not None:
+            rec = self._emit_direct("phi")
+        else:
+            rec = self._emit(v._placeholder_line)
+        v._instr = rec
+        if direct_builder is not None:
+            rec._direct_record_id = DirectIndexedFunctionBuilder.publish_phi(
+                direct_builder,
+                v,
+                ty,
+            )
         return v
 
     # ------------- landingpad / invoke / extract_value -------------
@@ -2827,10 +3266,6 @@ class IRBuilder:
     def extract_value(self, agg: Value, indices, name: str = "") -> Value:
         if isinstance(indices, int):
             indices = [indices]
-        idx_parts = []
-        for i in indices:
-            idx_parts.append(str(i))
-        idx_text = _join_text(idx_parts, ", ")
         # Element type is tricky without struct-type info; default to i32
         # for aggregates we don't know (pcc's uses are typically phi-
         # aggregates of (ptr, i32) where index 1 → i32).
@@ -2839,15 +3274,31 @@ class IRBuilder:
         else:
             elem_ty = IntType(32)
         v = self._next(name, elem_ty)
-        self._emit(
-            str(v)
-            + " = extractvalue "
-            + str(agg.type)
-            + " "
-            + str(agg)
-            + ", "
-            + idx_text
-        )
+        direct_builder = self._direct_builder_plane()
+        if self._direct_indexed_no_text and direct_builder is not None:
+            rec = self._emit_direct("extractvalue")
+        else:
+            idx_parts = []
+            for i in indices:
+                idx_parts.append(str(i))
+            idx_text = _join_text(idx_parts, ", ")
+            rec = self._emit(
+                str(v)
+                + " = extractvalue "
+                + str(agg.type)
+                + " "
+                + str(agg)
+                + ", "
+                + idx_text
+            )
+        if direct_builder is not None:
+            rec._direct_record_id = DirectIndexedFunctionBuilder.publish_extractvalue(
+                direct_builder,
+                v,
+                agg.type,
+                agg,
+                indices,
+            )
         return v
 
 
@@ -2858,23 +3309,65 @@ def _irbuilder_call_from_args_list(
     name: str = "",
     tail: bool = False,
 ) -> Value:
-    if _debug_ir_call_enabled():
+    if _debug_ir_call_trace_enabled():
         try:
             sys.stderr.write("[pcc.ir.call] enter argc=" + str(len(args_list)) + "\n")
         except Exception:
             pass
-    expected_arg_types = []
-    if _looks_like_function(fn):
-        callee_ref = "@" + str(fn.name)
-        ret_ty = fn.ftype.return_type
+    # None is the allocation-free sentinel here: pcc-native lowering
+    # materializes even ``()`` as py_tuple_new(0).  Function signatures and
+    # function pointers materialize their argument sequence below.
+    expected_arg_types = None
+    expected_arg_count = 0
+    is_vararg_call = False
+    render_call_text = not builder._direct_indexed_no_text
+    if _is_exact_function(fn):
+        # Keep exact Functions statically narrowed so pcc1 reads their fields
+        # by constant index.  Subclasses stay on the dynamic path below so
+        # descriptors and __getattribute__ overrides keep Python semantics.
+        # Signature memoization itself was measured and denied: a
+        # Function-owned entry cut instructions but improved median wall by
+        # only 1.46%, below its 1.08x acceptance line.
+        exact_fn: Function = fn
+        current_ftype = exact_fn.ftype
+        callee_ref = "@" + str(exact_fn.name)
+        ret_ty = current_ftype.return_type
+        expected_arg_types = []
         arg_type_parts = []
-        for t in fn.ftype.args:
+        for t in current_ftype.args:
             expected_arg_types.append(t)
-            arg_type_parts.append(str(t))
-        arg_types = _join_text(arg_type_parts, ", ")
-        if fn.ftype.var_arg:
-            arg_types = arg_types + ", ..." if arg_types else "..."
-        sig_text = str(ret_ty) + " (" + arg_types + ")"
+            if render_call_text:
+                arg_type_parts.append(str(t))
+        expected_arg_count = len(expected_arg_types)
+        is_vararg_call = bool(current_ftype.var_arg)
+        if render_call_text:
+            arg_types = _join_text(arg_type_parts, ", ")
+            if current_ftype.var_arg:
+                arg_types = arg_types + ", ..." if arg_types else "..."
+            sig_text = str(ret_ty) + " (" + arg_types + ")"
+        else:
+            sig_text = ""
+    elif _looks_like_function(fn):
+        # Compatibility duck-functions preserve the old generic behavior.
+        # Only an exact Function uses the static slot contract above.
+        callee_ref = "@" + str(fn.name)
+        current_ftype = fn.ftype
+        ret_ty = current_ftype.return_type
+        expected_arg_types = []
+        arg_type_parts = []
+        for t in current_ftype.args:
+            expected_arg_types.append(t)
+            if render_call_text:
+                arg_type_parts.append(str(t))
+        expected_arg_count = len(expected_arg_types)
+        is_vararg_call = bool(current_ftype.var_arg)
+        if render_call_text:
+            arg_types = _join_text(arg_type_parts, ", ")
+            if current_ftype.var_arg:
+                arg_types = arg_types + ", ..." if arg_types else "..."
+            sig_text = str(ret_ty) + " (" + arg_types + ")"
+        else:
+            sig_text = ""
     else:
         callee_ref = str(fn)
         if _looks_like_pointer_type(fn.type) and _looks_like_function_type(
@@ -2882,25 +3375,66 @@ def _irbuilder_call_from_args_list(
         ):
             fty = fn.type.pointee
             ret_ty = fty.return_type
+            expected_arg_types = []
             arg_type_parts = []
             for t in fty.args:
                 expected_arg_types.append(t)
-                arg_type_parts.append(str(t))
-            arg_types = _join_text(arg_type_parts, ", ")
-            if fty.var_arg:
-                arg_types = arg_types + ", ..." if arg_types else "..."
-            sig_text = str(ret_ty) + " (" + arg_types + ")"
+                if render_call_text:
+                    arg_type_parts.append(str(t))
+            expected_arg_count = len(expected_arg_types)
+            is_vararg_call = bool(fty.var_arg)
+            if render_call_text:
+                arg_types = _join_text(arg_type_parts, ", ")
+                if fty.var_arg:
+                    arg_types = arg_types + ", ..." if arg_types else "..."
+                sig_text = str(ret_ty) + " (" + arg_types + ")"
+            else:
+                sig_text = ""
         else:
             ret_ty = VoidType()
             sig_text = "void ()"
 
-    if _debug_ir_call_enabled():
+    if not render_call_text:
+        direct_builder = builder._direct_builder_plane()
+        if direct_builder is None:
+            raise RuntimeError("direct call record requested without builder plane")
+        direct_types = [] if expected_arg_types is None else expected_arg_types
+        if _looks_like_void_type(ret_ty):
+            rec = builder._emit_direct("call")
+            rec._direct_record_id = DirectIndexedFunctionBuilder.publish_call(
+                direct_builder,
+                None,
+                ret_ty,
+                callee_ref,
+                callee_ref.startswith("%"),
+                args_list,
+                direct_types,
+                expected_arg_count,
+                is_vararg_call,
+            )
+            return Value(VoidType(), "")
+        result = builder._next(name, ret_ty)
+        rec = builder._emit_direct("call")
+        rec._direct_record_id = DirectIndexedFunctionBuilder.publish_call(
+            direct_builder,
+            result,
+            ret_ty,
+            callee_ref,
+            callee_ref.startswith("%"),
+            args_list,
+            direct_types,
+            expected_arg_count,
+            is_vararg_call,
+        )
+        return result
+
+    if _debug_ir_call_trace_enabled():
         try:
             sys.stderr.write(
                 "[pcc.ir.call] sig callee="
                 + str(callee_ref)
                 + " expected="
-                + str(len(expected_arg_types))
+                + str(expected_arg_count)
                 + "\n"
             )
         except Exception:
@@ -2910,17 +3444,19 @@ def _irbuilder_call_from_args_list(
     i = 0
     while i < len(args_list):
         a = args_list[i]
-        if i < len(expected_arg_types):
+        if i < expected_arg_count:
             arg_ty = expected_arg_types[i]
         else:
             arg_ty = a.type
-        # Keep both owned text results in named locals across the allocating
-        # join.  An inline ``str(arg_ty) + ... + _value_ref(a)`` leaves the
-        # second call result as an unrooted SSA temporary in pcc1-native code;
-        # GC during concatenation can then store NULL into ``arg_parts``.
+        # Keep every owned text result in a named local across both allocating
+        # concatenations.  An inline ``str(arg_ty) + ... + _value_ref(a)``
+        # leaves a call result as an unrooted SSA temporary in pcc1-native
+        # code.  Building a three-item list for _join_text is also unnecessary
+        # work in this per-argument hot path.
         arg_ty_text = str(arg_ty)
         arg_ref_text = _value_ref(a)
-        arg_text = _join_text([arg_ty_text, " ", arg_ref_text], "")
+        arg_text = arg_ty_text + " "
+        arg_text = arg_text + arg_ref_text
         arg_parts.append(arg_text)
         i += 1
     args_text = ", ".join(arg_parts)
@@ -2928,23 +3464,93 @@ def _irbuilder_call_from_args_list(
     if _looks_like_void_type(ret_ty):
         line = tail_prefix + "call " + sig_text + " " + callee_ref + "("
         line = line + args_text + ")"
-        if _debug_ir_call_enabled():
+        if _debug_ir_call_trace_enabled():
             try:
                 sys.stderr.write("[pcc.ir.call] emit void\n")
             except Exception:
                 pass
-        builder._emit(line)
+        rec = builder._emit(line)
+        direct_builder = builder._direct_builder_plane()
+        if direct_builder is not None:
+            direct_types = [] if expected_arg_types is None else expected_arg_types
+            rec._direct_record_id = DirectIndexedFunctionBuilder.publish_call(
+                direct_builder,
+                None,
+                ret_ty,
+                callee_ref,
+                callee_ref.startswith("%"),
+                args_list,
+                direct_types,
+                expected_arg_count,
+                is_vararg_call,
+            )
         return Value(VoidType(), "")
     v = builder._next(name, ret_ty)
     line = str(v) + " = " + tail_prefix + "call " + sig_text + " " + callee_ref
     line = line + "(" + args_text + ")"
-    if _debug_ir_call_enabled():
+    if _debug_ir_call_trace_enabled():
         try:
             sys.stderr.write("[pcc.ir.call] emit value\n")
         except Exception:
             pass
-    builder._emit(line)
+    rec = builder._emit(line)
+    direct_builder = builder._direct_builder_plane()
+    if direct_builder is not None:
+        direct_types = [] if expected_arg_types is None else expected_arg_types
+        rec._direct_record_id = DirectIndexedFunctionBuilder.publish_call(
+            direct_builder,
+            v,
+            ret_ty,
+            callee_ref,
+            callee_ref.startswith("%"),
+            args_list,
+            direct_types,
+            expected_arg_count,
+            is_vararg_call,
+        )
     return v
+
+
+def _irbuilder_call_direct_exact_fixed(
+    builder: IRBuilder,
+    fn: Function,
+    arg_count: int,
+    arg0=None,
+    arg1=None,
+) -> Value:
+    """Write an exact arity-0/1/2 call without transient argument lists."""
+    if _debug_ir_call_trace_enabled():
+        if arg_count == 0:
+            return _irbuilder_call_from_args_list(builder, fn, [])
+        if arg_count == 1:
+            return _irbuilder_call_from_args_list(builder, fn, [arg0])
+        return _irbuilder_call_from_args_list(builder, fn, [arg0, arg1])
+
+    function_type = fn.ftype
+    ret_ty = function_type.return_type
+    direct_builder = builder._direct_builder_plane()
+    if direct_builder is None:
+        raise RuntimeError("direct call record requested without builder plane")
+
+    if _looks_like_void_type(ret_ty):
+        result = None
+        rec = builder._emit_direct("call")
+    else:
+        result = builder._next("", ret_ty)
+        rec = builder._emit_direct("call")
+
+    record_id = publish_exact_call_fixed(
+        direct_builder,
+        result,
+        fn,
+        arg_count,
+        arg0,
+        arg1,
+    )
+    rec._direct_record_id = record_id
+    if result is None:
+        return Value(VoidType(), "")
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -2959,6 +3565,13 @@ class PhiInstr(Value):
     def __init__(self, builder: IRBuilder, ty: Type, name: str) -> None:
         self.type = ty
         self._ref = "%" + str(name)
+        self._direct_value_id = -1
+        self._direct_name = (
+            self._ref
+            if name.startswith(".") and name[1:].isdigit()
+            else str(name)
+        )
+        self._instr = None
         self._builder = builder
         # A phi is owned by the block in which it was created.  Incoming
         # edges are commonly added only after the builder has emitted a
@@ -2967,9 +3580,12 @@ class PhiInstr(Value):
         self._parent_block = builder._block
         self._incomings: list[tuple[Value, Block]] = []
         self._placeholder_line = ""
-        self._refresh()
+        if not builder._direct_indexed_no_text:
+            self._refresh()
 
     def _refresh(self) -> None:
+        if self._builder._direct_indexed_no_text:
+            return
         pair_parts = []
         for v, b in self._incomings:
             pair_parts.append("[" + str(v) + ", %" + str(b.name) + "]")
@@ -3002,8 +3618,7 @@ class PhiInstr(Value):
             i += 1
 
     def add_incoming(self, value: Value, block: Block) -> None:
-        self._incomings.append((value, block))
-        self._refresh()
+        _phi_add_incoming_canonical(self, value, block)
 
 
 class LandingPadInstr(Value):
@@ -3012,6 +3627,8 @@ class LandingPadInstr(Value):
     def __init__(self, builder: IRBuilder, ty: Type, name: str, cleanup: bool) -> None:
         self.type = ty
         self._ref = "%" + str(name)
+        self._direct_value_id = -1
+        self._direct_name = ""
         self._builder = builder
         self._clauses: list[str] = []
         self._cleanup = cleanup
@@ -3080,17 +3697,8 @@ class SwitchInstr:
         self._instr = None
 
     def add_case(self, int_value, target: Block) -> None:
-        """Register a ``<int> -> %target`` case. ``int_value`` may be
-        a Python int or a Constant."""
-        if isinstance(int_value, Value):
-            try:
-                int_value = int(int_value.value)
-            except (AttributeError, TypeError, ValueError):
-                int_value = int_value._ref
-        self.cases.append((int_value, target))
-        # Refresh the rendered line in-place so the final text carries
-        # all accumulated cases.
-        self._refresh()
+        """Register a ``<int> -> %target`` case."""
+        _switch_add_case_canonical(self, int_value, target)
 
     def _render(self) -> str:
         val_ty = self.value.type
@@ -3327,14 +3935,20 @@ def LiteralStructType___init__7(arg0, arg1, arg2, arg3, arg4, arg5, arg6):
 
 
 def IRBuilder_call0(builder, fn):
+    if builder._direct_indexed_no_text and _is_exact_function(fn):
+        return _irbuilder_call_direct_exact_fixed(builder, fn, 0)
     return _irbuilder_call_from_args_list(builder, fn, [])
 
 
 def IRBuilder_call1(builder, fn, arg0):
+    if builder._direct_indexed_no_text and _is_exact_function(fn):
+        return _irbuilder_call_direct_exact_fixed(builder, fn, 1, arg0)
     return _irbuilder_call_from_args_list(builder, fn, [arg0])
 
 
 def IRBuilder_call2(builder, fn, arg0, arg1):
+    if builder._direct_indexed_no_text and _is_exact_function(fn):
+        return _irbuilder_call_direct_exact_fixed(builder, fn, 2, arg0, arg1)
     return _irbuilder_call_from_args_list(builder, fn, [arg0, arg1])
 
 
@@ -3401,6 +4015,28 @@ def IRBuilder_emit_raw(builder, line: str):
     return IRBuilder._emit(builder, line)
 
 
+def IRBuilder_publish_direct_raw_call(
+    builder,
+    record,
+    dest_ref,
+    ret_type,
+    callee_ref,
+    arg_type_texts,
+    arg_ref_texts,
+) -> None:
+    direct_builder = IRBuilder._direct_builder_plane(builder)
+    if direct_builder is None:
+        return
+    record._direct_record_id = DirectIndexedFunctionBuilder.publish_raw_call(
+        direct_builder,
+        dest_ref,
+        ret_type,
+        callee_ref,
+        arg_type_texts,
+        arg_ref_texts,
+    )
+
+
 def IRBuilder_next_value(builder, name: str, typ):
     return IRBuilder._next(builder, name, typ)
 
@@ -3418,7 +4054,64 @@ def IRBuilder_instruction_text_at(builder, index: int) -> str:
         return ""
     if index < 0 or index >= len(block._instrs):
         return ""
-    return block._instrs[index].text
+    record = block._instrs[index]
+    if record.text:
+        return record.text
+    if record._direct_record_id >= 0:
+        direct_builder = block.parent._direct_indexed_builder
+        if direct_builder is not None:
+            return DirectIndexedFunctionBuilder.diagnostic_record_text(
+                direct_builder,
+                record._direct_record_id
+            )
+    return ""
+
+
+def IRBuilder_can_inline_error_edge(builder) -> bool:
+    return bool(
+        _DIRECT_INLINE_ERROR_EDGE_CAPTURE_ENABLED
+        and builder._direct_indexed_no_text
+        and builder._block is not None
+        and not builder._block._terminated
+    )
+
+
+def IRBuilder_try_inline_error_edge(
+    builder,
+    condition,
+    error_block,
+    source_line: int,
+    cleanup_plan_id: int = 0,
+    payload: int = -1,
+) -> bool:
+    if not IRBuilder_can_inline_error_edge(builder) or cleanup_plan_id != 0:
+        return False
+    direct_builder = IRBuilder._direct_builder_plane(builder)
+    if direct_builder is None:
+        return False
+    DirectIndexedFunctionBuilder.publish_inline_error_edge(
+        direct_builder,
+        str(builder._block.name),
+        condition,
+        str(error_block.name),
+        int(source_line),
+        int(cleanup_plan_id),
+        int(payload),
+    )
+    return True
+
+
+def IRBuilder_declare_inline_error_landing(builder, block, slot) -> bool:
+    """Declare ``block`` as a shared frame landing reading payload ``slot``."""
+    direct_builder = IRBuilder._direct_builder_plane(builder)
+    if direct_builder is None:
+        return False
+    DirectIndexedFunctionBuilder.publish_inline_error_landing(
+        direct_builder,
+        str(block.name),
+        slot,
+    )
+    return True
 
 
 def IRBuilder_gep0(builder, ptr):
@@ -3457,9 +4150,54 @@ def IRBuilder_gep_dyn_inbounds(builder, ptr, indices):
     return IRBuilder.gep(builder, ptr, indices, inbounds=True)
 
 
-def IRBuilder_add_incoming(phi: PhiInstr, value: Value, block: Block):
+def _phi_add_incoming_canonical(
+    phi: PhiInstr,
+    value: Value,
+    block: Block,
+) -> None:
     phi._incomings.append((value, block))
+    if phi._instr is not None and phi._instr._direct_record_id >= 0:
+        direct_builder = phi._instr.block.parent._direct_indexed_builder
+        if direct_builder is not None:
+            DirectIndexedFunctionBuilder.append_phi_incoming(
+                direct_builder,
+                phi._instr._direct_record_id,
+                value,
+                str(block.name),
+            )
     phi._refresh()
+
+
+def _switch_add_case_canonical(
+    switch_inst: SwitchInstr,
+    int_value,
+    target: Block,
+) -> None:
+    if isinstance(int_value, Value):
+        try:
+            int_value = int(int_value.value)
+        except (AttributeError, TypeError, ValueError):
+            int_value = int_value._ref
+    switch_inst.cases.append((int_value, target))
+    if (
+        switch_inst._instr is not None
+        and switch_inst._instr._direct_record_id >= 0
+    ):
+        direct_builder = (
+            switch_inst._instr.block.parent._direct_indexed_builder
+        )
+        if direct_builder is not None:
+            DirectIndexedFunctionBuilder.append_switch_case(
+                direct_builder,
+                switch_inst._instr._direct_record_id,
+                int_value,
+                str(target.name),
+            )
+    switch_inst._refresh()
+
+
+def IRBuilder_add_incoming(phi: PhiInstr, value: Value, block: Block):
+    _phi_add_incoming_canonical(phi, value, block)
 
 
 def scaffold_SwitchInstr_add_case_i64(
@@ -3467,16 +4205,7 @@ def scaffold_SwitchInstr_add_case_i64(
     int_value: int,
     target: Block,
 ):
-    switch_inst.cases.append((int_value, target))
-    new_line = switch_inst._render()
-    for blk in switch_inst.default.parent.blocks:
-        for rec in blk._instrs:
-            if (
-                rec.text.startswith("switch ")
-                and f"label %{switch_inst.default.name}" in rec.text
-            ):
-                blk._replace_record_text(rec, new_line)
-                return
+    _switch_add_case_canonical(switch_inst, int_value, target)
 
 
 def IRBuilder_as_pointer(ty):
@@ -3493,6 +4222,17 @@ def scaffold_Function_append_basic_block(fn, name):
     blk = Block(fn, name)
     fn.blocks.append(blk)
     return blk
+
+
+# Direct publication calls known class methods as unbound functions and passes
+# the receiver explicitly.  That keeps compiled pcc1 on the static method ABI
+# without materializing a second family of wrapper functions/native adapters.
+# direct_indexed_kernel delays its matching import of this module until its
+# definitions are complete, so both import orders remain safe.
+from .direct_indexed_kernel import (
+    DirectIndexedFunctionBuilder,
+    publish_exact_call_fixed,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -3532,6 +4272,9 @@ __all__ = [
     "IRBuilder_next_value",
     "IRBuilder_current_instruction_count",
     "IRBuilder_instruction_text_at",
+    "IRBuilder_can_inline_error_edge",
+    "IRBuilder_try_inline_error_edge",
+    "IRBuilder_declare_inline_error_landing",
     "PhiInstr",
     "LandingPadInstr",
     "SwitchInstr",

@@ -7,6 +7,8 @@ those shell fallbacks with stronger platform intrinsics is a separate semantic
 cleanup.
 """
 
+__pcc_runtime_port__ = True
+
 from pcc.extern import (
     extern,
     c_abi_export,
@@ -70,6 +72,8 @@ py_str_new = extern("py_str_new", (c_ptr, c_int64), c_ptr)
 py_str_utf8 = extern("py_str_utf8", (c_ptr,), c_ptr)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_process_normalize_wait_status = extern(
     "py_process_normalize_wait_status", (c_int64,), c_int64
 )
@@ -253,7 +257,7 @@ def py_subprocess_check_output(argv):
             break
     status: int = pclose(fp)
     if status != 0:
-        py_raise(py_exc_new(14, cstr("subprocess failed")))  # PY_EXC_OSERROR = 14
+        py_raise_owned(py_exc_new(14, cstr("subprocess failed")))  # PY_EXC_OSERROR = 14
         free(tmp)
         _buf_free(st)
         return null()

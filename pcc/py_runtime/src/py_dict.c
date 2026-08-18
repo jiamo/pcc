@@ -50,6 +50,7 @@
 
 /* ---- Forward decls ---------------------------------------------------- */
 static int  py_dict_rehash(PyDictObject *d, int64_t new_capacity);
+static int  py_dict_maybe_grow(PyDictObject *d);
 
 static int py_dict_pointer_can_have_header(PyObject *obj) {
     return pcc_gc_pointer_is_managed(obj) != 0;
@@ -58,6 +59,35 @@ static int py_dict_pointer_can_have_header(PyObject *obj) {
 static int py_object_is_dict(PyObject *obj) {
     if (!py_dict_pointer_can_have_header(obj)) return 0;
     return py_header(obj)->type_tag == PY_TYPE_DICT;
+}
+
+static int py_dict_prepare_moving_root(PyObject **slot, void **out_handle) {
+    if (out_handle == NULL) return -1;
+    *out_handle = NULL;
+    if (slot == NULL || *slot == NULL || PY_IS_TAGGED_INT(*slot)) return 0;
+    int64_t backend = pcc_gc_backend();
+    if (
+        backend != PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR
+        && backend != PCC_GC_KIND_COLORED_RELOCATING
+    ) return 0;
+    void *handle = pcc_gc_scheduler_root_register_handle(slot);
+    if (handle == NULL) return -1;
+    *slot = pcc_gc_load_ptr(NULL, slot);
+    *out_handle = handle;
+    return 0;
+}
+
+static PyObject *py_dict_reload_moving_root(
+    PyObject **slot,
+    void *handle
+) {
+    if (slot == NULL) return NULL;
+    if (handle != NULL) *slot = pcc_gc_load_ptr(NULL, slot);
+    return *slot;
+}
+
+static void py_dict_finish_moving_root(void *handle) {
+    if (handle != NULL) pcc_gc_scheduler_root_unregister_handle(handle);
 }
 
 static PyObject *py_dict_entry_key(PyDictObject *d, DictEntry *e) {
@@ -74,18 +104,6 @@ static PyObject *py_dict_entry_value(PyDictObject *d, DictEntry *e) {
         return e->value;
     }
     return pcc_gc_load_ptr((PyObject *)d, &e->value);
-}
-
-static int py_dict_keys_equal(PyObject *entry_key, PyObject *key) {
-    if (entry_key == key) return 1;
-    if (PY_IS_TAGGED_INT(entry_key) && PY_IS_TAGGED_INT(key)) return 0;
-    if (!PY_IS_TAGGED_INT(entry_key)
-        && !PY_IS_TAGGED_INT(key)
-        && py_header(entry_key)->type_tag == PY_TYPE_STR
-        && py_header(key)->type_tag == PY_TYPE_STR) {
-        return py_str_eq(entry_key, key) != 0;
-    }
-    return py_obj_eq(entry_key, key) != 0;
 }
 
 /* ---- Allocation ------------------------------------------------------- */
@@ -128,152 +146,663 @@ PyObject *py_dict_new(void) {
         return NULL;
     }
     py_gc_track((PyObject *)d);
+    pcc_gc_publish_initialized((PyObject *)d);
     return (PyObject *)d;
 }
 
 /* ---- Probing ---------------------------------------------------------- */
 
-/* Locate the indices[] slot for `key`.
- *
- * On return:
- *   *out_slot      = index into indices[] where the key's entry would sit.
- *   *out_entry_idx = entries[] index if the key is live; -1 if missing.
- *
- * If the key is missing and there is a reusable TOMBSTONE slot, *out_slot
- * points at the first tombstone seen (so a subsequent insert can reuse it
- * without extra work). Otherwise *out_slot points at the EMPTY slot that
- * terminated the probe, which is also a valid insert target.
- */
-static void py_dict_lookup(PyDictObject *d, int64_t hash, PyObject *key,
-                           int64_t *out_slot, int64_t *out_entry_idx) {
-    if (!py_object_is_dict((PyObject *)d)) {
-        *out_slot = 0;
-        *out_entry_idx = -1;
-        return;
+/* Publish a fresh (key, value) pair plus its index and size under one graph
+ * lock.  Key and value each need their own store plan: a plan commits exactly
+ * one slot.  Both plans are initialized before the lock and finished after it,
+ * so an incref/decref finalizer can only observe the fully published table. */
+static int py_dict_insert_rooted_slot(
+    PyObject **dict_storage,
+    void *dict_handle,
+    PyObject **key_storage,
+    void *key_handle,
+    PyObject **value_storage,
+    void *value_handle,
+    int64_t *indices,
+    DictEntry *entries,
+    int64_t capacity,
+    int64_t entries_used,
+    int64_t slot,
+    int64_t hash
+) {
+    PyObject *dict = py_dict_reload_moving_root(dict_storage, dict_handle);
+    (void)py_dict_reload_moving_root(key_storage, key_handle);
+    (void)py_dict_reload_moving_root(value_storage, value_handle);
+    int64_t backend = pcc_gc_backend();
+    PccGcStoreRootPlan key_plan;
+    PccGcStoreRootPlan value_plan;
+    pcc_gc_store_ptr_plan_init(&key_plan, dict, backend);
+    pcc_gc_store_ptr_plan_init(&value_plan, dict, backend);
+    pcc_gc_root_slot_lock();
+    dict = py_dict_reload_moving_root(dict_storage, dict_handle);
+    PyObject *key = py_dict_reload_moving_root(key_storage, key_handle);
+    PyObject *value = py_dict_reload_moving_root(value_storage, value_handle);
+    int committed = 0;
+    if (py_object_is_dict(dict)) {
+        PyDictObject *d = (PyDictObject *)dict;
+        if (
+            d->indices == indices && d->entries == entries
+            && d->capacity == capacity && d->entries_used == entries_used
+            && slot >= 0 && slot < capacity
+            && entries_used >= 0 && entries_used < capacity
+            && (indices[slot] == PY_DICT_EMPTY
+                || indices[slot] == PY_DICT_TOMBSTONE)
+        ) {
+            int64_t ei = entries_used;
+            DictEntry *entry = &entries[ei];
+            entry->hash  = hash;
+            entry->key   = NULL;
+            entry->value = NULL;
+            int key_ok = pcc_gc_store_ptr_plan_commit_locked(
+                &key_plan, dict, &entry->key, key
+            ) != 0;
+            int value_ok = pcc_gc_store_ptr_plan_commit_locked(
+                &value_plan, dict, &entry->value, value
+            ) != 0;
+            if (key_ok && value_ok) {
+                d->entries_used = ei + 1;
+                indices[slot] = ei;
+                d->size++;
+                committed = 1;
+            } else {
+                /* The entry was never indexed, so it is unreachable; the
+                 * plans' finish still balances any partial store. */
+                entry->hash = 0;
+            }
+        }
     }
+    pcc_gc_root_slot_unlock();
+    pcc_gc_store_ptr_plan_finish(&key_plan);
+    pcc_gc_store_ptr_plan_finish(&value_plan);
+    if (committed) {
+        dict = py_dict_reload_moving_root(dict_storage, dict_handle);
+        if (py_object_is_dict(dict)) {
+            (void)py_dict_maybe_grow((PyDictObject *)dict);
+        }
+    }
+    return committed;
+}
+
+/* Replace the value of an existing entry.  `dict[k] = v` keeps the original
+ * stored key object, so the key slot is never written here.  The displaced
+ * value's release runs in plan finish, after the lock is dropped. */
+static int py_dict_replace_value_rooted_slot(
+    PyObject **dict_storage,
+    void *dict_handle,
+    PyObject **value_storage,
+    void *value_handle,
+    int64_t *indices,
+    DictEntry *entries,
+    int64_t capacity,
+    int64_t slot,
+    int64_t ix,
+    int64_t hash
+) {
+    PyObject *dict = py_dict_reload_moving_root(dict_storage, dict_handle);
+    (void)py_dict_reload_moving_root(value_storage, value_handle);
+    PccGcStoreRootPlan plan;
+    pcc_gc_store_ptr_plan_init(&plan, dict, pcc_gc_backend());
+    pcc_gc_root_slot_lock();
+    dict = py_dict_reload_moving_root(dict_storage, dict_handle);
+    PyObject *value = py_dict_reload_moving_root(value_storage, value_handle);
+    int committed = 0;
+    if (py_object_is_dict(dict)) {
+        PyDictObject *d = (PyDictObject *)dict;
+        if (
+            d->indices == indices && d->entries == entries
+            && d->capacity == capacity
+            && slot >= 0 && slot < capacity && indices[slot] == ix
+            && ix >= 0 && ix < d->entries_used
+            && entries[ix].hash == hash
+            && entries[ix].key != NULL
+        ) {
+            DictEntry *entry = &entries[ix];
+            committed = pcc_gc_store_ptr_plan_commit_locked(
+                &plan, dict, &entry->value, value
+            ) != 0;
+        }
+    }
+    pcc_gc_root_slot_unlock();
+    pcc_gc_store_ptr_plan_finish(&plan);
+    return committed;
+}
+
+/* Detach an entry: key, value, index tombstone and size all publish under one
+ * graph lock, and both releases run in plan finish after unlock.  The legacy
+ * path decref'd key and value first, so a finalizer re-entering the dict could
+ * observe a freed key behind a still-live index. */
+static int py_dict_del_rooted_slot(
+    PyObject **dict_storage,
+    void *dict_handle,
+    int64_t *indices,
+    DictEntry *entries,
+    int64_t capacity,
+    int64_t slot,
+    int64_t ix
+) {
+    PyObject *dict = py_dict_reload_moving_root(dict_storage, dict_handle);
+    int64_t backend = pcc_gc_backend();
+    PccGcStoreRootPlan key_plan;
+    PccGcStoreRootPlan value_plan;
+    pcc_gc_store_ptr_plan_init(&key_plan, dict, backend);
+    pcc_gc_store_ptr_plan_init(&value_plan, dict, backend);
+    pcc_gc_root_slot_lock();
+    dict = py_dict_reload_moving_root(dict_storage, dict_handle);
+    int committed = 0;
+    if (py_object_is_dict(dict)) {
+        PyDictObject *d = (PyDictObject *)dict;
+        if (
+            d->indices == indices && d->entries == entries
+            && d->capacity == capacity
+            && slot >= 0 && slot < capacity && indices[slot] == ix
+            && ix >= 0 && ix < d->entries_used
+            && entries[ix].key != NULL
+        ) {
+            DictEntry *entry = &entries[ix];
+            int key_ok = pcc_gc_store_ptr_plan_commit_locked(
+                &key_plan, dict, &entry->key, NULL
+            ) != 0;
+            int value_ok = pcc_gc_store_ptr_plan_commit_locked(
+                &value_plan, dict, &entry->value, NULL
+            ) != 0;
+            if (key_ok && value_ok) {
+                indices[slot] = PY_DICT_TOMBSTONE;
+                d->size--;
+                committed = 1;
+            }
+        }
+    }
+    pcc_gc_root_slot_unlock();
+    pcc_gc_store_ptr_plan_finish(&key_plan);
+    pcc_gc_store_ptr_plan_finish(&value_plan);
+    return committed;
+}
+
+/* mode 0: get, returning an owned value.  mode 1: delete.  mode 2: set —
+ * fresh insert or value replacement.  Modes 1 and 2 return NULL and
+ * report through *out_status. */
+static PyObject *py_dict_rooted_op(
+    PyObject *dict,
+    PyObject *key,
+    PyObject *value,
+    int mode,
+    int *out_status
+) {
+    if (out_status != NULL) *out_status = 0;
+    PyObject *dict_storage = dict;
+    PyObject *key_storage = key;
+    PyObject *value_storage = value;
+    void *dict_handle = NULL;
+    void *key_handle = NULL;
+    void *value_handle = NULL;
+    if (py_dict_prepare_moving_root(&dict_storage, &dict_handle) != 0) {
+        return NULL;
+    }
+    if (py_dict_prepare_moving_root(&key_storage, &key_handle) != 0) {
+        py_dict_finish_moving_root(dict_handle);
+        return NULL;
+    }
+    if (py_dict_prepare_moving_root(&value_storage, &value_handle) != 0) {
+        py_dict_finish_moving_root(key_handle);
+        py_dict_finish_moving_root(dict_handle);
+        return NULL;
+    }
+
+    key = py_dict_reload_moving_root(&key_storage, key_handle);
+    int64_t hash = py_obj_hash(key);
+    dict = py_dict_reload_moving_root(&dict_storage, dict_handle);
+    key = py_dict_reload_moving_root(&key_storage, key_handle);
+    if (py_err_occurred()) {
+        /* value_handle is already registered by this point, so a raising
+         * __hash__ must release all three or it leaks a scheduler root and
+         * keeps the value alive under GC3/GC4. */
+        py_dict_finish_moving_root(value_handle);
+        py_dict_finish_moving_root(key_handle);
+        py_dict_finish_moving_root(dict_handle);
+        return NULL;
+    }
+
+    int restarts = 0;
+restart:
+    if (restarts++ >= 16) {
+        py_dict_finish_moving_root(value_handle);
+        py_dict_finish_moving_root(key_handle);
+        py_dict_finish_moving_root(dict_handle);
+        return NULL;
+    }
+    dict = py_dict_reload_moving_root(&dict_storage, dict_handle);
+    key = py_dict_reload_moving_root(&key_storage, key_handle);
+    if (!py_object_is_dict(dict)) {
+        py_dict_finish_moving_root(value_handle);
+        py_dict_finish_moving_root(key_handle);
+        py_dict_finish_moving_root(dict_handle);
+        return NULL;
+    }
+    PyDictObject *d = (PyDictObject *)dict;
     if (d->capacity <= 0 || d->indices == NULL || d->entries == NULL) {
-        *out_slot = 0;
-        *out_entry_idx = -1;
-        return;
+        py_dict_finish_moving_root(value_handle);
+        py_dict_finish_moving_root(key_handle);
+        py_dict_finish_moving_root(dict_handle);
+        return NULL;
     }
-    int64_t mask = d->capacity - 1;
+    int64_t capacity = d->capacity;
+    int64_t *indices = d->indices;
+    DictEntry *entries = d->entries;
+    int64_t entries_used = d->entries_used;
+    int64_t mask = capacity - 1;
     uint64_t perturb = (uint64_t)hash;
     int64_t j = (int64_t)((uint64_t)hash & (uint64_t)mask);
-    int64_t first_tombstone = -1;
     int64_t probes = 0;
-    int64_t limit = d->capacity * 2;
-
+    /* See py_dict.py: capacity * 2 is not a sufficient probe budget. */
+    int64_t limit = capacity + 16;
+    int64_t first_tombstone = -1;
+    int64_t insert_slot = -1;
     while (probes < limit) {
-        int64_t ix = d->indices[j];
+        int64_t ix = indices[j];
         if (ix == PY_DICT_EMPTY) {
-            /* Key not present; insertion target is the earliest tombstone
-             * we saw, else this empty slot. */
-            *out_slot = (first_tombstone >= 0) ? first_tombstone : j;
-            *out_entry_idx = -1;
-            return;
+            insert_slot = (first_tombstone >= 0) ? first_tombstone : j;
+            break;
         }
         if (ix == PY_DICT_TOMBSTONE) {
             if (first_tombstone < 0) first_tombstone = j;
-        } else {
-            /* Live entry: compare hash cheap-first, then py_obj_eq. */
-            DictEntry *e = &d->entries[ix];
-            PyObject *entry_key = py_dict_entry_key(d, e);
-            if (entry_key != NULL && e->hash == hash &&
-                py_dict_keys_equal(entry_key, key)) {
-                *out_slot = j;
-                *out_entry_idx = ix;
-                return;
+        } else if (ix >= 0 && ix < d->entries_used) {
+            DictEntry *entry = &entries[ix];
+            PyObject *entry_key = py_dict_entry_key(d, entry);
+            if (entry_key != NULL && entry->hash == hash) {
+                int equal = 0;
+                int callback = 0;
+                if (entry_key == key) equal = 1;
+                else if (PY_IS_TAGGED_INT(entry_key) && PY_IS_TAGGED_INT(key)) {
+                    equal = 0;
+                } else if (
+                    !PY_IS_TAGGED_INT(entry_key)
+                    && !PY_IS_TAGGED_INT(key)
+                    && py_header(entry_key)->type_tag == PY_TYPE_STR
+                    && py_header(key)->type_tag == PY_TYPE_STR
+                ) {
+                    equal = py_str_eq(entry_key, key) != 0;
+                } else {
+                    callback = 1;
+                    py_incref(entry_key);
+                    PyObject *candidate_storage = entry_key;
+                    void *candidate_handle = NULL;
+                    if (py_dict_prepare_moving_root(
+                            &candidate_storage, &candidate_handle
+                        ) != 0) {
+                        py_decref(entry_key);
+                        break;
+                    }
+                    PyObject *before_dict = dict;
+                    equal = py_obj_eq(candidate_storage, key) != 0;
+                    dict = py_dict_reload_moving_root(
+                        &dict_storage, dict_handle
+                    );
+                    key = py_dict_reload_moving_root(
+                        &key_storage, key_handle
+                    );
+                    PyObject *candidate = py_dict_reload_moving_root(
+                        &candidate_storage, candidate_handle
+                    );
+                    py_dict_finish_moving_root(candidate_handle);
+                    int stable = dict == before_dict
+                        && py_object_is_dict(dict)
+                        && ((PyDictObject *)dict)->capacity == capacity
+                        && ((PyDictObject *)dict)->indices == indices
+                        && ((PyDictObject *)dict)->entries == entries
+                        && j < capacity
+                        && indices[j] == ix
+                        && ix >= 0
+                        && ix < ((PyDictObject *)dict)->entries_used
+                        && py_dict_entry_key(
+                            (PyDictObject *)dict, &entries[ix]
+                        ) == candidate;
+                    py_decref(candidate);
+                    if (py_err_occurred()) {
+                        /* A raising __eq__ leaves py_obj_eq returning 0.
+                         * Treating that as "not equal" would keep probing and,
+                         * in set mode, insert -- mutating the dict even though
+                         * the statement raises.  Abort without committing. */
+                        py_dict_finish_moving_root(value_handle);
+                        py_dict_finish_moving_root(key_handle);
+                        py_dict_finish_moving_root(dict_handle);
+                        return NULL;
+                    }
+                    if (!stable) goto restart;
+                }
+                (void)callback;
+                if (equal) {
+                    if (mode == 1) {
+                        int removed = py_dict_del_rooted_slot(
+                            &dict_storage,
+                            dict_handle,
+                            indices,
+                            entries,
+                            capacity,
+                            j,
+                            ix
+                        );
+                        if (!removed) goto restart;
+                        if (out_status != NULL) *out_status = 1;
+                        py_dict_finish_moving_root(value_handle);
+                        py_dict_finish_moving_root(key_handle);
+                        py_dict_finish_moving_root(dict_handle);
+                        return NULL;
+                    }
+                    if (mode == 2) {
+                        int replaced = py_dict_replace_value_rooted_slot(
+                            &dict_storage,
+                            dict_handle,
+                            &value_storage,
+                            value_handle,
+                            indices,
+                            entries,
+                            capacity,
+                            j,
+                            ix,
+                            hash
+                        );
+                        if (!replaced) goto restart;
+                        if (out_status != NULL) *out_status = 1;
+                        py_dict_finish_moving_root(value_handle);
+                        py_dict_finish_moving_root(key_handle);
+                        py_dict_finish_moving_root(dict_handle);
+                        return NULL;
+                    }
+                    PyObject *found = py_dict_entry_value(
+                        (PyDictObject *)dict, &entries[ix]
+                    );
+                    if (found != NULL) py_incref(found);
+                    py_dict_finish_moving_root(value_handle);
+                    py_dict_finish_moving_root(key_handle);
+                    py_dict_finish_moving_root(dict_handle);
+                    return found;
+                }
             }
         }
-        /* Advance probe. */
         perturb >>= 5;
         j = (int64_t)(((uint64_t)j * 5u + perturb + 1u) & (uint64_t)mask);
         probes++;
     }
-
-    /* A healthy table always reaches an EMPTY slot before this. Treat a
-     * bounded-out probe as a miss instead of letting a corrupt probe cycle
-     * hang the self-hosted compiler indefinitely. */
-    *out_slot = (first_tombstone >= 0) ? first_tombstone : 0;
-    *out_entry_idx = -1;
-}
-
-/* Insert a (hash, key, value) into indices[] + entries[]. Assumes there
- * is room (load factor already checked) and that `key` is not yet
- * present (caller verified via lookup). INCREFs key and value. */
-static void py_dict_insert_fresh(PyDictObject *d, int64_t hash,
-                                 PyObject *key, PyObject *value) {
-    int64_t slot, ix;
-    py_dict_lookup(d, hash, key, &slot, &ix);
-    /* ix must be -1 here; caller's contract. */
-    (void)ix;
-    int64_t ei = d->entries_used++;
-    DictEntry *e = &d->entries[ei];
-    e->hash  = hash;
-    e->key   = NULL;
-    e->value = NULL;
-    pcc_gc_store_ptr((PyObject *)d, &e->key, key);
-    pcc_gc_store_ptr((PyObject *)d, &e->value, value);
-    d->indices[slot] = ei;
-    d->size++;
+    if (mode == 2) {
+        int64_t target = insert_slot >= 0 ? insert_slot : first_tombstone;
+        if (target >= 0) {
+            int inserted = py_dict_insert_rooted_slot(
+                &dict_storage,
+                dict_handle,
+                &key_storage,
+                key_handle,
+                &value_storage,
+                value_handle,
+                indices,
+                entries,
+                capacity,
+                entries_used,
+                target,
+                hash
+            );
+            if (!inserted) goto restart;
+            if (out_status != NULL) *out_status = 1;
+        }
+    }
+    py_dict_finish_moving_root(value_handle);
+    py_dict_finish_moving_root(key_handle);
+    py_dict_finish_moving_root(dict_handle);
+    return NULL;
 }
 
 /* Rebuild indices[] and compact entries[] into a new capacity. `new_capacity`
  * must be a power of 2 and large enough to hold all live entries at load
  * factor < 2/3. */
-static int py_dict_rehash(PyDictObject *d, int64_t new_capacity) {
-    DictEntry *old_entries      = d->entries;
-    int64_t    old_entries_used = d->entries_used;
+static int64_t py_dict_rehash_find_empty_slot(
+    int64_t *indices,
+    int64_t capacity,
+    int64_t hash
+) {
+    int64_t mask = capacity - 1;
+    uint64_t perturb = (uint64_t)hash;
+    int64_t slot = (int64_t)((uint64_t)hash & (uint64_t)mask);
+    int64_t probes = 0;
+    while (probes < capacity + 16) {
+        if (indices[slot] == PY_DICT_EMPTY) return slot;
+        perturb >>= 5;
+        slot = (int64_t)(
+            ((uint64_t)slot * 5u + perturb + 1u) & (uint64_t)mask
+        );
+        probes++;
+    }
+    return -1;
+}
 
-    DictEntry *new_entries = (DictEntry *)malloc((size_t)new_capacity * sizeof(DictEntry));
-    int64_t   *new_indices = (int64_t *)malloc((size_t)new_capacity * sizeof(int64_t));
+static int py_dict_rehash_refcount_fast(
+    PyDictObject *d,
+    int64_t new_capacity
+) {
+    DictEntry *old_entries = d->entries;
+    int64_t *old_indices = d->indices;
+    int64_t old_entries_used = d->entries_used;
+    DictEntry *new_entries = (DictEntry *)calloc(
+        (size_t)new_capacity, sizeof(DictEntry)
+    );
+    int64_t *new_indices = (int64_t *)malloc(
+        (size_t)new_capacity * sizeof(int64_t)
+    );
     if (new_entries == NULL || new_indices == NULL) {
         free(new_entries);
         free(new_indices);
         return -1;
     }
-    for (int64_t i = 0; i < new_capacity; i++) new_indices[i] = PY_DICT_EMPTY;
-
-    /* Install the new buffers on the dict, free the old ones, then walk
-     * the old entries in insertion order copying only live slots. This
-     * compacts out any tombstoned holes. Refs are moved over — no
-     * incref/decref — so the overall refcount stays balanced. */
-    int64_t *old_indices = d->indices;
-    d->indices      = new_indices;
-    d->entries      = new_entries;
-    d->capacity     = new_capacity;
-    d->size         = 0;
-    d->entries_used = 0;
-    (void)pcc_gc_backend4_zpage_register_owner_payload_span(
-        (PyObject *)d,
-        d->entries,
-        new_capacity * (int64_t)sizeof(DictEntry)
-    );
-    free(old_indices);
-
-    for (int64_t i = 0; i < old_entries_used; i++) {
-        DictEntry *e = &old_entries[i];
-        PyObject *entry_key = py_dict_entry_key(d, e);
-        if (entry_key == NULL) continue;  /* skip dead entries */
-        PyObject *entry_value = py_dict_entry_value(d, e);
-        /* Insert without incref'ing again — we're moving refs over. We
-         * can't reuse insert_fresh which would double-count. Inline the
-         * move: find slot via lookup, copy entry, bump counters. */
-        int64_t slot, ix;
-        py_dict_lookup(d, e->hash, entry_key, &slot, &ix);
-        (void)ix;  /* guaranteed -1 during rehash */
-        int64_t ei = d->entries_used++;
-        DictEntry *ne = &d->entries[ei];
-        ne->hash  = e->hash;
-        ne->key   = entry_key;
-        ne->value = entry_value;
-        pcc_gc_note_slot_write_barrier((PyObject *)d, &ne->key, entry_key);
-        pcc_gc_note_slot_write_barrier((PyObject *)d, &ne->value, entry_value);
-        d->indices[slot] = ei;
-        d->size++;
+    for (int64_t i = 0; i < new_capacity; i++) {
+        new_indices[i] = PY_DICT_EMPTY;
     }
+    int64_t new_entries_used = 0;
+    for (int64_t i = 0; i < old_entries_used; i++) {
+        DictEntry *old_entry = &old_entries[i];
+        if (old_entry->key == NULL) continue;
+        int64_t slot = py_dict_rehash_find_empty_slot(
+            new_indices, new_capacity, old_entry->hash
+        );
+        if (slot < 0) {
+            free(new_entries);
+            free(new_indices);
+            return -1;
+        }
+        new_entries[new_entries_used] = *old_entry;
+        new_indices[slot] = new_entries_used;
+        new_entries_used++;
+    }
+    d->indices = new_indices;
+    d->entries = new_entries;
+    d->capacity = new_capacity;
+    d->size = new_entries_used;
+    d->entries_used = new_entries_used;
+    free(old_indices);
     free(old_entries);
     return 0;
+}
+
+static int py_dict_rehash(PyDictObject *d, int64_t new_capacity) {
+    if (d == NULL || new_capacity <= 0) return -1;
+    int64_t initial_backend = pcc_gc_backend();
+    if (initial_backend == PCC_GC_KIND_REFCOUNT_CYCLE) {
+        return py_dict_rehash_refcount_fast(d, new_capacity);
+    }
+    PyObject *owner_slot = (PyObject *)d;
+    void *owner_handle = NULL;
+    if (
+        initial_backend == PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR
+        || initial_backend == PCC_GC_KIND_COLORED_RELOCATING
+    ) {
+        owner_handle = pcc_gc_scheduler_root_register_handle(&owner_slot);
+        if (owner_handle == NULL) return -1;
+    }
+
+    for (int attempt = 0; attempt < 8; attempt++) {
+        pcc_gc_root_slot_lock();
+        if (pcc_gc_backend() != initial_backend) {
+            pcc_gc_root_slot_unlock();
+            break;
+        }
+        if (owner_handle != NULL) {
+            owner_slot = pcc_gc_load_ptr(NULL, &owner_slot);
+        }
+        d = (PyDictObject *)owner_slot;
+        DictEntry *old_entries = d->entries;
+        int64_t *old_indices = d->indices;
+        int64_t old_capacity = d->capacity;
+        int64_t old_entries_used = d->entries_used;
+        int64_t old_size = d->size;
+        pcc_gc_root_slot_unlock();
+        if (
+            old_entries == NULL
+            || old_indices == NULL
+            || old_capacity <= 0
+            || old_entries_used < 0
+            || old_entries_used > old_capacity
+            || new_capacity < old_capacity
+            || old_size < 0
+            || old_size > new_capacity
+            || old_entries_used > INT64_MAX / 4
+        ) break;
+
+        DictEntry *new_entries = (DictEntry *)calloc(
+            (size_t)new_capacity, sizeof(DictEntry)
+        );
+        int64_t *new_indices = (int64_t *)malloc(
+            (size_t)new_capacity * sizeof(int64_t)
+        );
+        PyObject ***slot_pairs = NULL;
+        if (old_entries_used > 0) {
+            slot_pairs = (PyObject ***)calloc(
+                (size_t)old_entries_used * 4u,
+                sizeof(PyObject **)
+            );
+        }
+        if (
+            new_entries == NULL
+            || new_indices == NULL
+            || (old_entries_used > 0 && slot_pairs == NULL)
+        ) {
+            free(slot_pairs);
+            free(new_entries);
+            free(new_indices);
+            break;
+        }
+        for (int64_t i = 0; i < new_capacity; i++) {
+            new_indices[i] = PY_DICT_EMPTY;
+        }
+
+        pcc_gc_root_slot_lock();
+        if (pcc_gc_backend() != initial_backend) {
+            pcc_gc_root_slot_unlock();
+            free(slot_pairs);
+            free(new_entries);
+            free(new_indices);
+            break;
+        }
+        if (owner_handle != NULL) {
+            owner_slot = pcc_gc_load_ptr(NULL, &owner_slot);
+        }
+        d = (PyDictObject *)owner_slot;
+        if (
+            d->entries != old_entries
+            || d->indices != old_indices
+            || d->capacity != old_capacity
+            || d->entries_used != old_entries_used
+            || d->size != old_size
+        ) {
+            pcc_gc_root_slot_unlock();
+            free(slot_pairs);
+            free(new_entries);
+            free(new_indices);
+            continue;
+        }
+
+        int64_t new_entries_used = 0;
+        int64_t new_size = 0;
+        int64_t pair_count = 0;
+        int copy_valid = 1;
+        for (int64_t i = 0; i < old_entries_used; i++) {
+            DictEntry *old_entry = &old_entries[i];
+            PyObject *entry_key = py_dict_entry_key(d, old_entry);
+            if (entry_key == NULL) continue;
+            PyObject *entry_value = py_dict_entry_value(d, old_entry);
+            int64_t slot = py_dict_rehash_find_empty_slot(
+                new_indices, new_capacity, old_entry->hash
+            );
+            if (slot < 0) {
+                copy_valid = 0;
+                break;
+            }
+            DictEntry *new_entry = &new_entries[new_entries_used];
+            new_entry->hash = old_entry->hash;
+            new_entry->key = entry_key;
+            new_entry->value = entry_value;
+            new_indices[slot] = new_entries_used;
+            slot_pairs[pair_count * 2] = &old_entry->key;
+            slot_pairs[pair_count * 2 + 1] = &new_entry->key;
+            pair_count++;
+            slot_pairs[pair_count * 2] = &old_entry->value;
+            slot_pairs[pair_count * 2 + 1] = &new_entry->value;
+            pair_count++;
+            new_entries_used++;
+            new_size++;
+        }
+        int64_t retargeted = 0;
+        if (copy_valid) {
+            retargeted = pcc_gc_backend4_retarget_mutator_payload_locked(
+                (PyObject *)d,
+                old_entries,
+                old_capacity * (int64_t)sizeof(DictEntry),
+                new_entries,
+                new_capacity * (int64_t)sizeof(DictEntry),
+                slot_pairs,
+                pair_count
+            );
+        }
+        if (!copy_valid || retargeted == 0) {
+            pcc_gc_root_slot_unlock();
+            free(slot_pairs);
+            free(new_entries);
+            free(new_indices);
+            break;
+        }
+        for (int64_t i = 0; i < pair_count; i++) {
+            PyObject **new_slot = slot_pairs[i * 2 + 1];
+            pcc_gc_note_slot_write_barrier(
+                (PyObject *)d, new_slot, *new_slot
+            );
+        }
+        d->indices = new_indices;
+        d->entries = new_entries;
+        d->capacity = new_capacity;
+        d->size = new_size;
+        d->entries_used = new_entries_used;
+        if (retargeted == 2) {
+            (void)pcc_gc_backend4_zpage_register_owner_payload_span(
+                (PyObject *)d,
+                new_entries,
+                new_capacity * (int64_t)sizeof(DictEntry)
+            );
+        }
+        pcc_gc_root_slot_unlock();
+
+        free(old_indices);
+        free(old_entries);
+        free(slot_pairs);
+        if (owner_handle != NULL) {
+            pcc_gc_scheduler_root_unregister_handle(owner_handle);
+        }
+        return 0;
+    }
+    if (owner_handle != NULL) {
+        pcc_gc_scheduler_root_unregister_handle(owner_handle);
+    }
+    return -1;
 }
 
 /* Decide the next capacity when we need to grow (or shrink). CPython uses
@@ -299,39 +828,12 @@ static int py_dict_maybe_grow(PyDictObject *d) {
 
 void py_dict_set(PyObject *dict, PyObject *key, PyObject *value) {
     if (!py_object_is_dict(dict) || key == NULL) return;
-    PyDictObject *d = (PyDictObject *)dict;
-
-    int64_t hash = py_obj_hash(key);
-    if (py_err_occurred()) return;
-    int64_t slot, ix;
-    py_dict_lookup(d, hash, key, &slot, &ix);
-    if (ix >= 0) {
-        /* Update existing. Replace value; key stays (Python semantics:
-         * dict[k] = v keeps the original key object). */
-        DictEntry *e = &d->entries[ix];
-        pcc_gc_store_ptr(dict, &e->value, value);
-        return;
-    }
-    /* Fresh insert. */
-    py_dict_insert_fresh(d, hash, key, value);
-    (void)py_dict_maybe_grow(d);
-    /* If maybe_grow fails, we've already inserted; the table just gets
-     * denser. A future op will try again. */
+    (void)py_dict_rooted_op(dict, key, value, 2, NULL);
 }
 
 PyObject *py_dict_get(PyObject *dict, PyObject *key) {
     if (!py_object_is_dict(dict) || key == NULL) return NULL;
-    PyDictObject *d = (PyDictObject *)dict;
-
-    int64_t hash = py_obj_hash(key);
-    if (py_err_occurred()) return NULL;
-    int64_t slot, ix;
-    py_dict_lookup(d, hash, key, &slot, &ix);
-    if (ix < 0) return NULL;
-    PyObject *v = pcc_gc_load_ptr(dict, &d->entries[ix].value);
-    if (v == NULL) return NULL;
-    py_incref(v);
-    return v;
+    return py_dict_rooted_op(dict, key, NULL, 0, NULL);
 }
 
 PyObject *py_dict_get_default(PyObject *dict, PyObject *key, PyObject *def) {
@@ -447,33 +949,17 @@ PyObject *py_dict_popitem(PyObject *dict) {
 }
 
 int64_t py_dict_contains(PyObject *dict, PyObject *key) {
-    if (!py_object_is_dict(dict) || key == NULL) return 0;
-    PyDictObject *d = (PyDictObject *)dict;
-    int64_t hash = py_obj_hash(key);
-    if (py_err_occurred()) return 0;
-    int64_t slot, ix;
-    py_dict_lookup(d, hash, key, &slot, &ix);
-    return ix >= 0 ? 1 : 0;
+    PyObject *value = py_dict_get(dict, key);
+    if (value == NULL) return 0;
+    py_decref(value);
+    return 1;
 }
 
 int64_t py_dict_del(PyObject *dict, PyObject *key) {
     if (!py_object_is_dict(dict) || key == NULL) return -1;
-    PyDictObject *d = (PyDictObject *)dict;
-    int64_t hash = py_obj_hash(key);
-    if (py_err_occurred()) return -1;
-    int64_t slot, ix;
-    py_dict_lookup(d, hash, key, &slot, &ix);
-    if (ix < 0) return -1;
-
-    DictEntry *e = &d->entries[ix];
-    py_decref(py_dict_entry_key(d, e));
-    py_decref(py_dict_entry_value(d, e));
-    e->key   = NULL;
-    e->value = NULL;
-    /* Leave e->hash intact; it's just a cached int and aids debugging. */
-    d->indices[slot] = PY_DICT_TOMBSTONE;
-    d->size--;
-    return 0;
+    int status = 0;
+    (void)py_dict_rooted_op(dict, key, NULL, 1, &status);
+    return status ? 0 : -1;
 }
 
 void py_dict_clear(PyObject *dict) {
@@ -581,12 +1067,118 @@ PyObject *py_dict_items(PyObject *dict) {
 
 void py_dict_update(PyObject *dst, PyObject *src) {
     if (!py_object_is_dict(dst) || !py_object_is_dict(src)) return;
-    PyDictObject *s = (PyDictObject *)src;
-    int64_t used = s->entries_used;
-    for (int64_t i = 0; i < used; i++) {
-        DictEntry *e = &s->entries[i];
-        PyObject *key = py_dict_entry_key(s, e);
-        if (key == NULL) continue;
-        py_dict_set(dst, key, py_dict_entry_value(s, e));
+    PyObject *dst_storage = dst;
+    PyObject *src_storage = src;
+    void *dst_handle = NULL;
+    void *src_handle = NULL;
+    if (py_dict_prepare_moving_root(&dst_storage, &dst_handle) != 0) return;
+    if (py_dict_prepare_moving_root(&src_storage, &src_handle) != 0) {
+        py_dict_finish_moving_root(dst_handle);
+        return;
     }
+    src = py_dict_reload_moving_root(&src_storage, src_handle);
+    if (!py_object_is_dict(src)) {
+        py_dict_finish_moving_root(src_handle);
+        py_dict_finish_moving_root(dst_handle);
+        return;
+    }
+
+    /* Snapshot the source before invoking destination hash/equality callbacks.
+     * py_dict_set runs user code, which may relocate either dict or mutate the
+     * source; caching the source PyDictObject and entries_used across those
+     * calls would leave later iterations reading a stale owner/table.  Mirrors
+     * py_set_update.  The snapshot holds key and value alternately. */
+    PyDictObject *source_dict = (PyDictObject *)src;
+    PyObject *snapshot_storage = py_list_new(
+        source_dict->size > 0 ? source_dict->size * 2 : 4
+    );
+    if (snapshot_storage == NULL) {
+        py_dict_finish_moving_root(src_handle);
+        py_dict_finish_moving_root(dst_handle);
+        return;
+    }
+    void *snapshot_handle = NULL;
+    if (py_dict_prepare_moving_root(
+            &snapshot_storage, &snapshot_handle
+        ) != 0) {
+        py_decref(snapshot_storage);
+        py_dict_finish_moving_root(src_handle);
+        py_dict_finish_moving_root(dst_handle);
+        return;
+    }
+
+    src = py_dict_reload_moving_root(&src_storage, src_handle);
+    source_dict = (PyDictObject *)src;
+    int64_t source_used = source_dict->entries_used;
+    for (int64_t i = 0; i < source_used; i++) {
+        src = py_dict_reload_moving_root(&src_storage, src_handle);
+        if (!py_object_is_dict(src)) break;
+        source_dict = (PyDictObject *)src;
+        if (i >= source_dict->entries_used) break;
+        DictEntry *entry = &source_dict->entries[i];
+        PyObject *key = py_dict_entry_key(source_dict, entry);
+        if (key == NULL) continue;
+        PyObject *value = py_dict_entry_value(source_dict, entry);
+        PyObject *snapshot = py_dict_reload_moving_root(
+            &snapshot_storage, snapshot_handle
+        );
+        py_list_append(snapshot, key);
+        if (py_err_occurred()) break;
+        snapshot = py_dict_reload_moving_root(
+            &snapshot_storage, snapshot_handle
+        );
+        py_list_append(snapshot, value);
+        if (py_err_occurred()) break;
+    }
+
+    PyObject *snapshot = py_dict_reload_moving_root(
+        &snapshot_storage, snapshot_handle
+    );
+    int64_t snapshot_len = py_list_len(snapshot);
+    for (int64_t i = 0; i + 1 < snapshot_len && !py_err_occurred(); i += 2) {
+        snapshot = py_dict_reload_moving_root(
+            &snapshot_storage, snapshot_handle
+        );
+        PyObject *key_storage = py_list_get(snapshot, i);
+        if (key_storage == NULL) break;
+        snapshot = py_dict_reload_moving_root(
+            &snapshot_storage, snapshot_handle
+        );
+        PyObject *value_storage = py_list_get(snapshot, i + 1);
+        if (value_storage == NULL) {
+            py_decref(key_storage);
+            break;
+        }
+        void *key_handle = NULL;
+        void *value_handle = NULL;
+        if (py_dict_prepare_moving_root(&key_storage, &key_handle) != 0) {
+            py_decref(key_storage);
+            py_decref(value_storage);
+            break;
+        }
+        if (py_dict_prepare_moving_root(&value_storage, &value_handle) != 0) {
+            py_dict_finish_moving_root(key_handle);
+            py_decref(key_storage);
+            py_decref(value_storage);
+            break;
+        }
+        dst = py_dict_reload_moving_root(&dst_storage, dst_handle);
+        py_dict_set(dst, key_storage, value_storage);
+        key_storage = py_dict_reload_moving_root(&key_storage, key_handle);
+        value_storage = py_dict_reload_moving_root(
+            &value_storage, value_handle
+        );
+        py_dict_finish_moving_root(value_handle);
+        py_dict_finish_moving_root(key_handle);
+        py_decref(key_storage);
+        py_decref(value_storage);
+    }
+
+    snapshot = py_dict_reload_moving_root(
+        &snapshot_storage, snapshot_handle
+    );
+    py_dict_finish_moving_root(snapshot_handle);
+    py_decref(snapshot);
+    py_dict_finish_moving_root(src_handle);
+    py_dict_finish_moving_root(dst_handle);
 }

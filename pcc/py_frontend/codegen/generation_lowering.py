@@ -158,6 +158,7 @@ class GenerationLoweringMixin:
         _codegen_log(self, debug_codegen, "start")
         saved_skip_program_main = self._skip_program_main
         saved_freestanding_module = self._freestanding_module
+        saved_runtime_port_module = self._runtime_port_module
         saved_sibling_module_inits = self._sibling_module_inits
         saved_native_module_exports = self._native_module_exports
         if module is not None:
@@ -165,6 +166,10 @@ class GenerationLoweringMixin:
             setattr(self, "_ast_body", module.body)
             setattr(self, "_try_err_block", None)
             setattr(self, "module", ir.Module(name=module.name or "pcc_py_module"))
+            # The constructor already built a compile unit, but for the module
+            # it was handed; this is a different ``ir.Module``, and debug nodes
+            # are owned per module.  Rebuild against the one that gets rendered.
+            self._di_init(getattr(module, "path", None) or module.name or "<module>")
             setattr(self, "runtime", declare_runtime(self.module))
             setattr(self, "_printf", self._declare_printf())
             setattr(self, "functions", {})
@@ -182,6 +187,7 @@ class GenerationLoweringMixin:
             setattr(self, "_post_call_frame_blocks", {})
             setattr(self, "_source_file_lines_cache", {})
             setattr(self, "_owned_dynamic_call_values", set())
+            setattr(self, "_last_fresh_direct_native_ctor_value", None)
             marshal.reset_boxed_i64_constants()
             setattr(self, "_fmt_int", None)
             setattr(self, "_fmt_float", None)
@@ -189,6 +195,7 @@ class GenerationLoweringMixin:
             setattr(self, "_fmt_bool_false", None)
             setattr(self, "_str_pool", {})
             setattr(self, "_str_obj_pool", {})
+            setattr(self, "_static_literal_init_fn", None)
             setattr(self, "_attr_pool", {})
             setattr(self, "_cstr_pool", {})
             setattr(self, "_str_counter", 0)
@@ -201,6 +208,7 @@ class GenerationLoweringMixin:
             setattr(self, "_extern_bindings", {})
             setattr(self, "_unsafe_bindings", {})
             setattr(self, "_extern_decls", {})
+            setattr(self, "_boxed_int_module_global_names", set())
             setattr(self, "_native_module_aliases", {})
             setattr(self, "_native_module_constant_bindings", {})
             setattr(self, "_native_builtin_module_aliases", {})
@@ -232,6 +240,7 @@ class GenerationLoweringMixin:
             setattr(self, "current_method_kind", None)
             setattr(self, "_skip_program_main", saved_skip_program_main)
             setattr(self, "_freestanding_module", saved_freestanding_module)
+            setattr(self, "_runtime_port_module", saved_runtime_port_module)
             setattr(self, "_sibling_module_inits", saved_sibling_module_inits)
             setattr(self, "_native_module_exports", saved_native_module_exports)
 
@@ -374,6 +383,11 @@ class GenerationLoweringMixin:
         for stmt in self.ast_module.body:
             if debug_codegen:
                 _codegen_log(self, debug_codegen, "declare begin")
+            # Record every ``del <name>`` target anywhere in the module,
+            # including inside function bodies where ``global x; del x``
+            # unbinds a module global.  Only a name deleted somewhere can be
+            # unbound, so reads of every other global stay a plain load.
+            self._collect_module_del_targets(stmt)
             if isinstance(stmt, FuncDef):
                 if (
                     self._freestanding_module
@@ -844,8 +858,76 @@ class GenerationLoweringMixin:
             self._emit_module_teardown()
             _codegen_log(self, debug_codegen, "module teardown end")
 
+        # Direct-mode shared frame landings reference two module tables whose
+        # length is known only now; size them before any rendering/capture.
+        self._finalize_traceback_index_tables()
+        # The static str literal pool is complete only now as well.
+        self._finalize_static_literal_init()
+
+        if str(
+            os.environ.get("PCC_DIRECT_INDEXED_KERNEL_CAPTURE", "") or ""
+        ).strip().lower() in ("1", "true", "yes", "on"):
+            direct_started = time.monotonic() if worker_timing else 0.0
+            self._direct_indexed_module = self.module.direct_indexed_module()
+            if worker_timing:
+                from pcc.llvm_capi.direct_indexed_kernel import (
+                    direct_indexed_module_cfg_stats,
+                    direct_indexed_module_cfg_stats_text,
+                )
+
+                sys.stderr.write(
+                    "pcc direct indexed capture module="
+                    + (self.ast_module.name or "<module>")
+                    + " elapsed_ms="
+                    + str(int((time.monotonic() - direct_started) * 1000))
+                    + " supported_records="
+                    + str(self.module._direct_indexed_supported_records)
+                    + " fallback_records="
+                    + str(self.module._direct_indexed_fallback_records)
+                    + "\n"
+                )
+                # CFG sizing for representation receipts (blocks, edges and
+                # the post-call block families), on the same timing channel.
+                sys.stderr.write(
+                    "pcc direct indexed kernel cfg module="
+                    + (self.ast_module.name or "<module>")
+                    + " "
+                    + direct_indexed_module_cfg_stats_text(
+                        direct_indexed_module_cfg_stats(
+                            self._direct_indexed_module
+                        )
+                    )
+                    + "\n"
+                )
         _codegen_log(self, debug_codegen, "module str begin")
-        out = str(self.module)
-        out = postprocess_varargs_ir(out)
+        render_started = time.monotonic() if worker_timing else 0.0
+        direct_only = (
+            str(os.environ.get("PCC_DIRECT_INDEXED_KERNEL_EMIT", "") or "")
+            .strip()
+            .lower()
+            in ("1", "true", "yes", "on")
+            and not (
+                str(
+                    os.environ.get("PCC_DIRECT_INDEXED_KERNEL_VALIDATE", "")
+                    or ""
+                )
+                .strip()
+                .lower()
+                in ("1", "true", "yes", "on")
+            )
+        )
+        if direct_only:
+            out = ""
+        else:
+            out = str(self.module)
+            out = postprocess_varargs_ir(out)
+        if worker_timing:
+            sys.stderr.write(
+                "pcc llvm text render module="
+                + (self.ast_module.name or "<module>")
+                + " elapsed_ms="
+                + str(int((time.monotonic() - render_started) * 1000))
+                + "\n"
+            )
         _codegen_log(self, debug_codegen, "module str end " + str(len(out)))
         return out

@@ -112,7 +112,9 @@ void py_gc_callbacks_remove(PyObject *callback) {
     PyListObject *lst = (PyListObject *)callbacks;
     for (int64_t i = 0; i < lst->length; i++) {
         PyObject *existing = pcc_gc_load_ptr(callbacks, &lst->items[i]);
-        if (pcc_gc_callback_eq(existing, callback)) {
+        int equal = pcc_gc_callback_eq(existing, callback);
+        if (py_err_occurred()) return;
+        if (equal) {
             PyObject *old = existing;
             if (i < lst->length - 1) {
                 memmove(
@@ -182,42 +184,90 @@ static int py_gc_backend4_should_check_slot(PyObject **slot) {
     return pcc_gc_slot_is_runtime_root(slot) == 0;
 }
 
-static void pcc_debug_maybe_abort_bad_decref(PyObject *o) {
-    if (!pcc_obj_debug_runtime_enabled()) return;
-    if (o == NULL || PY_IS_TAGGED_INT(o)) return;
-    if (!py_pointer_can_have_header(o)) {
-        fprintf(stderr, "py_decref suspicious pointer=%p\n", o);
-        fflush(stderr);
-        abort();
-    }
-    PyObjectHeader *h = py_header(o);
-    int32_t tag = h->type_tag;
-    if (tag == PY_TYPE_NONE || tag == PY_TYPE_BOOL || tag == PY_TYPE_INT
-        || tag == PY_TYPE_FLOAT || tag == PY_TYPE_STR || tag == PY_TYPE_LIST
-        || tag == PY_TYPE_DICT || tag == PY_TYPE_TUPLE || tag == PY_TYPE_SET
-        || tag == PY_TYPE_FUNC || tag == PY_TYPE_CLASS || tag == PY_TYPE_INSTANCE
-        || tag == PY_TYPE_EXC || tag == PY_TYPE_FILE || tag == PY_TYPE_ITER
-        || tag == PY_TYPE_GEN || tag == PY_TYPE_COMPLEX || tag == PY_TYPE_BYTES
-        || tag == PY_TYPE_BYTEARRAY || tag == PY_TYPE_MEMORYVIEW
-        || tag == PY_TYPE_COROUTINE || tag == PY_TYPE_WEAKREF
-        || tag == PY_TYPE_THREAD_LOCK || tag == PY_TYPE_THREAD_RLOCK
-        || tag == PY_TYPE_THREAD_EVENT || tag == PY_TYPE_THREAD_CONDITION
-        || tag == PY_TYPE_THREAD_SEMAPHORE
-        || tag == PY_TYPE_THREAD
-        || tag == PY_TYPE_TASK
-        || tag == PY_TYPE_CONTINUATION
-        || tag == PY_TYPE_VIRTUAL_THREAD
-        || tag == PY_TYPE_VTHREAD_CHANNEL
-        || tag >= PY_TYPE_USER) {
-        return;
-    }
-    fprintf(stderr,
-        "py_decref invalid type_tag=%d for ptr=%p (possible corruption)\n",
-        tag, o
-    );
-    fflush(stderr);
-    abort();
-}
+/* Refcount transitions are split at the graph-lock boundary.  Prepare owns
+ * canonicalization and the actual counter update; finish owns only logging
+ * and the potentially reentrant deallocation tail.  Keeping every scalar
+ * needed by finish here means it never has to resolve or decrement again. */
+typedef struct {
+    PyObject *obj;
+    int32_t type_tag;
+    int32_t flags;
+    int64_t backend;
+    int64_t new_refcount;
+    int32_t did_update;
+    int32_t underflow_before;
+    int32_t debug_bad_tag;
+    int32_t debug_bad;
+    int32_t debug_check_deferred;
+} PccRefcountPrepared;
+
+typedef struct {
+    PccRefcountPrepared new_prepared;
+    PccRefcountPrepared old_prepared;
+    int64_t backend;
+    int32_t debug_runtime_enabled;
+    int32_t state;
+} PccGcStoreRootPlanImpl;
+
+enum {
+    PCC_GC_STORE_ROOT_PLAN_ATTEMPTED = 1,
+    PCC_GC_STORE_ROOT_PLAN_PUBLISHED = 2,
+    PCC_GC_STORE_ROOT_PLAN_FINISHED = 4,
+};
+
+_Static_assert(
+    sizeof(PccRefcountPrepared) == 56,
+    "PccRefcountPrepared strict mirror size drift"
+);
+_Static_assert(
+    sizeof(PccGcRetainPlan) == sizeof(PccRefcountPrepared),
+    "PccGcRetainPlan opaque storage size drift"
+);
+_Static_assert(
+    _Alignof(PccGcRetainPlan) >= _Alignof(PccRefcountPrepared),
+    "PccGcRetainPlan opaque storage alignment drift"
+);
+_Static_assert(
+    offsetof(PccGcStoreRootPlanImpl, new_prepared) == 0,
+    "PccGcStoreRootPlan NEW packet offset drift"
+);
+_Static_assert(
+    offsetof(PccGcStoreRootPlanImpl, old_prepared) == 56,
+    "PccGcStoreRootPlan OLD packet offset drift"
+);
+_Static_assert(
+    offsetof(PccGcStoreRootPlanImpl, backend) == 112,
+    "PccGcStoreRootPlan backend offset drift"
+);
+_Static_assert(
+    offsetof(PccGcStoreRootPlanImpl, debug_runtime_enabled) == 120,
+    "PccGcStoreRootPlan debug offset drift"
+);
+_Static_assert(
+    offsetof(PccGcStoreRootPlanImpl, state) == 124,
+    "PccGcStoreRootPlan state offset drift"
+);
+_Static_assert(
+    sizeof(PccGcStoreRootPlanImpl) == sizeof(PccGcStoreRootPlan),
+    "PccGcStoreRootPlan opaque storage size drift"
+);
+_Static_assert(
+    _Alignof(PccGcStoreRootPlanImpl) <= _Alignof(PccGcStoreRootPlan),
+    "PccGcStoreRootPlan opaque storage alignment drift"
+);
+
+static void pcc_incref_prepare(
+    PyObject *o,
+    int debug_runtime_mode,
+    PccRefcountPrepared *prepared
+);
+static void pcc_incref_finish(const PccRefcountPrepared *prepared);
+static void pcc_decref_prepare(
+    PyObject *o,
+    int debug_runtime_mode,
+    PccRefcountPrepared *prepared
+);
+static void pcc_decref_finish(const PccRefcountPrepared *prepared);
 
 static int py_type_tag_is_valid(int32_t tag) {
     return (
@@ -269,6 +319,33 @@ PyObject *pcc_gc_alloc(int64_t size, int32_t type_tag, int32_t flags) {
     pcc_obj_runtime_log_event_code(1, 1, size, type_tag, NULL);
     int32_t stored_flags = flags;
     int64_t backend = pcc_gc_backend();
+    if (
+        backend == PCC_GC_KIND_COLORED_RELOCATING
+        && (
+            type_tag == PY_TYPE_LIST
+            || type_tag == PY_TYPE_TUPLE
+            || type_tag == PY_TYPE_DICT
+            || type_tag == PY_TYPE_SET
+            || type_tag == PY_TYPE_PROPERTY
+            || type_tag == PY_TYPE_CLASSMETHOD
+            || type_tag == PY_TYPE_WEAKREF
+            /* Every remaining tag pcc_gc_colored_relocate_copy_supported_tag
+             * accepts (GC-P1-BACKEND4-RELOCATABLE-TAGS-LACK-FRESH-ALLOC):
+             * without FRESH_ALLOC a mid-construction object can enter the
+             * relocation set.  Each tag's constructor publishes on its
+             * success path, mirroring the seven originals. */
+            || type_tag == PY_TYPE_FUNC
+            || type_tag == PY_TYPE_ITER
+            || type_tag == PY_TYPE_GEN
+            || type_tag == PY_TYPE_COROUTINE
+            || type_tag == PY_TYPE_CONTINUATION
+            || type_tag == PY_TYPE_TASK
+            || type_tag == PY_TYPE_EXC
+            || type_tag == PY_TYPE_CLASS
+            || type_tag == PY_TYPE_STATICMETHOD
+            || type_tag == PY_TYPE_MEMORYVIEW
+        )
+    ) stored_flags |= PY_FLAG_GC_FRESH_ALLOC;
     PyObjectHeader *h = NULL;
     if (backend == PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR) {
         h = (PyObjectHeader *)pcc_gc_try_minor_alloc(size);
@@ -308,6 +385,17 @@ PyObject *pcc_gc_alloc(int64_t size, int32_t type_tag, int32_t flags) {
     pcc_gc_note_object_allocated_sized((PyObject *)h, size);
     pcc_obj_runtime_log_event_code(1, 2, size, type_tag, h);
     return (PyObject *)h;
+}
+
+void pcc_gc_publish_initialized(PyObject *obj) {
+    if (
+        obj == NULL
+        || PY_IS_TAGGED_INT(obj)
+        || pcc_gc_backend() != PCC_GC_KIND_COLORED_RELOCATING
+    ) return;
+    pcc_gc_root_slot_lock();
+    py_header_flags_and(py_header(obj), ~PY_FLAG_GC_FRESH_ALLOC);
+    pcc_gc_root_slot_unlock();
 }
 
 PyObject *pcc_gc_retain(PyObject *o) {
@@ -469,7 +557,91 @@ PyObject *pcc_gc_resolve_owned_ptr(PyObject *value) {
     return value;
 }
 
+static void pcc_gc_incref_fresh_native_instance(PyObject *o) {
+    if (o == NULL || PY_IS_TAGGED_INT(o)) return;
+    PyObjectHeader *h = py_header(o);
+    if (
+        h->type_tag != PY_TYPE_INSTANCE
+        && (
+            h->type_tag < PY_TYPE_USER_CLASS_START
+            || h->type_tag > 500
+        )
+    ) {
+        /* Fail safely if a future compiler caller widens the trusted lane
+         * without supplying the corresponding provenance proof. */
+        py_incref(o);
+        return;
+    }
+    int64_t backend = pcc_gc_backend();
+    int32_t flags = py_header_flags_load(h);
+    if (
+        (
+            backend == PCC_GC_KIND_INCREMENTAL_TRICOLOR
+            || backend == PCC_GC_KIND_CONCURRENT_MARK_SWEEP
+        )
+        && flags == 0
+    ) {
+        return;
+    }
+    if (
+        backend == PCC_GC_KIND_COLORED_RELOCATING
+        && pcc_gc_forwarding_population_load() > 0
+        && (flags & PY_FLAG_GC_RELOCATION_CANDIDATE) != 0
+    ) {
+        PyObject *resolved = pcc_gc_note_relocation_read(o);
+        if (resolved != NULL && resolved != o) {
+            o = resolved;
+            h = py_header(o);
+            flags = py_header_flags_load(h);
+        }
+    }
+    if (
+        backend == PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR
+        && (flags & PY_FLAG_GC_MINOR_ARENA) != 0
+        && (flags & PY_FLAG_GC_OLD) != 0
+        && pcc_refcount_load(&h->refcount) <= 0
+    ) {
+        return;
+    }
+    if (flags & PY_FLAG_IMMORTAL) return;
+    int64_t new_refcount = pcc_refcount_incref(&h->refcount);
+    pcc_obj_runtime_log_event_code(3, 1, new_refcount, h->type_tag, o);
+}
+
+int64_t pcc_gc_store_ptr_plan_commit_locked(
+    PccGcStoreRootPlan *plan,
+    PyObject *owner,
+    PyObject **slot,
+    PyObject *value
+);
+void pcc_gc_store_ptr_plan_finish(PccGcStoreRootPlan *plan);
+
 void pcc_gc_store_ptr(PyObject *owner, PyObject **slot, PyObject *value) {
+    if (slot == NULL) return;
+    int64_t backend = pcc_gc_backend();
+    if (backend == PCC_GC_KIND_REFCOUNT_CYCLE) {
+        pcc_obj_runtime_log_event_code(2, 3, backend, 0, owner);
+        PyObject *old = *slot;
+        py_incref(value);
+        *slot = value;
+        py_decref(old);
+        return;
+    }
+    PccGcStoreRootPlan plan;
+    pcc_gc_store_ptr_plan_init(&plan, owner, backend);
+    pcc_gc_root_slot_lock();
+    (void)pcc_gc_store_ptr_plan_commit_locked(
+        &plan, owner, slot, value
+    );
+    pcc_gc_root_slot_unlock();
+    pcc_gc_store_ptr_plan_finish(&plan);
+}
+
+void pcc_gc_store_ptr_fresh_native_instance(
+    PyObject *owner,
+    PyObject **slot,
+    PyObject *value
+) {
     (void)owner;
     if (slot == NULL) return;
     int64_t backend = pcc_gc_backend();
@@ -506,9 +678,160 @@ void pcc_gc_store_ptr(PyObject *owner, PyObject **slot, PyObject *value) {
     }
     pcc_obj_runtime_log_event_code(2, 3, backend, 0, owner);
     PyObject *old = *slot;
-    py_incref(value);
+    pcc_gc_incref_fresh_native_instance(value);
     *slot = value;
     py_decref(old);
+}
+
+static PccGcStoreRootPlanImpl *pcc_gc_store_root_plan_impl(
+    PccGcStoreRootPlan *plan
+) {
+    return (PccGcStoreRootPlanImpl *)(void *)plan;
+}
+
+void pcc_gc_store_root_plan_init(
+    PccGcStoreRootPlan *plan,
+    int64_t backend
+) {
+    if (plan == NULL) return;
+    memset(plan, 0, sizeof(*plan));
+    PccGcStoreRootPlanImpl *impl = pcc_gc_store_root_plan_impl(plan);
+    impl->backend = backend;
+    /* Warm getenv/cache before an enclosing graph lock.  Commit passes only
+     * this captured predicate to refcount prepare, so diagnostics cannot run
+     * from the locked transaction. */
+    impl->debug_runtime_enabled = pcc_obj_debug_runtime_enabled();
+}
+
+void pcc_gc_store_ptr_plan_init(
+    PccGcStoreRootPlan *plan,
+    PyObject *owner,
+    int64_t backend
+) {
+    pcc_gc_store_root_plan_init(plan, backend);
+    pcc_obj_runtime_log_event_code(2, 3, backend, 0, owner);
+}
+
+static int64_t pcc_gc_store_plan_commit_locked_impl(
+    PccGcStoreRootPlan *plan,
+    PyObject *owner,
+    PyObject **slot,
+    PyObject *value
+) {
+    if (plan == NULL || slot == NULL) return 0;
+    PccGcStoreRootPlanImpl *impl = pcc_gc_store_root_plan_impl(plan);
+    if (impl->state != 0) return 0;
+    impl->state = PCC_GC_STORE_ROOT_PLAN_ATTEMPTED;
+    int64_t backend = impl->backend;
+    if (
+        backend == PCC_GC_KIND_INCREMENTAL_TRICOLOR
+        || backend == PCC_GC_KIND_CONCURRENT_MARK_SWEEP
+        || backend == PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR
+        || backend == PCC_GC_KIND_COLORED_RELOCATING
+    ) {
+        pcc_gc_note_store();
+    }
+    PyObject *canonical_value = value;
+    if (
+        (
+            backend == PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR
+            || backend == PCC_GC_KIND_COLORED_RELOCATING
+        )
+        && pcc_gc_forwarding_population_load() > 0
+        && py_gc_relocation_candidate(canonical_value)
+    ) {
+        canonical_value = pcc_gc_note_relocation_read(canonical_value);
+    }
+    pcc_incref_prepare(
+        canonical_value,
+        impl->debug_runtime_enabled,
+        &impl->new_prepared
+    );
+    if (impl->new_prepared.debug_bad) {
+        /* Preserve the public helper's debug-invalid contract: telemetry and
+         * the deferred diagnostic run, but no slot publication or old-value
+         * release occurs. */
+        return 0;
+    }
+    if (
+        backend == PCC_GC_KIND_INCREMENTAL_TRICOLOR
+        || backend == PCC_GC_KIND_CONCURRENT_MARK_SWEEP
+        || backend == PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR
+        || backend == PCC_GC_KIND_COLORED_RELOCATING
+    ) {
+        pcc_gc_note_slot_write_barrier(
+            owner, slot, impl->new_prepared.obj
+        );
+    }
+    PyObject *old = *slot;
+    *slot = impl->new_prepared.obj;
+    if (
+        old != NULL
+        && !PY_IS_TAGGED_INT(old)
+        && backend == PCC_GC_KIND_COLORED_RELOCATING
+        && pcc_gc_object_is_known_no_lock(old) == 0
+    ) {
+        old = NULL;
+    }
+    pcc_decref_prepare(
+        old,
+        impl->debug_runtime_enabled,
+        &impl->old_prepared
+    );
+    impl->state |= PCC_GC_STORE_ROOT_PLAN_PUBLISHED;
+    return 1;
+}
+
+int64_t pcc_gc_store_root_plan_commit_locked(
+    PccGcStoreRootPlan *plan,
+    PyObject **slot,
+    PyObject *value
+) {
+    return pcc_gc_store_plan_commit_locked_impl(
+        plan, NULL, slot, value
+    );
+}
+
+int64_t pcc_gc_store_ptr_plan_commit_locked(
+    PccGcStoreRootPlan *plan,
+    PyObject *owner,
+    PyObject **slot,
+    PyObject *value
+) {
+    return pcc_gc_store_plan_commit_locked_impl(
+        plan, owner, slot, value
+    );
+}
+
+static void pcc_gc_store_plan_finish_impl(
+    PccGcStoreRootPlan *plan,
+    int emit_store_log
+) {
+    if (plan == NULL) return;
+    PccGcStoreRootPlanImpl *impl = pcc_gc_store_root_plan_impl(plan);
+    if (
+        (impl->state & PCC_GC_STORE_ROOT_PLAN_ATTEMPTED) == 0
+        || (impl->state & PCC_GC_STORE_ROOT_PLAN_FINISHED) != 0
+    ) {
+        return;
+    }
+    impl->state |= PCC_GC_STORE_ROOT_PLAN_FINISHED;
+    /* Preserve the historical per-call telemetry sequence while keeping all
+     * logger I/O, finalizers, weakref callbacks and frees outside the lock. */
+    if (emit_store_log) {
+        pcc_obj_runtime_log_event_code(2, 3, impl->backend, 0, NULL);
+    }
+    pcc_incref_finish(&impl->new_prepared);
+    if ((impl->state & PCC_GC_STORE_ROOT_PLAN_PUBLISHED) == 0) return;
+    pcc_decref_finish(&impl->old_prepared);
+}
+
+void pcc_gc_store_root_plan_finish(PccGcStoreRootPlan *plan) {
+    pcc_gc_store_plan_finish_impl(plan, 1);
+}
+
+void pcc_gc_store_ptr_plan_finish(PccGcStoreRootPlan *plan) {
+    pcc_gc_store_plan_finish_impl(plan, 0);
 }
 
 void pcc_gc_store_root(PyObject **slot, PyObject *value) {
@@ -517,60 +840,39 @@ void pcc_gc_store_root(PyObject **slot, PyObject *value) {
     if (backend == PCC_GC_KIND_REFCOUNT_CYCLE) {
         pcc_obj_runtime_log_event_code(2, 3, backend, 0, NULL);
         PyObject *old = *slot;
-        py_incref(value);
+        /* Skip refcount calls for values that cannot be refcounted: a tagged
+         * immediate and NULL both make py_incref/py_decref return at once, so
+         * the calls are pure overhead.  Codegen emits ~47000 store_root sites
+         * and pcc_gc_store_root measured 17.5% of a list-append loop against
+         * 5.6% for the append itself.  The slot store is unconditional; only
+         * the no-op refcount calls are elided.  Mirrors py_obj.py. */
+        if (!PY_IS_TAGGED_INT(value) && value != NULL) py_incref(value);
         *slot = value;
-        py_decref(old);
+        if (!PY_IS_TAGGED_INT(old) && old != NULL) py_decref(old);
         return;
     }
+    PccGcStoreRootPlan plan;
+    pcc_gc_store_root_plan_init(&plan, backend);
     pcc_gc_root_slot_lock();
-    if (slot != NULL) {
-        if (
-            backend == PCC_GC_KIND_INCREMENTAL_TRICOLOR
-            || backend == PCC_GC_KIND_CONCURRENT_MARK_SWEEP
-            || backend == PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR
-            || backend == PCC_GC_KIND_COLORED_RELOCATING
-        ) {
-            pcc_gc_note_store();
-        }
-        if (backend == PCC_GC_KIND_COLORED_RELOCATING) {
-            if (
-                pcc_gc_forwarding_population_load() > 0
-                && py_gc_relocation_candidate(value)
-            ) {
-                value = pcc_gc_note_relocation_read(value);
-            }
-        } else if (backend == PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR) {
-            if (
-                pcc_gc_forwarding_population_load() > 0
-                && py_gc_relocation_candidate(value)
-            ) {
-                value = pcc_gc_note_relocation_read(value);
-            }
-        }
-        if (
-            backend == PCC_GC_KIND_INCREMENTAL_TRICOLOR
-            || backend == PCC_GC_KIND_CONCURRENT_MARK_SWEEP
-            || backend == PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR
-            || backend == PCC_GC_KIND_COLORED_RELOCATING
-        ) {
-            pcc_gc_note_slot_write_barrier(NULL, slot, value);
-        }
+    (void)pcc_gc_store_root_plan_commit_locked(&plan, slot, value);
+    pcc_gc_root_slot_unlock();
+    pcc_gc_store_root_plan_finish(&plan);
+}
+
+void pcc_gc_store_root_take(PyObject **slot, PyObject *value) {
+    /* Ownership-transferring root store; mirror of py_obj.py. */
+    if (slot == NULL) return;
+    int64_t backend = pcc_gc_backend();
+    if (backend == PCC_GC_KIND_REFCOUNT_CYCLE) {
         pcc_obj_runtime_log_event_code(2, 3, backend, 0, NULL);
         PyObject *old = *slot;
-        py_incref(value);
         *slot = value;
-        if (
-            old != NULL
-            && !PY_IS_TAGGED_INT(old)
-            && backend == PCC_GC_KIND_COLORED_RELOCATING
-        ) {
-            if (pcc_gc_object_is_known_no_lock(old) == 0) {
-                old = NULL;
-            }
-        }
-        py_decref(old);
+        if (!PY_IS_TAGGED_INT(old) && old != NULL) py_decref(old);
+        return;
     }
-    pcc_gc_root_slot_unlock();
+    pcc_gc_store_root(slot, value);
+    PyObject *stored = pcc_gc_load_ptr(NULL, slot);
+    if (!PY_IS_TAGGED_INT(stored) && stored != NULL) py_decref(stored);
 }
 
 void pcc_gc_frame_enter(const void *frame_map, PyObject **slots) {
@@ -625,12 +927,33 @@ int64_t pcc_gc_collect(int32_t reason) {
             stw = pcc_stop_the_world();
         }
         pcc_gc_begin_explicit_tracing_collect();
+        /* Sweep only when a mark cycle has actually finished.  The gate is
+         * pcc_gc_sweep_owed(), not pcc_gc_has_tracing_sweep(): the latter
+         * ignores mark_active, so candidates left over from a previous
+         * unfinished sweep read true mid-mark and sweeping there frees live
+         * objects (measured).
+         *
+         * The round bound is a LIVENESS backstop only, and it is not load
+         * bearing for correctness: a step legitimately reports zero progress at
+         * a phase boundary (measured 1, 0, 6 on backend 1), so breaking on the
+         * first zero returns with work outstanding, while looping unbounded
+         * would spin if the collector never converges.  Sweeping stays gated
+         * either way. */
+        int64_t idle_rounds = 0;
         for (;;) {
-            int64_t stepped = pcc_gc_step(1024);
-            if (stepped == 0) break;
-        }
-        if (pcc_gc_has_tracing_sweep() != 0) {
-            collected += pcc_gc_collect_tracing();
+            if (pcc_gc_sweep_owed() != 0) {
+                int64_t swept = pcc_gc_collect_tracing();
+                collected += swept;
+                if (swept == 0 && pcc_gc_sweep_owed() != 0) break;
+                idle_rounds = 0;
+                continue;
+            }
+            if (pcc_gc_step(1024) > 0) {
+                idle_rounds = 0;
+                continue;
+            }
+            idle_rounds++;
+            if (idle_rounds >= 4) break;
         }
         pcc_gc_end_explicit_tracing_collect();
         (void)pcc_resume_world();
@@ -668,14 +991,51 @@ void pcc_gc_immortalize(PyObject *o) {
 
 extern void pcc_debug_bad_incref(void *o, int32_t tag);
 
-void py_incref(PyObject *o) {
+static void pcc_refcount_prepared_reset(
+    PccRefcountPrepared *prepared,
+    PyObject *o
+) {
+    if (prepared == NULL) return;
+    prepared->obj = o;
+    prepared->type_tag = -1;
+    prepared->flags = 0;
+    prepared->backend = -1;
+    prepared->new_refcount = 0;
+    prepared->did_update = 0;
+    prepared->underflow_before = 0;
+    prepared->debug_bad_tag = -1;
+    prepared->debug_bad = 0;
+    prepared->debug_check_deferred = 0;
+}
+
+static void pcc_refcount_prepare_debug_bad(
+    PccRefcountPrepared *prepared,
+    int32_t bad_tag,
+    int debug_runtime_mode
+) {
+    prepared->debug_bad_tag = bad_tag;
+    if (debug_runtime_mode > 0) {
+        prepared->debug_bad = 1;
+    } else if (debug_runtime_mode < 0) {
+        /* Public refcount calls can run inside an existing graph-lock owner.
+         * Preserve the historical lazy getenv: valid values never query the
+         * debug predicate, while invalid values defer that query to finish. */
+        prepared->debug_check_deferred = 1;
+    }
+}
+
+static void pcc_incref_prepare(
+    PyObject *o,
+    int debug_runtime_mode,
+    PccRefcountPrepared *prepared
+) {
+    pcc_refcount_prepared_reset(prepared, o);
+    if (prepared == NULL) return;
     if (o == NULL) return;
     if (PY_IS_TAGGED_INT(o)) return;  /* tagged ints carry no refcount */
     int64_t backend = pcc_gc_backend();
     if (!py_pointer_can_have_header(o)) {
-        if (pcc_obj_debug_runtime_enabled()) {
-            pcc_debug_bad_incref(o, -2);
-        }
+        pcc_refcount_prepare_debug_bad(prepared, -2, debug_runtime_mode);
         return;
     }
     PyObjectHeader *h = py_header(o);
@@ -683,9 +1043,9 @@ void py_incref(PyObject *o) {
         (!py_type_tag_is_valid(h->type_tag) || h->type_tag > 500)
         && pcc_capi_is_cext_type_tag((int64_t)h->type_tag) == 0
     ) {
-        if (pcc_obj_debug_runtime_enabled()) {
-            pcc_debug_bad_incref(o, h->type_tag);
-        }
+        pcc_refcount_prepare_debug_bad(
+            prepared, h->type_tag, debug_runtime_mode
+        );
         return;
     }
     int32_t flags = py_header_flags_load(h);
@@ -711,6 +1071,10 @@ void py_incref(PyObject *o) {
             flags = py_header_flags_load(h);
         }
     }
+    prepared->obj = o;
+    prepared->type_tag = h->type_tag;
+    prepared->flags = flags;
+    prepared->backend = backend;
     if (
         backend == PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR
         && (flags & PY_FLAG_GC_MINOR_ARENA) != 0
@@ -720,8 +1084,52 @@ void py_incref(PyObject *o) {
         return;
     }
     if (flags & PY_FLAG_IMMORTAL) return;
-    int64_t new_refcount = pcc_refcount_incref(&h->refcount);
-    pcc_obj_runtime_log_event_code(3, 1, new_refcount, h->type_tag, o);
+    prepared->new_refcount = pcc_refcount_incref(&h->refcount);
+    prepared->did_update = 1;
+}
+
+static void pcc_incref_finish(const PccRefcountPrepared *prepared) {
+    if (prepared == NULL) return;
+    if (prepared->debug_check_deferred) {
+        if (!pcc_obj_debug_runtime_enabled()) return;
+        pcc_debug_bad_incref(prepared->obj, prepared->debug_bad_tag);
+        return;
+    }
+    if (prepared->debug_bad) {
+        pcc_debug_bad_incref(prepared->obj, prepared->debug_bad_tag);
+        return;
+    }
+    if (!prepared->did_update) return;
+    pcc_obj_runtime_log_event_code(
+        3,
+        1,
+        prepared->new_refcount,
+        prepared->type_tag,
+        prepared->obj
+    );
+}
+
+PyObject *pcc_gc_retain_plan_prepare_locked(
+    PccGcRetainPlan *plan,
+    PyObject *value
+) {
+    if (plan == NULL) return NULL;
+    PccRefcountPrepared *prepared = (PccRefcountPrepared *)(void *)plan;
+    pcc_incref_prepare(value, -1, prepared);
+    return prepared->obj;
+}
+
+void pcc_gc_retain_plan_finish(PccGcRetainPlan *plan) {
+    if (plan == NULL) return;
+    PccRefcountPrepared *prepared = (PccRefcountPrepared *)(void *)plan;
+    pcc_incref_finish(prepared);
+    pcc_refcount_prepared_reset(prepared, NULL);
+}
+
+void py_incref(PyObject *o) {
+    PccRefcountPrepared prepared;
+    pcc_incref_prepare(o, -1, &prepared);
+    pcc_incref_finish(&prepared);
 }
 
 typedef struct PccTrashNode {
@@ -840,15 +1248,18 @@ static void pcc_trash_drain(void) {
     }
 }
 
-void py_decref(PyObject *o) {
-    pcc_debug_maybe_abort_bad_decref(o);
+static void pcc_decref_prepare(
+    PyObject *o,
+    int debug_runtime_mode,
+    PccRefcountPrepared *prepared
+) {
+    pcc_refcount_prepared_reset(prepared, o);
+    if (prepared == NULL) return;
     if (o == NULL) return;
     if (PY_IS_TAGGED_INT(o)) return;
     int64_t backend = pcc_gc_backend();
     if (!py_pointer_can_have_header(o)) {
-        if (pcc_obj_debug_runtime_enabled()) {
-            pcc_debug_bad_incref(o, -2);
-        }
+        pcc_refcount_prepare_debug_bad(prepared, -2, debug_runtime_mode);
         return;
     }
     PyObjectHeader *h = py_header(o);
@@ -856,9 +1267,9 @@ void py_decref(PyObject *o) {
         (!py_type_tag_is_valid(h->type_tag) || h->type_tag > 500)
         && pcc_capi_is_cext_type_tag((int64_t)h->type_tag) == 0
     ) {
-        if (pcc_obj_debug_runtime_enabled()) {
-            pcc_debug_bad_incref(o, h->type_tag);
-        }
+        pcc_refcount_prepare_debug_bad(
+            prepared, h->type_tag, debug_runtime_mode
+        );
         return;
     }
     int32_t flags = py_header_flags_load(h);
@@ -888,6 +1299,10 @@ void py_decref(PyObject *o) {
             flags = py_header_flags_load(h);
         }
     }
+    prepared->obj = o;
+    prepared->type_tag = h->type_tag;
+    prepared->flags = flags;
+    prepared->backend = backend;
     if (
         backend == PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR
         && (flags & PY_FLAG_GC_MINOR_ARENA) != 0
@@ -908,36 +1323,70 @@ void py_decref(PyObject *o) {
     ) {
         return;
     }
-    PCC_RT_TRIPWIRE(pcc_refcount_load(&h->refcount) > 0,
-                    "py_decref: refcount underflow (<=0 before decref of a live, non-immortal object)");
-    assert(pcc_refcount_load(&h->refcount) > 0 && "py_decref: refcount underflow");
-    int32_t type_tag = h->type_tag;
-    int64_t new_refcount = pcc_refcount_decref(&h->refcount);
-    PCC_RT_TRIPWIRE(new_refcount >= 0,
-                    "py_decref: refcount went negative after decref (double free / concurrent over-release)");
+    if (pcc_refcount_load(&h->refcount) <= 0) {
+        prepared->underflow_before = 1;
+        return;
+    }
+    prepared->new_refcount = pcc_refcount_decref(&h->refcount);
+    prepared->did_update = 1;
+    if (prepared->new_refcount == 0) {
+        /* Publish logical death before releasing a graph/root-slot lock.  No
+         * selector or copy path may admit this object while finish runs. */
+        py_header_flags_or(h, PY_FLAG_GC_DEALLOCATING);
+    }
+}
+
+static void pcc_decref_finish(const PccRefcountPrepared *prepared) {
+    if (prepared == NULL) return;
+    if (prepared->debug_check_deferred) {
+        if (!pcc_obj_debug_runtime_enabled()) return;
+        pcc_debug_bad_incref(prepared->obj, prepared->debug_bad_tag);
+        return;
+    }
+    if (prepared->debug_bad) {
+        pcc_debug_bad_incref(prepared->obj, prepared->debug_bad_tag);
+        return;
+    }
+    if (prepared->underflow_before) {
+        PCC_RT_TRIPWIRE(
+            0,
+            "py_decref: refcount underflow (<=0 before decref of a live, non-immortal object)"
+        );
+        assert(0 && "py_decref: refcount underflow");
+        return;
+    }
+    if (!prepared->did_update) return;
+    PyObject *o = prepared->obj;
+    int32_t type_tag = prepared->type_tag;
+    int32_t flags = prepared->flags;
+    int64_t new_refcount = prepared->new_refcount;
+    PCC_RT_TRIPWIRE(
+        new_refcount >= 0,
+        "py_decref: refcount went negative after decref (double free / concurrent over-release)"
+    );
     assert(new_refcount >= 0 && "py_decref: refcount underflow");
     if (new_refcount > 0) {
+        /* Non-terminal finish is captured-scalar telemetry only. */
         pcc_obj_runtime_log_event_code(3, 2, new_refcount, type_tag, o);
         return;
     }
     int delay_zpage_freeing_note = (
-        backend == PCC_GC_KIND_COLORED_RELOCATING
+        prepared->backend == PCC_GC_KIND_COLORED_RELOCATING
         && (flags & PY_FLAG_GC_ZPAGE_ALLOC) != 0
     );
-    /* Publish logical death before logging, weakref invalidation, graph
-     * locking, or any other operation that can reach a safepoint.  This is a
-     * dedicated state rather than a refcount==0 test: forwarding shells may
-     * legitimately have a zero count without entering deallocation. */
-    py_header_flags_or(h, PY_FLAG_GC_DEALLOCATING);
+    int delay_instance_metadata = (
+        type_tag == PY_TYPE_INSTANCE
+        || type_tag >= PY_TYPE_USER_CLASS_START
+    );
     pcc_obj_runtime_log_event_code(3, 2, new_refcount, type_tag, o);
-    pcc_refcount_forget(&h->refcount);
+    pcc_refcount_forget(&py_header(o)->refcount);
     pcc_obj_runtime_log_event_code(3, 3, 0, type_tag, o);
 
     py_weakref_invalidate(o);
-    if (!delay_zpage_freeing_note) {
+    if (!delay_zpage_freeing_note && !delay_instance_metadata) {
         pcc_gc_note_object_freeing(o);
     }
-    py_gc_untrack(o);
+    if (!delay_instance_metadata) py_gc_untrack(o);
     /* zpage-resident objects must dealloc IMMEDIATELY, but their zpage
      * accounting cannot be decremented before type-specific dealloc runs:
      * the last object on a page may recycle the span, and finalizers still
@@ -945,7 +1394,7 @@ void py_decref(PyObject *o) {
     if (
         pcc_trash_dealloc_depth > 0
         && pcc_trash_should_defer(type_tag)
-        && (py_header_flags_load(h) & PY_FLAG_GC_ZPAGE_ALLOC) == 0
+        && (flags & PY_FLAG_GC_ZPAGE_ALLOC) == 0
         && pcc_trash_enqueue(o, type_tag)
     ) {
         return;
@@ -959,8 +1408,15 @@ void py_decref(PyObject *o) {
     pcc_trash_dealloc_depth--;
     if (
         delay_zpage_freeing_note
+        && !delay_instance_metadata
         && pcc_gc_pointer_is_managed(o) != 0
     ) {
         pcc_gc_note_object_freeing(o);
     }
+}
+
+void py_decref(PyObject *o) {
+    PccRefcountPrepared prepared;
+    pcc_decref_prepare(o, -1, &prepared);
+    pcc_decref_finish(&prepared);
 }

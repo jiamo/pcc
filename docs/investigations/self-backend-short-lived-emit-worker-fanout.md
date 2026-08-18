@@ -2,7 +2,7 @@
 
 ## Status
 
-active again: bounded concurrency retained compiler heap across an unbounded batch
+resolved
 
 ## Problem Description
 
@@ -95,3 +95,32 @@ two each for two), while retaining the explicit per-chain override and
 restoring four workers for the last chain.  Focused scheduling tests pass, and
 the forced-rebuild five-GC matrix passes all five backends in 1306.29 seconds
 with a sampled 13.13 GiB peak.  Complete-suite validation remains open.
+
+## Update 2026-09-04 — current guarded Stage2 closes the reopened safety boundary
+
+The later memory circuit breaker and measured admission scheduler replace the
+unsafe assumption that a fixed process count bounds memory. Each compiled
+worker remains short-lived; lane admission uses observed process-tree RSS and
+per-item floors, stops admitting under pressure, and can suspend/resume the
+youngest worker. An external 8 GiB process-tree guard remains authoritative.
+
+Frozen current-source Stage2 completed rc0 in 1349.675s at
+7,812,333,568 bytes peak and produced a runnable libSystem-only pcc2. The 224
+misses were split into one serial, six paired-oversized, eight heavy, sixteen
+medium and 193 small workers; pressure produced 2,161 denied admission polls
+and three suspend/resume cycles rather than unbounded fanout. No sampler table
+retry or child leak occurred.
+
+Current cache/identity focused gates pass 17 cases and bootstrap resource/cache
+gates pass seven. The retained phase-reuse receipt remains byte-identical and
+93.2% faster on an equivalent warm invocation. Full details are in
+`docs/goal/evidence/PERF-P0-SELF-BOOTSTRAP-PHASE-REUSE/002-current-cache-contract-and-safety-reclosure.md`.
+
+## Report
+
+The original fixed-width pool was insufficient because compiler heaps grow by
+module; the resolved design combines short-lived workers, lane-specific
+measured admission, live RSS feedback and an external hard ceiling. The result
+is memory safety, not acceptable cold performance: the 1350-second Stage2 is
+now owned by the native data-plane emit task. Fresh final-source Stage3 and
+GC1--4 remain deliberately downstream rather than being inferred here.

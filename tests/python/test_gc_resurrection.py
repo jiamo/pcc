@@ -115,6 +115,46 @@ def test_resurrection_is_transitive(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_collect_after_resurrection_still_reclaims_unrelated_garbage(tmp_path):
+    """A collect whose PASS-0 ran a resurrecting finalizer must not disable the
+    NEXT collect.  Backend 1 fabricated an active mark cycle from its write
+    barrier, so the following gc.collect() began no cycle, computed no
+    candidates and reclaimed nothing at all - not even unrelated garbage."""
+    result = _compile_and_run(tmp_path, """
+        import gc
+
+        zs = []
+
+        class A:
+            def __init__(self):
+                self.me = self
+
+        class Z(A):
+            def __del__(self):
+                zs.append(self)
+
+        def make(n: int) -> None:
+            i = 0
+            while i < n:
+                A()
+                i = i + 1
+
+        def main() -> None:
+            Z()
+            print(gc.collect())        # 0 - Z resurrected itself
+            zs.clear()
+            make(30)
+            print(gc.collect())        # >= 30 - the fresh cycles at least
+
+        if __name__ == "__main__":
+            main()
+        """)
+    assert result.returncode == 0, result.stderr
+    out = result.stdout.strip().split("\n")
+    assert out[0] == "0"
+    assert int(out[1]) >= 30
+
+
 def test_resurrection_does_not_block_other_cleanup(tmp_path):
     """A resurrecting object in a batch must NOT prevent peer
     (non-resurrecting) cycles from being reclaimed."""

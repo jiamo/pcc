@@ -27,7 +27,11 @@ from llvmlite import binding as llvm
 
 from pcc.backend import macho_spec as spec
 from pcc.backend.aarch64_fp_immediates import DIRECT_FP_IMMEDIATE_ENCODINGS
-from pcc.backend.arm64_encode import EncodeError, assemble_text
+from pcc.backend.arm64_encode import (
+    EncodeError,
+    assemble_text,
+    assemble_text_lines,
+)
 from pcc.backend.self_backend_aarch64_darwin_regs import emit_fp_constant
 from pcc.backend.self_backend_float_bits import float32_to_bits, float64_to_bits
 from pcc.backend.self_backend_ir import TypeDesc
@@ -57,6 +61,17 @@ else:
     _GATE = None
 
 pytestmark = pytest.mark.pcc_gate(unavailable=_GATE)
+
+
+def test_line_input_api_matches_string_projection() -> None:
+    text = """\
+_entry:
+  movz w0, #42
+  cbz w0, L_done
+L_done:
+  ret
+"""
+    assert assemble_text_lines(text.splitlines()) == assemble_text(text)
 
 
 def _run(cmd, **kw):
@@ -258,6 +273,10 @@ Lfwd:
 	fneg	d0, d1
 	fabs	d0, d1
 	fsqrt	d0, d1
+	frintm	d11, d9
+	frintn	d0, d1
+	frintp	d31, d0
+	frintz	d5, d17
 	fmov	d0, d1
 	fmov	d0, x9
 	fmov	x9, d0

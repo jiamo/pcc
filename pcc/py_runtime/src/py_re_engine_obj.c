@@ -155,7 +155,7 @@ static PyObject *re_match_method_call(PyObject *captures, PyObject *args) {
         py_decref(text);
         py_decref(spans);
         py_decref(names);
-        py_raise(py_exc_new(
+        py_raise_owned(py_exc_new(
             PY_EXC_NOTIMPLEMENTEDERROR,
             "pcc re: multi-group Match method arguments are not supported"
         ));
@@ -193,7 +193,7 @@ static PyObject *re_match_method_call(PyObject *captures, PyObject *args) {
         py_decref(text);
         py_decref(spans);
         py_decref(names);
-        py_raise(py_exc_new(PY_EXC_INDEXERROR, "no such group"));
+        py_raise_owned(py_exc_new(PY_EXC_INDEXERROR, "no such group"));
         return NULL;
     }
     {
@@ -322,17 +322,17 @@ static PyObject *re_match_object_new(PyObject *pattern, PyObject *text,
 
 static void re_engine_raise_for(int r) {
     if (r == PCC_RE_UNSUPPORTED) {
-        py_raise(py_exc_new(
+        py_raise_owned(py_exc_new(
             PY_EXC_NOTIMPLEMENTEDERROR,
             "pcc re: pattern outside the native regex subset (no-libpython)"
         ));
     } else if (r == PCC_RE_NONASCII) {
-        py_raise(py_exc_new(
+        py_raise_owned(py_exc_new(
             PY_EXC_NOTIMPLEMENTEDERROR,
             "pcc re: non-ASCII text outside the native regex subset"
         ));
     } else {
-        py_raise(py_exc_new(
+        py_raise_owned(py_exc_new(
             PY_EXC_RUNTIMEERROR,
             "pcc re: native regex engine limit reached"
         ));
@@ -448,14 +448,14 @@ PyObject *py_re_engine_sub(PyObject *pattern, PyObject *repl, PyObject *text,
     if (pattern == NULL || repl == NULL || text == NULL) return py_None;
     if (py_type_of(pattern) != PY_TYPE_STR || py_type_of(repl) != PY_TYPE_STR ||
         py_type_of(text) != PY_TYPE_STR) {
-        py_raise(py_exc_new(
+        py_raise_owned(py_exc_new(
             PY_EXC_TYPEERROR,
             "pcc re: sub expects string pattern, replacement, and text"
         ));
         return NULL;
     }
     if (re_str_has_byte(repl, '\\')) {
-        py_raise(py_exc_new(
+        py_raise_owned(py_exc_new(
             PY_EXC_NOTIMPLEMENTEDERROR,
             "pcc re: backslash replacement templates are not supported"
         ));
@@ -539,7 +539,7 @@ PyObject *py_re_engine_split(PyObject *pattern, PyObject *text,
     PyObject *out;
     if (pattern == NULL || text == NULL) return py_None;
     if (py_type_of(pattern) != PY_TYPE_STR || py_type_of(text) != PY_TYPE_STR) {
-        py_raise(py_exc_new(
+        py_raise_owned(py_exc_new(
             PY_EXC_TYPEERROR,
             "pcc re: split expects string pattern and text"
         ));
@@ -668,7 +668,7 @@ static PyObject *re_pattern_method_call(PyObject *captures, PyObject *args) {
         PyObject *text;
         if (nargs < 2) {
             py_decref(pattern);
-            py_raise(py_exc_new(
+            py_raise_owned(py_exc_new(
                 PY_EXC_TYPEERROR,
                 "pcc re: Pattern.sub expects replacement and string"
             ));
@@ -690,7 +690,7 @@ static PyObject *re_pattern_method_call(PyObject *captures, PyObject *args) {
         PyObject *text;
         if (nargs < 1) {
             py_decref(pattern);
-            py_raise(py_exc_new(
+            py_raise_owned(py_exc_new(
                 PY_EXC_TYPEERROR,
                 "pcc re: Pattern.split expects a string"
             ));
@@ -709,7 +709,7 @@ static PyObject *re_pattern_method_call(PyObject *captures, PyObject *args) {
         PyObject *text;
         if (nargs < 1) {
             py_decref(pattern);
-            py_raise(py_exc_new(
+            py_raise_owned(py_exc_new(
                 PY_EXC_TYPEERROR,
                 "pcc re: Pattern method expects one string argument"
             ));
@@ -778,14 +778,14 @@ PyObject *py_re_compile_obj(PyObject *pattern, int64_t flags) {
     PyObject *inst;
     const char *p;
     if (pattern == NULL || py_type_of(pattern) != PY_TYPE_STR) {
-        py_raise(py_exc_new(
+        py_raise_owned(py_exc_new(
             PY_EXC_TYPEERROR,
             "pcc re: re.compile pattern must be a string"
         ));
         return NULL;
     }
     if ((flags & ~(int64_t)PCC_RE_OK_FLAGS) != 0) {
-        py_raise(py_exc_new(
+        py_raise_owned(py_exc_new(
             PY_EXC_NOTIMPLEMENTEDERROR,
             "pcc re: re.compile flags are outside the native regex subset"
         ));
@@ -793,7 +793,7 @@ PyObject *py_re_compile_obj(PyObject *pattern, int64_t flags) {
     }
     p = py_str_utf8(pattern);
     if (p == NULL || !pcc_re_engine_supported_flags(p, flags)) {
-        py_raise(py_exc_new(
+        py_raise_owned(py_exc_new(
             PY_EXC_NOTIMPLEMENTEDERROR,
             "pcc re: pattern outside the native regex subset (no-libpython)"
         ));
@@ -851,20 +851,20 @@ PyObject *py_re_engine_truth_flags_from(PyObject *pattern, PyObject *text,
     }
     if (r == PCC_RE_NOMATCH) return py_None;
     if (r == PCC_RE_UNSUPPORTED) {
-        py_raise(py_exc_new(
+        py_raise_owned(py_exc_new(
             PY_EXC_NOTIMPLEMENTEDERROR,
             "pcc re: pattern outside the native regex subset (no-libpython)"
         ));
         return NULL;
     }
     if (r == PCC_RE_NONASCII) {
-        py_raise(py_exc_new(
+        py_raise_owned(py_exc_new(
             PY_EXC_NOTIMPLEMENTEDERROR,
             "pcc re: non-ASCII text outside the native regex subset"
         ));
         return NULL;
     }
-    py_raise(py_exc_new(
+    py_raise_owned(py_exc_new(
         PY_EXC_RUNTIMEERROR,
         "pcc re: native regex engine limit reached"
     ));
@@ -893,7 +893,7 @@ PyObject *py_re_engine_fullmatch_flags(PyObject *pattern, PyObject *text,
         return py_None;
     }
     if ((flags & ~(int64_t)(2 | 8 | 16)) != 0) {
-        py_raise(py_exc_new(
+        py_raise_owned(py_exc_new(
             PY_EXC_NOTIMPLEMENTEDERROR,
             "pcc re: flags outside the native regex subset (no-libpython)"
         ));
@@ -915,20 +915,20 @@ PyObject *py_re_engine_fullmatch_flags(PyObject *pattern, PyObject *text,
     }
     if (r == PCC_RE_NOMATCH) return py_None;
     if (r == PCC_RE_UNSUPPORTED) {
-        py_raise(py_exc_new(
+        py_raise_owned(py_exc_new(
             PY_EXC_NOTIMPLEMENTEDERROR,
             "pcc re: pattern outside the native regex subset (no-libpython)"
         ));
         return NULL;
     }
     if (r == PCC_RE_NONASCII) {
-        py_raise(py_exc_new(
+        py_raise_owned(py_exc_new(
             PY_EXC_NOTIMPLEMENTEDERROR,
             "pcc re: non-ASCII text outside the native regex subset"
         ));
         return NULL;
     }
-    py_raise(py_exc_new(
+    py_raise_owned(py_exc_new(
         PY_EXC_RUNTIMEERROR,
         "pcc re: native regex engine limit reached"
     ));

@@ -178,6 +178,31 @@ class L1CodeGenEntrypointMixin:
             + function_name
             + "\n"
         )
+        # Under a self-compiled stage the runtime keeps one frame per error
+        # check the exception crossed, and that trail is the only way to see
+        # WHERE a failing lookup sits.  Printing it needs ``traceback`` (a
+        # stdlib shim the stage1 closure must not grow by) or a ``pcc.extern``
+        # declaration (which the same-package walker would also link in), so
+        # it is not emitted here.  Recipe, from
+        # docs/investigations/pcc1-host-mixin-state-outside-contract-aliases-slots.md:
+        # temporarily ``import traceback``, then ``try: raise exc / except
+        # BaseException: write(traceback.format_exc())`` -- the re-raise makes
+        # the object the handled exception again, so its accumulated frames
+        # print.  The context line below comes before ``str(exc)``, which has
+        # segfaulted a corrupted stage.
+        try:
+            _write_line(
+                "PCC_CODEGEN_EXCEPTION_CONTEXT "
+                + "stmt_index="
+                + str(getattr(self, "_codegen_current_stmt_index", -1))
+                + " stmt_kind="
+                + str(getattr(self, "_codegen_current_stmt_kind", ""))
+                + " expr_kind="
+                + str(getattr(self, "_codegen_current_expr_kind", ""))
+                + "\n"
+            )
+        except Exception:
+            pass
         try:
             _write_line(
                 "PCC_CODEGEN_EXCEPTION_DETAIL message="
@@ -273,6 +298,19 @@ class L1CodeGenEntrypointMixin:
         StmtDispatchLoweringMixin._emit_stmts_impl(self, stmts)
 
     def _emit_stmt(self, stmt: Stmt) -> None:
+        # Marker BEFORE _di_locate: the debug-info location stamp is the first
+        # thing every statement goes through, so a failure there would leave any
+        # later marker unwritten and look like "the loop never ran".
+        # `span` (not `line`) is the attribute every statement carries; the
+        # earlier marker used `.line` and broke stage1 with
+        # "'If' object has no attribute 'line'".
+        _sp = getattr(stmt, "span", None)
+        _loc = "?"
+        if _sp is not None:
+            _loc = str(_sp.line) + ":" + str(_sp.col)
+        self._prologue_mark("pre_di " + str(type(stmt).__name__) + " @" + _loc)
+        self._di_locate(stmt)
+        self._prologue_mark("post_di " + str(type(stmt).__name__) + " @" + _loc)
         if self._codegen_trace_is_enabled():
             stmt_kind = ""
             stmt_index = self._codegen_current_stmt_index

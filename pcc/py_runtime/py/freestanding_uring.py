@@ -23,6 +23,8 @@ Owned surface (stable C ABI names):
   pcc_uring_cq_peek, pcc_uring_cq_advance, pcc_uring_cq_ready
 """
 
+__pcc_runtime_port__ = True
+
 from pcc.extern import c_abi_typed_export, c_int64, c_ptr, c_void, extern
 from pcc.unsafe import (
     cstr,

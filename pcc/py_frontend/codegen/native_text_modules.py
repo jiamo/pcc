@@ -403,6 +403,32 @@ class NativeTextModulesLoweringMixin:
             or len(expr.args) != 1
         ):
             return None
+        if attr.name == "load":
+            if expr.kwargs:
+                return None
+            source = expr.args[0]
+            if (
+                not isinstance(source, Name)
+                or not getattr(self, "_native_file_env_flags", {}).get(
+                    source.ident,
+                    False,
+                )
+            ):
+                return None
+            file_obj = self._emit_expr(source)
+            text_obj = self.builder.call(
+                self.runtime["py_file_read_all"],
+                [file_obj],
+                name=self._fresh("json.load.read"),
+            )
+            self._emit_post_call_err_check(getattr(expr, "span", None))
+            result = self.builder.call(
+                self.runtime["py_json_loads"],
+                [text_obj],
+                name=self._fresh("json.load"),
+            )
+            self._emit_post_call_err_check(getattr(expr, "span", None))
+            return result
         # Native strings are emitted as UTF-8, so literal
         # `ensure_ascii=False` selects the existing native behavior. Literal
         # `sort_keys` can be combined with it. Other keyword forms stay on the

@@ -272,6 +272,10 @@ extern int32_t pcc_gc_backend_selected;
 extern int32_t pcc_gc_config_initialized;
 extern int32_t pcc_gc_cycle_requested;
 extern int32_t pcc_gc_mark_active;
+extern int64_t pcc_gc_tracing_cycle_epoch;
+extern int64_t pcc_gc_tracing_finish_claim_epoch;
+extern int64_t pcc_gc_tracing_finish_claim_backend;
+extern int64_t pcc_gc_tracing_finish_commits;
 extern int32_t pcc_gc_cms_worker_started;
 extern int32_t pcc_gc_cms_worker_starts;
 extern int32_t pcc_gc_cms_worker_stops;
@@ -279,6 +283,12 @@ extern int32_t pcc_gc_cms_worker_drains;
 extern void *pcc_gc_cms_worker_handle;
 
 void *pcc_platform_getenv(void *name) { (void)name; return NULL; }
+int64_t pcc_platform_write(int64_t fd, void *data, int64_t length) {
+    (void)fd;
+    (void)data;
+    return length;
+}
+void pcc_platform_abort(void) { abort(); }
 int64_t pcc_threads_enabled(void) { return 1; }
 int64_t pcc_thread_start(void **out, void *entry, void *arg) {
     WorkerHandle *handle = (WorkerHandle *)calloc(1, sizeof(*handle));
@@ -308,8 +318,22 @@ int64_t pcc_platform_monotonic_us(void) {
     if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) return 0;
     return (int64_t)now.tv_sec * 1000000 + now.tv_nsec / 1000;
 }
-int64_t pcc_stop_the_world(void) { return 0; }
-int64_t pcc_resume_world(void) { return 0; }
+static _Thread_local int64_t world_owned;
+static int64_t stop_calls;
+static int64_t resume_calls;
+int64_t pcc_stop_the_world(void) {
+    if (world_owned != 0) return -1;
+    world_owned = 1;
+    stop_calls++;
+    return 0;
+}
+int64_t pcc_resume_world(void) {
+    if (world_owned == 0) return -1;
+    world_owned = 0;
+    resume_calls++;
+    return 0;
+}
+int64_t pcc_thread_owns_stopped_world(void) { return world_owned; }
 int64_t pcc_gc_tracing_has_sweep_candidate(void) { return 0; }
 int64_t pcc_gc_tracing_sweep_unreachable(int64_t budget) {
     (void)budget;
@@ -317,8 +341,36 @@ int64_t pcc_gc_tracing_sweep_unreachable(int64_t budget) {
 }
 void pcc_py_gc_minor_graph_lock(void) {}
 void pcc_py_gc_minor_graph_unlock(void) {}
-void pcc_gc_begin_mark_cycle(void) { pcc_gc_mark_active = 1; }
-int64_t pcc_gc_finish_tracing_cycle(void) { return 1; }
+void pcc_gc_begin_mark_cycle(void) {
+    pcc_gc_tracing_cycle_epoch++;
+    pcc_gc_mark_active = 1;
+    pcc_gc_cycle_requested = 0;
+}
+void pcc_gc_tracing_finish_claim_clear_unlocked(
+    int64_t claim_epoch, int64_t claim_backend
+) {
+    if (
+        pcc_gc_tracing_finish_claim_epoch == claim_epoch
+        && pcc_gc_tracing_finish_claim_backend == claim_backend
+    ) {
+        pcc_gc_tracing_finish_claim_epoch = 0;
+        pcc_gc_tracing_finish_claim_backend = -1;
+    }
+}
+int64_t pcc_gc_finish_tracing_cycle(
+    int64_t claim_epoch, int64_t claim_backend
+) {
+    if (
+        pcc_gc_tracing_finish_claim_epoch != claim_epoch
+        || pcc_gc_tracing_finish_claim_backend != claim_backend
+        || pcc_gc_tracing_cycle_epoch != claim_epoch
+        || pcc_gc_backend_selected != claim_backend
+    ) return 0;
+    pcc_gc_mark_active = 0;
+    pcc_gc_tracing_finish_commits++;
+    pcc_gc_tracing_finish_claim_clear_unlocked(claim_epoch, claim_backend);
+    return 1;
+}
 void pcc_gc_trace_referents(void *obj) { (void)obj; }
 int64_t pcc_gc_gray_count_load_acquire(void) { return 0; }
 void pcc_gc_gray_count_decrement_acq_rel(void) {}
@@ -335,11 +387,27 @@ int main(void) {
         || pcc_gc_cms_worker_handle == NULL
     ) return 10;
     pcc_gc_cms_note_alloc(64);
-    for (int i = 0; i < 1000 && pcc_gc_cms_worker_drains == 0; i++) {
+    for (
+        int i = 0;
+        i < 1000
+            && __atomic_load_n(
+                &pcc_gc_cms_worker_drains, __ATOMIC_ACQUIRE
+            ) == 0;
+        i++
+    ) {
         pcc_platform_sleep_ns(1000000);
     }
-    if (pcc_gc_cms_worker_drains == 0) return 11;
+    if (
+        __atomic_load_n(&pcc_gc_cms_worker_drains, __ATOMIC_ACQUIRE)
+        == 0
+    ) return 11;
     pcc_gc_cms_stop_worker();
+    if (
+        pcc_gc_tracing_finish_commits == 0
+        || stop_calls != resume_calls
+        || pcc_gc_tracing_finish_claim_epoch != 0
+        || pcc_gc_tracing_finish_claim_backend != -1
+    ) return 13;
     if (
         pcc_gc_cms_worker_started != 0
         || pcc_gc_cms_worker_handle != NULL

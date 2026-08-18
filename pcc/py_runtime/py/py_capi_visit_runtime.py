@@ -15,6 +15,8 @@ Owned surface (stable C ABI names):
   pcc_capi_visit_cext_object_slots_i64, pcc_capi_visit_cext_object_slot_ref
 """
 
+__pcc_runtime_port__ = True
+
 from pcc.extern import c_abi_typed_export, c_int32, c_int64, c_ptr, c_void, extern
 from pcc.unsafe import (
     call_i64_ptr2,
@@ -88,6 +90,21 @@ def pcc_capi_visit_cext_object_slots(o, visit, ctx) -> int:
     return 1
 
 
+@c_abi_typed_export(
+    "pcc_capi_visit_cext_object_slot_i64_adapter",
+    "void",
+    ("ptr", "i64", "ptr"),
+)
+def pcc_capi_visit_cext_object_slot_i64_adapter(
+    slot, role: int, arg
+) -> None:
+    if ptr_is_null(arg) or ptr_is_null(load_ptr(arg, 0)):
+        return
+    call_void_ptr_i64_ptr(
+        load_ptr(arg, 0), slot, role, load_ptr(arg, 8)
+    )
+
+
 @c_abi_typed_export("pcc_capi_visit_cext_object_slots_i64", "i32", ("ptr", "ptr", "ptr"))
 def pcc_capi_visit_cext_object_slots_i64(o, visit, ctx) -> int:
     if ptr_is_null(visit):
@@ -96,5 +113,7 @@ def pcc_capi_visit_cext_object_slots_i64(o, visit, ctx) -> int:
     store_ptr(visit_ctx, 0, visit)
     store_ptr(visit_ctx, 8, ctx)
     return pcc_capi_visit_cext_object_slots(
-        o, function_addr("pcc_capi_visit_cext_object_slot_ref"), visit_ctx
+        o,
+        function_addr("pcc_capi_visit_cext_object_slot_i64_adapter"),
+        visit_ctx,
     )

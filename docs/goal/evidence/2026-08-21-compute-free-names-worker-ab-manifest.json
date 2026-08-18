@@ -1,0 +1,517 @@
+{
+  "claim": "single frozen class_gen frontend worker",
+  "frozen": {
+    "baseline_pcc1": "b2ba3969609dd0ba2b25b5c9d99cc480b606f451af57d01517001d0afda29d47",
+    "candidate_pcc1": "0da3fad8a480fcf3fd719715cbb3bfe2bf13db339536b20ff14a797c6b31ecf1",
+    "module_81_ast": "02c90f74d88d452ada1e5f137ef1dfb88ad63cba2dcb0d49bacaea7800b1f4a5",
+    "native_exports": "d6a5902b6fe741cd6e80bf2312871845703932e22c9e11a569a7c2f1e1573912",
+    "runtime_archive": "b42890eeca1e1387c7282be0297a9f7daadb1042c0efb65d533cf8b94375b3d0",
+    "worker_ir": "19f1c3b6d0278941f30e35c9ae7ea67a21b301b3e85c7018ae0b37ffb10030ea",
+    "worker_manifest": "7fa94593c0550f2ab316360e9b00528564cd36dd2113e9ff55a35d08fca95cd6"
+  },
+  "pair_order": [
+    [
+      "candidate",
+      "baseline"
+    ],
+    [
+      "baseline",
+      "candidate"
+    ],
+    [
+      "baseline",
+      "candidate"
+    ],
+    [
+      "candidate",
+      "baseline"
+    ]
+  ],
+  "pairs": [
+    {
+      "baseline": {
+        "arm": "baseline",
+        "command": [
+          "/usr/bin/time",
+          "-lp",
+          "-o",
+          "/private/tmp/pcc-hoist-walker-ab.o2mKYC/worker-ab-v2/pair-01-arm-b/worker.time",
+          "/private/tmp/pcc-hoist-walker-ab.o2mKYC/build2-arm-b/pcc1",
+          "--pcc-python-multi-codegen-worker",
+          "/private/tmp/pcc-hoist-walker-ab.o2mKYC/worker-ab-v2/pair-01-arm-b/worker.manifest"
+        ],
+        "ir_sha256": "19f1c3b6d0278941f30e35c9ae7ea67a21b301b3e85c7018ae0b37ffb10030ea",
+        "ir_size_bytes": 10888793,
+        "manifest_sha256": "3437b1b9264d8c6461b81723ce2e84c0c1912ff2ad7da0329d68a5ef4284122b",
+        "metrics": {
+          "cpu_s": 28.970000000000002,
+          "cycles": 96201587969,
+          "instructions": 343861527054,
+          "max_rss_bytes": 2519416832,
+          "peak_footprint_bytes": 2473691320,
+          "system_s": 0.85,
+          "user_s": 28.12,
+          "wall_s": 29.36
+        },
+        "result_sha256": "32b7df7111e0738cb1d5127576ba8fa93e8c4e73513f2af6ff2282c9af37e949",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "time_sha256": "584e788e018dbd079c1e44f1e1e3f9bf953e6ad3278b22125f77a2a7305eb6f2",
+        "worker_phase_ms": []
+      },
+      "candidate": {
+        "arm": "candidate",
+        "command": [
+          "/usr/bin/time",
+          "-lp",
+          "-o",
+          "/private/tmp/pcc-hoist-walker-ab.o2mKYC/worker-ab-v2/pair-01-arm-a/worker.time",
+          "/private/tmp/pcc-hoist-walker-ab.o2mKYC/build2-arm-a/pcc1",
+          "--pcc-python-multi-codegen-worker",
+          "/private/tmp/pcc-hoist-walker-ab.o2mKYC/worker-ab-v2/pair-01-arm-a/worker.manifest"
+        ],
+        "ir_sha256": "19f1c3b6d0278941f30e35c9ae7ea67a21b301b3e85c7018ae0b37ffb10030ea",
+        "ir_size_bytes": 10888793,
+        "manifest_sha256": "9800ea7fecd3c8caad4ceede4fa93ce8f99b209a1006b4fee9ea01a82322d98e",
+        "metrics": {
+          "cpu_s": 28.35,
+          "cycles": 94243456505,
+          "instructions": 335653691055,
+          "max_rss_bytes": 2519384064,
+          "peak_footprint_bytes": 2473674936,
+          "system_s": 0.76,
+          "user_s": 27.59,
+          "wall_s": 28.66
+        },
+        "result_sha256": "a6b2625caa18c63847c33d167d7bd26b16a4b0fbc9f99b7e40009279c92a6a43",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "time_sha256": "40fccf722a048b954f5d0ea54967606d2461345076530afe692f819dd3d04fd6",
+        "worker_phase_ms": []
+      },
+      "index": 1,
+      "order": [
+        "candidate",
+        "baseline"
+      ]
+    },
+    {
+      "baseline": {
+        "arm": "baseline",
+        "command": [
+          "/usr/bin/time",
+          "-lp",
+          "-o",
+          "/private/tmp/pcc-hoist-walker-ab.o2mKYC/worker-ab-v2/pair-02-arm-b/worker.time",
+          "/private/tmp/pcc-hoist-walker-ab.o2mKYC/build2-arm-b/pcc1",
+          "--pcc-python-multi-codegen-worker",
+          "/private/tmp/pcc-hoist-walker-ab.o2mKYC/worker-ab-v2/pair-02-arm-b/worker.manifest"
+        ],
+        "ir_sha256": "19f1c3b6d0278941f30e35c9ae7ea67a21b301b3e85c7018ae0b37ffb10030ea",
+        "ir_size_bytes": 10888793,
+        "manifest_sha256": "6b87fba3392f5cd4ba5c3a611f14b0c1f0afcbae4612e957243f37232ea19fe1",
+        "metrics": {
+          "cpu_s": 28.87,
+          "cycles": 95638899805,
+          "instructions": 343561408205,
+          "max_rss_bytes": 2519400448,
+          "peak_footprint_bytes": 2473674936,
+          "system_s": 0.68,
+          "user_s": 28.19,
+          "wall_s": 29.3
+        },
+        "result_sha256": "d77d27572074f687a71e8ea45c9d5550e475c7713ea1c6adb2af2cbbade44769",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "time_sha256": "50b96fd36c3e2ebfc97b8dc2d57d2e7bdbb0a9d73f63b1ceebdc40a69d55616c",
+        "worker_phase_ms": []
+      },
+      "candidate": {
+        "arm": "candidate",
+        "command": [
+          "/usr/bin/time",
+          "-lp",
+          "-o",
+          "/private/tmp/pcc-hoist-walker-ab.o2mKYC/worker-ab-v2/pair-02-arm-a/worker.time",
+          "/private/tmp/pcc-hoist-walker-ab.o2mKYC/build2-arm-a/pcc1",
+          "--pcc-python-multi-codegen-worker",
+          "/private/tmp/pcc-hoist-walker-ab.o2mKYC/worker-ab-v2/pair-02-arm-a/worker.manifest"
+        ],
+        "ir_sha256": "19f1c3b6d0278941f30e35c9ae7ea67a21b301b3e85c7018ae0b37ffb10030ea",
+        "ir_size_bytes": 10888793,
+        "manifest_sha256": "72243895b6b7d15d33b8ea6a9f36e6e0dbe08874063ffa86aeec7002813202d0",
+        "metrics": {
+          "cpu_s": 28.560000000000002,
+          "cycles": 94834120870,
+          "instructions": 335823741812,
+          "max_rss_bytes": 2519400448,
+          "peak_footprint_bytes": 2473691320,
+          "system_s": 0.78,
+          "user_s": 27.78,
+          "wall_s": 28.8
+        },
+        "result_sha256": "e95141659325fb6cee41add6d9603d4111c3440ea97e693409790023186758f4",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "time_sha256": "bcea15db1701494f12ed0f317341e25f085f6bd44897e66fe47b0f9b7248a4fd",
+        "worker_phase_ms": []
+      },
+      "index": 2,
+      "order": [
+        "baseline",
+        "candidate"
+      ]
+    },
+    {
+      "baseline": {
+        "arm": "baseline",
+        "command": [
+          "/usr/bin/time",
+          "-lp",
+          "-o",
+          "/private/tmp/pcc-hoist-walker-ab.o2mKYC/worker-ab-v2/pair-03-arm-b/worker.time",
+          "/private/tmp/pcc-hoist-walker-ab.o2mKYC/build2-arm-b/pcc1",
+          "--pcc-python-multi-codegen-worker",
+          "/private/tmp/pcc-hoist-walker-ab.o2mKYC/worker-ab-v2/pair-03-arm-b/worker.manifest"
+        ],
+        "ir_sha256": "19f1c3b6d0278941f30e35c9ae7ea67a21b301b3e85c7018ae0b37ffb10030ea",
+        "ir_size_bytes": 10888793,
+        "manifest_sha256": "81a609ed07d5b81172dba986b6130e4362d1e9abe51f2552c587f59b001de6d5",
+        "metrics": {
+          "cpu_s": 28.92,
+          "cycles": 96051143390,
+          "instructions": 343489603269,
+          "max_rss_bytes": 2519433216,
+          "peak_footprint_bytes": 2473691320,
+          "system_s": 0.87,
+          "user_s": 28.05,
+          "wall_s": 29.13
+        },
+        "result_sha256": "08e1c26ab6e43b34d5092788532de67d4cf9809b1305c97bb8488d5cffb6f8df",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "time_sha256": "04cc6fc3ee444f87eb8a918e377c383671c8d1d087930023d7c0ef088aaf1ed3",
+        "worker_phase_ms": []
+      },
+      "candidate": {
+        "arm": "candidate",
+        "command": [
+          "/usr/bin/time",
+          "-lp",
+          "-o",
+          "/private/tmp/pcc-hoist-walker-ab.o2mKYC/worker-ab-v2/pair-03-arm-a/worker.time",
+          "/private/tmp/pcc-hoist-walker-ab.o2mKYC/build2-arm-a/pcc1",
+          "--pcc-python-multi-codegen-worker",
+          "/private/tmp/pcc-hoist-walker-ab.o2mKYC/worker-ab-v2/pair-03-arm-a/worker.manifest"
+        ],
+        "ir_sha256": "19f1c3b6d0278941f30e35c9ae7ea67a21b301b3e85c7018ae0b37ffb10030ea",
+        "ir_size_bytes": 10888793,
+        "manifest_sha256": "c705359faece6baa97f543b67a5c84310471cb5d051a336fe1043b541c693dd0",
+        "metrics": {
+          "cpu_s": 28.61,
+          "cycles": 94883275260,
+          "instructions": 335860942881,
+          "max_rss_bytes": 2519384064,
+          "peak_footprint_bytes": 2473691320,
+          "system_s": 0.79,
+          "user_s": 27.82,
+          "wall_s": 29.11
+        },
+        "result_sha256": "6c1cc82eb2accbcf2705fed912769022fb4d8c7f247da651dfa9fbfb20e13137",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "time_sha256": "174f49d2a6a4d6a469f324604797a97244c3ce3548358e43c099b040c736029d",
+        "worker_phase_ms": []
+      },
+      "index": 3,
+      "order": [
+        "baseline",
+        "candidate"
+      ]
+    },
+    {
+      "baseline": {
+        "arm": "baseline",
+        "command": [
+          "/usr/bin/time",
+          "-lp",
+          "-o",
+          "/private/tmp/pcc-hoist-walker-ab.o2mKYC/worker-ab-v2/pair-04-arm-b/worker.time",
+          "/private/tmp/pcc-hoist-walker-ab.o2mKYC/build2-arm-b/pcc1",
+          "--pcc-python-multi-codegen-worker",
+          "/private/tmp/pcc-hoist-walker-ab.o2mKYC/worker-ab-v2/pair-04-arm-b/worker.manifest"
+        ],
+        "ir_sha256": "19f1c3b6d0278941f30e35c9ae7ea67a21b301b3e85c7018ae0b37ffb10030ea",
+        "ir_size_bytes": 10888793,
+        "manifest_sha256": "fc1ad3d2f61ea7eecf298fa580431f6ac2ed612e08b2dc4ba3ac038a3bbc9149",
+        "metrics": {
+          "cpu_s": 28.900000000000002,
+          "cycles": 96088502332,
+          "instructions": 343335961293,
+          "max_rss_bytes": 2519433216,
+          "peak_footprint_bytes": 2473691320,
+          "system_s": 0.8,
+          "user_s": 28.1,
+          "wall_s": 29.05
+        },
+        "result_sha256": "f8fa09cf16ff358b5f2b12ada2b0fe4d6c963157c6abeecfc499abaa934ed691",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "time_sha256": "573e2ac68e15ee6e06220e8a2e251e90f477e8628720117e00913c88c6173db1",
+        "worker_phase_ms": []
+      },
+      "candidate": {
+        "arm": "candidate",
+        "command": [
+          "/usr/bin/time",
+          "-lp",
+          "-o",
+          "/private/tmp/pcc-hoist-walker-ab.o2mKYC/worker-ab-v2/pair-04-arm-a/worker.time",
+          "/private/tmp/pcc-hoist-walker-ab.o2mKYC/build2-arm-a/pcc1",
+          "--pcc-python-multi-codegen-worker",
+          "/private/tmp/pcc-hoist-walker-ab.o2mKYC/worker-ab-v2/pair-04-arm-a/worker.manifest"
+        ],
+        "ir_sha256": "19f1c3b6d0278941f30e35c9ae7ea67a21b301b3e85c7018ae0b37ffb10030ea",
+        "ir_size_bytes": 10888793,
+        "manifest_sha256": "020d50d1b4689c48c5bf6eae78ac3e7ba222e52c1d5e009edc1e6e58201c191b",
+        "metrics": {
+          "cpu_s": 28.73,
+          "cycles": 95062065699,
+          "instructions": 335734413931,
+          "max_rss_bytes": 2519367680,
+          "peak_footprint_bytes": 2473674936,
+          "system_s": 0.88,
+          "user_s": 27.85,
+          "wall_s": 29.2
+        },
+        "result_sha256": "a32236fedc9600e8ec96139e60674ce66bab22a3b24e9ac2f2e17dd6debc581b",
+        "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "time_sha256": "b8203476cd512e04d0851e535cdab57007a1431743d5173fb86326bb6f75bf34",
+        "worker_phase_ms": []
+      },
+      "index": 4,
+      "order": [
+        "candidate",
+        "baseline"
+      ]
+    }
+  ],
+  "schema": "pcc.frontend-worker-ab.v1",
+  "status": "DENY",
+  "summary": {
+    "baseline_medians": {
+      "cpu_s": 28.910000000000004,
+      "cycles": 96069822861.0,
+      "instructions": 343525505737.0,
+      "max_rss_bytes": 2519425024.0,
+      "peak_footprint_bytes": 2473691320.0,
+      "wall_s": 29.215
+    },
+    "candidate_medians": {
+      "cpu_s": 28.585,
+      "cycles": 94858698065.0,
+      "instructions": 335779077871.5,
+      "max_rss_bytes": 2519384064.0,
+      "peak_footprint_bytes": 2473683128.0,
+      "wall_s": 28.955
+    },
+    "median_wall_speedup": 1.0089794508720429,
+    "paired_max_resource_ratios": {
+      "cpu_s": 0.9941176470588234,
+      "cycles": 0.9915852342860397,
+      "instructions": 0.9778597402574066,
+      "max_rss_bytes": 1.0,
+      "peak_footprint_bytes": 1.0000066233439817
+    },
+    "paired_median_resource_ratios": {
+      "cpu_s": 0.9892714922284807,
+      "cycles": 0.9885794920816882,
+      "instructions": 0.9776343891504337,
+      "max_rss_bytes": 0.9999837423328841,
+      "peak_footprint_bytes": 0.9999966883499434
+    },
+    "paired_median_wall_speedup": 1.0090240801175616,
+    "paired_resource_ratios": {
+      "cpu_s": [
+        0.97859855022437,
+        0.9892622099064774,
+        0.989280774550484,
+        0.9941176470588234
+      ],
+      "cycles": [
+        0.9796455390670787,
+        0.9915852342860397,
+        0.9878411845108593,
+        0.9893177996525171
+      ],
+      "instructions": [
+        0.9761304032198082,
+        0.977478068816207,
+        0.9777907094846603,
+        0.9778597402574066
+      ],
+      "max_rss_bytes": [
+        0.9999869938155593,
+        1.0,
+        0.9999804908502088,
+        0.9999739878002784
+      ],
+      "peak_footprint_bytes": [
+        0.9999933766998867,
+        1.0000066233439817,
+        1.0,
+        0.9999933766998867
+      ]
+    },
+    "paired_wall_speedup_range": [
+      0.9948630136986302,
+      1.0244242847173761
+    ],
+    "paired_wall_speedups": [
+      1.0244242847173761,
+      1.0173611111111112,
+      1.0006870491240123,
+      0.9948630136986302
+    ],
+    "resource_regressions": [],
+    "thresholds": {
+      "max_candidate_compute_ratio": 1.0,
+      "max_candidate_memory_ratio": 1.02,
+      "max_each_pair_compute_ratio": 1.0,
+      "max_each_pair_memory_ratio": 1.02,
+      "min_each_pair_wall_speedup": 1.0,
+      "min_median_wall_speedup": 1.08,
+      "min_paired_median_wall_speedup": 1.08
+    },
+    "verdict": "DENY"
+  },
+  "warmup_order": [
+    "candidate",
+    "baseline",
+    "baseline",
+    "candidate"
+  ],
+  "warmups": [
+    {
+      "arm": "candidate",
+      "command": [
+        "/usr/bin/time",
+        "-lp",
+        "-o",
+        "/private/tmp/pcc-hoist-walker-ab.o2mKYC/worker-ab-v2/warmup-01-arm-a/worker.time",
+        "/private/tmp/pcc-hoist-walker-ab.o2mKYC/build2-arm-a/pcc1",
+        "--pcc-python-multi-codegen-worker",
+        "/private/tmp/pcc-hoist-walker-ab.o2mKYC/worker-ab-v2/warmup-01-arm-a/worker.manifest"
+      ],
+      "ir_sha256": "19f1c3b6d0278941f30e35c9ae7ea67a21b301b3e85c7018ae0b37ffb10030ea",
+      "ir_size_bytes": 10888793,
+      "manifest_sha256": "8dc41613067c3b77fe35a931c805125722d1be666f7617ff8dbb02b467c67e99",
+      "metrics": {
+        "cpu_s": 27.99,
+        "cycles": 93224963580,
+        "instructions": 335549669846,
+        "max_rss_bytes": 2519629824,
+        "peak_footprint_bytes": 2473937104,
+        "system_s": 0.49,
+        "user_s": 27.5,
+        "wall_s": 28.57
+      },
+      "result_sha256": "2fd2460fba5bfcc9f9c92ada3896b0df0233ee9c0c7b15b8d1a8ef264687f428",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "time_sha256": "31311c38c4e2f6fbd02db589dd55a620e460f09801ce61cccce50336679f1f39",
+      "worker_phase_ms": []
+    },
+    {
+      "arm": "baseline",
+      "command": [
+        "/usr/bin/time",
+        "-lp",
+        "-o",
+        "/private/tmp/pcc-hoist-walker-ab.o2mKYC/worker-ab-v2/warmup-02-arm-b/worker.time",
+        "/private/tmp/pcc-hoist-walker-ab.o2mKYC/build2-arm-b/pcc1",
+        "--pcc-python-multi-codegen-worker",
+        "/private/tmp/pcc-hoist-walker-ab.o2mKYC/worker-ab-v2/warmup-02-arm-b/worker.manifest"
+      ],
+      "ir_sha256": "19f1c3b6d0278941f30e35c9ae7ea67a21b301b3e85c7018ae0b37ffb10030ea",
+      "ir_size_bytes": 10888793,
+      "manifest_sha256": "e84829d638eafeaa37a904150b5e610482e8f5158b8f9ac9db284a6ad9badebc",
+      "metrics": {
+        "cpu_s": 28.33,
+        "cycles": 94428745484,
+        "instructions": 343706453897,
+        "max_rss_bytes": 2519547904,
+        "peak_footprint_bytes": 2473806008,
+        "system_s": 0.49,
+        "user_s": 27.84,
+        "wall_s": 28.48
+      },
+      "result_sha256": "749f45a6bc06c1ec2a92212731a43c131dc12662d7999dd888d0f2c7fd3bb7b8",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "time_sha256": "563d7abb2414c5631cf4794580a750af8df3e7ee963da41d0947d0786ae3a516",
+      "worker_phase_ms": []
+    },
+    {
+      "arm": "baseline",
+      "command": [
+        "/usr/bin/time",
+        "-lp",
+        "-o",
+        "/private/tmp/pcc-hoist-walker-ab.o2mKYC/worker-ab-v2/warmup-03-arm-b/worker.time",
+        "/private/tmp/pcc-hoist-walker-ab.o2mKYC/build2-arm-b/pcc1",
+        "--pcc-python-multi-codegen-worker",
+        "/private/tmp/pcc-hoist-walker-ab.o2mKYC/worker-ab-v2/warmup-03-arm-b/worker.manifest"
+      ],
+      "ir_sha256": "19f1c3b6d0278941f30e35c9ae7ea67a21b301b3e85c7018ae0b37ffb10030ea",
+      "ir_size_bytes": 10888793,
+      "manifest_sha256": "5a91f0354744dc714e98ffc1b8c6cce7a261006eedff28956f6cf121c89ba7db",
+      "metrics": {
+        "cpu_s": 28.5,
+        "cycles": 94763059451,
+        "instructions": 343274648249,
+        "max_rss_bytes": 2519531520,
+        "peak_footprint_bytes": 2473806008,
+        "system_s": 0.53,
+        "user_s": 27.97,
+        "wall_s": 29.01
+      },
+      "result_sha256": "4731b727b33c283f1b7b7bd0e8391c1265b0bce6dd49836486d798dc604578fa",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "time_sha256": "dfabbaaff200b79c16fd6eca9c987c87540b867136521b1397b526e9773cc9f8",
+      "worker_phase_ms": []
+    },
+    {
+      "arm": "candidate",
+      "command": [
+        "/usr/bin/time",
+        "-lp",
+        "-o",
+        "/private/tmp/pcc-hoist-walker-ab.o2mKYC/worker-ab-v2/warmup-04-arm-a/worker.time",
+        "/private/tmp/pcc-hoist-walker-ab.o2mKYC/build2-arm-a/pcc1",
+        "--pcc-python-multi-codegen-worker",
+        "/private/tmp/pcc-hoist-walker-ab.o2mKYC/worker-ab-v2/warmup-04-arm-a/worker.manifest"
+      ],
+      "ir_sha256": "19f1c3b6d0278941f30e35c9ae7ea67a21b301b3e85c7018ae0b37ffb10030ea",
+      "ir_size_bytes": 10888793,
+      "manifest_sha256": "4cd6ce48b5a84ac051bc04e231fa43893f666d69fcc52c1ed763aeec343f6ad8",
+      "metrics": {
+        "cpu_s": 27.94,
+        "cycles": 92989871191,
+        "instructions": 335552822226,
+        "max_rss_bytes": 2519515136,
+        "peak_footprint_bytes": 2473822392,
+        "system_s": 0.5,
+        "user_s": 27.44,
+        "wall_s": 28.22
+      },
+      "result_sha256": "a3ba6b51dce940b0996d0582d934319c6bcedb0756b4a6668681f3ad6ba969ca",
+      "stderr_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "time_sha256": "17f617a2e9b84fa10ae84e548625598c8794e9840b75eca849fad153b5238db0",
+      "worker_phase_ms": []
+    }
+  ]
+}

@@ -118,6 +118,27 @@ PyObject *pcc_gc_alloc(int64_t size, int32_t type_tag, int32_t flags);
  * runtime-owned indexes and never inspect an unproven candidate header. */
 int64_t pcc_gc_pointer_is_managed(PyObject *obj);
 int64_t pcc_gc_pointer_register(PyObject *obj);
+/* Slab-granule provenance map (design: ARCH-P0-PROVENANCE-GRANULE-MAP).
+ * Registration serializes its own sole writer; callers must not hold the
+ * allocator lock.  A duplicate granule is rejected without changing its
+ * immutable descriptor.  The registered 64 KiB mapping and its descriptor
+ * are permanent.  For kind 1, every carved cell's lifecycle word must be
+ * initialized before registration publishes any key. */
+int64_t pcc_gc_granule_register_slab(void *slab, int64_t kind, int64_t stride);
+void *pcc_gc_granule_span(void *ptr);
+int64_t pcc_gc_granule_kind(void *ptr);
+int64_t pcc_gc_granule_is_object_start(void *ptr);
+/* Object-family slot lifecycle.  publish: 1 handled, 0 unknown, -1 invalid;
+ * retire: 1 handled/idempotent, 0 unknown, -1 invalid.  Allocation reserves
+ * a slot; only a fully initialized PyObject may be published LIVE.  These
+ * operations and the objecthood query are ownership-epoch provenance checks,
+ * not a pin/lease or an address-generation token: a stale pointer must never
+ * publish or retire a cell after its ownership epoch has ended. */
+int64_t pcc_gc_granule_object_publish(void *ptr);
+int64_t pcc_gc_granule_object_retire(void *ptr);
+/* Diagnostic alias for the production LIVE-positive predicate.  Production
+ * callers use the normal managed-pointer API; this helper has no callers. */
+int64_t pcc_gc_granule_s2_candidate_positive(PyObject *obj);
 int64_t pcc_gc_pointer_unregister(PyObject *obj);
 PyObject *pcc_gc_retain(PyObject *o);
 void      pcc_gc_release(PyObject *o);
@@ -130,6 +151,7 @@ PyObject *pcc_gc_load_borrowed_ptr(PyObject *owner, PyObject **slot);
 PyObject *pcc_gc_resolve_owned_ptr(PyObject *value);
 void      pcc_gc_store_ptr(PyObject *owner, PyObject **slot, PyObject *value);
 void      pcc_gc_store_root(PyObject **slot, PyObject *value);
+void      pcc_gc_store_root_take(PyObject **slot, PyObject *value); /* consumes value's reference */
 void      pcc_gc_note_write_barrier(PyObject *owner, PyObject *value);
 void      pcc_gc_note_slot_write_barrier(
     PyObject *owner,
@@ -253,8 +275,28 @@ int64_t   pcc_gc_backend4_evacuation_drain(int64_t budget);
 int64_t   pcc_gc_backend4_evacuation_page_drain(int64_t page_budget);
 int64_t   pcc_gc_relocation_set_contains(PyObject *o);
 int64_t   pcc_gc_relocation_set_size(void);
+/* Historical raw edge installer.  Returns -3 without mutation when the
+ * selected backend needs relocation/oldification payload-commit adjuncts
+ * which this public seam cannot provide. */
 int64_t   pcc_gc_install_forwarding(PyObject *from, PyObject *to);
 PyObject *pcc_gc_relocate_copy(PyObject *o, int64_t size);
+/* Raw graph-lock-held cross-object transaction used by relocation-source
+ * retirement.  prepare allocates and snapshots without mutation; commit
+ * detaches owner store/remembered/zpage metadata without decref; finish
+ * releases the detached store-buffer references.  prepare/preflight may
+ * report failure; an invariant failure after commit starts mutating is an
+ * unconditional fail-stop and never returns partial state to the caller. */
+void     *pcc_gc_backend4_source_side_table_plan_prepare(PyObject *owner);
+int64_t   pcc_gc_backend4_source_side_table_plan_commit(void *plan);
+void      pcc_gc_backend4_source_side_table_plan_finish(
+    void *plan,
+    PyObject *decref_exclusion
+);
+/* Relocation-source ownership cleanup.  The caller holds the GC graph lock
+ * and preserves the source forwarding edge/flags through this call.  The
+ * transaction also removes any still-live source zpage owner/payload-span
+ * accounting before independent raw payload storage is freed. */
+int64_t   pcc_gc_relocation_retire_source_payload(PyObject *o);
 PyObject *pcc_gc_note_relocation_read(PyObject *o);
 
 enum {
@@ -426,6 +468,21 @@ int64_t   pcc_gc_backend4_evacuation_candidate_zpage_bytes(void);
 int64_t   pcc_gc_backend4_small_page_candidate_zpage_bytes(void);
 int64_t   pcc_gc_backend4_medium_page_candidate_zpage_bytes(void);
 int64_t   pcc_gc_backend4_evacuation_page_candidate_score(void);
+/* Deterministic diagnostic seam for relocation-reseed revalidation and OOM
+ * tests. pause is a phase bitmask (1=count/prepare, 2=aggregate, 4=page scan).
+ * Defaults are
+ * pause=0/allocation_limit=-1; production callers should not configure it. */
+void      pcc_gc_backend4_reseed_plan_probe_config(
+    int64_t pause,
+    int64_t allocation_limit
+);
+int64_t   pcc_gc_backend4_reseed_plan_probe_state(void);
+/* Deterministic Backend-3 remembered-owner OOM seam.  -1 is the production
+ * default, 0 forces overflow fallback, and positive values allow that many
+ * remembered-node allocations before forcing fallback. */
+void      pcc_gc_backend3_remembered_scan_probe_config(
+    int64_t allocation_limit
+);
 int64_t   pcc_gc_backend4_evacuation_page_candidate_bytes(void);
 int64_t   pcc_gc_backend4_evacuation_page_dirty_cards(void);
 int64_t   pcc_gc_backend4_store_buffer_drain_batches(void);
@@ -545,6 +602,42 @@ int64_t pcc_current_thread_id(void);
 void   *pcc_current_native_thread_token(void);
 int64_t pcc_refcount_strategy(void);
 void    pcc_thread_safepoint(void);
+/* Acquire-only observation of the thread-kernel stop publication.  This
+ * diagnostic performs no registration, lock, or safepoint and is not the
+ * generated-code poll contract.  Threaded stop/resume publish with release;
+ * the nonthread implementation always returns zero. */
+int64_t pcc_thread_stop_requested_acquire(void);
+/* Bounded, non-blocking native no-park regions.  A safepoint reached at
+ * nonzero depth returns without parking; the outermost exit always services
+ * the real safepoint path.  Regions may protect only short owner-derived raw
+ * memory transactions.  They must not span user callbacks, decref/finalizer
+ * execution, condition/join waits, blocking I/O, or any other unbounded call.
+ *
+ * A raw/extension pthread must register with pcc_current_thread_id() before it
+ * acquires a managed owner/raw address.  pcc_thread_no_park_enter() verifies
+ * registration defensively, but cannot make a pointer obtained before first
+ * registration safe retroactively.  These primitives do not yet wrap GC4
+ * graph/collector/container operations, do not prove acquire/release
+ * visibility for generated-code stop polls, and do not prove that a managed
+ * pcc_thread_start argument or result can survive relocation across its raw
+ * native handle/pthread handoff. */
+void    pcc_thread_no_park_enter(void);
+void    pcc_thread_no_park_exit(void);
+int64_t pcc_thread_no_park_depth(void);
+int64_t pcc_thread_owns_stopped_world(void);
+/* Diagnostic only: number of first-registration pthreads currently waiting
+ * for an active stopped-world epoch to resume.  It is protected by the world
+ * lock and is not an additional liveness lease. */
+int64_t pcc_thread_registration_waiter_count(void);
+/* Raw pthreads that called pcc_current_thread_id() must unregister before
+ * native thread exit.  Repeated/unregistered calls are safe no-ops; calling
+ * with a live no-park depth, or while the threaded runtime caller owns an
+ * active stopped-world epoch, is an unconditional fail-stop.  Recursive
+ * threaded teardown during exception/buffer cleanup also fail-stops instead
+ * of running cleanup twice.  The nonthread implementation remains a
+ * depth-checked no-op.  pcc_thread_start uses the same teardown path from its
+ * trampoline. */
+void    pcc_thread_unregister_current(void);
 int64_t pcc_stop_the_world(void);
 int64_t pcc_resume_world(void);
 int64_t pcc_runtime_now_us(void);
@@ -692,6 +785,7 @@ PyObject *py_bytes_strip(PyObject *o);
 PyObject *py_bytes_getitem(PyObject *o, PyObject *k);
 PyObject *py_bytes_slice(PyObject *o, PyObject *lo, PyObject *hi, PyObject *step);
 PyObject *py_bytes_concat(PyObject *a, PyObject *b);
+PyObject *py_bytes_join(PyObject *sep, PyObject *list); /* bytes/bytearray sep, list|tuple of bytes-like */
 PyObject *py_bytes_repeat(PyObject *src, int64_t count);
 PyObject *py_bytes_maketrans(PyObject *x, PyObject *y);
 PyObject *py_bytes_translate(PyObject *src, PyObject *table);
@@ -729,6 +823,7 @@ PyObject *py_str_new(const char *utf8, int64_t byte_len);
 int64_t   py_str_len(PyObject *s);             /* in codepoints */
 int64_t   py_str_byte_len(PyObject *s);        /* in UTF-8 bytes */
 const char *py_str_utf8(PyObject *s);          /* borrowed, NUL-terminated */
+const char *pcc_capi_str_utf8_pinned(PyObject *s);
 int64_t   py_str_ord(PyObject *s);             /* first codepoint, -1 on empty/invalid */
 int64_t   py_str_ord_at_i64(PyObject *s, int64_t i); /* codepoint at index, -1 invalid */
 int64_t   py_str_byte_at_i64(PyObject *s, int64_t i); /* raw UTF-8 byte, -1 invalid */
@@ -780,6 +875,9 @@ PyObject *py_os_urandom(PyObject *n);
 /* ---- List -------------------------------------------------------------- */
 PyObject *py_list_new(int64_t initial_capacity);
 void      py_list_append(PyObject *lst, PyObject *item);
+/* Borrowed-item append for compiler-proven fresh native instances.  This is
+ * not ownership transfer: the caller keeps and releases its owned ref. */
+void      py_list_append_fresh_native_instance(PyObject *lst, PyObject *item);
 PyObject *py_list_get(PyObject *lst, int64_t i);     /* new ref */
 PyObject *py_list_getitem(PyObject *lst, int64_t i); /* a[i]; IndexError if OOB */
 int64_t   py_list_get_i64(PyObject *lst, int64_t i); /* borrowed typed-int fast path */
@@ -890,6 +988,7 @@ int64_t   py_weak_key_dict_len(PyObject *dict);
 void      py_dealloc_weakref(PyObject *ref);
 PyObject *py_obj_getattr(PyObject *o, const char *name);
 PyObject *py_obj_getattr_default(PyObject *o, const char *name);
+PyObject *py_obj_getattr_maybe(PyObject *o, const char *name);
 PyObject *py_obj_vars(PyObject *o);
 int64_t   py_obj_setattr(PyObject *o, const char *name, PyObject *v);
 int64_t   py_obj_delattr(PyObject *o, const char *name);
@@ -899,6 +998,10 @@ PyObject *py_builtin_type_for_tag(int64_t tag);
 int64_t py_builtin_type_class_tag(PyObject *value);
 PyObject *py_obj_getitem(PyObject *o, PyObject *k);
 PyObject *py_obj_getitem_i64(PyObject *o, int64_t idx);
+/* Raising subscript entry points for frontend ``o[k]`` / ``o[i]``: the
+ * getitem primitives above stay silent-NULL for internal callers. */
+PyObject *py_obj_subscript(PyObject *o, PyObject *k);
+PyObject *py_obj_subscript_i64(PyObject *o, int64_t idx);
 int64_t   py_obj_setitem(PyObject *o, PyObject *k, PyObject *v);
 int64_t   py_obj_setitem_i64(PyObject *o, int64_t idx, PyObject *v);
 int64_t   py_obj_delitem(PyObject *o, PyObject *k);
@@ -1503,6 +1606,12 @@ void py_exc_append_frame(PyObject *exc,
                          const char *func_name,
                          const char *filename,
                          int32_t line);
+void py_exc_append_frame_indexed(PyObject *exc,
+                                 const char *func_name,
+                                 const char *filename,
+                                 const int32_t *lines,
+                                 const char *const *sources,
+                                 int32_t index);
 void py_exc_append_frame_source(PyObject *exc,
                                 const char *func_name,
                                 const char *filename,
@@ -1535,6 +1644,8 @@ void py_gc_init(void);
 int64_t py_gc_collect(void);
 void py_gc_track(PyObject *o);
 void py_gc_untrack(PyObject *o);
+int64_t pcc_gc_tracked_node_pool_cached_count(void);
+void pcc_gc_tracked_node_pool_drain(void);
 void py_gc_enable(void);
 void py_gc_disable(void);
 int64_t py_gc_is_enabled(void);
@@ -1589,6 +1700,9 @@ void   *py_cpy_iter_next(void *it);
  * get() borrows; the dealloc hook releases the foreign ref. */
 PyObject *py_cpy_handle_new(void *cpy_ref);
 void     *py_cpy_handle_get(PyObject *o);
+/* Move the one owned foreign reference from `from` to `to`.  `to` may hold
+ * the same pointer after a bytewise GC copy, or NULL during rollback. */
+void      pcc_cpy_handle_move_owned_ref(PyObject *from, PyObject *to);
 void      py_dealloc_cpy_handle(PyObject *o);
 void      py_cpy_handle_set_release_fn(void (*fn)(void *));
 PyObject *py_cpy_to_pcc_str(void *cpy_obj);

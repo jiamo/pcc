@@ -8,6 +8,8 @@ docs/goal/task-board.yaml so the workflow has no PyYAML dependency.
 from __future__ import annotations
 
 import argparse
+import datetime as dt
+import hashlib
 import json
 from pathlib import Path
 import sys
@@ -20,6 +22,7 @@ HEAD_TRUTH_MANIFEST = ROOT / "docs" / "goal" / "head-truth-manifest.json"
 CANONICAL_GOAL_PROTOCOL = "docs/goal/goal-prompt.md"
 
 VALID_PRIORITIES = {"P0": 0, "P1": 1, "P2": 2, "P3": 3}
+VALID_DISPATCH = {"NORMAL", "IMMEDIATE"}
 VALID_STATUSES = {
     "DISCOVERED",
     "TODO_READY",
@@ -165,6 +168,10 @@ def validate(board: dict[str, Any], root: Path = ROOT) -> list[str]:
         priority = task.get("priority")
         if priority not in VALID_PRIORITIES:
             errors.append(f"{task_id}: invalid priority {priority!r}")
+
+        dispatch = task.get("dispatch", "NORMAL")
+        if dispatch not in VALID_DISPATCH:
+            errors.append(f"{task_id}: invalid dispatch {dispatch!r}")
 
         status = task.get("status")
         if status not in VALID_STATUSES:
@@ -328,6 +335,7 @@ def sorted_open_tasks(
     indexed = list(enumerate(tasks))
     indexed.sort(
         key=lambda item: (
+            0 if item[1].get("dispatch", "NORMAL") == "IMMEDIATE" else 1,
             item[1].get("rank", item[0]),
             VALID_PRIORITIES.get(item[1].get("priority"), 99),
             item[1].get("id", ""),
@@ -335,7 +343,7 @@ def sorted_open_tasks(
     )
     open_tasks: list[dict[str, Any]] = []
     for _, task in indexed:
-        if task.get("status") == "DONE_STRONG":
+        if task.get("status") in {"BLOCKED", "DONE_STRONG"}:
             continue
         if active_only and active_milestone and task.get("milestone") != active_milestone:
             continue
@@ -364,10 +372,142 @@ def blocked_open_tasks(board: dict[str, Any]) -> list[tuple[dict[str, Any], list
             for dependency in task.get("depends_on", [])
             if task_by_id[dependency].get("status") != "DONE_STRONG"
         ]
-        if unmet:
+        if task.get("status") == "BLOCKED" or unmet:
             blocked.append((task, unmet))
     blocked.sort(key=lambda item: (item[0].get("rank", 0), item[0]["id"]))
     return blocked
+
+
+def _active_immediate_tasks(board: dict[str, Any]) -> list[dict[str, Any]]:
+    active_milestone = board.get("active_milestone")
+    tasks = [
+        task
+        for task in board["tasks"]
+        if task.get("status") != "DONE_STRONG"
+        and task.get("dispatch", "NORMAL") == "IMMEDIATE"
+        and (
+            not active_milestone
+            or task.get("milestone") == active_milestone
+        )
+    ]
+    tasks.sort(
+        key=lambda task: (
+            task.get("rank", 0),
+            VALID_PRIORITIES.get(task.get("priority"), 99),
+            task.get("id", ""),
+        )
+    )
+    return tasks
+
+
+def _unfinished_dependency_closure(
+    board: dict[str, Any], tasks: list[dict[str, Any]]
+) -> set[str]:
+    """Return unfinished prerequisites that can unblock supplied tasks."""
+
+    task_by_id = {task["id"]: task for task in board["tasks"]}
+    unfinished: set[str] = set()
+
+    def visit(task: dict[str, Any]) -> None:
+        for dependency_id in task.get("depends_on", []):
+            dependency = task_by_id[dependency_id]
+            if dependency.get("status") == "DONE_STRONG":
+                continue
+            if dependency_id in unfinished:
+                continue
+            unfinished.add(dependency_id)
+            if dependency.get("status") != "BLOCKED":
+                visit(dependency)
+
+    for task in tasks:
+        if task.get("status") != "BLOCKED":
+            visit(task)
+    return unfinished
+
+
+def resume_state(
+    board: dict[str, Any],
+) -> tuple[str, dict[str, Any] | None]:
+    """Return the runner-neutral continuation outcome and selected task.
+
+    COMPLETE is deliberately board-wide rather than milestone-local. A
+    finished active milestone with unfinished rows elsewhere requires an
+    explicit board transition, so it cannot be mistaken for full completion.
+    """
+
+    open_tasks = sorted_open_tasks(board)
+    immediate_tasks = _active_immediate_tasks(board)
+    if immediate_tasks:
+        ready_immediate = [
+            task
+            for task in open_tasks
+            if task.get("dispatch", "NORMAL") == "IMMEDIATE"
+        ]
+        if ready_immediate:
+            return "CONTINUE", ready_immediate[0]
+
+        prerequisite_ids = _unfinished_dependency_closure(
+            board, immediate_tasks
+        )
+        ready_prerequisites = [
+            task for task in open_tasks if task["id"] in prerequisite_ids
+        ]
+        if ready_prerequisites:
+            return "CONTINUE", ready_prerequisites[0]
+        return "BLOCKED", None
+
+    if open_tasks:
+        return "CONTINUE", open_tasks[0]
+
+    active_milestone = board.get("active_milestone")
+    active_unfinished = [
+        task
+        for task in board["tasks"]
+        if task.get("status") != "DONE_STRONG"
+        and (
+            not active_milestone
+            or task.get("milestone") == active_milestone
+        )
+    ]
+    if active_unfinished:
+        return "BLOCKED", None
+
+    if any(task.get("status") != "DONE_STRONG" for task in board["tasks"]):
+        return "MILESTONE_COMPLETE", None
+
+    return "COMPLETE", None
+
+
+def _print_task(task: dict[str, Any]) -> None:
+    print(f"id: {task['id']}")
+    if task.get("milestone"):
+        print(f"milestone: {task['milestone']}")
+    if "rank" in task:
+        print(f"rank: {task['rank']}")
+    print(f"priority: {task['priority']}")
+    print(f"status: {task['status']}")
+    if task.get("dispatch"):
+        print(f"dispatch: {task['dispatch']}")
+    print(f"title: {task.get('title', '')}")
+    if task.get("latest_evidence"):
+        print(f"latest_evidence: {task['latest_evidence']}")
+    if task.get("open_boundary"):
+        print(f"open_boundary: {task['open_boundary']}")
+    dependencies = task.get("depends_on") or []
+    if dependencies:
+        print("depends_on:")
+        for dependency in dependencies:
+            print(f"  - {dependency}")
+    exit_criteria = task.get("exit_criteria") or []
+    if exit_criteria:
+        print("exit_criteria:")
+        for criterion in exit_criteria:
+            print(f"  - {criterion}")
+    gates = task.get("required_gates") or []
+    if gates:
+        print("required_gates:")
+        for gate in gates:
+            print(f"  - {gate}")
 
 
 def command_next(args: argparse.Namespace) -> int:
@@ -391,34 +531,116 @@ def command_next(args: argparse.Namespace) -> int:
         else:
             print("All migrated task-board rows are DONE_STRONG.")
         return 0
-    task = open_tasks[0]
-    print(f"id: {task['id']}")
-    if task.get("milestone"):
-        print(f"milestone: {task['milestone']}")
-    if "rank" in task:
-        print(f"rank: {task['rank']}")
-    print(f"priority: {task['priority']}")
-    print(f"status: {task['status']}")
-    print(f"title: {task.get('title', '')}")
-    if task.get("latest_evidence"):
-        print(f"latest_evidence: {task['latest_evidence']}")
-    if task.get("open_boundary"):
-        print(f"open_boundary: {task['open_boundary']}")
-    dependencies = task.get("depends_on") or []
-    if dependencies:
-        print("depends_on:")
-        for dependency in dependencies:
-            print(f"  - {dependency}")
-    exit_criteria = task.get("exit_criteria") or []
-    if exit_criteria:
-        print("exit_criteria:")
-        for criterion in exit_criteria:
-            print(f"  - {criterion}")
-    gates = task.get("required_gates") or []
-    if gates:
-        print("required_gates:")
-        for gate in gates:
-            print(f"  - {gate}")
+    _print_task(open_tasks[0])
+    return 0
+
+
+def command_resume(args: argparse.Namespace) -> int:
+    """Validate and emit the next runner-neutral task-board action."""
+
+    board = load_task_board(Path(args.board))
+    errors = validate(board)
+    if errors:
+        for error in errors:
+            print(f"ERROR: {error}", file=sys.stderr)
+        return 2
+
+    state, task = resume_state(board)
+    print(f"state: {state}")
+    if state == "CONTINUE":
+        assert task is not None
+        immediate_tasks = _active_immediate_tasks(board)
+        if (
+            immediate_tasks
+            and task.get("dispatch", "NORMAL") != "IMMEDIATE"
+        ):
+            print(
+                "selection_reason: dependency-ready prerequisite for "
+                "an unfinished IMMEDIATE task"
+            )
+        _print_task(task)
+        print(
+            "after_completion: record evidence, update the task row, validate "
+            "the board, then rerun `gtimeout 30s env -u LC_ALL uv run python "
+            "scripts/goal_state.py resume`; continue while it reports CONTINUE."
+        )
+        return 0
+
+    active_milestone = board.get("active_milestone")
+    if active_milestone:
+        print(f"milestone: {active_milestone}")
+
+    if state == "BLOCKED":
+        print("reason: no executable task remains in the active milestone.")
+        for blocked_task, dependencies in blocked_open_tasks(board):
+            reasons: list[str] = []
+            if blocked_task.get("status") == "BLOCKED":
+                reasons.append("status BLOCKED")
+            if dependencies:
+                reasons.append("unmet dependencies: " + ", ".join(dependencies))
+            print(f"blocked: {blocked_task['id']} <- {'; '.join(reasons)}")
+        return 3
+
+    if state == "MILESTONE_COMPLETE":
+        unfinished_count = sum(
+            task.get("status") != "DONE_STRONG" for task in board["tasks"]
+        )
+        print(f"unfinished_rows_outside_active_milestone: {unfinished_count}")
+        print(
+            "next_action: reconcile active_milestone with the unfinished rows "
+            "according to milestone_order, then rerun resume; this is not full "
+            "task-board completion."
+        )
+        return 4
+
+    print("reason: every task-board row is DONE_STRONG.")
+    return 0
+
+
+def command_finish_check(args: argparse.Namespace) -> int:
+    """Reject finalization while the board still has executable work."""
+
+    board_path = Path(args.board)
+    board = load_task_board(board_path)
+    errors = validate(board)
+    if errors:
+        for error in errors:
+            print(f"ERROR: {error}", file=sys.stderr)
+        return 2
+
+    state, task = resume_state(board)
+    allowed = state in {"BLOCKED", "MILESTONE_COMPLETE", "COMPLETE"}
+    board_sha256 = hashlib.sha256(board_path.read_bytes()).hexdigest()
+    receipt = {
+        "schema": "pcc.goal_finalization_receipt.v1",
+        "checked_at_utc": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "board": str(board_path),
+        "board_sha256": board_sha256,
+        "state": state,
+        "allowed": allowed,
+        "selected_task": task.get("id") if task is not None else None,
+    }
+    if args.receipt:
+        receipt_path = Path(args.receipt)
+        temporary = receipt_path.with_suffix(receipt_path.suffix + ".tmp")
+        temporary.parent.mkdir(parents=True, exist_ok=True)
+        temporary.write_text(
+            json.dumps(receipt, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(receipt_path)
+
+    print("finalization: " + ("ALLOWED" if allowed else "DENIED"))
+    print(f"state: {state}")
+    print(f"board_sha256: {board_sha256}")
+    if task is not None:
+        _print_task(task)
+    if not allowed:
+        print(
+            "reason: executable task-board work remains; send a commentary "
+            "checkpoint and continue instead of finalizing."
+        )
+        return 4
     return 0
 
 
@@ -455,11 +677,13 @@ def render_markdown(board: dict[str, Any]) -> str:
             )
         )
     lines.append("")
-    open_tasks = sorted_open_tasks(board)
-    if open_tasks:
-        lines.append(f"Next: `{open_tasks[0]['id']}` ({open_tasks[0]['status']})")
+    state, selected_task = resume_state(board)
+    if state == "CONTINUE" and selected_task is not None:
+        lines.append(
+            f"Next: `{selected_task['id']}` ({selected_task['status']})"
+        )
     else:
-        lines.append("Next: all migrated rows are DONE_STRONG.")
+        lines.append(f"Next state: `{state}`.")
     lines.append("")
     return "\n".join(lines)
 
@@ -469,6 +693,12 @@ def load_head_truth_manifest(path: Path = HEAD_TRUTH_MANIFEST) -> dict[str, Any]
     if not isinstance(value, dict):
         raise ValueError(f"{path}: manifest root must be an object")
     return value
+
+
+# Hard bound on the startup projection's active-task table so the render
+# size is independent of the unfinished-task count (GOAL-P0-STARTUP-STATE-
+# BOUNDED-RENDER). The full queue always remains docs/goal/task-board.yaml.
+_STARTUP_TABLE_MAX_ROWS = 40
 
 
 def render_startup_markdown(
@@ -483,8 +713,7 @@ def render_startup_markdown(
     for task in active_tasks:
         status = str(task.get("status", ""))
         status_counts[status] = status_counts.get(status, 0) + 1
-    open_tasks = sorted_open_tasks(board)
-    next_task = open_tasks[0] if open_tasks else None
+    resume_outcome, next_task = resume_state(board)
 
     source = manifest.get("source")
     if not isinstance(source, dict):
@@ -525,9 +754,11 @@ def render_startup_markdown(
         lines.append(f"- `{status}`: `{status_counts[status]}`")
     if next_task is None:
         lines.append("- Next dependency-ready task: none")
+        lines.append(f"- Resume state: `{resume_outcome}`")
     else:
         lines.extend(
             [
+                f"- Resume state: `{resume_outcome}`",
                 f"- Next dependency-ready task: `{next_task['id']}`",
                 f"- Next title: {next_task.get('title', '')}",
                 f"- Next open boundary: {next_task.get('open_boundary', '')}",
@@ -543,22 +774,32 @@ def render_startup_markdown(
             "",
             "## Active task table",
             "",
-            f"`DONE_STRONG` rows ({done_strong}) are omitted here to keep the",
-            "startup state compact; the full ledger is `docs/goal/task-board.yaml`.",
+            f"`DONE_STRONG` rows ({done_strong}) are omitted and the table is",
+            f"hard-bounded to the {_STARTUP_TABLE_MAX_ROWS} highest-priority",
+            "unfinished rows so this projection stays bounded independently of the",
+            "task count; the full ledger is `docs/goal/task-board.yaml`.",
             "",
             "| Rank | ID | Status | Depends on | Evidence |",
             "|---:|---|---|---|---|",
         ]
     )
-    for task in sorted(
+    ranked_unfinished = sorted(
         unfinished_tasks,
         key=lambda item: (item.get("rank", 0), item.get("id", "")),
-    ):
+    )
+    for task in ranked_unfinished[:_STARTUP_TABLE_MAX_ROWS]:
         dependencies = ", ".join(task.get("depends_on", [])) or "-"
         evidence = str(task.get("latest_evidence") or "-")
         lines.append(
             f"| {task.get('rank', '')} | `{task.get('id', '')}` | "
             f"`{task.get('status', '')}` | {dependencies} | {evidence} |"
+        )
+    omitted = len(ranked_unfinished) - _STARTUP_TABLE_MAX_ROWS
+    if omitted > 0:
+        lines.append("")
+        lines.append(
+            f"_{omitted} more unfinished rows are not shown in this bounded "
+            "projection; the complete queue is `docs/goal/task-board.yaml`._"
         )
 
     lines.extend(
@@ -603,14 +844,19 @@ def render_startup_markdown(
             "## Work protocol",
             "",
             "```bash",
-            "gtimeout 30s env -u LC_ALL uv run python scripts/goal_state.py validate",
-            "gtimeout 30s env -u LC_ALL uv run python scripts/goal_state.py next",
+            "gtimeout 30s env -u LC_ALL uv run python scripts/goal_state.py resume",
             "```",
             "",
-            "Treat `DONE_WEAK` as unfinished. For a completed slice, add one evidence",
-            "file, update the task row, and regenerate this summary. Debugging and",
+            "`resume` validates before selection. While it reports `CONTINUE`, complete",
+            "the selected row or finite slice, add evidence, update the task row, and",
+            "run `resume` again instead of stopping after one task. `COMPLETE` means",
+            "every task-board row is `DONE_STRONG`; `DONE_WEAK` remains unfinished.",
+            "This runner-neutral loop does not depend on a product-specific persistent",
+            "mode. Regenerate this summary after updating the board. Debugging and",
             "investigation work must follow `docs/debugging-playbook.md` and",
             "`docs/investigation-workflow.md` respectively.",
+            "Before a final response, `scripts/goal_state.py finish-check` must",
+            "allow finalization; exit 4 means continue the selected task.",
             "",
         ]
     )
@@ -667,6 +913,19 @@ def main(argv: list[str] | None = None) -> int:
 
     next_parser = sub.add_parser("next", help="print the next migrated task")
     next_parser.set_defaults(func=command_next)
+
+    resume_parser = sub.add_parser(
+        "resume", help="validate and print the next runner-neutral board action"
+    )
+    resume_parser.set_defaults(func=command_resume)
+
+    finish_parser = sub.add_parser(
+        "finish-check", help="deny finalization unless resume state is terminal"
+    )
+    finish_parser.add_argument(
+        "--receipt", help="optional JSON receipt path bound to the board hash"
+    )
+    finish_parser.set_defaults(func=command_finish_check)
 
     validate_parser = sub.add_parser("validate", help="validate task-board shape")
     validate_parser.set_defaults(func=command_validate)

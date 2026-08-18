@@ -12,6 +12,9 @@ Constants (inlined per the pcc-Python runtime-module contract):
   PY_EXC_RUNTIMEERROR = 7, PY_EXC_TYPEERROR = 3, PY_EXC_VALUEERROR = 2,
   PY_EXC_MODULENOTFOUNDERROR = 21
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_STR,
 )
@@ -41,6 +44,8 @@ py_compiled_module_import_by_name = extern(
 )
 py_err_occurred = extern("py_err_occurred", (), c_int64)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 py_str_utf8 = extern("py_str_utf8", (c_ptr,), c_ptr)
 PyUnicode_AsUTF8 = extern("PyUnicode_AsUTF8", (c_ptr,), c_ptr)
@@ -79,7 +84,7 @@ def _python_not_found_message(name) -> c_ptr:
 @c_abi_typed_export("PyImport_ImportModule", "ptr", ("ptr",))
 def PyImport_ImportModule(name) -> c_ptr:
     if ptr_is_null(name) or load_i8(name, 0) == 0:
-        py_raise(py_exc_new(2, cstr("empty module name")))  # PY_EXC_VALUEERROR
+        py_raise_owned(py_exc_new(2, cstr("empty module name")))  # PY_EXC_VALUEERROR
         return null()
     module = py_native_extension_import_by_name(name)
     if ptr_is_null(module) and py_err_occurred() == 0:
@@ -87,20 +92,20 @@ def PyImport_ImportModule(name) -> c_ptr:
     if ptr_is_null(module) and py_err_occurred() == 0:
         message = _not_found_message(name)
         if ptr_is_null(message):
-            py_raise(
+            py_raise_owned(
                 py_exc_new(7, cstr("PCC-PYEXT-IMPORT-001 module not found"))
             )
         else:
             exc = py_exc_new(7, message)
             free(message)
-            py_raise(exc)
+            py_raise_owned(exc)
     return module
 
 
 @c_abi_typed_export("PyImport_Import", "ptr", ("ptr",))
 def PyImport_Import(name) -> c_ptr:
     if ptr_is_null(name):
-        py_raise(py_exc_new(3, cstr("import name required")))  # PY_EXC_TYPEERROR
+        py_raise_owned(py_exc_new(3, cstr("import name required")))  # PY_EXC_TYPEERROR
         return null()
     cname = PyUnicode_AsUTF8(name)
     if ptr_is_null(cname):
@@ -121,16 +126,16 @@ PyMem_Free = extern("PyMem_Free", (c_ptr,), c_void)
 @c_abi_typed_export("py_builtin_import", "ptr", ("ptr", "ptr"))
 def py_builtin_import(name, fromlist) -> c_ptr:
     if ptr_is_null(name) or is_tagged_int(name) or py_type_of(name) != PY_TYPE_STR:
-        py_raise(py_exc_new(3, cstr("module name must be a string")))
+        py_raise_owned(py_exc_new(3, cstr("module name must be a string")))
         return null()
     cname = py_str_utf8(name)
     if ptr_is_null(cname):
         return null()
     if py_str_byte_len(name) == 0:
-        py_raise(py_exc_new(2, cstr("Empty module name")))
+        py_raise_owned(py_exc_new(2, cstr("Empty module name")))
         return null()
     if strlen(cname) != py_str_byte_len(name):
-        py_raise(py_exc_new(2, cstr("module name contains a null character")))
+        py_raise_owned(py_exc_new(2, cstr("module name contains a null character")))
         return null()
     # Python-level __import__ owns ModuleNotFoundError.  The public C-API entry
     # above deliberately keeps its PCC-PYEXT RuntimeError diagnostic, so query
@@ -142,11 +147,11 @@ def py_builtin_import(name, fromlist) -> c_ptr:
         if py_err_occurred() == 0:
             message = _python_not_found_message(cname)
             if ptr_is_null(message):
-                py_raise(py_exc_new(21, cstr("module not found")))
+                py_raise_owned(py_exc_new(21, cstr("module not found")))
             else:
                 exc = py_exc_new(21, message)
                 free(message)
-                py_raise(exc)
+                py_raise_owned(exc)
         return null()
     fromlist_count: int = 0
     if not ptr_is_null(fromlist) and not ptr_eq(fromlist, global_load_ptr("py_None")):
@@ -163,7 +168,7 @@ def py_builtin_import(name, fromlist) -> c_ptr:
     top_name = PyMem_Malloc(top_len + 1)
     if ptr_is_null(top_name):
         py_decref(module)
-        py_raise(py_exc_new(19, cstr("out of memory importing module")))  # MEMORYERROR
+        py_raise_owned(py_exc_new(19, cstr("out of memory importing module")))  # MEMORYERROR
         return null()
     memcpy(top_name, cname, top_len)
     store_i8(top_name, top_len, 0)

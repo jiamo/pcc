@@ -121,7 +121,10 @@ def run_link_command(
     needs_libpython: bool = False,
     needs_native_extension_exports: bool = False,
     pcc_asm_inputs: tuple[str, ...] = (),
+    pcc_native_object_inputs: tuple[str, ...] = (),
+    pcc_internal_input_manifest: Optional[str] = None,
     semantic_layout_policy: Optional[str] = None,
+    link_profile_path: Optional[str] = None,
     resolve_self_link_mode,
     validate_pcc_self_link_surface,
     repo_root_for_link,
@@ -162,18 +165,41 @@ def run_link_command(
         raise SelfBackendLinkError(
             "pcc self-link mode requires a host Python executable"
         )
+    if pcc_asm_inputs and pcc_native_object_inputs:
+        raise SelfBackendLinkError(
+            "pcc self-link cannot mix internal assembly and native objects"
+        )
+    if pcc_internal_input_manifest and (
+        asm_path or pcc_asm_inputs or pcc_native_object_inputs
+    ):
+        raise SelfBackendLinkError(
+            "ordered internal-input manifest cannot be combined with direct "
+            "internal inputs"
+        )
+    if pcc_internal_input_manifest and linux_elf:
+        raise SelfBackendLinkError(
+            "ordered mixed internal inputs are implemented only by Mach-O"
+        )
+    internal_inputs = (
+        pcc_native_object_inputs if pcc_native_object_inputs else pcc_asm_inputs
+    )
+    internal_input_flag = (
+        "--native-object" if pcc_native_object_inputs else "--asm"
+    )
     link_cmd = build_pcc_link_command(
         host_python=host_python,
         driver=driver,
         output=str(tmp_out_path),
         asm_path=asm_path,
-        internal_asm_inputs=tuple(str(path) for path in pcc_asm_inputs),
+        internal_asm_inputs=tuple(str(path) for path in internal_inputs),
         runtime_archive=(
             None if runtime_archive is None else str(runtime_archive)
         ),
         extra_link_inputs=tuple(str(path) for path in (extra_link_inputs or ())),
-        internal_input_flag="--asm",
+        internal_input_flag=internal_input_flag,
+        internal_input_manifest=pcc_internal_input_manifest,
         semantic_layout_policy=semantic_layout_policy,
+        profile_json=link_profile_path,
     )
     log(verbose, "pcc link: " + join_strings(link_cmd, " "))
     try:

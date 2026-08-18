@@ -23,6 +23,9 @@ Owned surface (stable C ABI names):
 Public object type tags come from the generated ``py_abi_constants`` module.
 Private exception codes remain owned by the dictionary C-API contract.
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_DICT,
 )
@@ -50,7 +53,10 @@ from pcc.unsafe import (
 
 py_incref = extern("py_incref", (c_ptr,), c_void)
 py_decref = extern("py_decref", (c_ptr,), c_void)
+pcc_gc_pin = extern("pcc_gc_pin", (c_ptr,), c_void)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 py_clear_exception = extern("py_clear_exception", (), c_void)
 py_err_occurred = extern("py_err_occurred", (), c_int64)
@@ -82,7 +88,7 @@ def _is_dict(obj) -> int:
 
 
 def _type_error(message) -> None:
-    py_raise(py_exc_new(3, message))  # PY_EXC_TYPEERROR
+    py_raise_owned(py_exc_new(3, message))  # PY_EXC_TYPEERROR
 
 
 def _str_from_cstr(text):
@@ -129,6 +135,7 @@ def PyDict_GetItem(dict, key):
     if ptr_is_null(item):
         return null()
     # py_dict_get returns owned; CPython PyDict_GetItem returns borrowed.
+    pcc_gc_pin(item)
     py_decref(item)
     return item
 
@@ -153,6 +160,7 @@ def PyDict_GetItemWithError(dict, key):
     item = py_dict_get(dict, key)
     if ptr_is_null(item):
         return null()
+    pcc_gc_pin(item)
     py_decref(item)
     return item
 
@@ -234,7 +242,7 @@ def PyDict_Pop(dict, key, result) -> int:
         if not ptr_is_null(result):
             store_ptr(result, 0, null())
         if py_err_occurred() == 0:
-            py_raise(py_exc_new(4, cstr("missing dict key")))  # PY_EXC_KEYERROR
+            py_raise_owned(py_exc_new(4, cstr("missing dict key")))  # PY_EXC_KEYERROR
         return -1
     if not ptr_is_null(result):
         store_ptr(result, 0, item)
@@ -263,7 +271,7 @@ def PyDict_DelItem(dict, key) -> int:
         return -1
     rc: int = py_dict_del(dict, key)
     if rc != 0 and py_err_occurred() == 0:
-        py_raise(py_exc_new(4, cstr("missing dict key")))  # PY_EXC_KEYERROR
+        py_raise_owned(py_exc_new(4, cstr("missing dict key")))  # PY_EXC_KEYERROR
     if rc == 0:
         return 0
     return -1

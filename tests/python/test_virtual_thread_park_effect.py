@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+from copy import deepcopy
 from pathlib import Path
 
 import pytest
@@ -447,6 +448,119 @@ def test_closed_world_metadata_propagates_across_compiled_sibling_imports() -> N
     assert "handler" in names
 
 
+def test_summary_metadata_matches_eager_across_compiled_siblings(
+    tmp_path: Path,
+) -> None:
+    from pcc.py_frontend.parser import parse
+    from pcc.py_frontend.codegen.vthread_effect_analysis import (
+        annotate_closed_world_vthread_effect_summaries,
+        annotate_closed_world_vthread_effects,
+        build_closed_world_vthread_effect_summary,
+        closed_world_vthread_effect_export_surface,
+        write_closed_world_vthread_effect_summary,
+    )
+
+    modules = [
+        parse(CROSS_MODULE_LEAF_SOURCE, "park_effect_leaf.py"),
+        parse(CROSS_MODULE_MAIN_SOURCE, "park_effect_main.py"),
+    ]
+    module_names = ["park_effect_leaf", "park_effect_main"]
+    exports = {
+        "park_effect_leaf": {
+            "parked_leaf": {
+                "kind": "function",
+                "owning_module": "park_effect_leaf",
+                "export_name": "parked_leaf",
+            },
+        },
+        "park_effect_main": {
+            name: {
+                "kind": "function",
+                "owning_module": "park_effect_main",
+                "export_name": name,
+            }
+            for name in ("handler", "main")
+        },
+    }
+    eager = deepcopy(exports)
+    summarized = deepcopy(exports)
+    annotate_closed_world_vthread_effects(modules, module_names, eager)
+
+    surface = closed_world_vthread_effect_export_surface(summarized)
+    paths = []
+    for index, (module, module_name) in enumerate(zip(modules, module_names)):
+        summary = build_closed_world_vthread_effect_summary(
+            module,
+            module_name,
+            surface,
+        )
+        path = tmp_path / f"summary_{index}.wire"
+        write_closed_world_vthread_effect_summary(str(path), summary)
+        paths.append(str(path))
+
+    count, nodes, edges = annotate_closed_world_vthread_effect_summaries(
+        paths,
+        summarized,
+    )
+
+    assert summarized == eager
+    assert count == 2
+    assert nodes >= 3
+    assert edges >= 1
+
+
+def test_summary_duplicate_definition_uses_last_binding(tmp_path: Path) -> None:
+    from pcc.py_frontend.parser import parse
+    from pcc.py_frontend.codegen.vthread_effect_analysis import (
+        annotate_closed_world_vthread_effect_summaries,
+        annotate_closed_world_vthread_effects,
+        build_closed_world_vthread_effect_summary,
+        closed_world_vthread_effect_export_surface,
+        write_closed_world_vthread_effect_summary,
+    )
+
+    module = parse(
+        '''import pcc.virtual_thread as vt
+
+def leaf() -> int:
+    vt.yield_now()
+    return 1
+
+def caller() -> int:
+    return leaf()
+
+def caller() -> int:
+    return 2
+''',
+        "duplicate.py",
+    )
+    exports = {
+        "duplicate": {
+            name: {
+                "kind": "function",
+                "owning_module": "duplicate",
+                "export_name": name,
+            }
+            for name in ("leaf", "caller")
+        }
+    }
+    eager = deepcopy(exports)
+    summarized = deepcopy(exports)
+    annotate_closed_world_vthread_effects([module], ["duplicate"], eager)
+    summary = build_closed_world_vthread_effect_summary(
+        module,
+        "duplicate",
+        closed_world_vthread_effect_export_surface(summarized),
+    )
+    path = tmp_path / "duplicate.wire"
+    write_closed_world_vthread_effect_summary(str(path), summary)
+    annotate_closed_world_vthread_effect_summaries([str(path)], summarized)
+
+    assert summarized == eager
+    assert summarized["duplicate"]["leaf"]["may_park"] is True
+    assert summarized["duplicate"]["caller"]["may_park"] is False
+
+
 def test_closed_world_metadata_publishes_compiled_sibling_method_effect() -> None:
     from pcc.py_frontend.parser import parse
     from pcc.py_frontend.codegen.vthread_effect_analysis import (
@@ -488,6 +602,49 @@ def test_closed_world_metadata_publishes_compiled_sibling_method_effect() -> Non
     )
 
     assert method_row["may_park"] is True
+
+
+def test_eager_closed_world_effect_is_deterministic_across_fresh_asts() -> None:
+    from pcc.py_frontend.parser import parse
+    from pcc.py_frontend.codegen.vthread_effect_analysis import (
+        annotate_closed_world_vthread_effects,
+    )
+
+    def analyze():
+        method_row = {
+            "name": "run",
+            "kind": "instance",
+            "return_ty": "int",
+            "param_types": ("dyn", "int"),
+        }
+        exports = {
+            "park_method_leaf": {
+                "Worker": {"kind": "class", "methods": (method_row,)},
+            },
+            "park_method_main": {
+                "handler": {
+                    "kind": "function",
+                    "owning_module": "park_method_main",
+                    "export_name": "handler",
+                },
+                "main": {
+                    "kind": "function",
+                    "owning_module": "park_method_main",
+                    "export_name": "main",
+                },
+            },
+        }
+        annotate_closed_world_vthread_effects(
+            [
+                parse(CROSS_MODULE_METHOD_LEAF_SOURCE, "park_method_leaf.py"),
+                parse(CROSS_MODULE_METHOD_MAIN_SOURCE, "park_method_main.py"),
+            ],
+            ["park_method_leaf", "park_method_main"],
+            exports,
+        )
+        return exports
+
+    assert analyze() == analyze()
 
 
 def test_closed_world_effects_follow_package_reexported_function_and_class(
@@ -628,6 +785,71 @@ def test_joint_callable_analysis_scans_threading_hints_once_per_function(
 
     assert calls == 22
     assert "Worker.wait" in method_keys
+
+
+def test_callable_compute_and_classify_are_deterministic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pcc.py_frontend.parser import parse
+    from pcc.py_frontend.codegen import vthread_effect_analysis as analysis
+
+    module = parse(
+        '''import pcc.virtual_thread as vt
+import threading
+
+def leaf() -> None:
+    vt.yield_now()
+
+def wrapper() -> None:
+    leaf()
+
+def shadowed(vt) -> None:
+    vt.yield_now()
+
+class Worker:
+    def setup(self) -> None:
+        self.event = threading.Event()
+
+    def wait(self) -> None:
+        self.event.wait()
+
+    def dynamic(self, other) -> None:
+        other.wait()
+''',
+        "vthread_shared_kernel.py",
+    )
+    callable_count = len(analysis._module_function_defs(module)) + len(
+        analysis._class_method_defs(module)
+    )
+    scans = 0
+    original = analysis._function_scope_nodes
+
+    def counted(*args, **kwargs):
+        nonlocal scans
+        scans += 1
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(analysis, "_function_scope_nodes", counted)
+    first_effects = analysis.compute_vthread_may_park_callables(module)
+    first_rejected = analysis.classify_vthread_park_boundaries(
+        module,
+        first_effects[1],
+        None,
+        first_effects[3],
+    )
+    assert scans == callable_count * 2
+
+    scans = 0
+    second_effects = analysis.compute_vthread_may_park_callables(module)
+    second_rejected = analysis.classify_vthread_park_boundaries(
+        module,
+        second_effects[1],
+        None,
+        second_effects[3],
+    )
+    assert scans == callable_count * 2
+    assert first_effects == second_effects
+    assert first_rejected == second_rejected
 
 
 def test_suspension_call_proof_reuses_one_lexical_binding_scan(

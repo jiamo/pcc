@@ -17,6 +17,9 @@ PUBLIC_SYMBOLS = {
     "py_gc_index_remove",
     "pcc_gc_object_index_find",
     "pcc_gc_object_index_insert",
+    "pcc_gc_object_index_plan_capacity",
+    "pcc_gc_object_index_plan_commit",
+    "pcc_gc_object_index_insert_preallocated",
     "pcc_gc_object_index_remove",
     "pcc_gc_object_index_clear",
     "pcc_gc_ptr_index_tls_pool_drain",
@@ -38,14 +41,23 @@ PUBLIC_SYMBOLS = {
     "pcc_gc_identity_index_insert",
     "pcc_gc_identity_index_remove",
     "pcc_gc_identity_index_clear",
+    "pcc_gc_forwarding_plan_index_capacity",
+    "pcc_gc_forwarding_plan_index_commit",
+    "pcc_gc_forwarding_plan_index_insert",
     "pcc_gc_frame_index_find",
     "pcc_gc_frame_index_insert",
+    "pcc_gc_frame_index_plan_capacity",
+    "pcc_gc_frame_index_plan_commit",
     "pcc_gc_frame_index_replace",
+    "pcc_gc_frame_index_replace_preallocated",
     "pcc_gc_frame_index_remove",
     "pcc_gc_frame_index_clear",
     "pcc_gc_zpage_owner_index_find",
     "pcc_gc_zpage_owner_index_insert",
     "pcc_gc_zpage_owner_index_upsert",
+    "pcc_gc_zpage_owner_index_plan_capacity",
+    "pcc_gc_zpage_owner_index_plan_commit",
+    "pcc_gc_zpage_owner_index_upsert_preallocated",
     "pcc_gc_zpage_owner_index_remove",
     "pcc_gc_zpage_owner_index_clear",
     "pcc_gc_zpage_page_index_find",
@@ -94,12 +106,18 @@ def _harness_source() -> str:
     return r"""
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 
 void *py_gc_index_find(void *obj);
 int64_t py_gc_index_insert(void *obj, void *node);
 void *py_gc_index_remove(void *obj);
 void *pcc_gc_object_index_find(void *obj);
 int64_t pcc_gc_object_index_insert(void *obj, void *node);
+int64_t pcc_gc_object_index_plan_capacity(int64_t extra);
+int64_t pcc_gc_object_index_plan_commit(
+    void **prepared_slots, int64_t prepared_cap, int64_t extra
+);
+int64_t pcc_gc_object_index_insert_preallocated(void *obj, void *node);
 void *pcc_gc_object_index_remove(void *obj);
 void pcc_gc_object_index_clear(void);
 void pcc_gc_ptr_index_tls_pool_drain(void);
@@ -119,13 +137,32 @@ DECL_INDEX(pcc_gc_zpage_owner_index);
 DECL_INDEX(pcc_gc_zpage_page_index);
 DECL_INDEX(pcc_gc_frame_index);
 void *pcc_gc_frame_index_replace(void *key, void *node);
+int64_t pcc_gc_frame_index_plan_capacity(int64_t extra);
+int64_t pcc_gc_frame_index_plan_commit(
+    void **prepared_slots, int64_t prepared_cap, int64_t extra
+);
+void *pcc_gc_frame_index_replace_preallocated(void *key, void *node);
 int64_t pcc_gc_forwarding_target_index_insert(void *key, void *node);
 int64_t pcc_gc_forwarding_target_index_upsert(void *key, void *node);
 void *pcc_gc_forwarding_target_index_find(void *key);
 void *pcc_gc_forwarding_target_index_remove(void *key);
 void pcc_gc_forwarding_target_index_clear(void);
 int64_t pcc_gc_zpage_owner_index_upsert(void *key, void *node);
+int64_t pcc_gc_zpage_owner_index_plan_capacity(int64_t extra);
+int64_t pcc_gc_zpage_owner_index_plan_commit(
+    void **prepared_slots, int64_t prepared_cap, int64_t extra
+);
+int64_t pcc_gc_zpage_owner_index_upsert_preallocated(
+    void *key, void *node
+);
 int64_t pcc_gc_zpage_page_index_upsert(void *key, void *node);
+int64_t pcc_gc_forwarding_plan_index_capacity(int64_t kind, int64_t extra);
+int64_t pcc_gc_forwarding_plan_index_commit(
+    int64_t kind, void **prepared_slots, int64_t prepared_cap, int64_t extra
+);
+int64_t pcc_gc_forwarding_plan_index_insert(
+    int64_t kind, void *key, void *node
+);
 
 static uint64_t hash_ptr(const void *ptr) {
     uint64_t value = (uint64_t)(uintptr_t)ptr >> 3;
@@ -193,17 +230,39 @@ int main(void) {
     }
 
     cursor = 100000;
+    {
+        int64_t required = pcc_gc_object_index_plan_capacity(1);
+        if (required != 16384) return 48;
+        void *plan = calloc((size_t)required, 24);
+        if (plan == 0) return 49;
+        void *original_plan = plan;
+        if (pcc_gc_object_index_plan_commit(&plan, required / 2, 1) != -1) {
+            return 50;
+        }
+        if (plan != original_plan) return 51;
+        if (pcc_gc_object_index_plan_commit(&plan, required, 1) != 1) {
+            return 52;
+        }
+        if (plan != 0) return 53;
+    }
     for (i = 0; i < 6; i++) {
         keys[i] = key_for_bucket(16383, 16380, &cursor);
-        if (pcc_gc_object_index_insert(keys[i], &nodes[i]) != 1) return 50 + i;
+        if (pcc_gc_object_index_insert_preallocated(keys[i], &nodes[i]) != 1) {
+            return 54 + i;
+        }
     }
-    if (pcc_gc_object_index_insert(keys[1], &nodes[7]) != 0) return 56;
-    if (pcc_gc_object_index_find(keys[1]) != &nodes[1]) return 57;
-    if (pcc_gc_object_index_remove(keys[0]) != &nodes[0]) return 58;
-    if (pcc_gc_object_index_remove(keys[2]) != &nodes[2]) return 59;
-    if (pcc_gc_object_index_find(keys[5]) != &nodes[5]) return 60;
+    if (pcc_gc_object_index_insert_preallocated(keys[1], &nodes[7]) != 0) {
+        return 60;
+    }
+    if (pcc_gc_object_index_find(keys[1]) != &nodes[1]) return 61;
+    if (pcc_gc_object_index_remove(keys[0]) != &nodes[0]) return 62;
+    if (pcc_gc_object_index_remove(keys[2]) != &nodes[2]) return 63;
+    if (pcc_gc_object_index_find(keys[5]) != &nodes[5]) return 64;
     pcc_gc_object_index_clear();
-    if (pcc_gc_object_index_find(keys[5]) != 0) return 61;
+    if (pcc_gc_object_index_find(keys[5]) != 0) return 65;
+    if (pcc_gc_object_index_insert(keys[5], &nodes[5]) != 1) return 66;
+    if (pcc_gc_object_index_remove(keys[5]) != &nodes[5]) return 67;
+    pcc_gc_object_index_clear();
 
     {
         void *key = (void *)(uintptr_t)0x8000;
@@ -225,6 +284,90 @@ int main(void) {
     }
 
     {
+        int64_t cap = pcc_gc_forwarding_plan_index_capacity(0, 1);
+        if (cap != 256) return 110;
+        void *prepared = calloc((size_t)cap, 24);
+        if (prepared == 0) return 111;
+        if (
+            pcc_gc_forwarding_plan_index_commit(0, &prepared, cap, 1) != 1
+        ) return 112;
+        if (prepared != 0) return 113;
+        for (i = 0; i < 128; i++) {
+            void *key = (void *)(uintptr_t)(0x9000000u + (uintptr_t)i * 16u);
+            if (
+                pcc_gc_forwarding_plan_index_insert(0, key, &nodes[i]) != 1
+            ) return 114;
+        }
+        {
+            void *blocked_key = (void *)(uintptr_t)0x9800000u;
+            if (
+                pcc_gc_forwarding_plan_index_insert(
+                    0, blocked_key, &nodes[128]
+                )
+                != -1
+            ) return 115;
+            if (pcc_gc_forwarding_index_find(blocked_key) != 0) return 116;
+        }
+        cap = pcc_gc_forwarding_plan_index_capacity(0, 1);
+        if (cap <= 256) return 117;
+        prepared = calloc((size_t)(cap / 2), 24);
+        if (prepared == 0) return 118;
+        {
+            void *undersized = prepared;
+            if (
+                pcc_gc_forwarding_plan_index_commit(
+                    0, &prepared, cap / 2, 1
+                )
+                != -1
+            ) return 119;
+            if (prepared != undersized) return 120;
+            free(prepared);
+        }
+        prepared = calloc((size_t)cap, 24);
+        if (prepared == 0) return 121;
+        if (
+            pcc_gc_forwarding_plan_index_commit(0, &prepared, cap, 1) != 1
+        ) return 122;
+        if (prepared == 0) return 123;
+        free(prepared);
+        {
+            void *key = (void *)(uintptr_t)0x9900000u;
+            if (
+                pcc_gc_forwarding_plan_index_insert(0, key, &nodes[128]) != 1
+            ) return 124;
+            if (pcc_gc_forwarding_index_find(key) != &nodes[128]) return 125;
+        }
+        for (i = 0; i < 128; i++) {
+            void *key = (void *)(uintptr_t)(0x9000000u + (uintptr_t)i * 16u);
+            if (pcc_gc_forwarding_index_find(key) != &nodes[i]) return 126;
+        }
+        pcc_gc_forwarding_index_clear();
+
+        for (i = 1; i <= 2; i++) {
+            cap = pcc_gc_forwarding_plan_index_capacity(i, 1);
+            if (cap != 256) return 127;
+            prepared = calloc((size_t)cap, 24);
+            if (prepared == 0) return 128;
+            if (
+                pcc_gc_forwarding_plan_index_commit(
+                    i, &prepared, cap, 1
+                )
+                != 1
+            ) return 129;
+            if (prepared != 0) return 130;
+            if (
+                pcc_gc_forwarding_plan_index_insert(
+                    i, (void *)(uintptr_t)(0xa000000u + (uintptr_t)i * 16u),
+                    &nodes[130 + i]
+                )
+                != 1
+            ) return 131;
+        }
+        pcc_gc_forwarding_target_index_clear();
+        pcc_gc_identity_index_clear();
+    }
+
+    {
         char storage[32];
         void *odd = (void *)(storage + 1);
         if (pcc_gc_frame_index_insert(odd, &nodes[0]) != 1) return 80;
@@ -238,6 +381,52 @@ int main(void) {
     }
 
     {
+        int64_t cap = pcc_gc_frame_index_plan_capacity(1);
+        if (cap != 256) return 132;
+        void *prepared = calloc((size_t)cap, 24);
+        if (prepared == 0) return 133;
+        if (pcc_gc_frame_index_plan_commit(&prepared, cap, 1) != 1) return 134;
+        if (prepared != 0) return 135;
+        for (i = 0; i < 128; i++) {
+            void *key = (void *)(uintptr_t)(0xb000000u + (uintptr_t)i * 16u);
+            if (
+                pcc_gc_frame_index_replace_preallocated(key, &nodes[i]) != 0
+            ) return 136;
+        }
+        cap = pcc_gc_frame_index_plan_capacity(1);
+        if (cap <= 256) return 137;
+        prepared = calloc((size_t)(cap / 2), 24);
+        if (prepared == 0) return 138;
+        {
+            void *undersized = prepared;
+            if (
+                pcc_gc_frame_index_plan_commit(
+                    &prepared, cap / 2, 1
+                ) != -1
+            ) return 139;
+            if (prepared != undersized) return 140;
+            free(prepared);
+        }
+        prepared = calloc((size_t)cap, 24);
+        if (prepared == 0) return 141;
+        if (pcc_gc_frame_index_plan_commit(&prepared, cap, 1) != 1) return 142;
+        if (prepared == 0) return 143;
+        free(prepared);
+        {
+            void *key = (void *)(uintptr_t)0xb800000u;
+            if (
+                pcc_gc_frame_index_replace_preallocated(key, &nodes[128]) != 0
+            ) return 144;
+            if (pcc_gc_frame_index_find(key) != &nodes[128]) return 145;
+        }
+        for (i = 0; i < 128; i++) {
+            void *key = (void *)(uintptr_t)(0xb000000u + (uintptr_t)i * 16u);
+            if (pcc_gc_frame_index_find(key) != &nodes[i]) return 146;
+        }
+        pcc_gc_frame_index_clear();
+    }
+
+    {
         void *owner = (void *)(uintptr_t)0xa000;
         void *raw_page = (void *)(uintptr_t)3;
         if (pcc_gc_zpage_owner_index_upsert(owner, &nodes[0]) != 1) return 90;
@@ -245,6 +434,32 @@ int main(void) {
         if (pcc_gc_zpage_owner_index_find(owner) != &nodes[1]) return 92;
         if (pcc_gc_zpage_owner_index_remove(owner) != &nodes[1]) return 93;
         pcc_gc_zpage_owner_index_clear();
+
+        {
+            int64_t cap = pcc_gc_zpage_owner_index_plan_capacity(1);
+            if (cap != 256) return 147;
+            void *prepared = calloc((size_t)cap, 24);
+            if (prepared == 0) return 148;
+            if (
+                pcc_gc_zpage_owner_index_plan_commit(
+                    &prepared, cap, 1
+                ) != 1
+            ) return 149;
+            if (prepared != 0) return 150;
+            if (
+                pcc_gc_zpage_owner_index_upsert_preallocated(
+                    owner, &nodes[4]
+                ) != 1
+            ) return 151;
+            if (
+                pcc_gc_zpage_owner_index_upsert_preallocated(
+                    owner, &nodes[5]
+                ) != 0
+            ) return 152;
+            if (pcc_gc_zpage_owner_index_find(owner) != &nodes[5]) return 153;
+            if (pcc_gc_zpage_owner_index_remove(owner) != &nodes[5]) return 154;
+            pcc_gc_zpage_owner_index_clear();
+        }
 
         if (pcc_gc_zpage_page_index_insert(raw_page, &nodes[2]) != 1) return 94;
         if (pcc_gc_zpage_page_index_upsert(raw_page, &nodes[3]) != 0) return 95;

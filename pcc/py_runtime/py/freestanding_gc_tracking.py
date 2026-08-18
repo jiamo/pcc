@@ -96,6 +96,42 @@ def pcc_gc_default_drain_deferred_nodes() -> None:
         node = next_node
 
 
+@c_abi_export("pcc_gc_tracked_node_recycle")
+def _tracked_node_recycle(node) -> None:
+    # Caller holds the table lock.
+    count_slot = global_addr("pcc_gc_tracked_node_pool_count")
+    count: i64 = load_i32(count_slot, 0)
+    if count >= 4096:
+        free(node)
+        return
+    store_ptr(node, 0, null())
+    store_ptr(node, 24, null())
+    store_ptr(node, 32, global_load_ptr("pcc_gc_tracked_node_pool"))
+    global_store_ptr("pcc_gc_tracked_node_pool", node)
+    store_i32(count_slot, 0, count + 1)
+
+
+@c_abi_export("pcc_gc_tracked_node_pool_cached_count")
+def pcc_gc_tracked_node_pool_cached_count() -> i64:
+    pcc_gc_default_table_lock()
+    count: i64 = load_i32(global_addr("pcc_gc_tracked_node_pool_count"), 0)
+    pcc_gc_default_table_unlock()
+    return count
+
+
+@c_abi_export("pcc_gc_tracked_node_pool_drain")
+def pcc_gc_tracked_node_pool_drain() -> None:
+    pcc_gc_default_table_lock()
+    node = global_load_ptr("pcc_gc_tracked_node_pool")
+    global_store_ptr("pcc_gc_tracked_node_pool", null())
+    store_i32(global_addr("pcc_gc_tracked_node_pool_count"), 0, 0)
+    while ptr_is_null(node) == 0:
+        next_node = load_ptr(node, 32)
+        free(node)
+        node = next_node
+    pcc_gc_default_table_unlock()
+
+
 @c_abi_export("py_gc_track")
 def py_gc_track(obj) -> None:
     if ptr_is_null(obj):
@@ -118,20 +154,28 @@ def py_gc_track(obj) -> None:
         if collector_owns_lock == 0:
             pcc_gc_default_table_unlock()
         return
-    node = malloc(40)
+    node = global_load_ptr("pcc_gc_tracked_node_pool")
+    if ptr_is_null(node) == 0:
+        global_store_ptr("pcc_gc_tracked_node_pool", load_ptr(node, 32))
+        count_slot = global_addr("pcc_gc_tracked_node_pool_count")
+        count: i64 = load_i32(count_slot, 0)
+        if count > 0:
+            store_i32(count_slot, 0, count - 1)
+    else:
+        node = malloc(40)
     if ptr_is_null(node):
         if collector_owns_lock == 0:
             pcc_gc_default_table_unlock()
         return
     inserted: i64 = py_gc_index_insert(obj, node)
     if inserted == 0:
-        free(node)
+        _tracked_node_recycle(node)
         store_i32(obj, 12, flags | 2)
         if collector_owns_lock == 0:
             pcc_gc_default_table_unlock()
         return
     if inserted < 0:
-        free(node)
+        _tracked_node_recycle(node)
         if collector_owns_lock == 0:
             pcc_gc_default_table_unlock()
         return
@@ -184,7 +228,7 @@ def py_gc_untrack(obj) -> None:
             store_ptr(node, 32, deferred)
             global_store_ptr("pcc_gc_deferred_node_free_head", node)
         else:
-            free(node)
+            _tracked_node_recycle(node)
     store_i32(obj, 12, flags & ~2)
     if collector_owns_lock == 0:
         pcc_gc_default_table_unlock()

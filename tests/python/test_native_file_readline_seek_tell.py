@@ -166,6 +166,32 @@ def test_native_file_readline_binary_round_trip(tmp_path):
     _run_native_vs_python3(tmp_path, program, "native_file_readline_bin_rt")
 
 
+def test_native_file_binary_write_preserves_bytes_like_payloads(tmp_path):
+    data = tmp_path / "native-file-write.bin"
+    program = textwrap.dedent(
+        f"""
+        PATH = {str(data)!r}
+
+        def main() -> None:
+            first = b"\\x00\\xffPCC"
+            second = bytearray(b"\\x01\\x02")
+            third = memoryview(b"\\x03\\x04")
+            with open(PATH, "wb") as stream:
+                print(stream.write(first))
+                print(stream.write(second))
+                print(stream.write(third))
+            with open(PATH, "rb") as stream:
+                payload = stream.read()
+            print(len(payload))
+            print(payload.hex())
+
+        if __name__ == "__main__":
+            main()
+        """
+    ).lstrip()
+    _run_native_vs_python3(tmp_path, program, "native_file_binary_write_rt")
+
+
 def test_native_file_iteration_round_trip(tmp_path):
     data = tmp_path / "native-file-iteration.txt"
     program = textwrap.dedent(

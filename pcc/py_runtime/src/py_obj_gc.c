@@ -14,6 +14,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
+#include <string.h>
 
 static int32_t py_gc_enabled = 1;
 static int32_t py_gc_threshold0 = 700;
@@ -428,6 +429,56 @@ done:
     return collected;
 }
 
+/* Recycled tracking nodes; mirrors pcc_gc_tracked_node_pool in the
+ * freestanding_gc_tracking.py port.  Caller holds the table lock. */
+static PyGcNode *py_gc_node_pool = NULL;
+static int64_t py_gc_node_pool_count = 0;
+
+#define PCC_GC_TRACKED_NODE_POOL_LIMIT 4096
+
+static void py_gc_node_recycle(PyGcNode *n) {
+    if (py_gc_node_pool_count >= PCC_GC_TRACKED_NODE_POOL_LIMIT) {
+        free(n);
+        return;
+    }
+    n->obj = NULL;
+    n->prev = NULL;
+    n->next = py_gc_node_pool;
+    py_gc_node_pool = n;
+    py_gc_node_pool_count++;
+}
+
+static PyGcNode *py_gc_node_take(void) {
+    PyGcNode *n = py_gc_node_pool;
+    if (n != NULL) {
+        py_gc_node_pool = n->next;
+        if (py_gc_node_pool_count > 0) py_gc_node_pool_count--;
+        memset(n, 0, sizeof(PyGcNode));
+        return n;
+    }
+    return (PyGcNode *)calloc(1, sizeof(PyGcNode));
+}
+
+int64_t pcc_gc_tracked_node_pool_cached_count(void) {
+    py_gc_table_lock();
+    int64_t result = py_gc_node_pool_count;
+    py_gc_table_unlock();
+    return result;
+}
+
+void pcc_gc_tracked_node_pool_drain(void) {
+    py_gc_table_lock();
+    PyGcNode *node = py_gc_node_pool;
+    py_gc_node_pool = NULL;
+    py_gc_node_pool_count = 0;
+    while (node != NULL) {
+        PyGcNode *next = node->next;
+        free(node);
+        node = next;
+    }
+    py_gc_table_unlock();
+}
+
 void py_gc_track(PyObject *o) {
     if (o == NULL || PY_IS_TAGGED_INT(o)) return;
     if (
@@ -444,7 +495,7 @@ void py_gc_track(PyObject *o) {
         if (!collector_owns_lock) py_gc_table_unlock();
         return;
     }
-    PyGcNode *n = (PyGcNode *)calloc(1, sizeof(PyGcNode));
+    PyGcNode *n = py_gc_node_take();
     if (n == NULL) {
         if (!collector_owns_lock) py_gc_table_unlock();
         return;
@@ -452,12 +503,12 @@ void py_gc_track(PyObject *o) {
     int status = (int)py_gc_index_insert(o, n);
     if (status == 0) {
         py_header_flags_or(h, PY_FLAG_GC_TRACKED);
-        free(n);
+        py_gc_node_recycle(n);
         if (!collector_owns_lock) py_gc_table_unlock();
         return;
     }
     if (status != 1) {
-        free(n);
+        py_gc_node_recycle(n);
         if (!collector_owns_lock) py_gc_table_unlock();
         return;
     }
@@ -489,7 +540,7 @@ void py_gc_untrack(PyObject *o) {
     if (n != NULL) {
         py_gc_unlink_node(n);
         if (collector_owns_lock) py_gc_defer_node_free(n);
-        else free(n);
+        else py_gc_node_recycle(n);
     }
     py_header_flags_and(h, ~PY_FLAG_GC_TRACKED);
     if (!collector_owns_lock) py_gc_table_unlock();

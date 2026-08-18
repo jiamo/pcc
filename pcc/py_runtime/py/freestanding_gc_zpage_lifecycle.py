@@ -86,6 +86,7 @@ def pcc_gc_backend4_zpage_clear_reusable_state(page) -> None:
     store_i64(page, 88, 0)
     store_i64(page, 96, 0)
     store_i32(page, 104, 0)
+    store_i32(page, 108, 0)
     store_ptr(page, 112, null())
 
 
@@ -187,6 +188,32 @@ def pcc_gc_backend4_zpage_unlink_node(node) -> None:
     pcc_gc_zpage_owner_index_remove(load_ptr(node, 0))
     prev = load_ptr(node, 40)
     nxt = load_ptr(node, 16)
+    if ptr_eq(
+        global_load_ptr("pcc_gc_backend4_selector_scan_cursor"), node
+    ) != 0:
+        global_store_ptr("pcc_gc_backend4_selector_scan_cursor", nxt)
+    if ptr_eq(
+        global_load_ptr("pcc_gc_backend4_selector_scan_best"), node
+    ) != 0:
+        global_store_ptr("pcc_gc_backend4_selector_scan_best", null())
+        store_i64(
+            global_addr("pcc_gc_backend4_selector_scan_best_score"), 0, -1
+        )
+        store_i32(
+            global_addr("pcc_gc_backend4_selector_scan_restart"), 0, 1
+        )
+    page_next = load_ptr(node, 48)
+    if ptr_eq(
+        global_load_ptr("pcc_gc_backend4_selector_page_cursor"), node
+    ) != 0:
+        global_store_ptr("pcc_gc_backend4_selector_page_cursor", page_next)
+    if ptr_eq(
+        global_load_ptr("pcc_gc_backend4_selector_page_seed"), node
+    ) != 0:
+        global_store_ptr("pcc_gc_backend4_selector_page_seed", null())
+        store_i32(
+            global_addr("pcc_gc_backend4_selector_page_seed_pending"), 0, 0
+        )
     if ptr_is_null(prev) != 0:
         if ptr_eq(global_load_ptr("pcc_gc_backend4_zpage_head"), node) != 0:
             global_store_ptr("pcc_gc_backend4_zpage_head", nxt)
@@ -196,7 +223,6 @@ def pcc_gc_backend4_zpage_unlink_node(node) -> None:
         store_ptr(nxt, 40, prev)
     page = load_ptr(node, 8)
     page_prev = load_ptr(node, 56)
-    page_next = load_ptr(node, 48)
     if ptr_is_null(page) == 0:
         if ptr_is_null(page_prev) != 0:
             pcc_gc_backend4_zpage_set_page_head(page, page_next)
@@ -262,13 +288,11 @@ def pcc_gc_backend4_zpage_remove_payload_spans(owner_node) -> None:
     if ptr_is_null(owner_node) != 0:
         return
     node = load_ptr(owner_node, 64)
-    store_ptr(owner_node, 64, null())
     while ptr_is_null(node) == 0:
-        nxt = load_ptr(node, 40)
         page = load_ptr(node, 32)
         size: i64 = load_i64(node, 16)
-        if ptr_is_null(page) == 0 and size > 0:
-            offset: i64 = load_i64(node, 24)
+        offset: i64 = load_i64(node, 24)
+        if ptr_is_null(page) == 0 and size > 0 and offset >= 0:
             allocated: i64 = load_i64(page, 64)
             if offset >= 0 and allocated == offset + size:
                 store_i64(page, 64, offset)
@@ -277,6 +301,18 @@ def pcc_gc_backend4_zpage_remove_payload_spans(owner_node) -> None:
                 store_i64(page, 8, used - size)
             else:
                 store_i64(page, 8, 0)
+        node = load_ptr(node, 40)
+    _zpage_free_detached_payload_spans(owner_node)
+
+
+@c_abi_export("pcc_gc_backend4_zpage_free_detached_payload_spans")
+def _zpage_free_detached_payload_spans(owner_node) -> None:
+    if ptr_is_null(owner_node) != 0:
+        return
+    node = load_ptr(owner_node, 64)
+    store_ptr(owner_node, 64, null())
+    while ptr_is_null(node) == 0:
+        nxt = load_ptr(node, 40)
         free(node)
         node = nxt
 
@@ -300,7 +336,8 @@ def pcc_gc_backend4_zpage_remove_payload_span_base(owner_node, base) -> i64:
             store_ptr(prev, 40, nxt)
         page = load_ptr(node, 32)
         size: i64 = load_i64(node, 16)
-        if ptr_is_null(page) == 0 and size > 0:
+        offset: i64 = load_i64(node, 24)
+        if ptr_is_null(page) == 0 and size > 0 and offset >= 0:
             used: i64 = load_i64(page, 8)
             if used >= size:
                 store_i64(page, 8, used - size)
@@ -312,10 +349,10 @@ def pcc_gc_backend4_zpage_remove_payload_span_base(owner_node, base) -> i64:
     return removed
 
 
-@c_abi_export("pcc_gc_backend4_zpage_remove")
-def pcc_gc_backend4_zpage_remove(owner) -> None:
+@c_abi_export("pcc_gc_backend4_zpage_detach_for_relocation")
+def pcc_gc_backend4_zpage_detach_for_relocation(owner):
     if ptr_is_null(owner) != 0 or is_tagged_int(owner) != 0:
-        return
+        return null()
     obj_node = pcc_gc_object_index_find(owner)
     node = null()
     if ptr_is_null(obj_node) == 0:
@@ -332,11 +369,28 @@ def pcc_gc_backend4_zpage_remove(owner) -> None:
         # cascades quadratic — each object's second zpage_remove (from
         # the free path, after note_object_freeing already unlinked the
         # node) walked every remaining live node for nothing.
-        return
+        return null()
     page = load_ptr(node, 8)
     pcc_gc_backend4_zpage_unlink_node(node)
     if ptr_is_null(page) == 0:
-        pcc_gc_backend4_zpage_remove_payload_spans(node)
+        span = load_ptr(node, 64)
+        while ptr_is_null(span) == 0:
+            span_page = load_ptr(span, 32)
+            span_size: i64 = load_i64(span, 16)
+            span_offset: i64 = load_i64(span, 24)
+            if ptr_is_null(span_page) == 0 and span_size > 0 and span_offset >= 0:
+                span_allocated: i64 = load_i64(span_page, 64)
+                if (
+                    span_offset >= 0
+                    and span_allocated == span_offset + span_size
+                ):
+                    store_i64(span_page, 64, span_offset)
+                span_used: i64 = load_i64(span_page, 8)
+                if span_used >= span_size:
+                    store_i64(span_page, 8, span_used - span_size)
+                else:
+                    store_i64(span_page, 8, 0)
+            span = load_ptr(span, 40)
         size: i64 = load_i64(node, 32)
         if size <= 0:
             size = pcc_gc_object_known_size(owner)
@@ -404,4 +458,21 @@ def pcc_gc_backend4_zpage_remove(owner) -> None:
                     store_i64(counter, 0, load_i64(counter, 0) + 1)
                 store_i32(page, 104, 1)
                 pcc_gc_backend4_zpage_clear_active_page(page)
+    return node
+
+
+@c_abi_export("pcc_gc_backend4_zpage_finish_relocation_detach")
+def pcc_gc_backend4_zpage_finish_relocation_detach(node) -> None:
+    if ptr_is_null(node) != 0:
+        return
+    _zpage_free_detached_payload_spans(node)
+    free(node)
+
+
+@c_abi_export("pcc_gc_backend4_zpage_remove")
+def pcc_gc_backend4_zpage_remove(owner) -> None:
+    node = pcc_gc_backend4_zpage_detach_for_relocation(owner)
+    if ptr_is_null(node) != 0:
+        return
+    _zpage_free_detached_payload_spans(node)
     pcc_gc_backend4_zpage_node_release(node)

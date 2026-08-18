@@ -9,6 +9,8 @@ constants.  This module has private operation tables, but it must not carry a
 second numeric copy of the public object ABI in its docstring.
 """
 
+__pcc_runtime_port__ = True
+
 from pcc.extern import extern, c_abi_export, c_int32, c_ptr, c_int64, c_void, c_double
 from pcc.py_runtime.py.py_abi_constants import (
     C_POINTER_SIZE,
@@ -101,6 +103,12 @@ py_dict_update = extern("py_dict_update", (c_ptr, c_ptr), c_void)
 
 py_set_len = extern("py_set_len", (c_ptr,), c_int64)
 py_set_pop = extern("py_set_pop", (c_ptr,), c_ptr)
+py_set_new = extern("py_set_new", (), c_ptr)
+py_set_update = extern("py_set_update", (c_ptr, c_ptr), c_void)
+py_set_intersection = extern("py_set_intersection", (c_ptr, c_ptr), c_ptr)
+py_set_symmetric_difference = extern(
+    "py_set_symmetric_difference", (c_ptr, c_ptr), c_ptr
+)
 
 py_class_new = extern("py_class_new", (c_ptr, c_ptr, c_int32, c_ptr, c_int32), c_ptr)
 py_class_lookup = extern("py_class_lookup", (c_ptr, c_ptr), c_ptr)
@@ -192,6 +200,11 @@ py_user_binop_dispatch = extern(
 py_int_add = extern("py_int_add", (c_ptr, c_ptr), c_ptr)
 py_int_sub = extern("py_int_sub", (c_ptr, c_ptr), c_ptr)
 py_int_mul = extern("py_int_mul", (c_ptr, c_ptr), c_ptr)
+py_int_and = extern("py_int_and", (c_ptr, c_ptr), c_ptr)
+py_int_or = extern("py_int_or", (c_ptr, c_ptr), c_ptr)
+py_int_xor = extern("py_int_xor", (c_ptr, c_ptr), c_ptr)
+py_int_shl = extern("py_int_shl", (c_ptr, c_ptr), c_ptr)
+py_int_shr = extern("py_int_shr", (c_ptr, c_ptr), c_ptr)
 py_float_add = extern("py_float_add", (c_ptr, c_ptr), c_ptr)
 py_float_sub = extern("py_float_sub", (c_ptr, c_ptr), c_ptr)
 py_float_mul = extern("py_float_mul", (c_ptr, c_ptr), c_ptr)
@@ -667,7 +680,7 @@ def py_obj_type_tag(o) -> int:
 @c_abi_export("py_obj_add")
 def py_obj_add(a, b):
     if ptr_is_null(a) != 0 or ptr_is_null(b) != 0:
-        py_raise(py_exc_new(3, cstr("unsupported operand type(s) for +")))
+        py_raise_owned(py_exc_new(3, cstr("unsupported operand type(s) for +")))
         return null()
     at: int = _type_of(a)
     bt: int = _type_of(b)
@@ -705,7 +718,7 @@ def py_obj_add(a, b):
             cstr("__radd__"),
             cstr("unsupported operand type(s) for +"),
         )
-    py_raise(py_exc_new(3, cstr("unsupported operand type(s) for +")))
+    py_raise_owned(py_exc_new(3, cstr("unsupported operand type(s) for +")))
     return null()
 
 
@@ -717,7 +730,7 @@ def py_obj_sub(a, b):
     # boxed-float ``-`` (e.g. ``obj.attr - n`` where attr is a float) which fell
     # to the i64 path and misread the boxed pointer.
     if ptr_is_null(a) != 0 or ptr_is_null(b) != 0:
-        py_raise(py_exc_new(3, cstr("unsupported operand type(s) for -")))
+        py_raise_owned(py_exc_new(3, cstr("unsupported operand type(s) for -")))
         return null()
     at: int = _type_of(a)
     bt: int = _type_of(b)
@@ -743,7 +756,7 @@ def py_obj_sub(a, b):
             cstr("__rsub__"),
             cstr("unsupported operand type(s) for -"),
         )
-    py_raise(py_exc_new(3, cstr("unsupported operand type(s) for -")))
+    py_raise_owned(py_exc_new(3, cstr("unsupported operand type(s) for -")))
     return null()
 
 
@@ -755,7 +768,7 @@ def py_obj_mul(a, b):
     # which take an i64 count -> unbox with py_int_value_i64). Fixes boxed-float
     # ``*`` (``obj.attr * n``) which fell to the i64 path.
     if ptr_is_null(a) != 0 or ptr_is_null(b) != 0:
-        py_raise(py_exc_new(3, cstr("unsupported operand type(s) for *")))
+        py_raise_owned(py_exc_new(3, cstr("unsupported operand type(s) for *")))
         return null()
     at: int = _type_of(a)
     bt: int = _type_of(b)
@@ -793,8 +806,176 @@ def py_obj_mul(a, b):
             cstr("__rmul__"),
             cstr("unsupported operand type(s) for *"),
         )
-    py_raise(py_exc_new(3, cstr("unsupported operand type(s) for *")))
+    py_raise_owned(py_exc_new(3, cstr("unsupported operand type(s) for *")))
     return null()
+
+
+def _py_obj_bitwise_dispatch(a, b, op: int):
+    if ptr_is_null(a) != 0 or ptr_is_null(b) != 0:
+        if op == 0:
+            py_raise_owned(py_exc_new(3, cstr("unsupported operand type(s) for &")))
+        elif op == 1:
+            py_raise_owned(py_exc_new(3, cstr("unsupported operand type(s) for |")))
+        else:
+            py_raise_owned(py_exc_new(3, cstr("unsupported operand type(s) for ^")))
+        return null()
+    at: int = _type_of(a)
+    bt: int = _type_of(b)
+    if (
+        pcc_capi_is_cext_type_tag(at) != 0
+        or pcc_capi_is_cext_type_tag(bt) != 0
+    ):
+        cext_op: int = 8
+        if op == 1:
+            cext_op = 10
+        elif op == 2:
+            cext_op = 9
+        return pcc_capi_cext_binary_number(a, b, cext_op)
+    if (at == PY_TYPE_INT or at == PY_TYPE_BOOL) and (bt == PY_TYPE_INT or bt == PY_TYPE_BOOL):
+        if op == 0:
+            return py_int_and(a, b)
+        if op == 1:
+            return py_int_or(a, b)
+        return py_int_xor(a, b)
+    if at == PY_TYPE_SET and bt == PY_TYPE_SET:
+        if op == 0:
+            return py_set_intersection(a, b)
+        if op == 2:
+            return py_set_symmetric_difference(a, b)
+        out = py_set_new()
+        if ptr_is_null(out) != 0:
+            return null()
+        py_set_update(out, a)
+        if py_err_occurred() != 0:
+            py_decref(out)
+            return null()
+        py_set_update(out, b)
+        if py_err_occurred() != 0:
+            py_decref(out)
+            return null()
+        return out
+    if op == 1 and at == PY_TYPE_DICT and bt == PY_TYPE_DICT:
+        out = py_dict_new()
+        if ptr_is_null(out) != 0:
+            return null()
+        py_dict_update(out, a)
+        if py_err_occurred() != 0:
+            py_decref(out)
+            return null()
+        py_dict_update(out, b)
+        if py_err_occurred() != 0:
+            py_decref(out)
+            return null()
+        return out
+    if (
+        at == PY_TYPE_INSTANCE
+        or at >= PY_TYPE_USER_CLASS_START
+        or bt == PY_TYPE_INSTANCE
+        or bt >= PY_TYPE_USER_CLASS_START
+    ):
+        if op == 0:
+            return py_user_binop_dispatch(
+                a,
+                b,
+                cstr("__and__"),
+                cstr("__rand__"),
+                cstr("unsupported operand type(s) for &"),
+            )
+        if op == 1:
+            return py_user_binop_dispatch(
+                a,
+                b,
+                cstr("__or__"),
+                cstr("__ror__"),
+                cstr("unsupported operand type(s) for |"),
+            )
+        return py_user_binop_dispatch(
+            a,
+            b,
+            cstr("__xor__"),
+            cstr("__rxor__"),
+            cstr("unsupported operand type(s) for ^"),
+        )
+    if op == 0:
+        py_raise_owned(py_exc_new(3, cstr("unsupported operand type(s) for &")))
+    elif op == 1:
+        py_raise_owned(py_exc_new(3, cstr("unsupported operand type(s) for |")))
+    else:
+        py_raise_owned(py_exc_new(3, cstr("unsupported operand type(s) for ^")))
+    return null()
+
+
+@c_abi_export("py_obj_and")
+def py_obj_and(a, b):
+    return _py_obj_bitwise_dispatch(a, b, 0)
+
+
+@c_abi_export("py_obj_or")
+def py_obj_or(a, b):
+    return _py_obj_bitwise_dispatch(a, b, 1)
+
+
+@c_abi_export("py_obj_xor")
+def py_obj_xor(a, b):
+    return _py_obj_bitwise_dispatch(a, b, 2)
+
+
+def _py_obj_shift_dispatch(a, b, op: int):
+    if ptr_is_null(a) != 0 or ptr_is_null(b) != 0:
+        if op == 0:
+            py_raise_owned(py_exc_new(3, cstr("unsupported operand type(s) for <<")))
+        else:
+            py_raise_owned(py_exc_new(3, cstr("unsupported operand type(s) for >>")))
+        return null()
+    at: int = _type_of(a)
+    bt: int = _type_of(b)
+    if (
+        pcc_capi_is_cext_type_tag(at) != 0
+        or pcc_capi_is_cext_type_tag(bt) != 0
+    ):
+        if op == 0:
+            return pcc_capi_cext_binary_number(a, b, 6)
+        return pcc_capi_cext_binary_number(a, b, 7)
+    if (at == PY_TYPE_INT or at == PY_TYPE_BOOL) and (bt == PY_TYPE_INT or bt == PY_TYPE_BOOL):
+        if op == 0:
+            return py_int_shl(a, b)
+        return py_int_shr(a, b)
+    if (
+        at == PY_TYPE_INSTANCE
+        or at >= PY_TYPE_USER_CLASS_START
+        or bt == PY_TYPE_INSTANCE
+        or bt >= PY_TYPE_USER_CLASS_START
+    ):
+        if op == 0:
+            return py_user_binop_dispatch(
+                a,
+                b,
+                cstr("__lshift__"),
+                cstr("__rlshift__"),
+                cstr("unsupported operand type(s) for <<"),
+            )
+        return py_user_binop_dispatch(
+            a,
+            b,
+            cstr("__rshift__"),
+            cstr("__rrshift__"),
+            cstr("unsupported operand type(s) for >>"),
+        )
+    if op == 0:
+        py_raise_owned(py_exc_new(3, cstr("unsupported operand type(s) for <<")))
+    else:
+        py_raise_owned(py_exc_new(3, cstr("unsupported operand type(s) for >>")))
+    return null()
+
+
+@c_abi_export("py_obj_lshift")
+def py_obj_lshift(a, b):
+    return _py_obj_shift_dispatch(a, b, 0)
+
+
+@c_abi_export("py_obj_rshift")
+def py_obj_rshift(a, b):
+    return _py_obj_shift_dispatch(a, b, 1)
 
 
 @c_abi_export("py_obj_truediv")
@@ -805,7 +986,7 @@ def py_obj_truediv(a, b):
     # the ``__truediv__`` dunder. A tagged int has no ``__truediv__`` attribute,
     # so routing DynType ``/`` straight to the dunder raised AttributeError.
     if ptr_is_null(a) != 0 or ptr_is_null(b) != 0:
-        py_raise(py_exc_new(3, cstr("unsupported operand type(s) for /")))
+        py_raise_owned(py_exc_new(3, cstr("unsupported operand type(s) for /")))
         return null()
     at: int = _type_of(a)
     bt: int = _type_of(b)
@@ -818,7 +999,7 @@ def py_obj_truediv(a, b):
     if a_num == 1 and b_num == 1:
         bd: float = py_float_to_f64(b)
         if bd == 0.0:
-            py_raise(py_exc_new(9, cstr("division by zero")))
+            py_raise_owned(py_exc_new(9, cstr("division by zero")))
             return null()
         ad: float = py_float_to_f64(a)
         return py_float_from_f64(ad / bd)
@@ -994,6 +1175,70 @@ def py_obj_getitem_i64(o, idx: int):
         out = py_user_getitem_dispatch(o, key)
         py_decref(key)
         return out
+    py_decref(key)
+    return null()
+
+
+def _subscript_raise_missing(o, key) -> None:
+    # Mirror of py_obj_subscript_raise_missing in py_obj_ops_dispatch.c: turn
+    # the getitem primitives' silent NULL into the CPython exception.
+    tag: int = _type_of(o)
+    if tag == PY_TYPE_DICT:
+        py_raise_owned(py_exc_new_with_value(4, key))  # PY_EXC_KEYERROR
+        return
+    if tag == PY_TYPE_LIST:
+        py_raise_owned(py_exc_new(5, cstr("list index out of range")))  # PY_EXC_INDEXERROR
+        return
+    if tag == PY_TYPE_TUPLE:
+        py_raise_owned(py_exc_new(5, cstr("tuple index out of range")))
+        return
+    if tag == PY_TYPE_STR:
+        py_raise_owned(py_exc_new(5, cstr("string index out of range")))
+        return
+    if tag == PY_TYPE_BYTES or tag == PY_TYPE_BYTEARRAY or tag == PY_TYPE_MEMORYVIEW:
+        py_raise_owned(py_exc_new(5, cstr("index out of range")))
+        return
+    name = py_obj_type_name(o)
+    quote = py_str_new(cstr("'"), 1)
+    head = py_str_concat(quote, name)
+    tail = py_str_new(cstr("' object is not subscriptable"), 29)
+    message = py_str_concat(head, tail)
+    py_decref(quote)
+    py_decref(name)
+    py_decref(head)
+    py_decref(tail)
+    py_raise_owned(py_exc_new_with_value(3, message))  # PY_EXC_TYPEERROR
+    py_decref(message)
+
+
+@c_abi_export("py_obj_subscript")
+def py_obj_subscript(o, k):
+    # User-level o[k]; py_obj_getitem keeps its silent-NULL contract for the
+    # internal callers (tuple unpack, splat, capi shims).
+    out = py_obj_getitem(o, k)
+    if ptr_is_null(out) == 0:
+        return out
+    if ptr_is_null(o) != 0:
+        return null()
+    if ptr_is_null(k) != 0:
+        return null()
+    if py_err_occurred() != 0:
+        return null()
+    _subscript_raise_missing(o, k)
+    return null()
+
+
+@c_abi_export("py_obj_subscript_i64")
+def py_obj_subscript_i64(o, idx: int):
+    out = py_obj_getitem_i64(o, idx)
+    if ptr_is_null(out) == 0:
+        return out
+    if ptr_is_null(o) != 0:
+        return null()
+    if py_err_occurred() != 0:
+        return null()
+    key = py_int_from_i64(idx)
+    _subscript_raise_missing(o, key)
     py_decref(key)
     return null()
 
@@ -1797,9 +2042,12 @@ def py_obj_getattr(o, name):
             empty: int = 0
             if ptr_is_null(msg) != 0 or ptr_eq(msg, none) != 0:
                 empty = 1
-            elif load_i32(msg, 8) == PY_TYPE_STR and load_i64(msg, 16) == 0:
+            elif _type_of(msg) == PY_TYPE_STR and load_i64(msg, 16) == 0:
                 # PY_TYPE_STR(4) with byte_len 0: a no-arg exception stores ""
-                # as message, so args == () like CPython.
+                # as message, so args == () like CPython.  ``_type_of`` is
+                # tag-aware: KeyError(-1) stores a tagged small int here and a
+                # raw header read of it dereferenced the tag (mirrors
+                # py_type_of in py_obj_ops_dispatch.c).
                 empty = 1
             if empty != 0:
                 return py_tuple_new(0)
@@ -1844,6 +2092,45 @@ def py_obj_getattr_default(o, name):
         if py_err_occurred() != 0:
             return result
         return _raise_attribute_error(name)
+    return py_obj_getattr(o, name)
+
+
+# No-raise attribute probe for ``hasattr`` and 3-arg ``getattr``: identical
+# probe order to py_obj_getattr, but a plain not-found terminal returns NULL
+# WITHOUT constructing the AttributeError those callers immediately clear.
+# User __getattr__ still runs and its real exceptions still surface (NULL
+# with the error set).  Other tags fall back to the raising py_obj_getattr,
+# whose exception the callers clear exactly as before.  Mirror of the C
+# implementation in src/py_obj_ops_dispatch.c; keep both in sync.
+@c_abi_export("py_obj_getattr_maybe")
+def py_obj_getattr_maybe(o, name):
+    if ptr_is_null(o) != 0:
+        return null()
+    if ptr_is_null(name) != 0:
+        return null()
+    if _cstr_is_dunder_class(name) != 0:
+        return py_type_builtin(o)
+    if is_tagged_int(o) != 0:
+        return null()
+
+    tag: int = load_i32(o, 8)
+    pcc_runtime_log_event_code(7, 5, tag, 2, o)
+
+    type_attr = pcc_capi_type_object_getattr(o, name)
+    if ptr_is_null(type_attr) == 0 or py_err_occurred() != 0:
+        return type_attr
+
+    builtin_attr = pcc_capi_builtin_object_getattr(o, name)
+    if ptr_is_null(builtin_attr) == 0 or py_err_occurred() != 0:
+        return builtin_attr
+
+    if pcc_capi_is_cext_type_tag(tag) != 0:
+        return pcc_capi_cext_object_getattr(o, name)
+
+    if _is_instance_tag(tag) != 0:
+        return py_instance_getattr(o, name)
+    if tag == PY_TYPE_CLASS:  # PY_TYPE_CLASS
+        return py_class_getattr(o, name)
     return py_obj_getattr(o, name)
 
 
@@ -2255,18 +2542,18 @@ def py_obj_isinstance(o, cls) -> int:
 @c_abi_export("py_obj_issubclass")
 def py_obj_issubclass(derived, cls) -> int:
     if ptr_is_null(derived) != 0 or is_tagged_int(derived) != 0:
-        py_raise(py_exc_new(3, cstr("issubclass() arg 1 must be a class")))
+        py_raise_owned(py_exc_new(3, cstr("issubclass() arg 1 must be a class")))
         return -1
     derived_is_capi_type: int = pcc_capi_is_type_object_value(derived)
     if derived_is_capi_type == 0 and load_i32(derived, 8) != PY_TYPE_CLASS:  # PY_TYPE_CLASS
-        py_raise(py_exc_new(3, cstr("issubclass() arg 1 must be a class")))
+        py_raise_owned(py_exc_new(3, cstr("issubclass() arg 1 must be a class")))
         return -1
     if ptr_is_null(cls) != 0 or is_tagged_int(cls) != 0:
-        py_raise(py_exc_new(3, cstr("issubclass() arg 2 must be a class")))
+        py_raise_owned(py_exc_new(3, cstr("issubclass() arg 2 must be a class")))
         return -1
     cls_is_capi_type: int = pcc_capi_is_type_object_value(cls)
     if cls_is_capi_type == 0 and load_i32(cls, 8) != PY_TYPE_CLASS:  # PY_TYPE_CLASS
-        py_raise(py_exc_new(3, cstr("issubclass() arg 2 must be a class")))
+        py_raise_owned(py_exc_new(3, cstr("issubclass() arg 2 must be a class")))
         return -1
     if derived_is_capi_type != 0 or cls_is_capi_type != 0:
         if derived_is_capi_type == 0 or cls_is_capi_type == 0:

@@ -16,6 +16,9 @@ Public object type tags come from the generated ``py_abi_constants`` module.
 Private exception codes remain owned by the set C-API contract:
   PY_EXC_TYPEERROR = 3
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PYOBJECTHEADER_TYPE_TAG_OFFSET,
     PY_TYPE_SET,
@@ -40,6 +43,8 @@ py_obj_next = extern("py_obj_next", (c_ptr,), c_ptr)
 py_incref = extern("py_incref", (c_ptr,), c_void)
 py_decref = extern("py_decref", (c_ptr,), c_void)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 py_err_occurred = extern("py_err_occurred", (), c_int64)
 py_clear_exception = extern("py_clear_exception", (), c_void)
@@ -57,7 +62,7 @@ def _is_set(obj) -> int:
 
 
 def _type_error(message) -> None:
-    py_raise(py_exc_new(3, message))  # PY_EXC_TYPEERROR
+    py_raise_owned(py_exc_new(3, message))  # PY_EXC_TYPEERROR
 
 
 @c_abi_typed_export("PySet_New", "ptr", ("ptr",))

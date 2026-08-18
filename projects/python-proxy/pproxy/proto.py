@@ -1,6 +1,8 @@
 import asyncio, socket, urllib.parse, time, re, base64, hmac, struct, hashlib, io, os
 from . import admin
 HTTP_LINE = re.compile('([^ ]+) +(.+?) +(HTTP/[^ ]+)$')
+HTTP_PREFIXES = (b'GET ', b'HEAD', b'POST', b'PUT ', b'DELE', b'CONN', b'OPTI', b'TRAC', b'PATC')
+HTTP_PREFIX_INITIALS = tuple(dict.fromkeys(prefix[:1] for prefix in HTTP_PREFIXES))
 packstr = lambda s, n=1: len(s).to_bytes(n, 'big') + s
 
 def netloc_split(loc, default_host=None, default_port=None):
@@ -282,9 +284,13 @@ class Socks5(BaseProtocol):
 
 class HTTP(BaseProtocol):
     async def guess(self, reader, **kw):
-        header = await reader.read_w(4)
+        header = await reader.read_w(1)
+        if header not in HTTP_PREFIX_INITIALS:
+            reader.rollback(header)
+            return False
+        header += await reader.read_n(3)
         reader.rollback(header)
-        return header in (b'GET ', b'HEAD', b'POST', b'PUT ', b'DELE', b'CONN', b'OPTI', b'TRAC', b'PATC')
+        return header in HTTP_PREFIXES
     async def accept(self, reader, user, writer, **kw):
         lines = await reader.read_until(b'\r\n\r\n')
         headers = lines[:-4].decode().split('\r\n')

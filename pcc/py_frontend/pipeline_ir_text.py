@@ -126,47 +126,96 @@ def llvm_global_name_char(char: str) -> bool:
     return char.isalnum() or char in ("_", ".", "$", "-")
 
 
+def _skip_llvm_quoted(text: str, open_index: int) -> int:
+    """Index just past the string literal that opens at ``open_index``.
+
+    Escapes are honoured, so a ``\\"`` does not end the literal.  Uses ``find``
+    to jump between the only two characters that matter instead of inspecting
+    every character of the literal.
+    """
+    limit = len(text)
+    cursor = open_index + 1
+    while cursor < limit:
+        backslash = text.find("\\", cursor)
+        closing = text.find('"', cursor)
+        if closing < 0:
+            return limit
+        if backslash >= 0 and backslash < closing:
+            cursor = backslash + 2
+            continue
+        return closing + 1
+    return limit
+
+
 def rename_llvm_global_refs(text: str, rename_map: dict[str, str]) -> str:
+    """Rewrite ``@name`` references outside string literals.
+
+    Jumps to the next ``@`` or ``"`` with ``find`` rather than stepping one
+    character at a time.  The previous version inspected every character of the
+    whole IR text in Python, which made it **20.6% of host-side build CPU** on a
+    stage1 profile (plus 3.1% in ``llvm_global_name_char``, its per-character
+    helper) -- the single largest consumer there.  IR text is overwhelmingly
+    neither ``@`` nor ``"``, so the scan now happens below the interpreter and
+    the Python-level loop runs once per interesting position instead of once per
+    character.  Same function also runs inside pcc1, so stage2 pays it too.
+    """
     if not rename_map:
         return text
     pieces: list[str] = []
+    limit = len(text)
     index = 0
     literal_start = 0
-    in_quote = False
-    escape = False
-    while index < len(text):
-        char = text[index]
-        if in_quote:
-            if escape:
-                escape = False
-            elif char == "\\":
-                escape = True
-            elif char == '"':
-                in_quote = False
-            index += 1
+    # The quote position is carried, not re-found per iteration.  Re-finding it
+    # for every "@" re-scans the same span once per reference and made this
+    # measurably SLOWER than the character loop it replaced (0.8x on a 0.9 MB
+    # module): find is cheap per call but not free per character scanned.
+    next_quote = text.find('"')
+    while index < limit:
+        at = text.find("@", index)
+        if at < 0:
+            break
+        if next_quote >= 0 and next_quote < index:
+            next_quote = text.find('"', index)
+        if next_quote >= 0 and next_quote < at:
+            index = _skip_llvm_quoted(text, next_quote)
+            next_quote = text.find('"', index)
             continue
-        if char == '"':
-            in_quote = True
-            index += 1
-            continue
-        if char != "@":
-            index += 1
-            continue
-        start = index + 1
+        start = at + 1
         end = start
-        while end < len(text) and llvm_global_name_char(text[end]):
-            end += 1
-        name = text[start:end]
-        replacement = rename_map.get(name)
+        # Predicate inlined rather than called per character.  After the find-based
+        # rewrite above, llvm_global_name_char became the dominant remaining cost
+        # inside this function (3.3% of host build CPU) -- it is charged once per
+        # character *of each name*, and a Python-level call per character is most
+        # of that.  Kept as a module function too: pipeline.py re-exports it.
+        scanning = True
+        while scanning:
+            if end >= limit:
+                scanning = False
+            else:
+                name_char = text[end]
+                if (
+                    name_char.isalnum()
+                    or name_char == "_"
+                    or name_char == "."
+                    or name_char == "$"
+                    or name_char == "-"
+                ):
+                    end += 1
+                else:
+                    scanning = False
+        replacement = rename_map.get(text[start:end])
         if replacement is not None:
-            if literal_start < index:
-                pieces.append(text[literal_start:index])
+            if literal_start < at:
+                pieces.append(text[literal_start:at])
             pieces.append("@" + replacement)
             literal_start = end
         index = end
+        if end == at + 1:
+            # A bare "@" matches no name; advance so the scan cannot stall.
+            index = at + 1
     if not pieces:
         return text
-    if literal_start < len(text):
+    if literal_start < limit:
         pieces.append(text[literal_start:])
     return "".join(pieces)
 

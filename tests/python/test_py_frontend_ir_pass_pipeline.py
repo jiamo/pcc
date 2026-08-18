@@ -122,12 +122,16 @@ def test_python_frontend_jobs_env_can_force_serial(monkeypatch):
     assert pipeline._python_frontend_jobs(111) == 1
 
 
-def test_self_backend_jobs_defaults_to_conservative_pool(monkeypatch):
+def test_self_backend_jobs_defaults_to_bounded_pool(monkeypatch):
     monkeypatch.delenv("PCC_SELF_BACKEND_JOBS", raising=False)
     monkeypatch.delenv("PCC_OUTER_PARALLELISM", raising=False)
     monkeypatch.setattr(pipeline.os, "cpu_count", lambda: 12)
 
-    assert pipeline._self_backend_jobs(111) == 2
+    # SELF_BACKEND_DEFAULT_JOBS is 8: the four-worker cap was DENIED with a
+    # measured 52.8% wall regression on the frozen 32-item medium lane
+    # (docs/goal/evidence/2026-08-21-stage2-medium-concurrency-cap-denied.md),
+    # so the bounded default this asserts is min(n_modules, cpu, 8).
+    assert pipeline._self_backend_jobs(111) == 8
     assert pipeline._self_backend_jobs(1) == 1
 
 
@@ -147,17 +151,22 @@ def test_self_backend_large_ir_memory_budget_remains_overridable(monkeypatch):
     assert pipeline._self_backend_split_shard_bytes() == 1_500_000
 
 
-def test_compiled_self_backend_large_ir_defaults_to_one_worker(monkeypatch):
+def test_compiled_self_backend_large_ir_bounds_concurrency(monkeypatch):
     monkeypatch.delenv("PCC_SELF_BACKEND_JOBS", raising=False)
     monkeypatch.delenv("PCC_OUTER_PARALLELISM", raising=False)
     monkeypatch.delenv("PCC_SELF_BACKEND_SPLIT_THRESHOLD_BYTES", raising=False)
     monkeypatch.setattr(pipeline.os, "cpu_count", lambda: 12)
 
+    # Large inputs bound the lane to LARGE_INPUT_CONCURRENCY instead of
+    # collapsing to one worker: the old any-large->1 rule serialized all 525
+    # objects of a cold stage1 behind a single large module (35 s -> 434 s in
+    # the emit phase; see the comment in pipeline_self_backend_config.jobs_for_
+    # input_sizes).  Two inputs cap at min(2, LARGE_INPUT_CONCURRENCY).
     assert (
         pipeline._self_backend_jobs_for_ir_texts(
             ["x" * 2_000_000, "small"], native_worker=True
         )
-        == 1
+        == 2
     )
     assert (
         pipeline._self_backend_jobs_for_ir_texts(
@@ -264,7 +273,7 @@ def test_python_frontend_source_workers_use_short_bounded_chunks():
 
 def test_python_frontend_worker_executable_skips_text_console_script(
     monkeypatch, tmp_path
-):
+                ):
     console_script = tmp_path / "pcc"
     console_script.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
     monkeypatch.setattr(pipeline.sys, "argv", [str(console_script)])
@@ -1619,8 +1628,32 @@ def test_parallel_frontend_codegen_uses_shared_export_context(tmp_path, monkeypa
         for command in commands:
             manifest_path = command.split()[-1]
             manifest = pipeline._read_python_frontend_worker_manifest(manifest_path)
+            if manifest["job_kind"] == "summary":
+                assert pipeline._run_python_multi_summary_worker(manifest) == 0
+                continue
             if manifest["job_kind"] == "export":
                 export_manifests.append(manifest)
+                # The production export worker also writes one AST wire per
+                # assigned module (pipeline_frontend_worker_execution.py), and
+                # the coordinator reads them back; a fake that skips this makes
+                # the coordinator fail on a missing module_<index>.json.
+                ast_dir = str(manifest.get("ast_dir", "") or "")
+                if ast_dir:
+                    from pcc.parse.py_lift import parse_and_lift
+
+                    for index in manifest["assigned_indices"]:
+                        src_path = manifest["src_paths"][index]
+                        with open(src_path, "r", encoding="utf-8") as f:
+                            module_source = f.read()
+                        ast_module = parse_and_lift(
+                            module_source,
+                            src_path,
+                            manifest["module_names"][index],
+                        )
+                        pipeline._write_py_ast_wire(
+                            os.path.join(ast_dir, f"module_{index}.json"),
+                            ast_module,
+                        )
                 exports_path = os.path.join(
                     manifest["ir_dir"],
                     f"exports_{len(export_manifests)}.json",
@@ -1634,7 +1667,14 @@ def test_parallel_frontend_codegen_uses_shared_export_context(tmp_path, monkeypa
                     {"entry": {}, "helper": {}},
                     {},
                 )
-                pipeline._write_reexport_edges_wire(edges_path, ())
+                pipeline._write_reexport_edges_wire(
+                    edges_path,
+                    (),
+                    module_dependencies=tuple(
+                        (manifest["module_names"][index], ())
+                        for index in manifest["assigned_indices"]
+                    ),
+                )
                 with open(manifest["result_path"], "w", encoding="utf-8") as f:
                     f.write("EXPORT\t" + exports_path + "\t" + edges_path + "\n")
                 continue
@@ -1955,6 +1995,17 @@ def test_memory_pass_shards_default_fast_pipeline(monkeypatch):
 
 def test_batch_pass_skip_survives_large_module_sharding(monkeypatch, tmp_path):
     telemetry_path = tmp_path / "passes.jsonl"
+    # The sharding+skip contract this test guards lives on the memory-transport
+    # subprocess route.  With default_raw="default" (the self-backend request
+    # path) the exact versioned tier now runs through the compiled in-process
+    # path (PERF-P3), which never shards -- by design, not as a regression.
+    # Selecting the same tier through the ENV on a non-self request
+    # (default_raw=None) keeps the compiled branch out, per its own comment
+    # ("do not silently replace the normal LLVM/host optimizer"), and module
+    # sharding is only allowed for exactly this tier, so this is the one
+    # remaining configuration that exercises shard naming with a skip-listed
+    # module inside the batch.
+    monkeypatch.setenv("PCC_PYTHON_IR_PASSES", "default")
     monkeypatch.setenv("PCC_PYTHON_IR_PASS_TRANSPORT", "memory")
     monkeypatch.setenv("PCC_PYTHON_IR_PASS_CACHE", "off")
     monkeypatch.setenv("PCC_PYTHON_IR_PASS_TELEMETRY_PATH", str(telemetry_path))
@@ -1963,7 +2014,7 @@ def test_batch_pass_skip_survives_large_module_sharding(monkeypatch, tmp_path):
 
     out = pipeline._apply_python_ir_pass_pipeline_many(
         [("pcc.py_frontend.codegen.class_gen", _SIBLING_CALL_BRANCH_IR)],
-        default_raw="default",
+        default_raw=None,
     )
 
     assert [name for name, _text in out] == [

@@ -1791,8 +1791,21 @@ class AttrLoadLoweringMixin:
                 result,
                 expr.ty,
             )
+            # py_obj_getattr returns a NEW reference and marshal only
+            # unpacks (marshal.py contains no releases); once the scalar is
+            # extracted the boxed result is ours to drop.
+            self._gc_release(
+                result, self._release_context_label(f"attr.{expr.name}")
+            )
             self._gc_release_if_owned(obj, expr.obj)
             return native_result
+        # Register the NEW reference at the emitter — the only place that
+        # knows the raising getattr ran rather than the borrowed field
+        # read.  Consumers release through _gc_release_if_owned, whose
+        # AST-shape classifier says not-owned for Attr; the registry
+        # overrides it (same mechanism as the dynamic-call path).  See
+        # docs/goal/evidence/2026-08-25-attr-getattr-ownership-investigation.md.
+        self._note_owned_dynamic_call_value(result)
         self._gc_release_if_owned(obj, expr.obj)
         return result
 

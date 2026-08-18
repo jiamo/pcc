@@ -44,7 +44,7 @@ proves and what it does not.
   dependencies.
 - **Experimental native GUI.** A pcc-Python GUI stack covers layout, controls,
   declarative components, scheduling, events, styling, commands, and app
-  lifecycle. The macOS `mac_diff_app` canary compiles with pcc1/self/no-libpython
+  lifecycle. The macOS `mac_diff_app` canary (now in https://github.com/allstoalls/pcc-gui) compiles with pcc1/self/no-libpython
   and renders through an AppKit/Metal bridge, with explicitly bounded native
   interaction and pixel-correctness claims.
 - **No-libpython by default.** Python inputs compile to native binaries that do
@@ -71,7 +71,7 @@ pip install python-cc
 For repository development:
 
 ```bash
-git clone https://github.com/jiamo/pcc
+git clone https://github.com/allstoalls/pcc
 cd pcc
 uv sync
 ```
@@ -212,7 +212,7 @@ For a pinned offline/reproducibility gate, the repository also retains
 | GC | Five backends (0..4); all pass the full three-stage self-host bootstrap matrix. Backend #0 is the default/rollback reference. |
 | NumPy | `pcc1 -m pip install numpy` uses owned, hash-verified network acquisition of NumPy 2.4.x and installs into the active first-class pcc environment; a bare follow-up `pcc1 app.py` runs `import numpy` + `np.array(...) + scalar` under strict self/no-libpython across GC0..4. Narrow (import/version/array construct/scalar add/element access/iteration/`==`/`repr`); general resolver/build isolation, ufuncs, reductions, dtypes, and broadcasting are not covered; CPython-ABI artifacts stay intentionally rejected (`PCC-PKG-004`). |
 | GUI | Experimental pcc-Python runtime modules provide layout, elements/controls, binding, image/text, declarative components, keyed commit, state lanes, events/effects, style compilation, commands, and app lifecycle. The current product canary is a macOS AppKit/Metal dual-pane diff app; deterministic headless behavior and bounded native bridge reachability exist, while continuous interaction, pixel correctness, full text metrics, and platform portability remain open. |
-| Gateway / `pcc.web` | An experimental pcc-owned HTTP/1 gateway kernel and declarative framework are present in source, including virtual-thread I/O, routing, reverse proxying, DNS, lifecycle, and an explicit OpenSSL-provider ABI. The current source pass is unverified: no focused/current-pcc1/GC0..4/live-network gate has run, so this is not yet a gateway capability or nginx-replacement claim. |
+| Gateway / web framework | Moved to https://github.com/allstoalls/pcc-gateway (experimental; imported as an ordinary pcc package and compiled by pcc1 with the application). The runtime keeps only the generic process-control substrate it used. |
 | GPU kernel IR | Experimental, macOS/Metal only. Kernel-only IR with TIRx-style freeze and `.metallib` finalization; evidence is claim-leveled (`GPU_LEVEL_0`..`GPU_LEVEL_6`). Toolchain/device absence reports `SKIPPED_WITH_REASON`, never success. |
 | Distributed | Metadata-only first slice (`pcc.dist`): single process, CPU-only, no sockets. Every network mode reports `SKIPPED_WITH_REASON`. |
 
@@ -426,35 +426,17 @@ env -u LC_ALL uv run pytest tests/gpu_hardware -q -n0  # real Metal launch: Leve
 
 ### Native GUI (macOS, experimental)
 
-The pcc-Python runtime contains GUI owners for layout, elements and controls,
-window events, binding, text and images, theme/animation, a composition-tree
-kernel, declarative components, keyed render/commit, queued state lanes,
-targeted events and phased effects, compiled style utilities, typed commands,
-managed state, and application lifecycle. These live under
-`pcc/py_runtime/py/pcc_gui_*.py` and are compiled into the runtime rather than
-implemented as a Python wrapper around a general webview framework.
-
-The end-to-end canary is a native macOS dual-pane file comparison app authored
-in pcc-Python. Its application binary is compiled by pcc1 with the self backend
-and no libpython; AppKit owns the window, a Metal `CAMetalLayer` renders rects,
-and `CATextLayer` supplies the current text path.
-
-```bash
-scripts/bootstrap.sh --stage 1
-cd projects/mac_diff_app
-./build.sh
-./mac_diff_app
-```
-
-This is a bounded experimental path. The deterministic headless canary covers
-component/state/re-render behavior and the native bridge proves a real
-acknowledged render plus lifecycle-event reachability. The current native entry
-does not yet claim continuous interaction, captured pixel correctness,
-proportional or wide-glyph metrics, large-file virtualization, or non-macOS
-portability. It also uses AppKit, Metal, libSystem, and a clang-built Objective-C
-bridge dylib, so **no-libpython GUI does not mean zero-libc GUI**. See the
-[GUI design contract](docs/design/gui-declarative-absorption.md) and
-[`mac_diff_app` guide](projects/mac_diff_app/README.md).
+The declarative GUI framework (layout, elements and controls, window events,
+binding, text and images, theme/animation, composition-tree kernel, components,
+keyed render/commit, compiled style utilities, typed commands, application
+lifecycle) and its macOS canary, a dual-pane file comparison app, now live in
+https://github.com/allstoalls/pcc-gui. It is an ordinary pcc package: an
+application does `import pcc_gui` and `pcc1` compiles the framework into the
+program (`PCC_PACKAGE_SITE=/path/to/pcc-gui pcc1 ... app.py -o app`). The core
+keeps only the generic Metal render surface (`pcc/kernel_ir/metal_render_surface.py`)
+that the framework's window bridge is generated from. The GUI still uses AppKit,
+Metal, libSystem and a clang-built Objective-C bridge dylib, so **no-libpython
+GUI does not mean zero-libc GUI**.
 
 ## Bootstrap
 
@@ -589,12 +571,12 @@ linked `libpython`.
 | `pcc/evaluater/c_evaluator.py`, `pcc/codegen/c_codegen.py` | C compile/evaluate/link and main C lowering. |
 | `pcc/py_frontend/` | Python type inference and native lowering. |
 | `pcc/py_runtime/` | Runtime archive sources (C) and pcc-Python ports. |
-| `pcc/py_runtime/py/pcc_gui_*.py` | Experimental pcc-Python GUI kernel, declarative runtime, styling, commands, and lifecycle. |
+| GUI framework | Moved to https://github.com/allstoalls/pcc-gui (`import pcc_gui`, compiled by pcc1 with the application). |
 | `pcc/backend/`, `pcc/llvm_capi/` | Experimental self backend and in-repo LLVM-C path. |
 | `pcc/kernel_ir/`, `pcc/gpu_gc/`, `pcc/dist/` | GPU kernel IR, GPU-GC seam, local-only distributed oracles. |
 | `pcc/extern/`, `pcc/unsafe/` | Python→C extern decls and low-level intrinsics. |
 | `utils/fake_libc_include/` | Fake libc headers used by the C frontend. |
-| `projects/mac_diff_app/` | Native macOS AppKit/Metal GUI canary authored in pcc-Python. |
+| `mac_diff_app`, `harness` | GUI examples, now under `examples/` in https://github.com/allstoalls/pcc-gui. |
 | `tests/`, `projects/`, `benchmarks/` | Regression/corpus/integration tests, stress targets, perf tooling. |
 
 ## Environment controls
@@ -640,7 +622,7 @@ Current work is governed by
 | Python tutorial / how-to / limitations | [docs/python-tutorial.md](docs/python-tutorial.md), [docs/python-howto.md](docs/python-howto.md), [docs/python-limitations.md](docs/python-limitations.md) |
 | Python compat / NumPy plans | [docs/plans/python-compat-specialization-strategy.md](docs/plans/python-compat-specialization-strategy.md), [docs/plans/numpy_plan.md](docs/plans/numpy_plan.md) |
 | Freestanding runtime / libc ownership | [docs/investigations/freestanding-runtime-final-no-c-closure.md](docs/investigations/freestanding-runtime-final-no-c-closure.md), [Linux zero-libc tracer evidence](docs/goal/evidence/2026-08-03-linux-zero-libc-python-start.md) |
-| Declarative GUI and macOS canary | [docs/design/gui-declarative-absorption.md](docs/design/gui-declarative-absorption.md), [projects/mac_diff_app/README.md](projects/mac_diff_app/README.md) |
+| Declarative GUI and macOS canary | https://github.com/allstoalls/pcc-gui (`docs/gui-declarative-absorption.md` there) |
 | GPU route contract and Kernel IR | [docs/design/pcc-gpu-next-work.md](docs/design/pcc-gpu-next-work.md), [docs/design/pcc-kernel-ir.md](docs/design/pcc-kernel-ir.md) |
 | Investigation reports | [docs/investigations/](docs/investigations/) |
 | Contributor / agent notes | [AGENTS.md](AGENTS.md) |

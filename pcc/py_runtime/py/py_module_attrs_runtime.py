@@ -1,4 +1,7 @@
 """pcc-Python ownership of native compiled-module attribute storage."""
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_STR,
 )
@@ -33,6 +36,8 @@ py_obj_getitem_i64 = extern("py_obj_getitem_i64", (c_ptr, c_int64), c_ptr)
 py_decref = extern("py_decref", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 pcc_gc_pin = extern("pcc_gc_pin", (c_ptr,), c_void)
 pcc_gc_load_ptr = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_ptr)
 
@@ -140,7 +145,7 @@ def _is_string(value) -> bool:
 
 def _import_star_name(dest, source_module, source_attrs, name) -> int:
     if not _is_string(name):
-        py_raise(py_exc_new(3, cstr("module __all__ must contain only strings")))
+        py_raise_owned(py_exc_new(3, cstr("module __all__ must contain only strings")))
         return -1
     value = py_dict_get(source_attrs, name)
     if ptr_is_null(value):

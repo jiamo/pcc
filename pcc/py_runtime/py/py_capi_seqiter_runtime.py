@@ -12,8 +12,11 @@ Owned surface (stable C ABI names):
 
 Constants:
   Py_TPFLAGS_READY = 0x1000, Py_TPFLAGS_HAVE_GC = 0x2000,
-  PCC_TPFLAGS_MANAGED_DEALLOC = 0x1000000
+  PCC_TPFLAGS_MANAGED_DEALLOC = 1 << 62
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_GEN,
     PY_TYPE_ITER,
@@ -47,6 +50,8 @@ from pcc.unsafe import (
 py_type_of = extern("pcc_py_type_of", (c_ptr,), c_int64)
 py_decref = extern("py_decref", (c_ptr,), c_void)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 py_err_occurred = extern("py_err_occurred", (), c_int64)
 py_clear_exception = extern("py_clear_exception", (), c_void)
@@ -90,7 +95,7 @@ def _seqiter_type() -> c_ptr:
     store_i64(t, 0, 1)  # refcount
     store_ptr(t, 32, cstr("iterator"))
     store_i64(t, 40, 40)  # tp_basicsize
-    store_i64(t, 176, 0x1000 | 0x2000 | 0x1000000)
+    store_i64(t, 176, 0x1000 | 0x2000 | 4611686018427387904)
     store_ptr(t, 56, function_addr("pcc_capi_seqiter_dealloc"))
     store_ptr(t, 192, function_addr("pcc_capi_seqiter_traverse"))
     tag: int = pcc_capi_cext_tag_for(t)
@@ -136,7 +141,7 @@ def PyIter_Check(obj) -> int:
 @c_abi_typed_export("PyIter_Next", "ptr", ("ptr",))
 def PyIter_Next(obj) -> c_ptr:
     if ptr_is_null(obj):
-        py_raise(py_exc_new(3, cstr("NULL object is not an iterator")))
+        py_raise_owned(py_exc_new(3, cstr("NULL object is not an iterator")))
         return null()
     if pcc_capi_is_seqiter(obj) != 0:
         return pcc_capi_seqiter_next(obj)
@@ -151,11 +156,11 @@ def PyIter_Next(obj) -> c_ptr:
 @c_abi_typed_export("PyIter_NextItem", "i32", ("ptr", "ptr"))
 def PyIter_NextItem(iter_obj, item_out) -> int:
     if ptr_is_null(item_out):
-        py_raise(py_exc_new(7, cstr("NULL result pointer")))
+        py_raise_owned(py_exc_new(7, cstr("NULL result pointer")))
         return -1
     store_ptr(item_out, 0, null())
     if ptr_is_null(iter_obj) or PyIter_Check(iter_obj) == 0:
-        py_raise(py_exc_new(3, cstr("expected an iterator")))
+        py_raise_owned(py_exc_new(3, cstr("expected an iterator")))
         return -1
     item = PyIter_Next(iter_obj)
     store_ptr(item_out, 0, item)
@@ -169,7 +174,7 @@ def PyIter_NextItem(iter_obj, item_out) -> int:
 @c_abi_typed_export("PySeqIter_New", "ptr", ("ptr",))
 def PySeqIter_New(seq) -> c_ptr:
     if ptr_is_null(seq):
-        py_raise(py_exc_new(3, cstr("iteration over a non-sequence")))
+        py_raise_owned(py_exc_new(3, cstr("iteration over a non-sequence")))
         return null()
     type_obj = _seqiter_type()
     obj = PyType_GenericAlloc(type_obj, 0)

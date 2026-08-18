@@ -10,6 +10,10 @@ what stops a C-side layout change from silently missing the mirror
 (ARCH-P2-PORT-ABI-AUTOGEN).
 """
 
+# Runtime ports keep raw pointers in the pointer lane; the frontend reads
+# this directive from every module compiled into the runtime archive.
+__pcc_runtime_port__ = True
+
 # --- struct field offsets ---
 DICTENTRY_HASH_OFFSET = 0
 DICTENTRY_KEY_OFFSET = 8

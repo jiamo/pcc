@@ -18,34 +18,52 @@ MAKEFILE = RUNTIME_DIR / "Makefile"
 
 OWNED_SYMBOLS = {
     "pcc_gc_begin_mark_cycle",
+    "pcc_gc_drain_all_gray_locked_slice",
     "pcc_gc_drain_all_gray_unlocked",
     "pcc_gc_finish_tracing_cycle",
     "pcc_gc_seed_roots",
+    "pcc_gc_tracing_cycle_epoch_advance_unlocked",
+    "pcc_gc_tracing_finish_claim_clear_unlocked",
     "pcc_gc_trace_mark_gray_if_known",
+    "pcc_gc_trace_cext_referents_unlocked",
+    "pcc_gc_trace_cext_slot_transaction",
     "pcc_gc_trace_referents",
     "pcc_gc_trace_slot",
 }
 RAW_FUNCTION_IMPORTS = {
+    "pcc_capi_is_cext_type_tag",
     "pcc_gc_gray_count_decrement_acq_rel",
-    "pcc_gc_gray_count_load_acquire",
+    "pcc_gc_gray_count_store_release",
     "pcc_gc_gray_count_increment_acq_rel",
     "pcc_gc_gray_current_roots",
     "pcc_gc_gray_refcount_external_roots",
     "pcc_gc_load_ptr",
     "pcc_gc_forwarding_index_find",
     "pcc_gc_object_is_known_no_lock",
+    "pcc_gc_object_node_is_active",
     "pcc_gc_prepare_object_list_mark",
+    "pcc_py_gc_minor_graph_lock",
+    "pcc_py_gc_minor_graph_unlock",
     "pcc_gc_visit_object_slots",
-    "pcc_resume_world",
-    "pcc_stop_the_world",
-    "pcc_thread_safepoint",
+    "pcc_platform_abort",
+    "py_incref",
 }
 RAW_GLOBAL_IMPORTS = {
-    "pcc_gc_cycle_requested",
+    "pcc_gc_backend_selected",
     "pcc_gc_explicit_collect_active",
     "pcc_gc_mark_active",
     "pcc_gc_object_head",
     "pcc_gc_trace_cursor",
+    "pcc_gc_trace_cext_pending_backend",
+    "pcc_gc_trace_cext_pending_epoch",
+    "pcc_gc_trace_cext_pending_obj",
+    "pcc_gc_trace_extension_roots_backend",
+    "pcc_gc_trace_extension_roots_epoch",
+    "pcc_gc_trace_extension_roots_pending",
+    "pcc_gc_tracing_cycle_epoch",
+    "pcc_gc_tracing_finish_claim_backend",
+    "pcc_gc_tracing_finish_claim_epoch",
+    "pcc_gc_tracing_finish_commits",
 }
 
 
@@ -118,16 +136,24 @@ def test_common_mark_cycle_preserves_root_and_termination_order():
     )
 
     finish = source.split('@c_abi_export("pcc_gc_finish_tracing_cycle")', 1)[1]
-    assert finish.index("pcc_stop_the_world()") < finish.index(
-        "pcc_gc_gray_current_roots()"
+    assert "pcc_stop_the_world" not in finish
+    assert "pcc_resume_world" not in finish
+    assert "pcc_thread_safepoint" not in finish
+    assert finish.index('global_addr("pcc_gc_tracing_finish_claim_epoch")') < (
+        finish.index('global_addr("pcc_gc_tracing_cycle_epoch")')
     )
-    assert finish.index("pcc_gc_gray_current_roots()") < finish.index(
-        "pcc_gc_drain_all_gray_unlocked()"
+    assert finish.index('global_addr("pcc_gc_tracing_cycle_epoch")') < (
+        finish.index('global_addr("pcc_gc_backend_selected")')
+    ) < finish.index('global_addr("pcc_gc_mark_active")')
+    assert "pcc_gc_gray_current_roots()" not in finish
+    assert "pcc_gc_drain_all_gray" not in finish
+    assert finish.index("flags | 1024") < finish.index(
+        'global_store_ptr("pcc_gc_trace_cursor", null())'
+    ) < finish.index('global_addr("pcc_gc_mark_active")', finish.index("flags | 1024"))
+    assert 'store_i32(global_addr("pcc_gc_cycle_requested"), 0, 0)' not in finish
+    assert finish.index('global_addr("pcc_gc_tracing_finish_commits")') < (
+        finish.rindex("pcc_gc_tracing_finish_claim_clear_unlocked(")
     )
-    assert finish.index("pcc_gc_drain_all_gray_unlocked()") < finish.index(
-        "flags | 1024"
-    )
-    assert finish.index("flags | 1024") < finish.index("pcc_resume_world()")
 
 
 def test_referent_trace_does_not_regray_black_objects():

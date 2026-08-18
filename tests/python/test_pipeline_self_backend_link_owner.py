@@ -9,6 +9,21 @@ from pcc.py_frontend import pipeline_self_backend_link as self_link
 from pcc.py_frontend import pipeline_self_link as link_contract
 
 
+def test_explicit_repo_root_owns_self_link_driver_resolution(monkeypatch, tmp_path):
+    frozen = tmp_path / "frozen-source"
+    frozen.mkdir()
+    (frozen / "AGENTS.md").write_text("# frozen\n", encoding="utf-8")
+    monkeypatch.setenv("PCC_REPO_ROOT", str(frozen))
+    monkeypatch.setattr(pipeline, "__file__", "/live/repo/pcc/py_frontend/pipeline.py")
+    assert pipeline._repo_root_for_link() == str(frozen)
+
+
+def test_invalid_explicit_repo_root_fails_closed(monkeypatch, tmp_path):
+    monkeypatch.setenv("PCC_REPO_ROOT", str(tmp_path))
+    with pytest.raises(pipeline.PyPipelineError, match="complete pcc source root"):
+        pipeline._repo_root_for_link()
+
+
 def test_cc_link_owner_runs_the_exact_prepared_command(monkeypatch):
     calls = []
 
@@ -95,6 +110,11 @@ def test_facade_routes_ir_text_linking_to_the_owner(monkeypatch, tmp_path):
     assert observed["args"][0] == ["define i32 @main() { ret i32 0 }"]
     assert observed["kwargs"]["tmp_dir"] == str(tmp_path)
     assert observed["kwargs"]["link_run"] is pipeline._link_self_backend_ir_texts_run
+
+
+def test_link_facade_has_no_second_file_path_owner():
+    assert not hasattr(pipeline, "_link_with_self_backend_ir_paths")
+    assert not hasattr(self_link, "link_ir_paths")
 
 
 def test_semantic_layout_rejects_split_module_before_emission(

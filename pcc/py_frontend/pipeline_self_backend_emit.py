@@ -232,6 +232,48 @@ def _pack_batches(worker_items, batch_max_items: int, item_bytes):
     return [batch for batch in batches if batch]
 
 
+def pack_admission_waves(command_bytes, byte_cap: int, width: int):
+    """Group per-command input-byte weights into memory-safe waves.
+
+    First-fit-decreasing: commands sorted by weight descending, each placed
+    into the first wave whose byte sum stays within ``byte_cap`` and whose
+    width stays within ``width``; otherwise it opens a new wave.  Returns a
+    list of waves, each a list of original command indices.
+
+    Input bytes are the footprint proxy calibrated from the 2026-08-27
+    oversized-lane receipts (~1.3-1.4 GB peak footprint per input MB, pair
+    sums measured <= 7.2 GB under a 7 MB byte cap; see
+    docs/goal/evidence/2026-08-27-oversized-lane-pairing-schedule-design.md).
+    The general sliding window in run_worker_commands is better for many
+    small children, but it cannot keep two specific giants from being
+    co-resident; for a handful of multi-GiB workers the bounded barrier
+    loss buys a hard memory guarantee.
+    """
+    order = sorted(
+        range(len(command_bytes)),
+        key=lambda index: (-int(command_bytes[index]), index),
+    )
+    waves: list[list[int]] = []
+    wave_bytes: list[int] = []
+    for index in order:
+        weight = int(command_bytes[index])
+        placed = False
+        for wave_index in range(len(waves)):
+            if placed:
+                continue
+            if len(waves[wave_index]) >= width:
+                continue
+            if wave_bytes[wave_index] + weight > byte_cap:
+                continue
+            waves[wave_index].append(index)
+            wave_bytes[wave_index] = wave_bytes[wave_index] + weight
+            placed = True
+        if not placed:
+            waves.append([index])
+            wave_bytes.append(weight)
+    return waves
+
+
 def run_emit_worker_pool(
     worker_command_prefix: list[str],
     worker_items: list[tuple[str, str, str]],
@@ -247,13 +289,42 @@ def run_emit_worker_pool(
     small_int_decimal,
     shell_quote_arg,
     run_worker_commands,
+    admission_byte_cap: int = 0,
+    admission_width: int = 2,
 ) -> int:
     if not worker_items:
         return 0
     max_parallel = max(1, min(int(max_parallel), len(worker_items)))
-    batches = _pack_batches(worker_items, batch_max_items, None)  # BISECT: packing off
+    # An oversized input can retain several GiB in a native worker.  Never put
+    # two such inputs in one process: even though the lane is serial, batching
+    # kept every completed IR graph alive and one stage2 worker grew past
+    # 12 GiB while processing its fourth shard.  A fresh process is the memory
+    # lifetime boundary.  Callers can also select batch_max_items=1 for safe
+    # native inputs; source workers retain byte-balanced startup amortization.
+    effective_batch_max_items = (
+        1 if batch_label == "oversized" else batch_max_items
+    )
+    batches = _pack_batches(
+        worker_items,
+        effective_batch_max_items,
+        item_bytes,
+    )
+    # _pack_batches REORDERS by descending bytes (LPT), so the caller's
+    # item_bytes list no longer aligns with the batch/command order.  Weigh
+    # each command from its own batch contents instead.
+    bytes_by_item = {}
+    if item_bytes is not None and len(item_bytes) == len(worker_items):
+        for item_index in range(len(worker_items)):
+            bytes_by_item[worker_items[item_index]] = int(
+                item_bytes[item_index]
+            )
+    command_bytes: list[int] = []
     commands: list[str] = []
     for batch_index, batch in enumerate(batches):
+        batch_weight = 0
+        for batch_item in batch:
+            batch_weight = batch_weight + bytes_by_item.get(batch_item, 0)
+        command_bytes.append(batch_weight)
         manifest_path = str(
             os.path.join(
                 tmp_dir,
@@ -278,6 +349,28 @@ def run_emit_worker_pool(
             [shell_quote_arg(worker_arg), shell_quote_arg(manifest_path)]
         )
         commands.append(join_strings(command_parts, " "))
+    if (
+        admission_byte_cap > 0
+        and batch_label == "oversized"
+        and bytes_by_item
+        and len(commands) > 1
+        and len(command_bytes) == len(commands)
+    ):
+        # Memory-safe width-2 waves for the multi-GiB oversized workers.
+        # Each wave's input-byte sum respects the cap, so two giants are
+        # never co-resident; pools are sequential, so the wave peak is the
+        # machine peak.  Serial behavior is recovered with cap 0.
+        waves = pack_admission_waves(
+            command_bytes,
+            int(admission_byte_cap),
+            int(admission_width),
+        )
+        for wave in waves:
+            run_worker_commands(
+                [commands[index] for index in wave],
+                max_parallel=len(wave),
+            )
+        return len(commands)
     run_worker_commands(
         commands,
         max_parallel=min(max_parallel, len(commands)),
@@ -568,12 +661,32 @@ def emit_objects_many_in_process(
         explicit_emit_jobs = str(
             os.environ.get(jobs_env, "") or ""
         ).strip()
+        # Memory-aware width-2 waves for the oversized lane, calibrated by
+        # the 2026-08-27 per-item receipts (input bytes track peak footprint
+        # at ~1.3-1.4 GB/MB; a 7 MB concurrent-input cap held every measured
+        # pair <= 7.2 GB while the serial lane cost 164.8 s).  Cap 0 keeps
+        # the serial lane; an explicit jobs env keeps the legacy unbounded
+        # override and disables admission rather than stacking both.
+        oversized_admission_cap = 7_000_000
+        admission_env = str(
+            os.environ.get("PCC_SELF_BACKEND_OVERSIZED_BYTE_CAP", "") or ""
+        ).strip()
+        if admission_env:
+            cap_valid = True
+            for ch in admission_env:
+                if ch < "0" or ch > "9":
+                    cap_valid = False
+            if cap_valid:
+                oversized_admission_cap = int(admission_env)
+            else:
+                oversized_admission_cap = 0
         if oversized_worker_items:
             oversized_emit_jobs = 1
             if explicit_emit_jobs:
                 oversized_emit_jobs = jobs(
                     len(oversized_worker_items)
                 )
+                oversized_admission_cap = 0
         effective_emit_jobs = max(safe_emit_jobs, oversized_emit_jobs)
         profile_counter(
             profile,
@@ -615,7 +728,9 @@ def emit_objects_many_in_process(
                 tmp_dir,
                 "oversized",
                 oversized_emit_jobs,
+                bool(native_worker),
                 item_bytes=_item_byte_sizes(oversized_worker_items),
+                admission_byte_cap=oversized_admission_cap,
             )
             profile_end(
                 profile,
@@ -644,6 +759,7 @@ def emit_objects_many_in_process(
                     tmp_dir,
                     "huge",
                     min(2, safe_emit_jobs, len(huge_items)),
+                    bool(native_worker),
                     item_bytes=huge_bytes,
                 )
             if medium_items:
@@ -654,6 +770,7 @@ def emit_objects_many_in_process(
                     tmp_dir,
                     "medium",
                     min(8, safe_emit_jobs, len(medium_items)),
+                    bool(native_worker),
                     item_bytes=medium_bytes,
                 )
         if small_worker_items:
@@ -664,6 +781,7 @@ def emit_objects_many_in_process(
                 tmp_dir,
                 "small",
                 min(12, safe_emit_jobs, len(small_worker_items)),
+                bool(native_worker),
             )
         if large_worker_items or small_worker_items:
             profile_end(
@@ -970,4 +1088,3 @@ def emit_objects_many_via_host_python(
         len(pairs) if internal_link else 0,
     )
     return pairs
-

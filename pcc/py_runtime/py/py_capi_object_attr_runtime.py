@@ -16,6 +16,8 @@ Constants (inlined per the pcc-Python runtime-module contract):
   PY_EXC_TYPEERROR = 3, PY_EXC_ATTRIBUTEERROR = 6
 """
 
+__pcc_runtime_port__ = True
+
 from pcc.extern import c_abi_typed_export, c_int32, c_int64, c_ptr, c_void, extern
 from pcc.unsafe import (
     cstr,
@@ -32,6 +34,8 @@ py_obj_getattr = extern("py_obj_getattr", (c_ptr, c_ptr), c_ptr)
 py_obj_setattr = extern("py_obj_setattr", (c_ptr, c_ptr, c_ptr), c_int64)
 py_decref = extern("py_decref", (c_ptr,), c_void)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 py_err_occurred = extern("py_err_occurred", (), c_int64)
 py_clear_exception = extern("py_clear_exception", (), c_void)
@@ -51,7 +55,7 @@ pcc_gc_note_object_allocated_sized = extern(
 
 
 def _type_error(message) -> None:
-    py_raise(py_exc_new(3, message))  # PY_EXC_TYPEERROR
+    py_raise_owned(py_exc_new(3, message))  # PY_EXC_TYPEERROR
 
 
 def _is_attribute_error() -> int:

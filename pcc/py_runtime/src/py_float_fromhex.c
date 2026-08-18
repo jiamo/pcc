@@ -55,7 +55,7 @@ static int pcc_fh_ci_match(const char *s, const char *word) {
 }
 
 static void pcc_fh_error(void) {
-    py_raise(py_exc_new(PY_EXC_VALUEERROR,
+    py_raise_owned(py_exc_new(PY_EXC_VALUEERROR,
         "invalid hexadecimal floating-point string"));
 }
 
@@ -248,13 +248,13 @@ static int pcc_fh_parse_hexfloat(const char *s, double sign, double *out) {
 PyObject *py_float_fromhex(PyObject *text) {
     if (text == NULL || PY_IS_TAGGED_INT(text)
         || py_type_of(text) != PY_TYPE_STR) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR,
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR,
             "float.fromhex() argument must be str"));
         return NULL;
     }
     const char *s = py_str_utf8(text);
     if (s == NULL) {
-        py_raise(py_exc_new(PY_EXC_VALUEERROR,
+        py_raise_owned(py_exc_new(PY_EXC_VALUEERROR,
             "invalid hexadecimal floating-point string"));
         return NULL;
     }
@@ -289,12 +289,12 @@ PyObject *py_float_fromhex(PyObject *text) {
         /* malloc failure building the canonical strtod buffer. Raise so the
          * py_err_occurred() contract holds and generated code branches to the
          * error path (there is no PY_EXC_MEMORYERROR tag yet). */
-        py_raise(py_exc_new(PY_EXC_RUNTIMEERROR,
+        py_raise_owned(py_exc_new(PY_EXC_RUNTIMEERROR,
             "out of memory parsing hexadecimal float"));
         return NULL;
     }
     if (rc == -3) {
-        py_raise(py_exc_new(PY_EXC_OVERFLOWERROR,
+        py_raise_owned(py_exc_new(PY_EXC_OVERFLOWERROR,
             "hexadecimal value too large to represent as a float"));
         return NULL;
     }

@@ -211,12 +211,12 @@ def test_gc_backend_selector_runs_in_no_libpython_binary(tmp_path):
     src = tmp_path / "prog.py"
     exe = tmp_path / "prog.out"
     src.write_text(textwrap.dedent(f"""
-        from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void
+        from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void, c_obj
         from pcc.unsafe import free, load_i32, malloc, null, ptr_add, store_i32, store_i64, store_ptr
 
-        pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
+        pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_obj)
         pcc_gc_release = extern("pcc_gc_release", (c_ptr,), c_void)
-        pcc_gc_load_ptr = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_ptr)
+        pcc_gc_load_ptr = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_obj)
         pcc_gc_store_ptr = extern("pcc_gc_store_ptr", (c_ptr, c_ptr, c_ptr), c_void)
         pcc_gc_pin = extern("pcc_gc_pin", (c_ptr,), c_void)
         pcc_gc_unpin = extern("pcc_gc_unpin", (c_ptr,), c_void)
@@ -317,7 +317,10 @@ def test_gc_backend_selector_runs_in_no_libpython_binary(tmp_path):
     assert result.returncode == 0, result.stderr
     assert result.stdout.strip().splitlines() == [
         "0", "0", "1", "0", "4", "-1", "4", "0", "0", "1", "1", "1",
-        "1", "0", "8", "16", "32", "0", "1", "0", "32",
+            # No tracing step occurs between selecting backend #1 and this
+            # store, so there is no active tricolor invariant: the white child
+            # correctly remains white until the following explicit step.
+            "1", "0", "8", "0", "32", "0", "1", "0", "32",
         "128", "0", "64", "0",
     ]
 
@@ -328,10 +331,10 @@ def test_tracing_gc_backend_preserves_owned_locals_and_frame_roots(tmp_path):
     src = tmp_path / "prog.py"
     exe = tmp_path / "prog.out"
     src.write_text(textwrap.dedent(f"""
-        from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void
+        from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void, c_obj
         from pcc.unsafe import free, load_i32, malloc, null, store_i32, store_ptr
 
-        pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
+        pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_obj)
         pcc_gc_release = extern("pcc_gc_release", (c_ptr,), c_void)
         pcc_gc_set_backend = extern("pcc_gc_set_backend", (c_int64,), c_int64)
         pcc_gc_step = extern("pcc_gc_step", (c_int64,), c_int64)
@@ -394,10 +397,10 @@ def test_tracing_gc_backend_traces_tuple_child_from_frame_root(tmp_path):
     src = tmp_path / "prog.py"
     exe = tmp_path / "prog.out"
     src.write_text(textwrap.dedent(f"""
-        from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void
+        from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void, c_obj
         from pcc.unsafe import free, load_i32, malloc, store_i32, store_i64, store_ptr
 
-        pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
+        pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_obj)
         pcc_gc_release = extern("pcc_gc_release", (c_ptr,), c_void)
         pcc_gc_set_backend = extern("pcc_gc_set_backend", (c_int64,), c_int64)
         pcc_gc_collect = extern("pcc_gc_collect", (c_int32,), c_int64)
@@ -449,10 +452,10 @@ def test_tracing_gc_backend_traces_dict_and_instance_children(tmp_path):
     src = tmp_path / "prog.py"
     exe = tmp_path / "prog.out"
     src.write_text(textwrap.dedent(f"""
-        from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void
+        from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void, c_obj
         from pcc.unsafe import free, load_i32, malloc, null, store_i32, store_i64, store_ptr
 
-        pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
+        pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_obj)
         pcc_gc_set_backend = extern("pcc_gc_set_backend", (c_int64,), c_int64)
         pcc_gc_step = extern("pcc_gc_step", (c_int64,), c_int64)
         pcc_gc_frame_enter = extern("pcc_gc_frame_enter", (c_ptr, c_ptr), c_void)
@@ -520,10 +523,10 @@ def test_tracing_gc_backend_traces_instance_class_child(tmp_path):
     src = tmp_path / "prog.py"
     exe = tmp_path / "prog.out"
     src.write_text(textwrap.dedent(f"""
-        from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void
+        from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void, c_obj
         from pcc.unsafe import free, load_i32, malloc, null, store_i32, store_ptr
 
-        pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
+        pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_obj)
         pcc_gc_set_backend = extern("pcc_gc_set_backend", (c_int64,), c_int64)
         pcc_gc_step = extern("pcc_gc_step", (c_int64,), c_int64)
         pcc_gc_frame_enter = extern("pcc_gc_frame_enter", (c_ptr, c_ptr), c_void)
@@ -586,10 +589,10 @@ def test_tracing_gc_backend_traces_coroutine_children(tmp_path):
     src = tmp_path / "prog.py"
     exe = tmp_path / "prog.out"
     src.write_text(textwrap.dedent(f"""
-        from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void
+        from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void, c_obj
         from pcc.unsafe import free, load_i32, malloc, store_i32, store_ptr
 
-        pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
+        pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_obj)
         pcc_gc_set_backend = extern("pcc_gc_set_backend", (c_int64,), c_int64)
         pcc_gc_collect = extern("pcc_gc_collect", (c_int32,), c_int64)
         pcc_gc_frame_enter = extern("pcc_gc_frame_enter", (c_ptr, c_ptr), c_void)
@@ -640,10 +643,10 @@ def test_generational_gc_surface_reports_young_allocations(tmp_path):
     src = tmp_path / "prog.py"
     exe = tmp_path / "prog.out"
     src.write_text(textwrap.dedent(f"""
-        from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void
+        from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void, c_obj
         from pcc.unsafe import load_i32
 
-        pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
+        pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_obj)
         pcc_gc_release = extern("pcc_gc_release", (c_ptr,), c_void)
         pcc_gc_step = extern("pcc_gc_step", (c_int64,), c_int64)
         pcc_gc_telemetry_reset = extern("pcc_gc_telemetry_reset", (), c_void)
@@ -680,16 +683,16 @@ def test_colored_relocating_gc_read_barrier_clears_candidate(tmp_path):
     src = tmp_path / "prog.py"
     exe = tmp_path / "prog.out"
     src.write_text(textwrap.dedent(f"""
-        from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void
+        from pcc.extern import extern, c_int32, c_int64, c_ptr, c_void, c_obj
         from pcc.unsafe import free, load_i32, malloc, null, store_ptr
 
-        pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
+        pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_obj)
         pcc_gc_release = extern("pcc_gc_release", (c_ptr,), c_void)
         pcc_gc_set_backend = extern("pcc_gc_set_backend", (c_int64,), c_int64)
         pcc_gc_select_relocation_set = extern("pcc_gc_select_relocation_set", (c_int64,), c_int64)
-        pcc_gc_load_ptr = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_ptr)
+        pcc_gc_load_ptr = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_obj)
         pcc_gc_store_ptr = extern("pcc_gc_store_ptr", (c_ptr, c_ptr, c_ptr), c_void)
-        py_list_new = extern("py_list_new", (c_int64,), c_ptr)
+        py_list_new = extern("py_list_new", (c_int64,), c_obj)
 
         def main() -> None:
             pcc_gc_set_backend({BACKEND_COLORED_RELOCATING})

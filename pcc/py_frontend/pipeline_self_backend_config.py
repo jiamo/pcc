@@ -28,6 +28,11 @@ from .pipeline_pass_config import (
 # that shows both a shorter emit phase and a peak the host can hold.
 SELF_BACKEND_DEFAULT_JOBS = 8
 SELF_BACKEND_JOBS_ENV = "PCC_SELF_BACKEND_JOBS"
+# The eight-worker default above is retained for host/source Stage1, where its
+# 1.27 GiB whole-pool peak was actually measured.  A compiled pcc1 worker has a
+# different allocator/object cost model and has reached tens of GiB per item;
+# automatic Stage2+ emission must therefore use the separately proven bound.
+COMPILED_NATIVE_SAFE_JOBS = 2
 # How many >=threshold modules may be emitted concurrently.  See
 # jobs_for_input_sizes for the measurement behind this.
 LARGE_INPUT_CONCURRENCY = 4
@@ -66,6 +71,8 @@ def jobs_for_input_sizes(input_sizes, *, native_worker: bool) -> int:
     raw = str(os.environ.get(SELF_BACKEND_JOBS_ENV, "") or "").strip()
     if raw:
         return selected
+    if selected > COMPILED_NATIVE_SAFE_JOBS:
+        selected = COMPILED_NATIVE_SAFE_JOBS
     threshold = split_threshold_bytes()
     large_inputs = 0
     for input_bytes in input_sizes:
@@ -82,7 +89,10 @@ def jobs_for_input_sizes(input_sizes, *, native_worker: bool) -> int:
     # worker combined.  Keeping a cap (rather than removing it) preserves the
     # protection for a host with genuinely little memory and for a future
     # regression that makes a single module expensive again.
-    return max(1, min(selected, LARGE_INPUT_CONCURRENCY))
+    return max(
+        1,
+        min(selected, LARGE_INPUT_CONCURRENCY, COMPILED_NATIVE_SAFE_JOBS),
+    )
 
 
 def skip_ll_temp() -> bool:

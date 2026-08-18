@@ -17,10 +17,63 @@ _source_module_scope_lines = _pipeline_import_scan._source_module_scope_lines
 
 def source_declares_freestanding_module(source: str) -> bool:
     """Return whether source opts into the strict freestanding contract."""
-    marker = "__pcc_freestanding__"
+    return _source_declares_module_directive(source, "__pcc_freestanding__")
+
+
+def source_declares_runtime_port_module(source: str) -> bool:
+    """Return whether source is a runtime port (pointer-lane raw pointers).
+
+    Runtime ports build Python objects out of raw memory, so their pointer
+    intrinsics and ``c_ptr`` extern results stay in the pointer lane exactly
+    as in freestanding mode.  Application modules (everything without this
+    directive or the freestanding directive) type raw addresses as ``int``.
+    """
+    return _source_declares_module_directive(source, "__pcc_runtime_port__")
+
+
+def _blank_triple_quoted_lines(source: str) -> str:
+    """Replace the interior of triple-quoted strings with empty lines.
+
+    The module-scope line scanner is a bootstrap-safe indentation tracker; a
+    docstring line that begins with ``class `` or ``def `` would otherwise
+    open a phantom local scope and hide every later module-scope directive.
+    Line numbers are preserved so diagnostics keep pointing at the source.
+    """
+    out: list[str] = []
+    fence: str | None = None
+    for raw_line in source.splitlines():
+        if fence is None:
+            code = raw_line.split("#", 1)[0] if '"""' not in raw_line and "\'\'\'" not in raw_line else raw_line
+            first = min(
+                (i for i in (code.find('"""'), code.find("\'\'\'")) if i >= 0),
+                default=-1,
+            )
+            if first < 0:
+                out.append(raw_line)
+                continue
+            quote = code[first:first + 3]
+            rest = code[first + 3:]
+            if quote in rest:
+                # opens and closes on one line: keep the line as-is
+                out.append(raw_line)
+                continue
+            fence = quote
+            out.append(raw_line[:first])
+            continue
+        if fence in raw_line:
+            fence = None
+            out.append("")
+            continue
+        out.append("")
+    return "\n".join(out) + ("\n" if source.endswith("\n") else "")
+
+
+def _source_declares_module_directive(source: str, marker: str) -> bool:
     declaration = marker + " = True"
     found = False
-    for raw_line, at_module_scope in _source_module_scope_lines(source):
+    for raw_line, at_module_scope in _source_module_scope_lines(
+        _blank_triple_quoted_lines(source)
+    ):
         if marker not in raw_line:
             continue
         stripped = raw_line.split("#", 1)[0].strip()
@@ -32,11 +85,11 @@ def source_declares_freestanding_module(source: str) -> bool:
             or compact != marker + "=True"
         ):
             raise PyPipelineError(
-                "freestanding directive must be the unconditional module-scope "
+                marker + " directive must be the unconditional module-scope "
                 "assignment `" + declaration + "`"
             )
         if found:
-            raise PyPipelineError("freestanding directive may appear only once")
+            raise PyPipelineError(marker + " directive may appear only once")
         found = True
     return found
 

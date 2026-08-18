@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import sys
 
-from pcc.extern import c_int, c_int64, c_ptr, c_uint32, extern
+from pcc.extern import c_int, c_int64, c_ptr, c_uint32, extern, c_obj, c_rawptr
 from pcc.unsafe import (
     free,
     int_to_ptr,
@@ -28,9 +28,9 @@ from pcc.unsafe import (
 )
 
 
-_strsignal: "extern" = extern("strsignal", (c_int,), c_ptr)
+_strsignal: "extern" = extern("strsignal", (c_int,), c_rawptr)
 _strlen: "extern" = extern("strlen", (c_ptr,), c_int64)
-_py_str_new: "extern" = extern("py_str_new", (c_ptr, c_int64), c_ptr)
+_py_str_new: "extern" = extern("py_str_new", (c_ptr, c_int64), c_obj)
 _raise_signal: "extern" = extern("raise", (c_int,), c_int)
 _alarm: "extern" = extern("alarm", (c_uint32,), c_uint32)
 _sigaction: "extern" = extern("sigaction", (c_int, c_ptr, c_ptr), c_int)

@@ -1,4 +1,7 @@
 """Classic kDLMetal DLPack capsule ABI authored in pcc-Python."""
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_SET,
 )

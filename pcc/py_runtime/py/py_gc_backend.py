@@ -9,6 +9,8 @@ Names are algorithmic, not project-branded:
 4. colored-relocating
 """
 
+__pcc_runtime_port__ = True
+
 from pcc.extern import c_abi_export, c_int32, c_int64, c_ptr, c_void, extern
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_BOOL,
@@ -46,6 +48,7 @@ from pcc.unsafe import (
     ptr_diff,
     ptr_eq,
     ptr_is_null,
+    stack_alloc,
     store_ptr,
     store_i64,
     store_i32,
@@ -68,17 +71,35 @@ from pcc.unsafe import (
 # Shared ABI entry points used by backend-level finalization.
 py_incref = extern("py_incref", (c_ptr,), c_void)
 py_decref = extern("py_decref", (c_ptr,), c_void)
+pcc_py_gc_defer_tripwire = extern(
+    "pcc_py_gc_defer_tripwire", (c_ptr, c_ptr, c_int32), c_void
+)
 pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
 pcc_gc_object_index_find = extern("pcc_gc_object_index_find", (c_ptr,), c_ptr)
-pcc_gc_object_index_insert = extern(
-    "pcc_gc_object_index_insert",
-    (c_ptr, c_ptr),
+pcc_gc_object_index_plan_capacity = extern(
+    "pcc_gc_object_index_plan_capacity", (c_int64,), c_int64
+)
+pcc_gc_object_index_plan_commit = extern(
+    "pcc_gc_object_index_plan_commit",
+    (c_ptr, c_int64, c_int64),
     c_int64,
+)
+pcc_gc_object_index_insert_preallocated = extern(
+    "pcc_gc_object_index_insert_preallocated", (c_ptr, c_ptr), c_int64
 )
 pcc_gc_object_index_remove = extern("pcc_gc_object_index_remove", (c_ptr,), c_ptr)
 pcc_gc_object_index_clear = extern("pcc_gc_object_index_clear", (), c_void)
 pcc_gc_managed_pointer_index_contains = extern(
     "pcc_gc_managed_pointer_index_contains", (c_ptr,), c_int64
+)
+pcc_gc_granule_is_object_start = extern(
+    "pcc_gc_granule_is_object_start", (c_ptr,), c_int64
+)
+pcc_gc_granule_object_publish = extern(
+    "pcc_gc_granule_object_publish", (c_ptr,), c_int64
+)
+pcc_gc_granule_object_retire = extern(
+    "pcc_gc_granule_object_retire", (c_ptr,), c_int64
 )
 pcc_gc_managed_pointer_index_insert = extern(
     "pcc_gc_managed_pointer_index_insert", (c_ptr,), c_int64
@@ -193,7 +214,13 @@ _object_node_young_prev = extern(
 _set_object_node_young_prev = extern(
     "pcc_gc_object_node_set_young_prev", (c_ptr, c_ptr), c_void
 )
-_object_node_alloc = extern("pcc_gc_object_node_alloc", (), c_ptr)
+_object_node_prepare = extern("pcc_gc_object_node_prepare", (), c_ptr)
+_object_node_plan_requires_prepare = extern(
+    "pcc_gc_object_node_plan_requires_prepare", (), c_int64
+)
+_object_node_take_prepared = extern(
+    "pcc_gc_object_node_take_prepared", (c_ptr,), c_ptr
+)
 _object_node_release = extern("pcc_gc_object_node_release", (c_ptr,), c_void)
 _unlink_object_node = extern("pcc_gc_object_node_unlink", (c_ptr,), c_void)
 _backend3_young_link_head = extern(
@@ -202,7 +229,6 @@ _backend3_young_link_head = extern(
 _backend3_young_unlink = extern(
     "pcc_gc_backend3_young_unlink", (c_ptr,), c_void
 )
-_backend3_young_rebuild = extern("pcc_gc_backend3_young_rebuild", (), c_void)
 _object_known_size = extern("pcc_gc_object_known_size", (c_ptr,), c_int64)
 _live_bytes_subtract = extern("pcc_gc_live_bytes_subtract", (c_int64,), c_void)
 _relocate_copy_supported_tag = extern(
@@ -228,9 +254,6 @@ _relocate_copy_payload = extern(
     (c_ptr, c_ptr, c_int64, c_int64),
     c_int64,
 )
-_backend4_relocate_copy_unlocked = extern(
-    "pcc_gc_backend4_relocate_copy_unlocked", (c_ptr, c_int64), c_ptr
-)
 pcc_gc_relocate_copy = extern(
     "pcc_gc_relocate_copy", (c_ptr, c_int64), c_ptr
 )
@@ -251,6 +274,16 @@ pcc_gc_backend4_try_zpage_alloc = extern(
 )
 _backend4_zpage_track_alloc = extern(
     "pcc_gc_backend4_zpage_track_alloc", (c_ptr, c_int64), c_ptr
+)
+_backend4_zpage_track_page_prepare = extern(
+    "pcc_gc_backend4_zpage_track_page_prepare",
+    (c_ptr, c_ptr, c_int64),
+    c_ptr,
+)
+_backend4_zpage_track_alloc_preallocated = extern(
+    "pcc_gc_backend4_zpage_track_alloc_preallocated",
+    (c_ptr, c_int64, c_ptr, c_ptr, c_int64),
+    c_ptr,
 )
 _backend4_active_page = extern(
     "pcc_gc_backend4_zpage_active_page", (c_int64, c_int64), c_ptr
@@ -277,6 +310,12 @@ _backend4_zpage_reset = extern(
 )
 _backend4_zpage_node_alloc = extern(
     "pcc_gc_backend4_zpage_node_alloc", (), c_ptr
+)
+_backend4_zpage_node_prepare = extern(
+    "pcc_gc_backend4_zpage_node_prepare", (), c_ptr
+)
+_backend4_zpage_node_plan_requires_prepare = extern(
+    "pcc_gc_backend4_zpage_node_plan_requires_prepare", (), c_int64
 )
 _backend4_zpage_node_release = extern(
     "pcc_gc_backend4_zpage_node_release", (c_ptr,), c_void
@@ -335,8 +374,11 @@ _backend4_zpage_remove = extern(
     "pcc_gc_backend4_zpage_remove", (c_ptr,), c_void
 )
 _forwarding_remove = extern("pcc_gc_forwarding_remove", (c_ptr,), c_void)
+_forwarding_detach_into_finish = extern(
+    "pcc_gc_forwarding_detach_into_finish", (c_ptr, c_ptr), c_void
+)
 _forwarding_remove_target = extern(
-    "pcc_gc_forwarding_remove_target", (c_ptr,), c_void
+    "pcc_gc_forwarding_remove_target", (c_ptr, c_ptr), c_void
 )
 _backend4_park_page = extern(
     "pcc_gc_backend4_park_page", (c_ptr,), c_void
@@ -344,8 +386,11 @@ _backend4_park_page = extern(
 _backend4_drain_parked_pages = extern(
     "pcc_gc_backend4_drain_parked_pages", (), c_void
 )
-_backend4_remap_and_retire = extern(
-    "pcc_gc_backend4_remap_and_retire_unlocked", (), c_void
+_backend4_finish_retained_page_releases = extern(
+    "pcc_gc_backend4_finish_retained_page_releases", (c_ptr,), c_void
+)
+_backend4_finish_remap_retirement = extern(
+    "pcc_gc_backend4_finish_remap_retirement", (c_ptr,), c_void
 )
 _backend4_note_forwarding_removed_on_page = extern(
     "pcc_gc_backend4_note_forwarding_removed_on_page", (c_ptr,), c_void
@@ -364,10 +409,10 @@ _backend3_remember_owner = extern(
     "pcc_gc_backend3_remember_owner", (c_ptr, c_int64), c_void
 )
 _backend3_clear_remembered_owners = extern(
-    "pcc_gc_backend3_clear_remembered_owners", (), c_void
+    "pcc_gc_backend3_clear_remembered_owners", (), c_ptr
 )
-_backend3_drain_remembered_owners = extern(
-    "pcc_gc_backend3_drain_remembered_owners", (c_int64,), c_int64
+_backend3_finish_detached_remembered_owners = extern(
+    "pcc_gc_backend3_finish_detached_remembered_owners", (c_ptr,), c_void
 )
 _promote_young_if_known = extern(
     "pcc_gc_generational_promote_young_if_known", (c_ptr,), c_void
@@ -423,6 +468,14 @@ pcc_gc_zpage_owner_index_upsert = extern(
     (c_ptr, c_ptr),
     c_int64,
 )
+pcc_gc_zpage_owner_index_plan_capacity = extern(
+    "pcc_gc_zpage_owner_index_plan_capacity", (c_int64,), c_int64
+)
+pcc_gc_zpage_owner_index_plan_commit = extern(
+    "pcc_gc_zpage_owner_index_plan_commit",
+    (c_ptr, c_int64, c_int64),
+    c_int64,
+)
 pcc_gc_zpage_owner_index_remove = extern(
     "pcc_gc_zpage_owner_index_remove",
     (c_ptr,),
@@ -449,7 +502,17 @@ pcc_gc_zpage_page_index_remove = extern(
     c_ptr,
 )
 pcc_gc_load_ptr_extern = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_ptr)
-pcc_gc_store_root_extern = extern("pcc_gc_store_root", (c_ptr, c_ptr), c_void)
+pcc_gc_store_root_plan_init = extern(
+    "pcc_gc_store_root_plan_init", (c_ptr, c_int64), c_void
+)
+pcc_gc_store_root_plan_commit_locked = extern(
+    "pcc_gc_store_root_plan_commit_locked",
+    (c_ptr, c_ptr, c_ptr),
+    c_int64,
+)
+pcc_gc_store_root_plan_finish = extern(
+    "pcc_gc_store_root_plan_finish", (c_ptr,), c_void
+)
 py_tls_exc_get = extern("py_tls_exc_get", (), c_ptr)
 py_tls_exc_set = extern("py_tls_exc_set", (c_ptr,), c_void)
 pcc_mutex_new = extern("pcc_mutex_new", (), c_ptr)
@@ -477,11 +540,14 @@ pcc_py_gc_pending_minor_block_set = extern(
 )
 pcc_py_gc_minor_graph_lock = extern("pcc_py_gc_minor_graph_lock", (), c_void)
 pcc_py_gc_minor_graph_unlock = extern("pcc_py_gc_minor_graph_unlock", (), c_void)
-pcc_gc_scheduler_root_register_handle = extern(
-    "pcc_gc_scheduler_root_register_handle", (c_ptr,), c_ptr
+pcc_gc_scheduler_root_link_locked = extern(
+    "pcc_gc_scheduler_root_link_locked", (c_ptr,), c_void
 )
-pcc_gc_scheduler_root_unregister_handle = extern(
-    "pcc_gc_scheduler_root_unregister_handle", (c_ptr,), c_void
+pcc_gc_scheduler_root_unlink_locked = extern(
+    "pcc_gc_scheduler_root_unlink_locked", (c_ptr,), c_int64
+)
+pcc_gc_cycle_requested_store_release = extern(
+    "pcc_gc_cycle_requested_store_release", (c_int64,), c_void
 )
 _py_visit_registered_root_slots = extern(
     "pcc_gc_visit_registered_root_slots",
@@ -524,7 +590,12 @@ _drain_all_gray_unlocked = extern(
     "pcc_gc_drain_all_gray_unlocked", (), c_int64
 )
 _begin_mark_cycle = extern("pcc_gc_begin_mark_cycle", (), c_void)
-_finish_tracing_cycle = extern("pcc_gc_finish_tracing_cycle", (), c_int64)
+_finish_tracing_cycle = extern(
+    "pcc_gc_finish_tracing_cycle", (c_int64, c_int64), c_int64
+)
+_tracing_cycle_epoch_advance_unlocked = extern(
+    "pcc_gc_tracing_cycle_epoch_advance_unlocked", (), c_int64
+)
 _clear_unreachable = extern("pcc_gc_tracing_clear_unreachable", (c_ptr,), c_void)
 _has_sweep_candidate = extern(
     "pcc_gc_tracing_has_sweep_candidate", (), c_int64
@@ -904,6 +975,9 @@ def _frame_roots_disabled_fast() -> int:
 
 def _clear_object_list() -> None:
     _object_graph_lock()
+    global_store_ptr("pcc_gc_backend4_reset_object_cursor", null())
+    global_store_ptr("pcc_gc_backend3_remembered_scan_cursor", null())
+    store_i64(global_addr("pcc_gc_backend3_remembered_scan_revision"), 0, 0)
     node = _object_head()
     while ptr_is_null(node) == 0:
         nxt = _object_node_next(node)
@@ -1006,8 +1080,12 @@ def _relocation_set_find(obj):
 def _relocation_set_add(obj) -> int:
     if ptr_is_null(obj) != 0 or is_tagged_int(obj) != 0:
         return 0
+    if load_i64(
+        global_addr("pcc_gc_backend4_relocation_reset_owner"), 0
+    ) != 0:
+        return 0
     flags: int = load_i32(obj, 12)
-    if (flags & 8192) != 0:
+    if (flags & (64 | 8192 | 16384 | 524288)) != 0:
         return 0
     if ptr_is_null(_forwarding_find(obj)) == 0:
         return 0
@@ -1021,6 +1099,14 @@ def _relocation_set_add(obj) -> int:
     store_ptr(node, 0, obj)
     store_ptr(node, 8, _relocation_set_head())
     _set_relocation_set_head(node)
+    revision: int = load_i64(
+        global_addr("pcc_gc_backend4_reseed_relocation_revision"), 0
+    )
+    store_i64(
+        global_addr("pcc_gc_backend4_reseed_relocation_revision"),
+        0,
+        revision + 1,
+    )
     store_i32(obj, 12, flags | 2048)
     return 1
 
@@ -1034,6 +1120,21 @@ def _relocation_set_remove(obj) -> None:
     while ptr_is_null(node) == 0:
         nxt = load_ptr(node, 8)
         if ptr_eq(load_ptr(node, 0), obj) != 0:
+            if ptr_eq(
+                global_load_ptr("pcc_gc_backend4_reseed_relocation_cursor"),
+                node,
+            ) != 0:
+                global_store_ptr(
+                    "pcc_gc_backend4_reseed_relocation_cursor", nxt
+                )
+            revision: int = load_i64(
+                global_addr("pcc_gc_backend4_reseed_relocation_revision"), 0
+            )
+            store_i64(
+                global_addr("pcc_gc_backend4_reseed_relocation_revision"),
+                0,
+                revision + 1,
+            )
             if ptr_is_null(prev) != 0:
                 _set_relocation_set_head(nxt)
             else:
@@ -1266,6 +1367,183 @@ def _backend4_store_buffer_remove(owner) -> None:
         node = nxt
 
 
+@c_abi_export("pcc_gc_backend4_source_side_table_plan_prepare")
+def pcc_gc_backend4_source_side_table_plan_prepare(owner):
+    """Prepare stable buffered-value records without mutating side tables."""
+    if ptr_is_null(owner) != 0 or is_tagged_int(owner) != 0:
+        return null()
+    count: int = 0
+    node = _store_buffer_medium_head()
+    while ptr_is_null(node) == 0:
+        if ptr_eq(load_ptr(node, 0), owner) != 0:
+            if count >= 1152921504606846975:
+                return null()
+            count = count + 1
+        node = load_ptr(node, 24)
+    node = _store_buffer_head()
+    while ptr_is_null(node) == 0:
+        if ptr_eq(load_ptr(node, 0), owner) != 0:
+            if count >= 1152921504606846975:
+                return null()
+            count = count + 1
+        node = load_ptr(node, 24)
+    plan = malloc(32)
+    if ptr_is_null(plan) != 0:
+        return null()
+    memset(plan, 0, 32)
+    values = null()
+    if count > 0:
+        values = malloc(count * 8)
+        if ptr_is_null(values) != 0:
+            free(plan)
+            return null()
+        memset(values, 0, count * 8)
+    index: int = 0
+    node = _store_buffer_medium_head()
+    while ptr_is_null(node) == 0:
+        if ptr_eq(load_ptr(node, 0), owner) != 0:
+            if index >= count:
+                free(values)
+                free(plan)
+                return null()
+            store_ptr(values, index * 8, load_ptr(node, 16))
+            index = index + 1
+        node = load_ptr(node, 24)
+    node = _store_buffer_head()
+    while ptr_is_null(node) == 0:
+        if ptr_eq(load_ptr(node, 0), owner) != 0:
+            if index >= count:
+                free(values)
+                free(plan)
+                return null()
+            store_ptr(values, index * 8, load_ptr(node, 16))
+            index = index + 1
+        node = load_ptr(node, 24)
+    if index != count:
+        free(values)
+        free(plan)
+        return null()
+    store_ptr(plan, 0, owner)
+    store_ptr(plan, 8, values)
+    store_i64(plan, 16, count)
+    store_i32(plan, 24, 0)
+    return plan
+
+
+@c_abi_export("pcc_gc_backend4_source_side_table_plan_commit")
+def pcc_gc_backend4_source_side_table_plan_commit(plan) -> int:
+    """Detach owner metadata with no allocation and no reference release."""
+    if ptr_is_null(plan) != 0 or load_i32(plan, 24) != 0:
+        return 0
+    owner = load_ptr(plan, 0)
+    values = load_ptr(plan, 8)
+    count: int = load_i64(plan, 16)
+    if ptr_is_null(owner) != 0 or is_tagged_int(owner) != 0 or count < 0:
+        return 0
+    if count > 0 and ptr_is_null(values) != 0:
+        return 0
+
+    # Re-verify the complete stable snapshot before the first side-table
+    # mutation.  The caller-held graph lock makes an exact mismatch fatal.
+    index: int = 0
+    node = _store_buffer_medium_head()
+    while ptr_is_null(node) == 0:
+        if ptr_eq(load_ptr(node, 0), owner) != 0:
+            if index >= count:
+                return 0
+            if ptr_eq(load_ptr(values, index * 8), load_ptr(node, 16)) == 0:
+                return 0
+            index = index + 1
+        node = load_ptr(node, 24)
+    node = _store_buffer_head()
+    while ptr_is_null(node) == 0:
+        if ptr_eq(load_ptr(node, 0), owner) != 0:
+            if index >= count:
+                return 0
+            if ptr_eq(load_ptr(values, index * 8), load_ptr(node, 16)) == 0:
+                return 0
+            index = index + 1
+        node = load_ptr(node, 24)
+    if index != count:
+        return 0
+
+    # All references live in plan-owned stable storage now.  Remove every
+    # owner entry from both visible queues before any later decref can reenter.
+    removed: int = 0
+    prev = null()
+    node = _store_buffer_medium_head()
+    while ptr_is_null(node) == 0:
+        nxt = load_ptr(node, 24)
+        if ptr_eq(load_ptr(node, 0), owner) != 0:
+            if ptr_is_null(prev) != 0:
+                _set_store_buffer_medium_head(nxt)
+            else:
+                store_ptr(prev, 24, nxt)
+            _backend4_store_buffer_dec()
+            medium_count: int = _backend4_store_buffer_medium_count()
+            if medium_count > 0:
+                _backend4_store_buffer_medium_set_count(medium_count - 1)
+            free(node)
+            removed = removed + 1
+            node = nxt
+            continue
+        prev = node
+        node = nxt
+    prev = null()
+    node = _store_buffer_head()
+    while ptr_is_null(node) == 0:
+        nxt = load_ptr(node, 24)
+        if ptr_eq(load_ptr(node, 0), owner) != 0:
+            if ptr_is_null(prev) != 0:
+                _set_store_buffer_head(nxt)
+            else:
+                store_ptr(prev, 24, nxt)
+            _backend4_store_buffer_dec()
+            free(node)
+            removed = removed + 1
+            node = nxt
+            continue
+        prev = node
+        node = nxt
+    if removed != count:
+        pcc_py_gc_defer_tripwire(
+            cstr("source side-table commit detached count mismatch"),
+            cstr("pcc/py_runtime/py/py_gc_backend.py"),
+            1417,
+        )
+        return 0
+    _backend4_remembered_set_remove(owner)
+    _backend4_zpage_remove(owner)
+    store_i32(plan, 24, 1)
+    return 1
+
+
+@c_abi_export("pcc_gc_backend4_source_side_table_plan_finish")
+def pcc_gc_backend4_source_side_table_plan_finish(
+    plan, decref_exclusion
+) -> None:
+    """Release detached store-buffer references after raw payload teardown."""
+    if ptr_is_null(plan) != 0 or load_i32(plan, 24) != 1:
+        return
+    values = load_ptr(plan, 8)
+    count: int = load_i64(plan, 16)
+    store_ptr(plan, 0, null())
+    store_ptr(plan, 8, null())
+    store_i64(plan, 16, 0)
+    store_i32(plan, 24, 2)
+    index: int = 0
+    while index < count:
+        value = load_ptr(values, index * 8)
+        if (
+            ptr_is_null(decref_exclusion) != 0
+            or ptr_eq(value, decref_exclusion) == 0
+        ):
+            py_decref(value)
+        index = index + 1
+    free(values)
+    free(plan)
+
+
 def _backend4_store_buffer_owner_pending(owner) -> int:
     if ptr_is_null(owner) != 0 or is_tagged_int(owner) != 0:
         return 0
@@ -1490,6 +1768,10 @@ def _backend4_zpage_note_remembered_slot(owner, delta: int) -> None:
     if current < 0:
         current = 0
     store_i64(page, 40, current)
+    owner_current: int = load_i64(node, 72) + delta
+    if owner_current < 0:
+        owner_current = 0
+    store_i64(node, 72, owner_current)
 
 
 def _backend4_zpage_note_remembered_card(owner, delta: int) -> None:
@@ -1690,6 +1972,16 @@ def _is_known_object(o) -> int:
     return _gc_object_is_known_no_lock(o)
 
 
+@c_abi_export("pcc_gc_granule_s2_candidate_positive")
+def _granule_s2_candidate_positive(o) -> int:
+    """Expose the same fail-closed exact-positive predicate used by S2."""
+    if ptr_is_null(o) != 0 or is_tagged_int(o) != 0:
+        return 0
+    if pcc_gc_granule_is_object_start(o) == 1:
+        return 1
+    return 0
+
+
 def _pointer_is_managed_no_lock(o) -> int:
     if ptr_is_null(o) != 0 or is_tagged_int(o) != 0:
         return 0
@@ -1700,6 +1992,12 @@ def _pointer_is_managed_no_lock(o) -> int:
     if ptr_eq(o, global_load_ptr("py_True")) != 0:
         return 1
     if ptr_eq(o, global_load_ptr("py_False")) != 0:
+        return 1
+    # A granule hit is an exact positive only for a fully initialized LIVE
+    # object-family slot.  Unknown, reserved, free, raw, large, foreign and
+    # moving-arena/zpage addresses all continue through the exact/index/type/
+    # forwarding chain below.
+    if pcc_gc_granule_is_object_start(o) == 1:
         return 1
     # Ordering matters and is not arbitrary.  This is a disjunction of
     # side-effect-free lookups, so any order returns the same answer, but the
@@ -1740,6 +2038,16 @@ def pcc_gc_pointer_is_managed(o) -> int:
     # from the pointer bits alone.
     if ptr_is_null(o) != 0 or is_tagged_int(o) != 0:
         return 0
+    # Hoisting the four immortal-singleton compares ahead of the granule probe
+    # was measured and DENIED on 2026-09-06: on the cli_bootstrap ASM worker it
+    # added 3.2% instructions (four extra compares on every probe) and saved
+    # less, so singleton refcount traffic is too rare to pay for it here.
+    # The allocator publishes LIVE with release ordering only after the object
+    # header is complete.  Readers may therefore accept this exact positive
+    # without the graph lock.  Every other result takes the lock and executes
+    # the complete historical provenance chain.
+    if pcc_gc_granule_is_object_start(o) == 1:
+        return 1
     _object_graph_lock()
     managed: int = _pointer_is_managed_no_lock(o)
     _object_graph_unlock()
@@ -1750,6 +2058,11 @@ def pcc_gc_pointer_is_managed(o) -> int:
 def pcc_gc_pointer_register(o) -> int:
     if ptr_is_null(o) != 0 or is_tagged_int(o) != 0:
         return -1
+    granule_result: int = pcc_gc_granule_object_publish(o)
+    if granule_result < 0:
+        return -1
+    if granule_result > 0:
+        return 0
     _object_graph_lock()
     result: int = pcc_gc_managed_pointer_index_insert(o)
     _object_graph_unlock()
@@ -1759,6 +2072,19 @@ def pcc_gc_pointer_register(o) -> int:
 @c_abi_export("pcc_gc_pointer_unregister")
 def pcc_gc_pointer_unregister(o) -> int:
     if ptr_is_null(o) != 0 or is_tagged_int(o) != 0:
+        return 0
+    granule_was_live: int = pcc_gc_granule_is_object_start(o)
+    granule_result: int = pcc_gc_granule_object_retire(o)
+    if granule_result < 0:
+        return -1
+    if granule_result > 0:
+        # Constructor/error cleanup may retire a RESERVED/FREE object-family
+        # slot after note_object_freeing conservatively inserted an exact key.
+        # Do not let that key survive when the address returns to the freelist.
+        if granule_was_live != 1:
+            _object_graph_lock()
+            pcc_gc_managed_pointer_index_remove(o)
+            _object_graph_unlock()
         return 0
     _object_graph_lock()
     result: int = pcc_gc_managed_pointer_index_remove(o)
@@ -1892,48 +2218,73 @@ def pcc_gc_set_backend(backend: int) -> int:
     _init_config()
     if backend < 0 or backend > 4:
         return -1
+    # Forwarding policy is collector-specific: GC3 oldification and GC4
+    # two-epoch relocation share a node layout but not ownership semantics.
+    # Never change collectors while either representation is active.  A
+    # same-backend reset remains legal.
+    _object_graph_lock()
     old_backend: int = load_i32(global_addr("pcc_gc_backend_selected"), 0)
+    if load_i32(
+        global_addr("pcc_gc_trace_extension_roots_pending"), 0
+    ) == 4:
+        _object_graph_unlock()
+        return -1
+    if load_i32(global_addr("pcc_gc_backend4_remap_active"), 0) != 0:
+        _object_graph_unlock()
+        return -1
+    if (
+        backend != old_backend
+        and (
+            ptr_is_null(_forwarding_head()) == 0
+            or load_i32(global_addr("pcc_gc_forwarding_population"), 0) != 0
+        )
+    ):
+        _object_graph_unlock()
+        return -1
     if backend == 0:
-        # Publish exact keys before backend 0 discards the object index.  The
-        # selected-backend store occurs under the same lock, so no tracked
-        # allocation can slip into the list after this migration.
-        _object_graph_lock()
+        # Preserve provenance before backend 0 discards the object index.
+        # Object-family LIVE slots need no duplicate exact key; every other
+        # origin is inserted.  The selected-backend store occurs under the
+        # same lock, so no tracked allocation can slip into the list after
+        # this migration.
         migration_node = _object_head()
         while ptr_is_null(migration_node) == 0:
-            if (
-                pcc_gc_managed_pointer_index_insert(
-                    load_ptr(migration_node, 0)
-                )
-                < 0
-            ):
-                _object_graph_unlock()
-                return -1
+            migration_obj = load_ptr(migration_node, 0)
+            if pcc_gc_granule_is_object_start(migration_obj) != 1:
+                if pcc_gc_managed_pointer_index_insert(migration_obj) < 0:
+                    _object_graph_unlock()
+                    return -1
             migration_node = _object_node_next(migration_node)
-        store_i32(global_addr("pcc_gc_backend_selected"), 0, backend)
+    if _tracing_cycle_epoch_advance_unlocked() == 0:
         _object_graph_unlock()
+        return -1
+    store_i32(global_addr("pcc_gc_backend_selected"), 0, backend)
+    store_i32(global_addr("pcc_gc_mark_active"), 0, 0)
+    store_i32(global_addr("pcc_gc_cycle_requested"), 0, 1)
+    store_i32(
+        global_addr("pcc_gc_trace_extension_roots_pending"), 0, 0
+    )
+    store_i64(global_addr("pcc_gc_trace_extension_roots_epoch"), 0, 0)
+    store_i64(global_addr("pcc_gc_trace_extension_roots_backend"), 0, -1)
+    global_store_ptr("pcc_gc_trace_cursor", null())
+    _set_gray_count(0)
+    _object_graph_unlock()
     if backend == 3 or backend == 4:
         store_i32(global_addr("pcc_gc_read_barrier_enabled"), 0, 1)
     if backend == 0:
         store_i32(global_addr("pcc_gc_backend0_frame_roots_enabled"), 0, 1)
-    if backend != 0:
-        store_i32(global_addr("pcc_gc_backend_selected"), 0, backend)
     if backend != 3 and backend != 4:
         store_i32(global_addr("pcc_gc_read_barrier_enabled"), 0, 0)
-    store_i32(global_addr("pcc_gc_mark_active"), 0, 0)
-    store_i32(global_addr("pcc_gc_cycle_requested"), 0, 1)
-    if backend == 3:
-        _backend3_young_rebuild()
-    else:
-        _set_backend3_young_head(null())
-        node = _object_head()
-        while ptr_is_null(node) == 0:
-            _set_object_node_young_next(node, null())
-            _set_object_node_young_prev(node, null())
-            node = _object_node_next(node)
-    _set_gray_count(0)
     store_i32(global_addr("pcc_gc_debt_bytes"), 0, 0)
     store_i32(global_addr("pcc_gc_last_alloc_bytes"), 0, 0)
     if backend == 0:
+        global_store_ptr("pcc_gc_backend3_promotion_head", null())
+        global_store_ptr("pcc_gc_backend3_promotion_tail", null())
+        store_i64(
+            global_addr("pcc_gc_backend3_promotion_revision"),
+            0,
+            load_i64(global_addr("pcc_gc_object_list_revision"), 0),
+        )
         _clear_object_list()
         store_i32(global_addr("pcc_gc_live_bytes"), 0, 0)
     if _backend_uses_forwarding() == 0:
@@ -1967,8 +2318,9 @@ def pcc_gc_backend_name(backend: int):
 def pcc_gc_telemetry_reset() -> None:
     _init_config()
     _object_graph_lock()
-    _backend3_clear_remembered_owners()
+    detached_remembered = _backend3_clear_remembered_owners()
     _object_graph_unlock()
+    _backend3_finish_detached_remembered_owners(detached_remembered)
     i: int = 0
     while i <= 5:
         store_i32(_counter_global(i), 0, 0)
@@ -2001,6 +2353,12 @@ def pcc_gc_telemetry_reset() -> None:
     store_i32(global_addr("pcc_gc_backend4_evacuation_candidates"), 0, 0)
     store_i32(global_addr("pcc_gc_backend4_evacuated_bytes_count"), 0, 0)
     store_i32(global_addr("pcc_gc_backend4_large_object_defers"), 0, 0)
+    store_i64(
+        global_addr("pcc_gc_backend4_candidate_fresh_skips_g"), 0, 0
+    )
+    store_i64(
+        global_addr("pcc_gc_backend4_relocation_add_refusals_g"), 0, 0
+    )
     store_i32(global_addr("pcc_gc_backend4_large_object_deferred_bytes_count"), 0, 0)
     store_i32(global_addr("pcc_gc_backend4_large_object_reconsiderations_count"), 0, 0)
     store_i32(global_addr("pcc_gc_backend4_small_page_candidates"), 0, 0)
@@ -2528,6 +2886,98 @@ def pcc_gc_backend4_zpage_owner_slot_span_card(owner, slot) -> int:
     return (span_offset // 512) % 64
 
 
+@c_abi_export("pcc_gc_backend4_zpage_payload_span_preflight_locked")
+def pcc_gc_backend4_zpage_payload_span_preflight_locked(
+    owner, total_size_bytes: int
+) -> int:
+    if (
+        ptr_is_null(owner) != 0
+        or is_tagged_int(owner) != 0
+        or total_size_bytes < 0
+    ):
+        return 0
+    if total_size_bytes == 0:
+        return 1
+    node = _backend4_zpage_find(owner)
+    if ptr_is_null(node) != 0:
+        return 0
+    if ptr_is_null(load_ptr(node, 64)) == 0:
+        return 0
+    page = load_ptr(node, 8)
+    if ptr_is_null(page) != 0:
+        return 0
+    allocated: int = load_i64(page, 64)
+    capacity: int = load_i64(page, 16)
+    if allocated < 0 or allocated > capacity:
+        return 0
+    if total_size_bytes > capacity - allocated:
+        return 0
+    return 1
+
+
+@c_abi_export(
+    "pcc_gc_backend4_zpage_publish_relocation_payload_spans_locked"
+)
+def pcc_gc_backend4_zpage_publish_relocation_payload_spans_locked(
+    owner, span_head, span_count: int, total_size_bytes: int
+) -> int:
+    if ptr_is_null(owner) != 0 or is_tagged_int(owner) != 0:
+        return 0
+    if (
+        ptr_is_null(span_head) != 0
+        or span_count <= 0
+        or span_count > 4
+        or total_size_bytes <= 0
+    ):
+        return 0
+    node = _backend4_zpage_find(owner)
+    if ptr_is_null(node) != 0:
+        return 0
+    if ptr_is_null(load_ptr(node, 64)) == 0:
+        return 0
+    page = load_ptr(node, 8)
+    if ptr_is_null(page) != 0:
+        return 0
+    computed_size_bytes: int = 0
+    span = span_head
+    index: int = 0
+    while index < span_count:
+        if ptr_is_null(span) != 0 or ptr_is_null(load_ptr(span, 8)) != 0:
+            return 0
+        size_bytes: int = load_i64(span, 16)
+        if size_bytes <= 0 or size_bytes > 9223372036854775807 - computed_size_bytes:
+            return 0
+        computed_size_bytes = computed_size_bytes + size_bytes
+        span = load_ptr(span, 40)
+        index = index + 1
+    if ptr_is_null(span) == 0 or computed_size_bytes != total_size_bytes:
+        return 0
+    allocated: int = load_i64(page, 64)
+    capacity: int = load_i64(page, 16)
+    if allocated < 0 or allocated > capacity:
+        return 0
+    if total_size_bytes > capacity - allocated:
+        return 0
+    used: int = load_i64(page, 8)
+    if used < 0 or total_size_bytes > 9223372036854775807 - used:
+        return 0
+
+    offset_bytes: int = allocated
+    span = span_head
+    index = 0
+    while index < span_count:
+        store_ptr(span, 0, owner)
+        store_i64(span, 24, offset_bytes)
+        store_ptr(span, 32, page)
+        offset_bytes = offset_bytes + load_i64(span, 16)
+        span = load_ptr(span, 40)
+        index = index + 1
+    store_ptr(node, 64, span_head)
+    store_i64(page, 64, offset_bytes)
+    store_i64(page, 8, used + total_size_bytes)
+    return 1
+
+
 @c_abi_export("pcc_gc_backend4_zpage_register_owner_payload_span")
 def pcc_gc_backend4_zpage_register_owner_payload_span(
     owner, base, size_bytes: int
@@ -2552,10 +3002,19 @@ def pcc_gc_backend4_zpage_register_owner_payload_span(
                 return -1
             offset_existing: int = load_i64(span_existing, 24)
             if offset_existing < 0:
-                return -1
+                store_i64(span_existing, 16, size_bytes)
+                return 0
             capacity_existing: int = load_i64(page, 16)
             if size_bytes > capacity_existing - offset_existing:
-                return -1
+                overflow_old_size: int = load_i64(span_existing, 16)
+                used_existing: int = load_i64(page, 8)
+                if used_existing >= overflow_old_size:
+                    store_i64(page, 8, used_existing - overflow_old_size)
+                else:
+                    store_i64(page, 8, 0)
+                store_i64(span_existing, 24, -1)
+                store_i64(span_existing, 16, size_bytes)
+                return 0
             old_size: int = load_i64(span_existing, 16)
             used_existing: int = load_i64(page, 8)
             if size_bytes >= old_size:
@@ -2575,7 +3034,7 @@ def pcc_gc_backend4_zpage_register_owner_payload_span(
         span_existing = load_ptr(span_existing, 40)
     allocated: int = load_i64(page, 64)
     capacity: int = load_i64(page, 16)
-    if allocated > capacity or size_bytes > capacity - allocated:
+    if allocated > capacity:
         return -1
     span = malloc(48)
     if ptr_is_null(span) != 0:
@@ -2583,13 +3042,18 @@ def pcc_gc_backend4_zpage_register_owner_payload_span(
     store_ptr(span, 0, owner)
     store_ptr(span, 8, base)
     store_i64(span, 16, size_bytes)
-    store_i64(span, 24, allocated)
+    external: int = 0
+    if size_bytes > capacity - allocated:
+        external = 1
+    store_i64(span, 24, -1 if external != 0 else allocated)
     store_ptr(span, 32, page)
     store_ptr(span, 40, load_ptr(node, 64))
     store_ptr(node, 64, span)
-    store_i64(page, 64, allocated + size_bytes)
-    store_i64(page, 8, load_i64(page, 8) + size_bytes)
-    return allocated
+    if external == 0:
+        store_i64(page, 64, allocated + size_bytes)
+        store_i64(page, 8, load_i64(page, 8) + size_bytes)
+        return allocated
+    return 0
 
 
 @c_abi_export("pcc_gc_backend4_zpage_unregister_owner_payload_span")
@@ -2629,10 +3093,21 @@ def pcc_gc_backend4_zpage_retarget_owner_payload_span(
                 return -1
             offset: int = load_i64(span, 24)
             if offset < 0:
-                return -1
+                store_ptr(span, 8, new_base)
+                store_i64(span, 16, size_bytes)
+                return 0
             capacity: int = load_i64(page, 16)
             if size_bytes > capacity - offset:
-                return -1
+                overflow_old_size: int = load_i64(span, 16)
+                used: int = load_i64(page, 8)
+                if used >= overflow_old_size:
+                    store_i64(page, 8, used - overflow_old_size)
+                else:
+                    store_i64(page, 8, 0)
+                store_ptr(span, 8, new_base)
+                store_i64(span, 16, size_bytes)
+                store_i64(span, 24, -1)
+                return 0
             old_size: int = load_i64(span, 16)
             used: int = load_i64(page, 8)
             if size_bytes >= old_size:
@@ -2652,6 +3127,171 @@ def pcc_gc_backend4_zpage_retarget_owner_payload_span(
             return offset
         span = load_ptr(span, 40)
     return -1
+
+
+def _backend4_map_mutator_payload_slot(
+    slot,
+    old_base,
+    old_size_bytes: int,
+    new_base,
+    new_size_bytes: int,
+    slot_pairs,
+    pair_count: int,
+):
+    if ptr_is_null(slot) != 0:
+        return slot
+    offset: int = ptr_diff(slot, old_base)
+    if offset < 0 or offset > old_size_bytes - 8:
+        return slot
+    if (offset & 7) != 0:
+        return null()
+    i: int = 0
+    while i < pair_count:
+        old_slot = load_ptr(slot_pairs, i * 16)
+        if ptr_eq(old_slot, slot) != 0:
+            return load_ptr(slot_pairs, i * 16 + 8)
+        i = i + 1
+    if offset >= new_size_bytes:
+        return null()
+    return ptr_add(new_base, offset)
+
+
+@c_abi_export("pcc_gc_backend4_retarget_mutator_payload_locked")
+def pcc_gc_backend4_retarget_mutator_payload_locked(
+    owner,
+    old_base,
+    old_size_bytes: int,
+    new_base,
+    new_size_bytes: int,
+    slot_pairs,
+    pair_count: int,
+) -> int:
+    if load_i32(global_addr("pcc_gc_backend_selected"), 0) != 4:
+        return 1
+    if ptr_is_null(owner) != 0 or is_tagged_int(owner) != 0:
+        return 0
+    if ptr_is_null(old_base) != 0 or ptr_is_null(new_base) != 0:
+        return 0
+    if old_size_bytes <= 0 or new_size_bytes < old_size_bytes:
+        return 0
+    if pair_count < 0:
+        return 0
+    if pair_count > 0 and ptr_is_null(slot_pairs) != 0:
+        return 0
+
+    owner_node = _backend4_zpage_find(owner)
+    if ptr_is_null(owner_node) != 0:
+        return 0
+    page = load_ptr(owner_node, 8)
+    if ptr_is_null(page) != 0:
+        return 0
+    payload_span = load_ptr(owner_node, 64)
+    while ptr_is_null(payload_span) == 0:
+        if ptr_eq(load_ptr(payload_span, 8), old_base) != 0:
+            break
+        payload_span = load_ptr(payload_span, 40)
+    has_payload_span: int = 0
+    span_offset: int = 0
+    if ptr_is_null(payload_span) == 0:
+        has_payload_span = 1
+        if ptr_eq(load_ptr(payload_span, 32), page) == 0:
+            return 0
+        if load_i64(payload_span, 16) != old_size_bytes:
+            return 0
+        span_offset = load_i64(payload_span, 24)
+        if span_offset < -1:
+            return 0
+
+    i = 0
+    while i < pair_count:
+        old_slot = load_ptr(slot_pairs, i * 16)
+        new_slot = load_ptr(slot_pairs, i * 16 + 8)
+        old_offset: int = ptr_diff(old_slot, old_base)
+        new_offset: int = ptr_diff(new_slot, new_base)
+        if old_offset < 0 or old_offset > old_size_bytes - 8:
+            return 0
+        if new_offset < 0 or new_offset > new_size_bytes - 8:
+            return 0
+        if (old_offset & 7) != 0 or (new_offset & 7) != 0:
+            return 0
+        i = i + 1
+
+    entry = _store_buffer_medium_head()
+    while ptr_is_null(entry) == 0:
+        if ptr_eq(load_ptr(entry, 0), owner) != 0:
+            mapped = _backend4_map_mutator_payload_slot(
+                load_ptr(entry, 8),
+                old_base,
+                old_size_bytes,
+                new_base,
+                new_size_bytes,
+                slot_pairs,
+                pair_count,
+            )
+            store_ptr(entry, 8, mapped)
+        entry = load_ptr(entry, 24)
+    entry = _store_buffer_head()
+    while ptr_is_null(entry) == 0:
+        if ptr_eq(load_ptr(entry, 0), owner) != 0:
+            mapped = _backend4_map_mutator_payload_slot(
+                load_ptr(entry, 8),
+                old_base,
+                old_size_bytes,
+                new_base,
+                new_size_bytes,
+                slot_pairs,
+                pair_count,
+            )
+            store_ptr(entry, 8, mapped)
+        entry = load_ptr(entry, 24)
+
+    entry = _remembered_set_head()
+    while ptr_is_null(entry) == 0:
+        if ptr_eq(load_ptr(entry, 0), owner) != 0:
+            mapped = _backend4_map_mutator_payload_slot(
+                load_ptr(entry, 8),
+                old_base,
+                old_size_bytes,
+                new_base,
+                new_size_bytes,
+                slot_pairs,
+                pair_count,
+            )
+            if ptr_is_null(mapped) != 0:
+                return 0
+            store_ptr(entry, 8, mapped)
+        entry = load_ptr(entry, 16)
+
+    if has_payload_span != 0:
+        old_span_size: int = load_i64(payload_span, 16)
+        page_capacity: int = load_i64(page, 16)
+        if span_offset >= 0 and new_size_bytes > page_capacity - span_offset:
+            used: int = load_i64(page, 8)
+            if used >= old_span_size:
+                store_i64(page, 8, used - old_span_size)
+            else:
+                store_i64(page, 8, 0)
+            span_offset = -1
+            store_i64(payload_span, 24, -1)
+        elif span_offset >= 0:
+            used = load_i64(page, 8)
+            if new_size_bytes >= old_span_size:
+                store_i64(page, 8, used + new_size_bytes - old_span_size)
+            else:
+                delta: int = old_span_size - new_size_bytes
+                if used >= delta:
+                    store_i64(page, 8, used - delta)
+                else:
+                    store_i64(page, 8, 0)
+        store_ptr(payload_span, 8, new_base)
+        store_i64(payload_span, 16, new_size_bytes)
+        if span_offset >= 0:
+            span_end: int = span_offset + new_size_bytes
+            allocated: int = load_i64(page, 64)
+            if allocated < span_end:
+                store_i64(page, 64, span_end)
+        return 1
+    return 2
 
 
 @c_abi_export("pcc_gc_backend4_zpage_fragmentation_per_mille")
@@ -2946,125 +3586,6 @@ def pcc_gc_backend4_verify_no_old_addresses() -> int:
     return 1
 
 
-@c_abi_export("pcc_gc_backend4_step_remembered_roots")
-def _step_colored_remembered_roots(remaining_budget: int) -> int:
-    if remaining_budget <= 0:
-        return 0
-    _object_graph_lock()
-    local_processed: int = 0
-    local_drained: int = 0
-    batch_limit: int = remaining_budget
-    capacity: int = _backend4_store_buffer_batch_capacity()
-    if batch_limit > capacity:
-        batch_limit = capacity
-    node = _store_buffer_head()
-    _backend4_store_buffer_flush_medium_locked()
-    node = _store_buffer_head()
-    while ptr_is_null(node) == 0 and local_drained < batch_limit:
-        nxt = load_ptr(node, 24)
-        _set_store_buffer_head(nxt)
-        owner = load_ptr(node, 0)
-        slot = load_ptr(node, 8)
-        value = load_ptr(node, 16)
-        free(node)
-        _backend4_store_buffer_dec()
-        local_drained = local_drained + 1
-        node = nxt
-        if _is_known_object(owner) == 0:
-            py_decref(value)
-            continue
-        flags: int = load_i32(owner, 12)
-        if (flags & 512) != 0:
-            _promote_young_if_known(value)
-            if ptr_is_null(slot) == 0:
-                _promote_young_slot(slot, 0)
-            else:
-                _trace_referents_for_promotion(owner)
-            if _backend4_store_buffer_owner_pending(owner) == 0:
-                store_i32(owner, 12, flags & ~512)
-            local_processed = local_processed + 1
-            py_decref(value)
-            if (local_processed % 16) == 0:
-                pcc_thread_safepoint()
-        else:
-            py_decref(value)
-    if local_drained > 0:
-        batches: int = load_i32(
-            global_addr("pcc_gc_backend4_store_buffer_drain_batches_count"), 0
-        )
-        store_i32(
-            global_addr("pcc_gc_backend4_store_buffer_drain_batches_count"),
-            0,
-            batches + 1,
-        )
-        drained_entries: int = load_i32(
-            global_addr("pcc_gc_backend4_store_buffer_drained_entries_count"), 0
-        )
-        store_i32(
-            global_addr("pcc_gc_backend4_store_buffer_drained_entries_count"),
-            0,
-            drained_entries + local_drained,
-        )
-        _backend4_store_buffer_note_max_batch(local_drained)
-        if local_drained >= _backend4_store_buffer_batch_capacity():
-            full_batches: int = load_i32(
-                global_addr("pcc_gc_backend4_store_buffer_full_batches_count"), 0
-            )
-            store_i32(
-                global_addr("pcc_gc_backend4_store_buffer_full_batches_count"),
-                0,
-                full_batches + 1,
-            )
-        if ptr_is_null(_store_buffer_head()) == 0:
-            incomplete: int = load_i32(
-                global_addr("pcc_gc_backend4_store_buffer_incomplete_drains_count"), 0
-            )
-            store_i32(
-                global_addr("pcc_gc_backend4_store_buffer_incomplete_drains_count"),
-                0,
-                incomplete + 1,
-            )
-    if local_processed > 0:
-        pcc_thread_safepoint()
-    _object_graph_unlock()
-    return local_processed
-
-
-@c_abi_export("pcc_gc_backend4_step_generation_aging")
-def _step_colored_generation_aging(remaining_budget: int) -> int:
-    if remaining_budget <= 0:
-        return 0
-    _object_graph_lock()
-    local_processed: int = 0
-    node = _object_head()
-    while ptr_is_null(node) == 0 and local_processed < remaining_budget:
-        if _object_node_is_active(node) == 0:
-            node = _object_node_next(node)
-            continue
-        o = load_ptr(node, 0)
-        if ptr_is_null(_forwarding_find(o)) == 0:
-            node = _object_node_next(node)
-            continue
-        flags: int = load_i32(o, 12)
-        if (flags & 128) != 0:
-            store_i32(o, 12, (flags & ~128) | 256)
-            _backend4_zpage_note_owner_promoted(o)
-            promotions: int = load_i32(
-                global_addr("pcc_gc_backend4_young_promotions"), 0
-            )
-            store_i32(
-                global_addr("pcc_gc_backend4_young_promotions"), 0, promotions + 1
-            )
-            local_processed = local_processed + 1
-            if (local_processed % 16) == 0:
-                pcc_thread_safepoint()
-        node = _object_node_next(node)
-    if local_processed > 0:
-        pcc_thread_safepoint()
-    _object_graph_unlock()
-    return local_processed
-
-
 @c_abi_export("pcc_gc_free_object_memory")
 def pcc_gc_free_object_memory(o) -> None:
     if ptr_is_null(o) != 0:
@@ -3082,7 +3603,10 @@ def pcc_gc_free_object_memory(o) -> None:
     # Direct constructor cleanup does not necessarily pass through decref.
     # The ordinary dealloc path already emitted this idempotent event.
     pcc_gc_note_object_freeing(o)
-    pcc_gc_pointer_unregister(o)
+    # A structurally invalid object-family lifecycle must remain quarantined:
+    # never hand the pointer back to an allocator after retirement failed.
+    if pcc_gc_pointer_unregister(o) < 0:
+        return
     if (flags & 65536) != 0:
         return
     if (backend == 1 or backend == 2) and flags == 0:
@@ -3151,39 +3675,414 @@ def pcc_gc_note_object_allocated_sized(o, size: int) -> None:
     if backend == 0:
         return
     pending_block = null()
-    if backend == 1 or backend == 2:
-        flags: int = load_i32(o, 12)
-        color: int = 8
-        if load_i32(global_addr("pcc_gc_mark_active"), 0) != 0:
-            color = 32
-        store_i32(o, 12, (flags & ~56) | color | 16384)
-        store_i32(global_addr("pcc_gc_cycle_requested"), 0, 1)
-    elif backend == 3:
+    if backend == 3:
         pending_block = _pending_minor_block()
-        flags: int = load_i32(o, 12)
-        new_flags: int = (flags & ~(56 | 384)) | 136
-        if ptr_is_null(pending_block) == 0:
-            new_flags = new_flags | 4096
-        store_i32(o, 12, new_flags)
-        store_i32(global_addr("pcc_gc_cycle_requested"), 0, 1)
-    elif backend == 4:
-        flags: int = load_i32(o, 12)
-        new_flags: int = (flags & ~(56 | 2048 | 8192)) | 8
-        if (flags & 384) == 0:
-            new_flags = new_flags | 128
-        store_i32(o, 12, new_flags)
-        store_i32(global_addr("pcc_gc_cycle_requested"), 0, 1)
-    if (
-        (backend == 3 or backend == 4)
-        and ptr_is_null(pending_block) != 0
-        and _backend3_graph_leaf_tag(load_i32(o, 8)) != 0
-    ):
-        _set_pending_minor_block(null())
-        global_store_ptr("pcc_gc_last_alloc", o)
-        return
-    node = _object_node_alloc()
-    if ptr_is_null(node) == 0:
+    prepared_node = null()
+    prepared_slots = null()
+    prepared_cap: int = 0
+    prepared_zpage_node = null()
+    prepared_zpage_slots = null()
+    prepared_zpage_cap: int = 0
+    prepared_zpage = null()
+    prepared_zpage_from_free: int = 0
+    prepared_zpage_ready: int = 0
+    node_owner = stack_alloc(8)
+    slots_owner = stack_alloc(8)
+    zpage_node_owner = stack_alloc(8)
+    zpage_slots_owner = stack_alloc(8)
+    zpage_owner = stack_alloc(8)
+    while 1:
         _object_graph_lock()
+        backend = load_i32(global_addr("pcc_gc_backend_selected"), 0)
+        graph_leaf: int = 0
+        if (
+            (backend == 3 or backend == 4)
+            and ptr_is_null(pending_block) != 0
+            and _backend3_graph_leaf_tag(load_i32(o, 8)) != 0
+        ):
+            graph_leaf = 1
+        if graph_leaf == 0:
+            required: int = pcc_gc_object_index_plan_capacity(1)
+            need_node: int = _object_node_plan_requires_prepare()
+            zpage_required: int = 0
+            need_zpage_node: int = 0
+            need_zpage_page: int = 0
+            if backend == 4:
+                zpage_required = pcc_gc_zpage_owner_index_plan_capacity(1)
+                need_zpage_node = (
+                    _backend4_zpage_node_plan_requires_prepare()
+                )
+                current_page = null()
+                if (load_i32(o, 12) & 65536) != 0:
+                    current_page = _backend4_zpage_find_page_for_addr(
+                        o, size
+                    )
+                if ptr_is_null(current_page) != 0:
+                    current_page = _backend4_zpage_find_reusable_page(
+                        o, size
+                    )
+                if (
+                    ptr_is_null(current_page) != 0
+                    and ptr_is_null(prepared_zpage) != 0
+                ):
+                    prepared_zpage = _backend4_zpage_pop_free_page(size)
+                    if ptr_is_null(prepared_zpage) == 0:
+                        prepared_zpage_from_free = 1
+                    else:
+                        prepared_zpage_from_free = 0
+                    prepared_zpage_ready = 0
+                if (
+                    ptr_is_null(current_page) != 0
+                    and prepared_zpage_ready == 0
+                ):
+                    need_zpage_page = 1
+            if required < 0 or zpage_required < 0:
+                if (
+                    ptr_is_null(prepared_zpage) == 0
+                    and prepared_zpage_from_free != 0
+                ):
+                    store_ptr(
+                        prepared_zpage,
+                        56,
+                        global_load_ptr("pcc_gc_backend4_free_page_head"),
+                    )
+                    global_store_ptr(
+                        "pcc_gc_backend4_free_page_head", prepared_zpage
+                    )
+                    prepared_zpage = null()
+                    prepared_zpage_from_free = 0
+                _object_graph_unlock()
+                free(prepared_node)
+                free(prepared_slots)
+                free(prepared_zpage_node)
+                free(prepared_zpage_slots)
+                if ptr_is_null(prepared_zpage) == 0:
+                    free(load_ptr(prepared_zpage, 72))
+                    free(prepared_zpage)
+                _set_pending_minor_block(null())
+                global_store_ptr("pcc_gc_last_alloc", o)
+                return
+            if (
+                (need_node != 0 and ptr_is_null(prepared_node) != 0)
+                or (
+                    required > 0
+                    and (
+                        ptr_is_null(prepared_slots) != 0
+                        or prepared_cap < required
+                    )
+                )
+                or (
+                    need_zpage_node != 0
+                    and ptr_is_null(prepared_zpage_node) != 0
+                )
+                or (
+                    zpage_required > 0
+                    and (
+                        ptr_is_null(prepared_zpage_slots) != 0
+                        or prepared_zpage_cap < zpage_required
+                    )
+                )
+                or need_zpage_page != 0
+            ):
+                _object_graph_unlock()
+                if need_node != 0 and ptr_is_null(prepared_node) != 0:
+                    prepared_node = _object_node_prepare()
+                    if ptr_is_null(prepared_node) != 0:
+                        free(prepared_slots)
+                        free(prepared_zpage_node)
+                        free(prepared_zpage_slots)
+                        if (
+                            ptr_is_null(prepared_zpage) == 0
+                            and prepared_zpage_from_free != 0
+                        ):
+                            _object_graph_lock()
+                            store_ptr(
+                                prepared_zpage,
+                                56,
+                                global_load_ptr(
+                                    "pcc_gc_backend4_free_page_head"
+                                ),
+                            )
+                            global_store_ptr(
+                                "pcc_gc_backend4_free_page_head",
+                                prepared_zpage,
+                            )
+                            _object_graph_unlock()
+                            prepared_zpage = null()
+                        if ptr_is_null(prepared_zpage) == 0:
+                            free(load_ptr(prepared_zpage, 72))
+                            free(prepared_zpage)
+                        _set_pending_minor_block(null())
+                        global_store_ptr("pcc_gc_last_alloc", o)
+                        return
+                if (
+                    required > 0
+                    and (
+                        ptr_is_null(prepared_slots) != 0
+                        or prepared_cap < required
+                    )
+                ):
+                    free(prepared_slots)
+                    prepared_slots = malloc(required * 24)
+                    if ptr_is_null(prepared_slots) != 0:
+                        free(prepared_node)
+                        free(prepared_zpage_node)
+                        free(prepared_zpage_slots)
+                        if (
+                            ptr_is_null(prepared_zpage) == 0
+                            and prepared_zpage_from_free != 0
+                        ):
+                            _object_graph_lock()
+                            store_ptr(
+                                prepared_zpage,
+                                56,
+                                global_load_ptr(
+                                    "pcc_gc_backend4_free_page_head"
+                                ),
+                            )
+                            global_store_ptr(
+                                "pcc_gc_backend4_free_page_head",
+                                prepared_zpage,
+                            )
+                            _object_graph_unlock()
+                            prepared_zpage = null()
+                        if ptr_is_null(prepared_zpage) == 0:
+                            free(load_ptr(prepared_zpage, 72))
+                            free(prepared_zpage)
+                        _set_pending_minor_block(null())
+                        global_store_ptr("pcc_gc_last_alloc", o)
+                        return
+                    memset(prepared_slots, 0, required * 24)
+                    prepared_cap = required
+                if (
+                    need_zpage_node != 0
+                    and ptr_is_null(prepared_zpage_node) != 0
+                ):
+                    prepared_zpage_node = _backend4_zpage_node_prepare()
+                    if ptr_is_null(prepared_zpage_node) != 0:
+                        free(prepared_node)
+                        free(prepared_slots)
+                        free(prepared_zpage_slots)
+                        if (
+                            ptr_is_null(prepared_zpage) == 0
+                            and prepared_zpage_from_free != 0
+                        ):
+                            _object_graph_lock()
+                            store_ptr(
+                                prepared_zpage,
+                                56,
+                                global_load_ptr(
+                                    "pcc_gc_backend4_free_page_head"
+                                ),
+                            )
+                            global_store_ptr(
+                                "pcc_gc_backend4_free_page_head",
+                                prepared_zpage,
+                            )
+                            _object_graph_unlock()
+                            prepared_zpage = null()
+                        if ptr_is_null(prepared_zpage) == 0:
+                            free(load_ptr(prepared_zpage, 72))
+                            free(prepared_zpage)
+                        _set_pending_minor_block(null())
+                        global_store_ptr("pcc_gc_last_alloc", o)
+                        return
+                if (
+                    zpage_required > 0
+                    and (
+                        ptr_is_null(prepared_zpage_slots) != 0
+                        or prepared_zpage_cap < zpage_required
+                    )
+                ):
+                    free(prepared_zpage_slots)
+                    prepared_zpage_slots = malloc(zpage_required * 24)
+                    if ptr_is_null(prepared_zpage_slots) != 0:
+                        free(prepared_node)
+                        free(prepared_slots)
+                        free(prepared_zpage_node)
+                        if (
+                            ptr_is_null(prepared_zpage) == 0
+                            and prepared_zpage_from_free != 0
+                        ):
+                            _object_graph_lock()
+                            store_ptr(
+                                prepared_zpage,
+                                56,
+                                global_load_ptr(
+                                    "pcc_gc_backend4_free_page_head"
+                                ),
+                            )
+                            global_store_ptr(
+                                "pcc_gc_backend4_free_page_head",
+                                prepared_zpage,
+                            )
+                            _object_graph_unlock()
+                            prepared_zpage = null()
+                        if ptr_is_null(prepared_zpage) == 0:
+                            free(load_ptr(prepared_zpage, 72))
+                            free(prepared_zpage)
+                        _set_pending_minor_block(null())
+                        global_store_ptr("pcc_gc_last_alloc", o)
+                        return
+                    memset(prepared_zpage_slots, 0, zpage_required * 24)
+                    prepared_zpage_cap = zpage_required
+                if need_zpage_page != 0:
+                    prepared_zpage = _backend4_zpage_track_page_prepare(
+                        prepared_zpage, o, size
+                    )
+                    if ptr_is_null(prepared_zpage) != 0:
+                        prepared_zpage_from_free = 0
+                        free(prepared_node)
+                        free(prepared_slots)
+                        free(prepared_zpage_node)
+                        free(prepared_zpage_slots)
+                        _set_pending_minor_block(null())
+                        global_store_ptr("pcc_gc_last_alloc", o)
+                        return
+                    prepared_zpage_ready = 1
+                continue
+            store_ptr(slots_owner, 0, prepared_slots)
+            commit_result: int = pcc_gc_object_index_plan_commit(
+                slots_owner, prepared_cap, 1
+            )
+            prepared_slots = load_ptr(slots_owner, 0)
+            if commit_result < 0:
+                if (
+                    ptr_is_null(prepared_zpage) == 0
+                    and prepared_zpage_from_free != 0
+                ):
+                    store_ptr(
+                        prepared_zpage,
+                        56,
+                        global_load_ptr("pcc_gc_backend4_free_page_head"),
+                    )
+                    global_store_ptr(
+                        "pcc_gc_backend4_free_page_head", prepared_zpage
+                    )
+                    prepared_zpage = null()
+                _object_graph_unlock()
+                free(prepared_node)
+                free(prepared_slots)
+                free(prepared_zpage_node)
+                free(prepared_zpage_slots)
+                if ptr_is_null(prepared_zpage) == 0:
+                    free(load_ptr(prepared_zpage, 72))
+                    free(prepared_zpage)
+                _set_pending_minor_block(null())
+                global_store_ptr("pcc_gc_last_alloc", o)
+                return
+            if backend == 4:
+                store_ptr(zpage_slots_owner, 0, prepared_zpage_slots)
+                zpage_commit_result: int = (
+                    pcc_gc_zpage_owner_index_plan_commit(
+                        zpage_slots_owner, prepared_zpage_cap, 1
+                    )
+                )
+                prepared_zpage_slots = load_ptr(zpage_slots_owner, 0)
+                if zpage_commit_result < 0:
+                    if (
+                        ptr_is_null(prepared_zpage) == 0
+                        and prepared_zpage_from_free != 0
+                    ):
+                        store_ptr(
+                            prepared_zpage,
+                            56,
+                            global_load_ptr(
+                                "pcc_gc_backend4_free_page_head"
+                            ),
+                        )
+                        global_store_ptr(
+                            "pcc_gc_backend4_free_page_head",
+                            prepared_zpage,
+                        )
+                        prepared_zpage = null()
+                    _object_graph_unlock()
+                    free(prepared_node)
+                    free(prepared_slots)
+                    free(prepared_zpage_node)
+                    free(prepared_zpage_slots)
+                    if ptr_is_null(prepared_zpage) == 0:
+                        free(load_ptr(prepared_zpage, 72))
+                        free(prepared_zpage)
+                    _set_pending_minor_block(null())
+                    global_store_ptr("pcc_gc_last_alloc", o)
+                    return
+
+        if backend == 1 or backend == 2:
+            flags: int = load_i32(o, 12)
+            color: int = 8
+            if load_i32(global_addr("pcc_gc_mark_active"), 0) != 0:
+                color = 32
+            store_i32(o, 12, (flags & ~56) | color | 16384)
+            store_i32(global_addr("pcc_gc_cycle_requested"), 0, 1)
+        elif backend == 3:
+            flags: int = load_i32(o, 12)
+            new_flags: int = (flags & ~(56 | 384)) | 136
+            if ptr_is_null(pending_block) == 0:
+                new_flags = new_flags | 4096
+            store_i32(o, 12, new_flags)
+            store_i32(global_addr("pcc_gc_cycle_requested"), 0, 1)
+        elif backend == 4:
+            flags: int = load_i32(o, 12)
+            new_flags: int = (flags & ~(56 | 2048 | 8192)) | 8
+            if (flags & 384) == 0:
+                new_flags = new_flags | 128
+            store_i32(o, 12, new_flags)
+            store_i32(global_addr("pcc_gc_cycle_requested"), 0, 1)
+        if graph_leaf != 0:
+            if (
+                ptr_is_null(prepared_zpage) == 0
+                and prepared_zpage_from_free != 0
+            ):
+                store_ptr(
+                    prepared_zpage,
+                    56,
+                    global_load_ptr("pcc_gc_backend4_free_page_head"),
+                )
+                global_store_ptr(
+                    "pcc_gc_backend4_free_page_head", prepared_zpage
+                )
+                prepared_zpage = null()
+            _object_graph_unlock()
+            free(prepared_node)
+            free(prepared_slots)
+            free(prepared_zpage_node)
+            free(prepared_zpage_slots)
+            if ptr_is_null(prepared_zpage) == 0:
+                free(load_ptr(prepared_zpage, 72))
+                free(prepared_zpage)
+            _set_pending_minor_block(null())
+            global_store_ptr("pcc_gc_last_alloc", o)
+            return
+
+        store_ptr(node_owner, 0, prepared_node)
+        node = _object_node_take_prepared(node_owner)
+        prepared_node = load_ptr(node_owner, 0)
+        if ptr_is_null(node) != 0:
+            if (
+                ptr_is_null(prepared_zpage) == 0
+                and prepared_zpage_from_free != 0
+            ):
+                store_ptr(
+                    prepared_zpage,
+                    56,
+                    global_load_ptr("pcc_gc_backend4_free_page_head"),
+                )
+                global_store_ptr(
+                    "pcc_gc_backend4_free_page_head", prepared_zpage
+                )
+                prepared_zpage = null()
+            _object_graph_unlock()
+            free(prepared_node)
+            free(prepared_slots)
+            free(prepared_zpage_node)
+            free(prepared_zpage_slots)
+            if ptr_is_null(prepared_zpage) == 0:
+                free(load_ptr(prepared_zpage, 72))
+                free(prepared_zpage)
+            _set_pending_minor_block(null())
+            global_store_ptr("pcc_gc_last_alloc", o)
+            return
         old_head = _object_head()
         store_ptr(node, 0, o)
         store_i64(node, 8, size)
@@ -3198,18 +4097,54 @@ def pcc_gc_note_object_allocated_sized(o, size: int) -> None:
         if ptr_is_null(old_head) == 0:
             _set_object_node_prev(old_head, node)
         _set_object_head(node)
-        index_result: int = pcc_gc_object_index_insert(o, node)
+        index_result: int = pcc_gc_object_index_insert_preallocated(o, node)
         if index_result >= 0:
-            pcc_gc_managed_pointer_index_remove(o)
-        if backend == 3:
+            if pcc_gc_granule_is_object_start(o) != 1:
+                pcc_gc_managed_pointer_index_remove(o)
+        final_generation: int = load_i32(o, 12) & 384
+        if final_generation == 128:
             _backend3_young_link_head(node)
         live: int = load_i32(global_addr("pcc_gc_live_bytes"), 0)
         store_i32(global_addr("pcc_gc_live_bytes"), 0, live + size)
         if backend == 4:
-            _set_object_node_zpage(node, _backend4_zpage_track_alloc(o, size))
+            store_ptr(zpage_node_owner, 0, prepared_zpage_node)
+            store_ptr(zpage_owner, 0, prepared_zpage)
+            zpage_node = _backend4_zpage_track_alloc_preallocated(
+                o,
+                size,
+                zpage_node_owner,
+                zpage_owner,
+                prepared_zpage_from_free,
+            )
+            prepared_zpage_node = load_ptr(zpage_node_owner, 0)
+            prepared_zpage = load_ptr(zpage_owner, 0)
+            if ptr_is_null(prepared_zpage) != 0:
+                prepared_zpage_from_free = 0
+            _set_object_node_zpage(node, zpage_node)
+        if (
+            ptr_is_null(prepared_zpage) == 0
+            and prepared_zpage_from_free != 0
+        ):
+            store_ptr(
+                prepared_zpage,
+                56,
+                global_load_ptr("pcc_gc_backend4_free_page_head"),
+            )
+            global_store_ptr(
+                "pcc_gc_backend4_free_page_head", prepared_zpage
+            )
+            prepared_zpage = null()
         _object_graph_unlock()
-    _set_pending_minor_block(null())
-    global_store_ptr("pcc_gc_last_alloc", o)
+        free(prepared_node)
+        free(prepared_slots)
+        free(prepared_zpage_node)
+        free(prepared_zpage_slots)
+        if ptr_is_null(prepared_zpage) == 0:
+            free(load_ptr(prepared_zpage, 72))
+            free(prepared_zpage)
+        _set_pending_minor_block(null())
+        global_store_ptr("pcc_gc_last_alloc", o)
+        return
 
 
 @c_abi_export("pcc_gc_note_object_allocated")
@@ -3226,13 +4161,31 @@ def pcc_gc_note_object_freeing(o) -> None:
         backend = load_i32(global_addr("pcc_gc_backend_selected"), 0)
     if ptr_is_null(o) != 0:
         return
-    _object_graph_lock()
-    if pcc_gc_managed_pointer_index_insert(o) < 0:
-        _object_graph_unlock()
-        return
+    # The remap-finish struct is written only by the forwarding backends
+    # (3/4): every writer below sits under that backend check, so on 0/1/2 it
+    # is all-null at every exit and the six-way retirement fan-out is pure
+    # per-free overhead.  Gate the fan-out, not the struct init, and keep the
+    # C mirror in py_gc_backend.c the same shape.
+    moving: int = 0
     if backend == 3 or backend == 4:
-        _forwarding_remove(o)
-        _forwarding_remove_target(o)
+        moving = 1
+    finish = stack_alloc(48)
+    store_ptr(finish, 0, null())
+    store_ptr(finish, 8, null())
+    store_ptr(finish, 16, null())
+    store_ptr(finish, 24, null())
+    store_ptr(finish, 32, null())
+    store_ptr(finish, 40, null())
+    _object_graph_lock()
+    if pcc_gc_granule_is_object_start(o) != 1:
+        if pcc_gc_managed_pointer_index_insert(o) < 0:
+            _object_graph_unlock()
+            if moving != 0:
+                _backend4_finish_remap_retirement(finish)
+            return
+    if moving != 0:
+        _forwarding_detach_into_finish(o, finish)
+        _forwarding_remove_target(o, finish)
     _identity_remove(o)
     if backend == 4:
         _relocation_set_remove(o)
@@ -3252,6 +4205,8 @@ def pcc_gc_note_object_freeing(o) -> None:
             _backend4_zpage_remove(o)
     if _gc_tracks_objects() == 0:
         _object_graph_unlock()
+        if moving != 0:
+            _backend4_finish_remap_retirement(finish)
         return
     node = pcc_gc_object_index_find(o)
     if ptr_is_null(node) == 0:
@@ -3260,59 +4215,218 @@ def pcc_gc_note_object_freeing(o) -> None:
         _set_object_node_freeing(node, 1)
         if ptr_is_null(_object_node_minor_block(node)) == 0:
             _object_graph_unlock()
+            if moving != 0:
+                _backend4_finish_remap_retirement(finish)
             return
         pcc_gc_object_index_remove(o)
         _unlink_object_node(node)
         _object_node_release(node)
         _object_graph_unlock()
+        if moving != 0:
+            _backend4_finish_remap_retirement(finish)
         return
     last = global_load_ptr("pcc_gc_last_alloc")
     if ptr_eq(last, o) != 0:
         global_store_ptr("pcc_gc_last_alloc", null())
     _object_graph_unlock()
+    if moving != 0:
+        _backend4_finish_remap_retirement(finish)
 
 
 @c_abi_export("pcc_gc_reset_relocation_set")
 def pcc_gc_reset_relocation_set() -> None:
     _init_config()
+    owner: int = pcc_current_thread_id()
+    if owner <= 0:
+        return
+    while 1:
+        _object_graph_lock()
+        reset_owner: int = load_i64(
+            global_addr("pcc_gc_backend4_relocation_reset_owner"), 0
+        )
+        if reset_owner == 0:
+            store_i64(
+                global_addr("pcc_gc_backend4_relocation_reset_owner"),
+                0,
+                owner,
+            )
+            break
+        if reset_owner == owner:
+            _object_graph_unlock()
+            return
+        _object_graph_unlock()
+        pcc_thread_safepoint()
+
+    while 1:
+        batch = null()
+        examined: int = 0
+        while ptr_is_null(_relocation_set_head()) == 0 and examined < 16:
+            node = _relocation_set_head()
+            _set_relocation_set_head(load_ptr(node, 8))
+            if ptr_eq(
+                global_load_ptr("pcc_gc_backend4_reseed_relocation_cursor"),
+                node,
+            ) != 0:
+                global_store_ptr(
+                    "pcc_gc_backend4_reseed_relocation_cursor",
+                    load_ptr(node, 8),
+                )
+            revision: int = load_i64(
+                global_addr("pcc_gc_backend4_reseed_relocation_revision"), 0
+            )
+            store_i64(
+                global_addr("pcc_gc_backend4_reseed_relocation_revision"),
+                0,
+                revision + 1,
+            )
+            store_ptr(node, 8, batch)
+            batch = node
+            obj = load_ptr(node, 0)
+            if ptr_is_null(obj) == 0:
+                if is_tagged_int(obj) == 0:
+                    if ptr_is_null(_forwarding_find(obj)) != 0:
+                        flags: int = load_i32(obj, 12)
+                        store_i32(obj, 12, flags & ~2048)
+            examined = examined + 1
+        complete: int = ptr_is_null(_relocation_set_head())
+        _object_graph_unlock()
+        _relocation_reset_finish(batch, null())
+        if complete != 0:
+            break
+        pcc_thread_safepoint()
+        _object_graph_lock()
+
     _object_graph_lock()
-    node = _relocation_set_head()
-    _set_relocation_set_head(null())
-    _backend4_evacuation_page_clear()
+    while 1:
+        page_batch = null()
+        examined = 0
+        while ptr_is_null(_evacuation_page_head()) == 0 and examined < 16:
+            page_node = _evacuation_page_head()
+            _set_evacuation_page_head(load_ptr(page_node, 8))
+            if ptr_eq(
+                global_load_ptr("pcc_gc_backend4_reseed_page_count_cursor"),
+                page_node,
+            ) != 0:
+                global_store_ptr(
+                    "pcc_gc_backend4_reseed_page_count_cursor",
+                    load_ptr(page_node, 8),
+                )
+            revision = load_i64(
+                global_addr("pcc_gc_backend4_reseed_page_revision"), 0
+            )
+            store_i64(
+                global_addr("pcc_gc_backend4_reseed_page_revision"),
+                0,
+                revision + 1,
+            )
+            store_ptr(page_node, 8, page_batch)
+            page_batch = page_node
+            page = load_ptr(page_node, 0)
+            if ptr_is_null(page) == 0:
+                store_i32(page, 108, 0)
+            examined = examined + 1
+        complete = ptr_is_null(_evacuation_page_head())
+        _object_graph_unlock()
+        _backend4_evacuation_page_finish_detached(page_batch)
+        if complete != 0:
+            break
+        pcc_thread_safepoint()
+        _object_graph_lock()
+
+    _object_graph_lock()
+    global_store_ptr("pcc_gc_backend4_reset_object_cursor", _object_head())
+    while 1:
+        examined = 0
+        while (
+            ptr_is_null(
+                global_load_ptr("pcc_gc_backend4_reset_object_cursor")
+            ) == 0
+            and examined < 16
+        ):
+            obj_node = global_load_ptr(
+                "pcc_gc_backend4_reset_object_cursor"
+            )
+            global_store_ptr(
+                "pcc_gc_backend4_reset_object_cursor",
+                _object_node_next(obj_node),
+            )
+            obj = load_ptr(obj_node, 0)
+            if ptr_is_null(obj) == 0:
+                if is_tagged_int(obj) == 0:
+                    flags = load_i32(obj, 12)
+                    store_i32(obj, 12, flags & ~8192)
+            examined = examined + 1
+        if ptr_is_null(
+            global_load_ptr("pcc_gc_backend4_reset_object_cursor")
+        ) != 0:
+            store_i32(
+                global_addr("pcc_gc_backend4_evacuation_candidates"), 0, 0
+            )
+            store_i32(
+                global_addr(
+                    "pcc_gc_backend4_evacuation_candidate_bytes_count"
+                ),
+                0,
+                0,
+            )
+            store_i32(
+                global_addr("pcc_gc_backend4_small_page_candidates"), 0, 0
+            )
+            store_i32(
+                global_addr("pcc_gc_backend4_medium_page_candidates"), 0, 0
+            )
+            store_i32(
+                global_addr(
+                    "pcc_gc_backend4_small_page_candidate_bytes_count"
+                ),
+                0,
+                0,
+            )
+            store_i32(
+                global_addr(
+                    "pcc_gc_backend4_medium_page_candidate_bytes_count"
+                ),
+                0,
+                0,
+            )
+            store_i32(
+                global_addr(
+                    "pcc_gc_backend4_evacuation_candidate_zpage_bytes_count"
+                ),
+                0,
+                0,
+            )
+            store_i32(
+                global_addr(
+                    "pcc_gc_backend4_small_page_candidate_zpage_bytes_count"
+                ),
+                0,
+                0,
+            )
+            store_i32(
+                global_addr(
+                    "pcc_gc_backend4_medium_page_candidate_zpage_bytes_count"
+                ),
+                0,
+                0,
+            )
+            store_i64(
+                global_addr("pcc_gc_backend4_relocation_reset_owner"), 0, 0
+            )
+            _object_graph_unlock()
+            return
+        _object_graph_unlock()
+        pcc_thread_safepoint()
+        _object_graph_lock()
+
+
+def _relocation_reset_finish(relocation_nodes, evacuation_nodes) -> None:
+    node = relocation_nodes
     while ptr_is_null(node) == 0:
         nxt = load_ptr(node, 8)
-        obj = load_ptr(node, 0)
-        if ptr_is_null(obj) == 0:
-            if is_tagged_int(obj) == 0:
-                if ptr_is_null(_forwarding_find(obj)) != 0:
-                    flags: int = load_i32(obj, 12)
-                    store_i32(obj, 12, flags & ~2048)
         free(node)
         node = nxt
-    obj_node = _object_head()
-    while ptr_is_null(obj_node) == 0:
-        obj = load_ptr(obj_node, 0)
-        if ptr_is_null(obj) == 0:
-            if is_tagged_int(obj) == 0:
-                flags: int = load_i32(obj, 12)
-                store_i32(obj, 12, flags & ~8192)
-        obj_node = _object_node_next(obj_node)
-    store_i32(global_addr("pcc_gc_backend4_evacuation_candidates"), 0, 0)
-    store_i32(global_addr("pcc_gc_backend4_evacuation_candidate_bytes_count"), 0, 0)
-    store_i32(global_addr("pcc_gc_backend4_small_page_candidates"), 0, 0)
-    store_i32(global_addr("pcc_gc_backend4_medium_page_candidates"), 0, 0)
-    store_i32(global_addr("pcc_gc_backend4_small_page_candidate_bytes_count"), 0, 0)
-    store_i32(global_addr("pcc_gc_backend4_medium_page_candidate_bytes_count"), 0, 0)
-    store_i32(
-        global_addr("pcc_gc_backend4_evacuation_candidate_zpage_bytes_count"), 0, 0
-    )
-    store_i32(
-        global_addr("pcc_gc_backend4_small_page_candidate_zpage_bytes_count"), 0, 0
-    )
-    store_i32(
-        global_addr("pcc_gc_backend4_medium_page_candidate_zpage_bytes_count"), 0, 0
-    )
-    _object_graph_unlock()
+    _backend4_evacuation_page_finish_detached(evacuation_nodes)
 
 
 @c_abi_export("pcc_gc_relocation_set_contains")
@@ -3374,81 +4488,410 @@ def _backend4_clear_large_deferred_flags() -> None:
     _object_graph_unlock()
 
 
+@c_abi_export("pcc_gc_backend4_reseed_plan_probe_config")
+def pcc_gc_backend4_reseed_plan_probe_config(
+    pause: int, allocation_limit: int
+) -> None:
+    atomic_store_i64(
+        global_addr("pcc_gc_backend4_reseed_plan_probe_allocation_limit"),
+        0,
+        allocation_limit,
+        "release",
+    )
+    atomic_store_i64(
+        global_addr("pcc_gc_backend4_reseed_plan_probe_pause"),
+        0,
+        pause != 0,
+        "release",
+    )
+
+
+@c_abi_export("pcc_gc_backend4_reseed_plan_probe_state")
+def pcc_gc_backend4_reseed_plan_probe_state() -> int:
+    return atomic_load_i64(
+        global_addr("pcc_gc_backend4_reseed_plan_probe_state_value"),
+        0,
+        "acquire",
+    )
+
+
+def _backend4_reseed_plan_probe_wait(phase: int) -> None:
+    if (atomic_load_i64(
+        global_addr("pcc_gc_backend4_reseed_plan_probe_pause"), 0, "acquire"
+    ) & phase) == 0:
+        return
+    atomic_store_i64(
+        global_addr("pcc_gc_backend4_reseed_plan_probe_state_value"),
+        0,
+        1,
+        "release",
+    )
+    while (atomic_load_i64(
+        global_addr("pcc_gc_backend4_reseed_plan_probe_pause"), 0, "acquire"
+    ) & phase) != 0:
+        pcc_thread_safepoint()
+    atomic_store_i64(
+        global_addr("pcc_gc_backend4_reseed_plan_probe_state_value"),
+        0,
+        0,
+        "release",
+    )
+
+
 def _backend4_reseed_relocation_epoch_state() -> None:
     if pcc_gc_backend() != 4:
         return
-    _object_graph_lock()
-    node = _relocation_set_head()
-    candidates: int = 0
-    candidate_bytes: int = 0
-    small_candidates: int = 0
-    medium_candidates: int = 0
-    small_bytes: int = 0
-    medium_bytes: int = 0
-    zpage_bytes: int = 0
-    small_zpage_bytes: int = 0
-    medium_zpage_bytes: int = 0
-    _backend4_evacuation_page_clear()
-    while ptr_is_null(node) == 0:
-        obj = load_ptr(node, 0)
-        size: int = _object_known_size(obj)
-        if size > 0:
-            candidates = candidates + 1
-            candidate_bytes = candidate_bytes + size
-            if size <= 4096:
-                small_candidates = small_candidates + 1
-                small_bytes = small_bytes + size
-            elif size <= 65536:
-                medium_candidates = medium_candidates + 1
-                medium_bytes = medium_bytes + size
-        node = load_ptr(node, 8)
-    page = _zpage_page_head()
-    while ptr_is_null(page) == 0:
-        if _backend4_relocation_set_contains_page(page) != 0:
-            _backend4_evacuation_page_add(page)
-            page_bytes: int = load_i64(page, 8)
-            page_class: int = load_i32(page, 24)
-            if page_bytes > 0:
-                zpage_bytes = zpage_bytes + page_bytes
-                if page_class == 0:
-                    small_zpage_bytes = small_zpage_bytes + page_bytes
-                elif page_class == 1:
-                    medium_zpage_bytes = medium_zpage_bytes + page_bytes
-        page = load_ptr(page, 56)
-    store_i32(global_addr("pcc_gc_backend4_evacuation_candidates"), 0, candidates)
-    store_i32(
-        global_addr("pcc_gc_backend4_evacuation_candidate_bytes_count"),
-        0,
-        candidate_bytes,
-    )
-    store_i32(global_addr("pcc_gc_backend4_small_page_candidates"), 0, small_candidates)
-    store_i32(
-        global_addr("pcc_gc_backend4_medium_page_candidates"), 0, medium_candidates
-    )
-    store_i32(
-        global_addr("pcc_gc_backend4_small_page_candidate_bytes_count"), 0, small_bytes
-    )
-    store_i32(
-        global_addr("pcc_gc_backend4_medium_page_candidate_bytes_count"),
-        0,
-        medium_bytes,
-    )
-    store_i32(
-        global_addr("pcc_gc_backend4_evacuation_candidate_zpage_bytes_count"),
-        0,
-        zpage_bytes,
-    )
-    store_i32(
-        global_addr("pcc_gc_backend4_small_page_candidate_zpage_bytes_count"),
-        0,
-        small_zpage_bytes,
-    )
-    store_i32(
-        global_addr("pcc_gc_backend4_medium_page_candidate_zpage_bytes_count"),
-        0,
-        medium_zpage_bytes,
-    )
-    _object_graph_unlock()
+    owner: int = pcc_current_thread_id()
+    if owner <= 0:
+        return
+    prepared_nodes = null()
+    prepared_count: int = 0
+    while 1:
+        _object_graph_lock()
+        count_owner: int = load_i64(
+            global_addr("pcc_gc_backend4_reseed_page_count_owner"), 0
+        )
+        if count_owner == 0:
+            store_i64(
+                global_addr("pcc_gc_backend4_reseed_page_count_owner"),
+                0,
+                owner,
+            )
+            break
+        if count_owner == owner:
+            _object_graph_unlock()
+            return
+        _object_graph_unlock()
+        pcc_thread_safepoint()
+    while 1:
+        required: int = 0
+        observed_revision: int = load_i64(
+            global_addr("pcc_gc_backend4_reseed_page_revision"), 0
+        )
+        global_store_ptr(
+            "pcc_gc_backend4_reseed_page_count_cursor",
+            _evacuation_page_head(),
+        )
+        while 1:
+            examined: int = 0
+            while (
+                ptr_is_null(
+                    global_load_ptr(
+                        "pcc_gc_backend4_reseed_page_count_cursor"
+                    )
+                ) == 0
+                and examined < 16
+            ):
+                page_node = global_load_ptr(
+                    "pcc_gc_backend4_reseed_page_count_cursor"
+                )
+                global_store_ptr(
+                    "pcc_gc_backend4_reseed_page_count_cursor",
+                    load_ptr(page_node, 8),
+                )
+                required = required + 1
+                examined = examined + 1
+            complete: int = ptr_is_null(
+                global_load_ptr("pcc_gc_backend4_reseed_page_count_cursor")
+            )
+            revision: int = load_i64(
+                global_addr("pcc_gc_backend4_reseed_page_revision"), 0
+            )
+            if revision != observed_revision:
+                required = 0
+                observed_revision = revision
+                global_store_ptr(
+                    "pcc_gc_backend4_reseed_page_count_cursor",
+                    _evacuation_page_head(),
+                )
+                complete = 0
+            if complete != 0:
+                break
+            _object_graph_unlock()
+            _backend4_reseed_plan_probe_wait(1)
+            pcc_thread_safepoint()
+            _object_graph_lock()
+        if required > prepared_count:
+            _object_graph_unlock()
+            _backend4_reseed_plan_probe_wait(1)
+            prepared_nodes = _backend4_evacuation_page_nodes_prepare(
+                prepared_nodes, required - prepared_count
+            )
+            prepared_count = _backend4_evacuation_page_nodes_count(
+                prepared_nodes
+            )
+            if prepared_count < required:
+                _object_graph_lock()
+                global_store_ptr(
+                    "pcc_gc_backend4_reseed_page_count_cursor", null()
+                )
+                global_store_ptr(
+                    "pcc_gc_backend4_reseed_relocation_cursor", null()
+                )
+                store_i64(
+                    global_addr("pcc_gc_backend4_reseed_commit_owner"),
+                    0,
+                    0,
+                )
+                store_i64(
+                    global_addr("pcc_gc_backend4_reseed_page_count_owner"),
+                    0,
+                    0,
+                )
+                _object_graph_unlock()
+                _backend4_evacuation_page_finish_detached(prepared_nodes)
+                return
+            _object_graph_lock()
+            continue
+
+        while 1:
+            candidates: int = 0
+            candidate_bytes: int = 0
+            small_candidates: int = 0
+            medium_candidates: int = 0
+            small_bytes: int = 0
+            medium_bytes: int = 0
+            zpage_bytes: int = 0
+            small_zpage_bytes: int = 0
+            medium_zpage_bytes: int = 0
+            observed_relocation_revision: int = load_i64(
+                global_addr("pcc_gc_backend4_reseed_relocation_revision"), 0
+            )
+            global_store_ptr(
+                "pcc_gc_backend4_reseed_relocation_cursor",
+                _relocation_set_head(),
+            )
+            while 1:
+                examined = 0
+                while (
+                    ptr_is_null(
+                        global_load_ptr(
+                            "pcc_gc_backend4_reseed_relocation_cursor"
+                        )
+                    ) == 0
+                    and examined < 16
+                ):
+                    rel_node = global_load_ptr(
+                        "pcc_gc_backend4_reseed_relocation_cursor"
+                    )
+                    global_store_ptr(
+                        "pcc_gc_backend4_reseed_relocation_cursor",
+                        load_ptr(rel_node, 8),
+                    )
+                    obj = load_ptr(rel_node, 0)
+                    size: int = _object_known_size(obj)
+                    if size > 0:
+                        candidates = candidates + 1
+                        candidate_bytes = candidate_bytes + size
+                        if size <= 4096:
+                            small_candidates = small_candidates + 1
+                            small_bytes = small_bytes + size
+                        elif size <= 65536:
+                            medium_candidates = medium_candidates + 1
+                            medium_bytes = medium_bytes + size
+                    examined = examined + 1
+                complete = ptr_is_null(
+                    global_load_ptr(
+                        "pcc_gc_backend4_reseed_relocation_cursor"
+                    )
+                )
+                revision = load_i64(
+                    global_addr(
+                        "pcc_gc_backend4_reseed_relocation_revision"
+                    ),
+                    0,
+                )
+                if revision != observed_relocation_revision:
+                    candidates = 0
+                    candidate_bytes = 0
+                    small_candidates = 0
+                    medium_candidates = 0
+                    small_bytes = 0
+                    medium_bytes = 0
+                    observed_relocation_revision = revision
+                    global_store_ptr(
+                        "pcc_gc_backend4_reseed_relocation_cursor",
+                        _relocation_set_head(),
+                    )
+                    complete = 0
+                if complete != 0:
+                    break
+                _object_graph_unlock()
+                _backend4_reseed_plan_probe_wait(2)
+                pcc_thread_safepoint()
+                _object_graph_lock()
+
+            # Freeze candidate admission and relocation commit while scanning
+            # the authoritative evacuation list.  The unlink paths repair the
+            # cursor before recycling a node/page, and raw page locals are
+            # cleared before every unlock.
+            store_i64(
+                global_addr("pcc_gc_backend4_reseed_commit_owner"),
+                0,
+                owner,
+            )
+            observed_page_revision: int = load_i64(
+                global_addr("pcc_gc_backend4_reseed_page_revision"), 0
+            )
+            observed_commit_relocation_revision: int = load_i64(
+                global_addr("pcc_gc_backend4_reseed_relocation_revision"), 0
+            )
+            restart_commit: int = 0
+            global_store_ptr(
+                "pcc_gc_backend4_reseed_page_count_cursor",
+                _evacuation_page_head(),
+            )
+            while 1:
+                examined = 0
+                page_node = null()
+                page = null()
+                while (
+                    ptr_is_null(
+                        global_load_ptr(
+                            "pcc_gc_backend4_reseed_page_count_cursor"
+                        )
+                    ) == 0
+                    and examined < 16
+                ):
+                    page_node = global_load_ptr(
+                        "pcc_gc_backend4_reseed_page_count_cursor"
+                    )
+                    global_store_ptr(
+                        "pcc_gc_backend4_reseed_page_count_cursor",
+                        load_ptr(page_node, 8),
+                    )
+                    page = load_ptr(page_node, 0)
+                    if ptr_is_null(page) == 0:
+                        page_bytes: int = load_i64(page, 8)
+                        page_class: int = load_i32(page, 24)
+                        if page_bytes > 0:
+                            zpage_bytes = zpage_bytes + page_bytes
+                            if page_class == 0:
+                                small_zpage_bytes = (
+                                    small_zpage_bytes + page_bytes
+                                )
+                            elif page_class == 1:
+                                medium_zpage_bytes = (
+                                    medium_zpage_bytes + page_bytes
+                                )
+                    examined = examined + 1
+                page_node = null()
+                page = null()
+                complete = ptr_is_null(
+                    global_load_ptr(
+                        "pcc_gc_backend4_reseed_page_count_cursor"
+                    )
+                )
+                revision = load_i64(
+                    global_addr("pcc_gc_backend4_reseed_page_revision"), 0
+                )
+                relocation_revision: int = load_i64(
+                    global_addr(
+                        "pcc_gc_backend4_reseed_relocation_revision"
+                    ),
+                    0,
+                )
+                reset_owner: int = load_i64(
+                    global_addr("pcc_gc_backend4_relocation_reset_owner"), 0
+                )
+                if (
+                    revision != observed_page_revision
+                    or relocation_revision
+                    != observed_commit_relocation_revision
+                    or reset_owner != 0
+                ):
+                    restart_commit = 1
+                    break
+                if complete != 0:
+                    break
+                _object_graph_unlock()
+                _backend4_reseed_plan_probe_wait(4)
+                pcc_thread_safepoint()
+                _object_graph_lock()
+            if restart_commit != 0:
+                global_store_ptr(
+                    "pcc_gc_backend4_reseed_page_count_cursor", null()
+                )
+                global_store_ptr(
+                    "pcc_gc_backend4_reseed_relocation_cursor", null()
+                )
+                _object_graph_unlock()
+                pcc_thread_safepoint()
+                _object_graph_lock()
+                continue
+
+            store_i32(
+                global_addr("pcc_gc_backend4_evacuation_candidates"),
+                0,
+                candidates,
+            )
+            store_i32(
+                global_addr(
+                    "pcc_gc_backend4_evacuation_candidate_bytes_count"
+                ),
+                0,
+                candidate_bytes,
+            )
+            store_i32(
+                global_addr("pcc_gc_backend4_small_page_candidates"),
+                0,
+                small_candidates,
+            )
+            store_i32(
+                global_addr("pcc_gc_backend4_medium_page_candidates"),
+                0,
+                medium_candidates,
+            )
+            store_i32(
+                global_addr(
+                    "pcc_gc_backend4_small_page_candidate_bytes_count"
+                ),
+                0,
+                small_bytes,
+            )
+            store_i32(
+                global_addr(
+                    "pcc_gc_backend4_medium_page_candidate_bytes_count"
+                ),
+                0,
+                medium_bytes,
+            )
+            store_i32(
+                global_addr(
+                    "pcc_gc_backend4_evacuation_candidate_zpage_bytes_count"
+                ),
+                0,
+                zpage_bytes,
+            )
+            store_i32(
+                global_addr(
+                    "pcc_gc_backend4_small_page_candidate_zpage_bytes_count"
+                ),
+                0,
+                small_zpage_bytes,
+            )
+            store_i32(
+                global_addr(
+                    "pcc_gc_backend4_medium_page_candidate_zpage_bytes_count"
+                ),
+                0,
+                medium_zpage_bytes,
+            )
+            global_store_ptr(
+                "pcc_gc_backend4_reseed_page_count_cursor", null()
+            )
+            global_store_ptr(
+                "pcc_gc_backend4_reseed_relocation_cursor", null()
+            )
+            store_i64(
+                global_addr("pcc_gc_backend4_reseed_commit_owner"), 0, 0
+            )
+            store_i64(
+                global_addr("pcc_gc_backend4_reseed_page_count_owner"), 0, 0
+            )
+            _object_graph_unlock()
+            _backend4_evacuation_page_finish_detached(prepared_nodes)
+            return
 
 
 @c_abi_export("pcc_gc_backend4_evacuation_page_find")
@@ -3467,7 +4910,7 @@ def _backend4_evacuation_page_find(page):
 def _backend4_evacuation_page_add(page) -> int:
     if ptr_is_null(page) != 0:
         return 0
-    if ptr_is_null(_backend4_evacuation_page_find(page)) == 0:
+    if load_i32(page, 108) != 0:
         return 0
     _backend4_clear_active_page(page)
     node = malloc(16)
@@ -3476,6 +4919,15 @@ def _backend4_evacuation_page_add(page) -> int:
     store_ptr(node, 0, page)
     store_ptr(node, 8, _evacuation_page_head())
     _set_evacuation_page_head(node)
+    store_i32(page, 108, 1)
+    revision: int = load_i64(
+        global_addr("pcc_gc_backend4_reseed_page_revision"), 0
+    )
+    store_i64(
+        global_addr("pcc_gc_backend4_reseed_page_revision"),
+        0,
+        revision + 1,
+    )
     return 1
 
 
@@ -3492,15 +4944,90 @@ def _backend4_evacuation_page_remove(page) -> None:
                 _set_evacuation_page_head(nxt)
             else:
                 store_ptr(prev, 8, nxt)
+            if ptr_eq(
+                global_load_ptr("pcc_gc_backend4_reseed_page_count_cursor"),
+                node,
+            ) != 0:
+                global_store_ptr(
+                    "pcc_gc_backend4_reseed_page_count_cursor", nxt
+                )
+            revision: int = load_i64(
+                global_addr("pcc_gc_backend4_reseed_page_revision"), 0
+            )
+            store_i64(
+                global_addr("pcc_gc_backend4_reseed_page_revision"),
+                0,
+                revision + 1,
+            )
+            store_i32(page, 108, 0)
             free(node)
             return
         prev = node
         node = nxt
 
 
-def _backend4_evacuation_page_clear() -> None:
-    node = _evacuation_page_head()
-    _set_evacuation_page_head(null())
+def _backend4_evacuation_page_nodes_count(node) -> int:
+    count: int = 0
+    while ptr_is_null(node) == 0:
+        count = count + 1
+        node = load_ptr(node, 8)
+    return count
+
+
+def _backend4_evacuation_page_nodes_prepare(head, capacity: int):
+    while capacity > 0:
+        allocation_limit: int = atomic_load_i64(
+            global_addr("pcc_gc_backend4_reseed_plan_probe_allocation_limit"),
+            0,
+            "acquire",
+        )
+        if allocation_limit == 0:
+            return head
+        node = malloc(16)
+        if ptr_is_null(node) != 0:
+            return head
+        store_ptr(node, 0, null())
+        store_ptr(node, 8, head)
+        head = node
+        capacity = capacity - 1
+        if allocation_limit > 0:
+            atomic_store_i64(
+                global_addr(
+                    "pcc_gc_backend4_reseed_plan_probe_allocation_limit"
+                ),
+                0,
+                allocation_limit - 1,
+                "release",
+            )
+    return head
+
+
+def _backend4_evacuation_page_add_preallocated(page, available) -> int:
+    if ptr_is_null(page) != 0 or ptr_is_null(available) != 0:
+        return 0
+    if load_i32(page, 108) != 0:
+        return 0
+    node = load_ptr(available, 0)
+    if ptr_is_null(node) != 0:
+        return 0
+    store_ptr(available, 0, load_ptr(node, 8))
+    _backend4_clear_active_page(page)
+    store_ptr(node, 0, page)
+    store_ptr(node, 8, _evacuation_page_head())
+    _set_evacuation_page_head(node)
+    store_i32(page, 108, 1)
+    revision: int = load_i64(
+        global_addr("pcc_gc_backend4_reseed_page_revision"), 0
+    )
+    store_i64(
+        global_addr("pcc_gc_backend4_reseed_page_revision"),
+        0,
+        revision + 1,
+    )
+    return 1
+
+
+def _backend4_evacuation_page_finish_detached(node) -> None:
     while ptr_is_null(node) == 0:
         nxt = load_ptr(node, 8)
         free(node)
@@ -3555,14 +5082,37 @@ def pcc_gc_note_pin(delta: int) -> None:
     _counter_inc(4, delta)
 
 
+def _scheduler_root_node_alloc(slot):
+    if ptr_is_null(slot) != 0:
+        return null()
+    node = malloc(24)
+    if ptr_is_null(node) != 0:
+        return null()
+    memset(node, 0, 24)
+    store_ptr(node, 0, slot)
+    return node
+
+
+def _scheduler_root_node_free(node) -> None:
+    if ptr_is_null(node) == 0:
+        free(node)
+
+
 def _scheduler_queue_entry_free(entry) -> None:
     if ptr_is_null(entry):
         return
+    backend: int = pcc_gc_backend()
+    clear_plan = stack_alloc(128)
+    pcc_gc_store_root_plan_init(clear_plan, backend)
+    root_node = load_ptr(entry, 16)
     _object_graph_lock()
     barrier_before: int = load_i32(global_addr("pcc_gc_relocation_barrier_forwards"), 0)
-    _resolve_root_slot_unlocked(entry, 0)
-    if pcc_gc_backend() == 4:
-        if ptr_is_null(load_ptr(entry, 0)) == 0:
+    had_value: int = 0
+    if ptr_is_null(load_ptr(entry, 0)) == 0:
+        had_value = 1
+    pcc_gc_store_root_plan_commit_locked(clear_plan, entry, null())
+    if backend == 4:
+        if had_value != 0:
             if load_i32(global_addr("pcc_gc_relocation_forwards"), 0) > 0:
                 if (
                     load_i32(global_addr("pcc_gc_relocation_barrier_forwards"), 0)
@@ -3573,11 +5123,14 @@ def _scheduler_queue_entry_free(entry) -> None:
                         0,
                         barrier_before + 1,
                     )
-    pcc_gc_scheduler_root_unregister_handle(load_ptr(entry, 16))
+    pcc_gc_scheduler_root_unlink_locked(root_node)
     store_ptr(entry, 16, null())
     _object_graph_unlock()
-    pcc_gc_store_root_extern(entry, null())
+    if ptr_is_null(root_node) == 0:
+        pcc_gc_cycle_requested_store_release(1)
+        _scheduler_root_node_free(root_node)
     free(entry)
+    pcc_gc_store_root_plan_finish(clear_plan)
 
 
 def _scheduler_queue_entry_alloc(queue):
@@ -3627,13 +5180,19 @@ def _scheduler_queue_entry_recycle(queue, entry) -> None:
 def _scheduler_queue_entry_release(queue, entry) -> None:
     if ptr_is_null(entry) != 0:
         return
+    clear_plan = stack_alloc(128)
+    pcc_gc_store_root_plan_init(clear_plan, pcc_gc_backend())
+    root_node = load_ptr(entry, 16)
     _object_graph_lock()
-    _resolve_root_slot_unlocked(entry, 0)
-    pcc_gc_scheduler_root_unregister_handle(load_ptr(entry, 16))
+    pcc_gc_store_root_plan_commit_locked(clear_plan, entry, null())
+    pcc_gc_scheduler_root_unlink_locked(root_node)
     store_ptr(entry, 16, null())
     _object_graph_unlock()
-    pcc_gc_store_root_extern(entry, null())
+    if ptr_is_null(root_node) == 0:
+        pcc_gc_cycle_requested_store_release(1)
+        _scheduler_root_node_free(root_node)
     _scheduler_queue_entry_recycle(queue, entry)
+    pcc_gc_store_root_plan_finish(clear_plan)
 
 
 @c_abi_export("pcc_gc_scheduler_queue_new")
@@ -3690,15 +5249,28 @@ def pcc_gc_scheduler_queue_push(queue, value) -> int:
     entry = _scheduler_queue_entry_alloc(queue)
     if ptr_is_null(entry):
         return -1
-    _object_graph_lock()
-    handle = pcc_gc_scheduler_root_register_handle(entry)
-    if ptr_is_null(handle) != 0:
-        _object_graph_unlock()
+    root_node = _scheduler_root_node_alloc(entry)
+    if ptr_is_null(root_node) != 0:
         _scheduler_queue_entry_recycle(queue, entry)
         return -1
-    store_ptr(entry, 16, handle)
-    pcc_gc_store_root_extern(entry, value)
+    store_plan = stack_alloc(128)
+    pcc_gc_store_root_plan_init(store_plan, pcc_gc_backend())
+    _object_graph_lock()
+    published: int = pcc_gc_store_root_plan_commit_locked(
+        store_plan, entry, value
+    )
+    if published != 0:
+        store_ptr(entry, 16, root_node)
+        pcc_gc_scheduler_root_link_locked(root_node)
     _object_graph_unlock()
+    if published != 0:
+        pcc_gc_cycle_requested_store_release(1)
+    if published == 0:
+        _scheduler_root_node_free(root_node)
+        _scheduler_queue_entry_recycle(queue, entry)
+    pcc_gc_store_root_plan_finish(store_plan)
+    if published == 0:
+        return -1
     mutex = load_ptr(queue, 0)
     if pcc_mutex_lock(mutex) != 0:
         _scheduler_queue_entry_release(queue, entry)
@@ -3731,15 +5303,30 @@ def pcc_gc_scheduler_queue_pop_into(queue, out_slot) -> int:
         store_ptr(queue, 16, null())
     store_i64(queue, 24, load_i64(queue, 24) - 1)
     pcc_mutex_unlock(mutex)
-    _object_graph_lock()
-    value = _resolve_root_slot_unlocked(entry, 0)
+    backend: int = pcc_gc_backend()
+    out_plan = stack_alloc(128)
     if ptr_is_null(out_slot) == 0:
-        pcc_gc_store_root_extern(out_slot, value)
-    pcc_gc_scheduler_root_unregister_handle(load_ptr(entry, 16))
+        pcc_gc_store_root_plan_init(out_plan, backend)
+    clear_plan = stack_alloc(128)
+    pcc_gc_store_root_plan_init(clear_plan, backend)
+    root_node = load_ptr(entry, 16)
+    _object_graph_lock()
+    value = load_ptr(entry, 0)
+    if ptr_is_null(out_slot) == 0:
+        pcc_gc_store_root_plan_commit_locked(
+            out_plan, out_slot, value
+        )
+    pcc_gc_store_root_plan_commit_locked(clear_plan, entry, null())
+    pcc_gc_scheduler_root_unlink_locked(root_node)
     store_ptr(entry, 16, null())
     _object_graph_unlock()
-    pcc_gc_store_root_extern(entry, null())
+    if ptr_is_null(root_node) == 0:
+        pcc_gc_cycle_requested_store_release(1)
+        _scheduler_root_node_free(root_node)
     _scheduler_queue_entry_recycle(queue, entry)
+    if ptr_is_null(out_slot) == 0:
+        pcc_gc_store_root_plan_finish(out_plan)
+    pcc_gc_store_root_plan_finish(clear_plan)
     return 1
 
 

@@ -7,11 +7,11 @@ delegates to extern libc.
 
 from __future__ import annotations
 
-from pcc.extern import extern, c_int, c_int64, c_str, c_ptr
+from pcc.extern import extern, c_int, c_int64, c_str, c_ptr, c_rawptr
 
-_getenv = extern("getenv", (c_str,), c_str)
+_getenv = extern("getenv", (c_str,), c_rawptr)
 _setenv = extern("setenv", (c_str, c_str, c_int), c_int)
-_getcwd = extern("getcwd", (c_str, c_int64), c_str)
+_getcwd = extern("getcwd", (c_str, c_int64), c_rawptr)
 _access = extern("access", (c_str, c_int), c_int)
 _getpid = extern("getpid", (), c_int)
 

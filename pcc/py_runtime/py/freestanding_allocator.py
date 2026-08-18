@@ -10,8 +10,11 @@ pointer.  The only platform boundary is ``pcc.unsafe.page_alloc/page_free``.
 from pcc import i64
 from pcc.extern import c_abi_export, c_ptr
 from pcc.unsafe import (
+    logical_shift_right_i64,
+    atomic_cas_i64,
     atomic_clear,
     atomic_load_i64,
+    atomic_store_i64,
     atomic_rmw_i64,
     atomic_test_and_set,
     define_global_i8,
@@ -41,9 +44,23 @@ __pcc_freestanding__ = True
 
 define_global_i8("pcc_allocator_lock", 0)
 define_global_i64("pcc_allocator_mapped", 0)
+define_global_i64("pcc_allocator_metadata_mapped", 0)
 define_global_i64("pcc_allocator_live_requested", 0)
 define_global_i64("pcc_allocator_live_usable", 0)
+define_global_i64("pcc_allocator_fully_free_slabs", 0)
+define_global_ptr_null("pcc_allocator_trim_queue")
 define_global_ptr_null("pcc_allocator_free_16")
+define_global_ptr_null("pcc_allocator_free_obj_16")
+define_global_ptr_null("pcc_allocator_free_obj_32")
+define_global_ptr_null("pcc_allocator_free_obj_64")
+define_global_ptr_null("pcc_allocator_free_obj_128")
+define_global_ptr_null("pcc_allocator_free_obj_256")
+define_global_ptr_null("pcc_allocator_free_obj_512")
+define_global_ptr_null("pcc_allocator_free_obj_1024")
+define_global_ptr_null("pcc_allocator_free_obj_2048")
+define_global_ptr_null("pcc_allocator_free_obj_4096")
+define_global_ptr_null("pcc_allocator_free_obj_8192")
+define_global_ptr_null("pcc_allocator_free_obj_16384")
 define_global_ptr_null("pcc_allocator_free_32")
 define_global_ptr_null("pcc_allocator_free_64")
 define_global_ptr_null("pcc_allocator_free_128")
@@ -129,6 +146,18 @@ def pcc_os_heap_in_use_bytes() -> i64:
 def pcc_os_heap_capacity_bytes() -> i64:
     # Bytes of mapped capacity retained by the production pcc allocator.
     return pcc_allocator_mapped_bytes()
+
+
+@c_abi_export("pcc_allocator_reclaimable_slab_bytes")
+def pcc_allocator_reclaimable_slab_bytes() -> i64:
+    # Bytes held by raw (kind-2) slabs whose every cell is currently free --
+    # the upper bound a quiescent-point trim could return to the OS.
+    return wrapping_mul_i64(
+        atomic_load_i64(
+            global_addr("pcc_allocator_fully_free_slabs"), 0, "relaxed"
+        ),
+        65536,
+    )
 
 
 @c_abi_export("pcc_allocator_size_class")
@@ -272,8 +301,729 @@ def pcc_allocator_initialize_small(user, slab, usable: i64) -> None:
     store_i64(user, -8, 16)
 
 
+
+
+# ---- slab-granule provenance map (allocator-owned; ARCH-P0, v2) ----
+#
+# v2 design (review P0-1/P0-2/P0-3, P1-4 fixes):
+# * keys are 4 KiB OS-page granules (address >> 12), the minimum page_alloc
+#   alignment on every supported target.  A 64 KiB slab owns sixteen keys and
+#   no key can be shared by adjacent mappings;
+# * one granule maps to ONE stable span descriptor: a 32-byte immortal
+#   record {kind, stride, slab_base, 0} bump-allocated from page_alloc
+#   chunks that are never freed, so a descriptor pointer never dangles;
+# * each table generation is append-only [cap | keys[cap] | spans[cap]] in a
+#   single block behind one global pointer.  Growth builds and release-publishes
+#   a new generation; old generations are deliberately leaked (total waste
+#   bounded by 2x the final table), so a concurrent reader never observes a
+#   moved/deleted key or freed table;
+# * the public registration ABI serializes writers.  It preflights all sixteen
+#   keys and reserves count+16 capacity before allocating/publishing a span.
+#   Publication therefore cannot fail after the first key becomes visible and
+#   never needs an in-place rollback that could make an unrelated reader miss.
+define_global_ptr_null("pcc_allocator_granule_table")
+define_global_i64("pcc_allocator_granule_count", 0)
+define_global_ptr_null("pcc_allocator_span_arena")
+define_global_i64("pcc_allocator_span_arena_used", 0)
+define_global_ptr_null("pcc_allocator_granule_radix_root")
+define_global_i64("pcc_allocator_granule_radix_node_count", 0)
+
+
+@c_abi_export("pcc_allocator_granule_stride_count")
+def _granule_stride_count(stride: i64) -> i64:
+    if stride == 64:
+        return 1024
+    if stride == 80:
+        return 819
+    if stride == 112:
+        return 585
+    if stride == 176:
+        return 372
+    if stride == 304:
+        return 215
+    if stride == 560:
+        return 117
+    if stride == 1072:
+        return 61
+    if stride == 2096:
+        return 31
+    if stride == 4144:
+        return 15
+    if stride == 8240:
+        return 7
+    if stride == 16432:
+        return 3
+    return 0
+
+
+@c_abi_export("pcc_allocator_span_new")
+def _span_new(kind: i64, stride: i64, base) -> c_ptr:
+    arena = global_load_ptr("pcc_allocator_span_arena")
+    used: i64 = load_i64(global_addr("pcc_allocator_span_arena_used"), 0)
+    if ptr_is_null(arena) != 0 or used + 40 > 65536:
+        arena = page_alloc(65536)
+        if ptr_is_null(arena):
+            return null()
+        # Span arenas are immortal allocator metadata.  They contribute to
+        # retained mapped capacity even though they never contribute to a
+        # caller's requested or usable payload bytes.
+        atomic_rmw_i64(
+            "add", global_addr("pcc_allocator_mapped"), 0, 65536, "relaxed"
+        )
+        atomic_rmw_i64(
+            "add",
+            global_addr("pcc_allocator_metadata_mapped"),
+            0,
+            65536,
+            "relaxed",
+        )
+        global_store_ptr("pcc_allocator_span_arena", arena)
+        used = 0
+    span = ptr_add(arena, used)
+    store_i64(global_addr("pcc_allocator_span_arena_used"), 0, used + 40)
+    store_i64(span, 0, kind)
+    store_i64(span, 8, stride)
+    store_ptr(span, 16, base)
+    # Cell count cached in the descriptor so the hot objecthood probe never
+    # re-derives it through the 11-way stride table.
+    store_i64(span, 24, _granule_stride_count(stride))
+    # Per-slab free-cell counter for empty-slab reclamation (raw kind-2
+    # slabs only); kind-1 readers never read offset 32.
+    store_i64(span, 32, 0)
+    return span
+
+
+@c_abi_export("pcc_allocator_granule_hash")
+def _granule_hash(key: i64) -> i64:
+    value: i64 = wrapping_mul_i64(key, -7046029254386353131)
+    return value ^ logical_shift_right_i64(value, 32)
+
+
+@c_abi_export("pcc_allocator_granule_find_slot")
+def _granule_find_slot(keys, cap: i64, key: i64) -> i64:
+    # Keys are loaded with acquire so a lock-free reader that observes a
+    # key also observes the span slot written before the key's release
+    # store in _granule_bind_new_locked.  Writers run under the allocator lock.
+    mask: i64 = cap - 1
+    index: i64 = _granule_hash(key) & mask
+    # -1 is a tombstone left by raw-slab retirement: probe past it (the
+    # chain continues), but remember the first one so a not-found result
+    # hands back that slot for reuse.  Tombstones stay counted in the
+    # load-factor count until a rehash purges them, so an empty slot always
+    # exists and this loop terminates.
+    insert_at: i64 = -1
+    while True:
+        candidate: i64 = atomic_load_i64(keys, index * 8, "acquire")
+        if candidate == 0:
+            if insert_at < 0:
+                insert_at = index
+            return -insert_at - 1
+        if candidate == key:
+            return index
+        if candidate == -1 and insert_at < 0:
+            insert_at = index
+        index = (index + 1) & mask
+
+
+@c_abi_export("pcc_allocator_granule_grow")
+def _granule_grow(requested_cap: i64) -> i64:
+    """Grow the table while the allocator lock serializes the sole writer."""
+    new_cap: i64 = 256
+    while new_cap < requested_cap:
+        new_cap = new_cap * 2
+    bytes_needed: i64 = 64 + new_cap * 16
+    pages: i64 = (bytes_needed + 65535) & -65536
+    block = page_alloc(pages)
+    if ptr_is_null(block):
+        return -1
+    # Every table generation remains mapped for lock-free readers.  Account
+    # the complete immutable snapshot as retained allocator capacity; payload
+    # requested/usable counters deliberately remain unchanged.
+    atomic_rmw_i64(
+        "add", global_addr("pcc_allocator_mapped"), 0, pages, "relaxed"
+    )
+    atomic_rmw_i64(
+        "add",
+        global_addr("pcc_allocator_metadata_mapped"),
+        0,
+        pages,
+        "relaxed",
+    )
+    store_i64(block, 0, new_cap)
+    new_keys = ptr_add(block, 64)
+    new_spans = ptr_add(block, 64 + new_cap * 8)
+    live_keys: i64 = 0
+    old_table = global_load_ptr("pcc_allocator_granule_table")
+    if ptr_is_null(old_table) == 0:
+        old_cap: i64 = load_i64(old_table, 0)
+        old_keys = ptr_add(old_table, 64)
+        old_spans = ptr_add(old_table, 64 + old_cap * 8)
+        index: i64 = 0
+        while index < old_cap:
+            key: i64 = load_i64(old_keys, index * 8)
+            # Tombstones (-1) from slab retirement are purged by the rehash.
+            if key != 0 and key != -1:
+                slot: i64 = _granule_find_slot(new_keys, new_cap, key)
+                store_i64(new_keys, (-slot - 1) * 8, key)
+                store_i64(
+                    new_spans, (-slot - 1) * 8, load_i64(old_spans, index * 8)
+                )
+                live_keys = live_keys + 1
+            index = index + 1
+    # The load-factor count tracks occupied probe slots (live + tombstone);
+    # after a rehash only live keys remain.
+    store_i64(global_addr("pcc_allocator_granule_count"), 0, live_keys)
+    # Old snapshot leaked on purpose: immutable-snapshot publish (P0-2).
+    # Release store so the fully built block is visible before the pointer.
+    atomic_store_i64(
+        global_addr("pcc_allocator_granule_table"), 0,
+        ptr_diff(block, null()), "release",
+    )
+    return 0
+
+
+@c_abi_export("pcc_allocator_granule_bind_new_locked")
+def _granule_bind_new_locked(key: i64, span) -> i64:
+    """Publish one absent key without allocation while the lock is held."""
+    table = global_load_ptr("pcc_allocator_granule_table")
+    if ptr_is_null(table) != 0:
+        return -1
+    cap: i64 = load_i64(table, 0)
+    keys = ptr_add(table, 64)
+    slot: i64 = _granule_find_slot(keys, cap, key)
+    # A visible key's descriptor is immutable.  Registration preflights all
+    # sixteen keys, so reaching this branch means a duplicate/misuse rather
+    # than a permissible rebind.
+    if slot >= 0:
+        return -1
+    # Publish order: span slot FIRST, then the key with release, so a lock-free
+    # reader that observes the key always observes the immutable descriptor.
+    new_index: i64 = -slot - 1
+    # A reused tombstone slot already counts toward probe occupancy; only a
+    # fresh empty slot raises the load-factor count (see _granule_find_slot).
+    was_tombstone: i64 = 0
+    if load_i64(keys, new_index * 8) == -1:
+        was_tombstone = 1
+    store_i64(
+        ptr_add(table, 64 + cap * 8), new_index * 8,
+        ptr_diff(span, null()),
+    )
+    atomic_store_i64(keys, new_index * 8, key, "release")
+    if was_tombstone == 0:
+        store_i64(
+            global_addr("pcc_allocator_granule_count"), 0,
+            load_i64(global_addr("pcc_allocator_granule_count"), 0) + 1,
+        )
+    return 1
+
+
+@c_abi_export("pcc_allocator_granule_reserve_locked")
+def _granule_reserve_locked(additional: i64) -> i64:
+    """Ensure ``additional`` absent keys fit without a later allocation."""
+    table = global_load_ptr("pcc_allocator_granule_table")
+    cap: i64 = 256
+    if ptr_is_null(table) == 0:
+        cap = load_i64(table, 0)
+    count: i64 = load_i64(global_addr("pcc_allocator_granule_count"), 0)
+    required: i64 = count + additional
+    requested_cap: i64 = cap
+    while required > requested_cap // 2:
+        requested_cap = requested_cap * 2
+    if ptr_is_null(table) != 0 or requested_cap != cap:
+        return _granule_grow(requested_cap)
+    return 0
+
+
+@c_abi_export("pcc_allocator_granule_radix_node_new")
+def _granule_radix_node_new() -> c_ptr:
+    """Allocate one immortal zeroed 4096-slot radix node."""
+    node = page_alloc(32768)
+    if ptr_is_null(node) != 0:
+        return null()
+    atomic_rmw_i64(
+        "add", global_addr("pcc_allocator_mapped"), 0, 32768, "relaxed"
+    )
+    atomic_rmw_i64(
+        "add",
+        global_addr("pcc_allocator_metadata_mapped"),
+        0,
+        32768,
+        "relaxed",
+    )
+    store_i64(
+        global_addr("pcc_allocator_granule_radix_node_count"),
+        0,
+        load_i64(global_addr("pcc_allocator_granule_radix_node_count"), 0) + 1,
+    )
+    return node
+
+
+@c_abi_export("pcc_allocator_granule_radix_leaf_slot_locked")
+def _granule_radix_leaf_slot_locked(key: i64) -> c_ptr:
+    """Return an exact leaf slot, allocating nodes under allocator lock."""
+    if key <= 0 or logical_shift_right_i64(key, 48) != 0:
+        return null()
+    root = global_load_ptr("pcc_allocator_granule_radix_root")
+    if ptr_is_null(root) != 0:
+        root = _granule_radix_node_new()
+        if ptr_is_null(root) != 0:
+            return null()
+        atomic_store_i64(
+            global_addr("pcc_allocator_granule_radix_root"),
+            0,
+            ptr_diff(root, null()),
+            "release",
+        )
+    root_index: i64 = logical_shift_right_i64(key, 36) & 4095
+    level2_bits: i64 = atomic_load_i64(root, root_index * 8, "acquire")
+    if level2_bits == 0:
+        level2 = _granule_radix_node_new()
+        if ptr_is_null(level2) != 0:
+            return null()
+        level2_bits = ptr_diff(level2, null())
+        atomic_store_i64(root, root_index * 8, level2_bits, "release")
+    level2 = ptr_add(null(), level2_bits)
+    level2_index: i64 = logical_shift_right_i64(key, 24) & 4095
+    level3_bits: i64 = atomic_load_i64(level2, level2_index * 8, "acquire")
+    if level3_bits == 0:
+        level3 = _granule_radix_node_new()
+        if ptr_is_null(level3) != 0:
+            return null()
+        level3_bits = ptr_diff(level3, null())
+        atomic_store_i64(level2, level2_index * 8, level3_bits, "release")
+    level3 = ptr_add(null(), level3_bits)
+    level3_index: i64 = logical_shift_right_i64(key, 12) & 4095
+    leaf_bits: i64 = atomic_load_i64(level3, level3_index * 8, "acquire")
+    if leaf_bits == 0:
+        leaf = _granule_radix_node_new()
+        if ptr_is_null(leaf) != 0:
+            return null()
+        leaf_bits = ptr_diff(leaf, null())
+        atomic_store_i64(level3, level3_index * 8, leaf_bits, "release")
+    return ptr_add(ptr_add(null(), leaf_bits), (key & 4095) * 8)
+
+
+@c_abi_export("pcc_allocator_granule_radix_span_key")
+def _granule_radix_span_key(key: i64) -> c_ptr:
+    if key <= 0 or logical_shift_right_i64(key, 48) != 0:
+        return null()
+    root_bits: i64 = atomic_load_i64(
+        global_addr("pcc_allocator_granule_radix_root"), 0, "acquire"
+    )
+    if root_bits == 0:
+        return null()
+    root = ptr_add(null(), root_bits)
+    level2_bits: i64 = atomic_load_i64(
+        root, (logical_shift_right_i64(key, 36) & 4095) * 8, "acquire"
+    )
+    if level2_bits == 0:
+        return null()
+    level3_bits: i64 = atomic_load_i64(
+        ptr_add(null(), level2_bits),
+        (logical_shift_right_i64(key, 24) & 4095) * 8,
+        "acquire",
+    )
+    if level3_bits == 0:
+        return null()
+    leaf_bits: i64 = atomic_load_i64(
+        ptr_add(null(), level3_bits),
+        (logical_shift_right_i64(key, 12) & 4095) * 8,
+        "acquire",
+    )
+    if leaf_bits == 0:
+        return null()
+    span_bits: i64 = atomic_load_i64(
+        ptr_add(null(), leaf_bits), (key & 4095) * 8, "acquire"
+    )
+    return ptr_add(null(), span_bits)
+
+
+@c_abi_export("pcc_gc_granule_span")
+def pcc_gc_granule_span(ptr) -> c_ptr:
+    if ptr_is_null(ptr) != 0:
+        return null()
+    key: i64 = logical_shift_right_i64(ptr_diff(ptr, null()), 12)
+    return _granule_radix_span_key(key)
+
+
+@c_abi_export("pcc_gc_granule_kind")
+def pcc_gc_granule_kind(ptr) -> i64:
+    span = pcc_gc_granule_span(ptr)
+    if ptr_is_null(span) != 0:
+        return 0
+    return load_i64(span, 0)
+
+
+@c_abi_export("pcc_allocator_granule_register_slab_locked")
+def _granule_register_slab_locked(slab, kind: i64, stride: i64) -> i64:
+    """Register one slab while the caller holds the allocator lock."""
+    if ptr_is_null(slab) != 0 or kind <= 0:
+        return -1
+    if ptr_diff(slab, null()) & 4095 != 0:
+        return -1
+    if kind == 1:
+        if _granule_stride_count(stride) == 0:
+            return -1
+    base_key: i64 = logical_shift_right_i64(ptr_diff(slab, null()), 12)
+
+    # Reject every duplicate before allocating metadata or publishing a key.
+    # A key's first descriptor is permanent; silently rebinding it would race
+    # lock-free readers and could change raw/object family underneath free().
+    table = global_load_ptr("pcc_allocator_granule_table")
+    if ptr_is_null(table) == 0:
+        cap: i64 = load_i64(table, 0)
+        keys = ptr_add(table, 64)
+        preflight_index: i64 = 0
+        while preflight_index < 16:
+            if _granule_find_slot(keys, cap, base_key + preflight_index) >= 0:
+                return -1
+            preflight_index = preflight_index + 1
+
+    # Every operation that can fail happens before the first key is visible.
+    # With the single writer lock held, the following sixteen binds cannot
+    # encounter a resize, allocation failure, or newly introduced duplicate.
+    if _granule_reserve_locked(16) != 0:
+        return -1
+    page_index: i64 = 0
+    while page_index < 16:
+        if ptr_is_null(
+            _granule_radix_leaf_slot_locked(base_key + page_index)
+        ) != 0:
+            return -1
+        page_index = page_index + 1
+    span = _span_new(kind, stride, slab)
+    if ptr_is_null(span) != 0:
+        return -1
+    page_index = 0
+    while page_index < 16:
+        if _granule_bind_new_locked(base_key + page_index, span) < 0:
+            # Preflight + single-writer serialization make this unreachable.
+            # Fail closed rather than ever rebinding an already visible key.
+            return -1
+        leaf_slot = _granule_radix_leaf_slot_locked(base_key + page_index)
+        atomic_store_i64(
+            leaf_slot, 0, ptr_diff(span, null()), "release"
+        )
+        page_index = page_index + 1
+    return 1
+
+
+@c_abi_export("pcc_gc_granule_register_slab")
+def pcc_gc_granule_register_slab(slab, kind: i64, stride: i64) -> i64:
+    """Serialize and register a 64 KiB slab's sixteen 4 KiB granules."""
+    pcc_allocator_lock_acquire()
+    result: i64 = _granule_register_slab_locked(slab, kind, stride)
+    pcc_allocator_lock_release()
+    return result
+
+
+@c_abi_export("pcc_allocator_granule_retire_slab_locked")
+def _granule_retire_slab_locked(slab) -> i64:
+    """Retire a fully-free RAW slab's sixteen granule keys before munmap.
+
+    Only kind-2 (raw) spans may be retired: no reader dereferences a raw
+    slab's memory (every kind-1 consumer bails at kind != 1), so a lock-free
+    reader racing this sees either the immortal kind-2 span or null -- never
+    an unmapped page.  Radix leaves are zeroed FIRST so no reader can observe
+    a span for a page about to be unmapped; the writer-only flat table then
+    tombstones the keys so a later page_alloc that reuses the address
+    re-registers cleanly.
+    """
+    if ptr_is_null(slab) != 0:
+        return -1
+    if ptr_diff(slab, null()) & 4095 != 0:
+        return -1
+    span = pcc_gc_granule_span(slab)
+    if ptr_is_null(span) != 0:
+        return -1
+    if load_i64(span, 0) != 2:
+        return -1
+    base_key: i64 = logical_shift_right_i64(ptr_diff(slab, null()), 12)
+    page_index: i64 = 0
+    while page_index < 16:
+        leaf_slot = _granule_radix_leaf_slot_locked(base_key + page_index)
+        if ptr_is_null(leaf_slot) == 0:
+            atomic_store_i64(leaf_slot, 0, 0, "release")
+        page_index = page_index + 1
+    table = global_load_ptr("pcc_allocator_granule_table")
+    if ptr_is_null(table) == 0:
+        cap: i64 = load_i64(table, 0)
+        keys = ptr_add(table, 64)
+        page_index = 0
+        while page_index < 16:
+            slot: i64 = _granule_find_slot(keys, cap, base_key + page_index)
+            if slot >= 0:
+                store_i64(keys, slot * 8, -1)
+            page_index = page_index + 1
+    return 1
+
+
+@c_abi_export("pcc_allocator_trim_rebuild_list_locked")
+def _trim_rebuild_list_locked(head) -> c_ptr:
+    """Rebuild one raw free list without the cells of fully-free slabs.
+
+    Each fully-free kind-2 slab is queued once (span free count set to the -1
+    'queued' marker on the first cell seen; later cells of that slab match the
+    marker and are dropped too).  The queue links through slab+0, which is the
+    dead first cell's header, never a live free-list link (links live at each
+    cell's user offset 0 = slab+48+i*stride).
+    """
+    kept_head = null()
+    cursor = head
+    while ptr_is_null(cursor) == 0:
+        nxt = load_ptr(cursor, 0)
+        drop: i64 = 0
+        span = pcc_gc_granule_span(cursor)
+        if ptr_is_null(span) == 0:
+            if load_i64(span, 0) == 2:
+                free_cells: i64 = load_i64(span, 32)
+                if free_cells == -1:
+                    drop = 1
+                elif free_cells == load_i64(span, 24):
+                    drop = 1
+                    store_i64(span, 32, -1)
+                    slab = load_ptr(span, 16)
+                    store_ptr(slab, 0, global_load_ptr("pcc_allocator_trim_queue"))
+                    global_store_ptr("pcc_allocator_trim_queue", slab)
+        if drop == 0:
+            store_ptr(cursor, 0, kept_head)
+            kept_head = cursor
+        cursor = nxt
+    return kept_head
+
+
+@c_abi_export("pcc_allocator_trim_locked")
+def _trim_locked() -> i64:
+    """Munmap every fully-free raw slab and retire its granules; lock held.
+
+    A slab whose retirement fails (cannot happen for a slab queued from its
+    own kind-2 span, but fail closed) is left mapped rather than unmapped
+    under a live granule: a 64 KiB leak is preferable to a dangling span.
+    """
+    global_store_ptr("pcc_allocator_trim_queue", null())
+    global_store_ptr("pcc_allocator_free_16", _trim_rebuild_list_locked(global_load_ptr("pcc_allocator_free_16")))
+    global_store_ptr("pcc_allocator_free_32", _trim_rebuild_list_locked(global_load_ptr("pcc_allocator_free_32")))
+    global_store_ptr("pcc_allocator_free_64", _trim_rebuild_list_locked(global_load_ptr("pcc_allocator_free_64")))
+    global_store_ptr("pcc_allocator_free_128", _trim_rebuild_list_locked(global_load_ptr("pcc_allocator_free_128")))
+    global_store_ptr("pcc_allocator_free_256", _trim_rebuild_list_locked(global_load_ptr("pcc_allocator_free_256")))
+    global_store_ptr("pcc_allocator_free_512", _trim_rebuild_list_locked(global_load_ptr("pcc_allocator_free_512")))
+    global_store_ptr("pcc_allocator_free_1024", _trim_rebuild_list_locked(global_load_ptr("pcc_allocator_free_1024")))
+    global_store_ptr("pcc_allocator_free_2048", _trim_rebuild_list_locked(global_load_ptr("pcc_allocator_free_2048")))
+    global_store_ptr("pcc_allocator_free_4096", _trim_rebuild_list_locked(global_load_ptr("pcc_allocator_free_4096")))
+    global_store_ptr("pcc_allocator_free_8192", _trim_rebuild_list_locked(global_load_ptr("pcc_allocator_free_8192")))
+    global_store_ptr("pcc_allocator_free_16384", _trim_rebuild_list_locked(global_load_ptr("pcc_allocator_free_16384")))
+    reclaimed: i64 = 0
+    slab = global_load_ptr("pcc_allocator_trim_queue")
+    while ptr_is_null(slab) == 0:
+        nxt = load_ptr(slab, 0)
+        if _granule_retire_slab_locked(slab) > 0:
+            if page_free(slab, 65536) == 0:
+                atomic_rmw_i64(
+                    "sub", global_addr("pcc_allocator_mapped"), 0, 65536, "relaxed"
+                )
+                atomic_rmw_i64(
+                    "sub",
+                    global_addr("pcc_allocator_fully_free_slabs"),
+                    0,
+                    1,
+                    "relaxed",
+                )
+                reclaimed = reclaimed + 1
+        slab = nxt
+    global_store_ptr("pcc_allocator_trim_queue", null())
+    return reclaimed
+
+
+@c_abi_export("pcc_allocator_trim")
+def pcc_allocator_trim() -> i64:
+    """Return every fully-free raw slab to the OS; returns slabs reclaimed."""
+    pcc_allocator_lock_acquire()
+    reclaimed: i64 = _trim_locked()
+    pcc_allocator_lock_release()
+    return reclaimed
+
+
+@c_abi_export("pcc_allocator_take_small_object")
+def pcc_allocator_take_small_object(usable: i64) -> c_ptr:
+    if usable == 16:
+        head = global_load_ptr("pcc_allocator_free_obj_16")
+        if ptr_is_null(head) == 0:
+            global_store_ptr("pcc_allocator_free_obj_16", load_ptr(head, 0))
+        return head
+    if usable == 32:
+        head = global_load_ptr("pcc_allocator_free_obj_32")
+        if ptr_is_null(head) == 0:
+            global_store_ptr("pcc_allocator_free_obj_32", load_ptr(head, 0))
+        return head
+    if usable == 64:
+        head = global_load_ptr("pcc_allocator_free_obj_64")
+        if ptr_is_null(head) == 0:
+            global_store_ptr("pcc_allocator_free_obj_64", load_ptr(head, 0))
+        return head
+    if usable == 128:
+        head = global_load_ptr("pcc_allocator_free_obj_128")
+        if ptr_is_null(head) == 0:
+            global_store_ptr("pcc_allocator_free_obj_128", load_ptr(head, 0))
+        return head
+    if usable == 256:
+        head = global_load_ptr("pcc_allocator_free_obj_256")
+        if ptr_is_null(head) == 0:
+            global_store_ptr("pcc_allocator_free_obj_256", load_ptr(head, 0))
+        return head
+    if usable == 512:
+        head = global_load_ptr("pcc_allocator_free_obj_512")
+        if ptr_is_null(head) == 0:
+            global_store_ptr("pcc_allocator_free_obj_512", load_ptr(head, 0))
+        return head
+    if usable == 1024:
+        head = global_load_ptr("pcc_allocator_free_obj_1024")
+        if ptr_is_null(head) == 0:
+            global_store_ptr("pcc_allocator_free_obj_1024", load_ptr(head, 0))
+        return head
+    if usable == 2048:
+        head = global_load_ptr("pcc_allocator_free_obj_2048")
+        if ptr_is_null(head) == 0:
+            global_store_ptr("pcc_allocator_free_obj_2048", load_ptr(head, 0))
+        return head
+    if usable == 4096:
+        head = global_load_ptr("pcc_allocator_free_obj_4096")
+        if ptr_is_null(head) == 0:
+            global_store_ptr("pcc_allocator_free_obj_4096", load_ptr(head, 0))
+        return head
+    if usable == 8192:
+        head = global_load_ptr("pcc_allocator_free_obj_8192")
+        if ptr_is_null(head) == 0:
+            global_store_ptr("pcc_allocator_free_obj_8192", load_ptr(head, 0))
+        return head
+    head = global_load_ptr("pcc_allocator_free_obj_16384")
+    if ptr_is_null(head) == 0:
+        global_store_ptr("pcc_allocator_free_obj_16384", load_ptr(head, 0))
+    return head
+
+
+@c_abi_export("pcc_allocator_put_small_object")
+def pcc_allocator_put_small_object(ptr, usable: i64) -> None:
+    # Retire the slot before the payload becomes a free-list link.  Managed
+    # readers acquire-load this state, so none can observe overwritten object
+    # bytes while the slot still advertises LIVE.
+    atomic_store_i64(ptr, -48, 5783538902897647427, "release")
+    if usable == 16:
+        store_ptr(ptr, 0, global_load_ptr("pcc_allocator_free_obj_16"))
+        global_store_ptr("pcc_allocator_free_obj_16", ptr)
+        return
+    if usable == 32:
+        store_ptr(ptr, 0, global_load_ptr("pcc_allocator_free_obj_32"))
+        global_store_ptr("pcc_allocator_free_obj_32", ptr)
+        return
+    if usable == 64:
+        store_ptr(ptr, 0, global_load_ptr("pcc_allocator_free_obj_64"))
+        global_store_ptr("pcc_allocator_free_obj_64", ptr)
+        return
+    if usable == 128:
+        store_ptr(ptr, 0, global_load_ptr("pcc_allocator_free_obj_128"))
+        global_store_ptr("pcc_allocator_free_obj_128", ptr)
+        return
+    if usable == 256:
+        store_ptr(ptr, 0, global_load_ptr("pcc_allocator_free_obj_256"))
+        global_store_ptr("pcc_allocator_free_obj_256", ptr)
+        return
+    if usable == 512:
+        store_ptr(ptr, 0, global_load_ptr("pcc_allocator_free_obj_512"))
+        global_store_ptr("pcc_allocator_free_obj_512", ptr)
+        return
+    if usable == 1024:
+        store_ptr(ptr, 0, global_load_ptr("pcc_allocator_free_obj_1024"))
+        global_store_ptr("pcc_allocator_free_obj_1024", ptr)
+        return
+    if usable == 2048:
+        store_ptr(ptr, 0, global_load_ptr("pcc_allocator_free_obj_2048"))
+        global_store_ptr("pcc_allocator_free_obj_2048", ptr)
+        return
+    if usable == 4096:
+        store_ptr(ptr, 0, global_load_ptr("pcc_allocator_free_obj_4096"))
+        global_store_ptr("pcc_allocator_free_obj_4096", ptr)
+        return
+    if usable == 8192:
+        store_ptr(ptr, 0, global_load_ptr("pcc_allocator_free_obj_8192"))
+        global_store_ptr("pcc_allocator_free_obj_8192", ptr)
+        return
+    store_ptr(ptr, 0, global_load_ptr("pcc_allocator_free_obj_16384"))
+    global_store_ptr("pcc_allocator_free_obj_16384", ptr)
+
 @c_abi_export("pcc_allocator_refill_small")
 def pcc_allocator_refill_small(usable: i64) -> c_ptr:
+    stride: i64 = 64
+    count: i64 = 1024
+    if usable == 32:
+        stride: i64 = 80
+        count: i64 = 819
+    elif usable == 64:
+        stride: i64 = 112
+        count: i64 = 585
+    elif usable == 128:
+        stride: i64 = 176
+        count: i64 = 372
+    elif usable == 256:
+        stride: i64 = 304
+        count: i64 = 215
+    elif usable == 512:
+        stride: i64 = 560
+        count: i64 = 117
+    elif usable == 1024:
+        stride: i64 = 1072
+        count: i64 = 61
+    elif usable == 2048:
+        stride: i64 = 2096
+        count: i64 = 31
+    elif usable == 4096:
+        stride: i64 = 4144
+        count: i64 = 15
+    elif usable == 8192:
+        stride: i64 = 8240
+        count: i64 = 7
+    elif usable == 16384:
+        stride: i64 = 16432
+        count: i64 = 3
+
+    # Before growing the mapped footprint, return idle footprint: a raw slab
+    # whose every cell is free is pure high-water.  This makes the retained
+    # footprint self-limiting across allocation phases.
+    # ponytail: fixed 4-slab (256 KiB) threshold; tune if refill thrash appears
+    if atomic_load_i64(
+        global_addr("pcc_allocator_fully_free_slabs"), 0, "relaxed"
+    ) >= 4:
+        _trim_locked()
+    slab = page_alloc(65536)
+    if ptr_is_null(slab):
+        return null()
+    atomic_rmw_i64(
+        "add", global_addr("pcc_allocator_mapped"), 0, 65536, "relaxed"
+    )
+    _granule_register_slab_locked(slab, 2, stride)
+    reclaim_span = pcc_gc_granule_span(slab)
+    if ptr_is_null(reclaim_span) == 0:
+        store_i64(reclaim_span, 32, count - 1)
+    first = ptr_add(slab, 48)
+    pcc_allocator_initialize_small(first, slab, usable)
+    cursor = first
+    i: i64 = 1
+    while i < count:
+        cursor = ptr_add(cursor, stride)
+        pcc_allocator_initialize_small(cursor, slab, usable)
+        pcc_allocator_put_small(cursor, usable)
+        i = i + 1
+    return first
+
+
+@c_abi_export("pcc_allocator_refill_small_object")
+def pcc_allocator_refill_small_object(usable: i64) -> c_ptr:
+    """Object-family slab refill (ARCH-P0-PROVENANCE-GRANULE-MAP, S1).
+
+    Identical carve to pcc_allocator_refill_small, but cells go to the
+    OBJECT free lists and the slab registers its sixteen 4 KiB granules in
+    the granule map (one shared span descriptor) so exact objecthood can
+    later be answered structurally.
+    """
     stride: i64 = 64
     count: i64 = 1024
     if usable == 32:
@@ -313,14 +1063,37 @@ def pcc_allocator_refill_small(usable: i64) -> c_ptr:
     atomic_rmw_i64(
         "add", global_addr("pcc_allocator_mapped"), 0, 65536, "relaxed"
     )
+    # Initialize every slot state before publishing the slab descriptor.
+    # Otherwise a lock-free reader could find a kind-1 span while its cell
+    # headers still contain fresh page contents.  No cell is reachable from a
+    # free list until registration chooses the object or raw family below.
     first = ptr_add(slab, 48)
     pcc_allocator_initialize_small(first, slab, usable)
+    cursor = first
+    initialized: i64 = 1
+    while initialized < count:
+        cursor = ptr_add(cursor, stride)
+        pcc_allocator_initialize_small(cursor, slab, usable)
+        initialized = initialized + 1
+    if _granule_register_slab_locked(slab, 1, stride) < 0:
+        # Failure-atomic registration published no metadata.  Reuse
+        # THIS slab as a raw carve -- the mapping is already accounted, so
+        # allocating another slab here would leak this one.  free() misses
+        # the granule and routes the cells to the raw family, matching the
+        # carve; provenance stays exact via the per-object set.
+        fallback_first = first
+        fallback_cursor = first
+        fallback_index: i64 = 1
+        while fallback_index < count:
+            fallback_cursor = ptr_add(fallback_cursor, stride)
+            pcc_allocator_put_small(fallback_cursor, usable)
+            fallback_index = fallback_index + 1
+        return fallback_first
     cursor = first
     i: i64 = 1
     while i < count:
         cursor = ptr_add(cursor, stride)
-        pcc_allocator_initialize_small(cursor, slab, usable)
-        pcc_allocator_put_small(cursor, usable)
+        pcc_allocator_put_small_object(cursor, usable)
         i = i + 1
     return first
 
@@ -359,6 +1132,208 @@ def pcc_allocator_allocate_raw(size: i64, alignment: i64) -> c_ptr:
     return user
 
 
+@c_abi_export("pcc_allocator_granule_object_slot")
+def _granule_object_slot(ptr) -> c_ptr:
+    """Return ``ptr`` only when it is an exact object-family slot start."""
+    span = pcc_gc_granule_span(ptr)
+    if ptr_is_null(span) != 0:
+        return null()
+    if load_i64(span, 0) != 1:
+        return null()
+    stride: i64 = load_i64(span, 8)
+    # The span descriptor is immortal and write-once: registration rejects a
+    # stride whose carve count is 0 and stores that count at offset 24 BEFORE
+    # the granule key is release-published, so any acquire-side reader that
+    # observes the key observes an already validated (stride, count) pair.
+    # Recomputing the count from the 11-entry class table on every query was
+    # 3.1% of a heavy-object workload's samples and cross-checked only this one
+    # field while kind, stride and base were already trusted from the same
+    # record; the check now lives once at registration.
+    count: i64 = load_i64(span, 24)
+    if count <= 0 or stride <= 0:
+        return null()
+    base = load_ptr(span, 16)
+    if ptr_is_null(base) != 0 or (ptr_diff(base, null()) & 4095) != 0:
+        return null()
+    slab_offset: i64 = ptr_diff(ptr, base)
+    if slab_offset < 48 or slab_offset >= 65536:
+        return null()
+    carve_offset: i64 = slab_offset - 48
+    # One division: cell = offset // stride, then verify exact alignment by
+    # multiply-back.  The independently recomputed count and slab bounds keep
+    # the cached descriptor fields from weakening structural validation.
+    cell: i64 = carve_offset // stride
+    if cell * stride != carve_offset or cell >= count:
+        return null()
+    return ptr
+
+
+@c_abi_export("pcc_gc_granule_object_publish")
+def pcc_gc_granule_object_publish(ptr) -> i64:
+    """Publish a fully initialized object-family slot.
+
+    Return 1 when handled (including an already-LIVE idempotent publish), 0
+    for a non-object-family/structurally unknown pointer, and -1 for a slot in
+    a state that cannot be published.  The compare/exchange prevents a
+    concurrent retire from being overwritten by a stale publish.
+    """
+    slot = _granule_object_slot(ptr)
+    if ptr_is_null(slot) != 0:
+        return 0
+    observed: i64 = atomic_cas_i64(
+        slot,
+        -48,
+        5783538902897647429,
+        5783538902897647428,
+        "release",
+        "relaxed",
+    )
+    if observed == 5783538902897647429 or observed == 5783538902897647428:
+        return 1
+    return -1
+
+
+@c_abi_export("pcc_gc_granule_object_retire")
+def pcc_gc_granule_object_retire(ptr) -> i64:
+    """Release-retire a structurally valid object slot to FREE.
+
+    LIVE, RESERVED, and already-FREE slots are handled; an unknown pointer
+    returns 0 and a corrupt/transitioned slot returns -1.  A single CAS avoids
+    overwriting a different lifecycle transition observed after validation.
+    """
+    slot = _granule_object_slot(ptr)
+    if ptr_is_null(slot) != 0:
+        return 0
+    state: i64 = atomic_load_i64(slot, -48, "acquire")
+    if state == 5783538902897647427:
+        return 1
+    if state != 5783538902897647428 and state != 5783538902897647429:
+        return -1
+    observed: i64 = atomic_cas_i64(
+        slot,
+        -48,
+        state,
+        5783538902897647427,
+        "release",
+        "relaxed",
+    )
+    if observed == state or observed == 5783538902897647427:
+        return 1
+    return -1
+
+
+@c_abi_export("pcc_gc_granule_is_object_start")
+def pcc_gc_granule_is_object_start(ptr) -> i64:
+    """Exact live structural objecthood; -1 = unknown/not currently live.
+
+    Raw, foreign, large, moving-arena, RESERVED, and FREE pointers remain on
+    the existing exact/index/forwarding decision chain.  Only a structurally
+    valid object-family cell whose lifecycle state acquire-loads as LIVE is a
+    positive.
+
+    This is the hot provenance predicate: `pcc_gc_pointer_is_managed` asks it
+    before touching the graph lock, so every barrier, class check, dunder
+    dispatch and container operation reaches it.  Decomposed, one question cost
+    five pcc-compiled calls -- is_object_start -> _granule_object_slot ->
+    pcc_gc_granule_span -> _granule_hash / _granule_find_slot -- and each call
+    pays frame and root bookkeeping under this compiler's cost model.  The
+    chain is therefore fused here as straight-line code.  The decomposed
+    helpers remain exported and unchanged for their own callers and for the
+    focused granule tests, and every check below is theirs in their order:
+    table acquire-load, nonzero granule key, acquire-load probe, object kind,
+    validated carve count, 4 KiB-aligned base, slab bounds, exact cell
+    alignment, then the acquire-load of the LIVE lifecycle word.
+    """
+    if ptr_is_null(ptr) != 0:
+        return -1
+    key: i64 = logical_shift_right_i64(ptr_diff(ptr, null()), 12)
+    if key <= 0 or logical_shift_right_i64(key, 48) != 0:
+        return -1
+    root_bits: i64 = atomic_load_i64(
+        global_addr("pcc_allocator_granule_radix_root"), 0, "acquire"
+    )
+    if root_bits == 0:
+        return -1
+    level2_bits: i64 = atomic_load_i64(
+        ptr_add(null(), root_bits),
+        (logical_shift_right_i64(key, 36) & 4095) * 8,
+        "acquire",
+    )
+    if level2_bits == 0:
+        return -1
+    level3_bits: i64 = atomic_load_i64(
+        ptr_add(null(), level2_bits),
+        (logical_shift_right_i64(key, 24) & 4095) * 8,
+        "acquire",
+    )
+    if level3_bits == 0:
+        return -1
+    leaf_bits: i64 = atomic_load_i64(
+        ptr_add(null(), level3_bits),
+        (logical_shift_right_i64(key, 12) & 4095) * 8,
+        "acquire",
+    )
+    if leaf_bits == 0:
+        return -1
+    span_bits: i64 = atomic_load_i64(
+        ptr_add(null(), leaf_bits), (key & 4095) * 8, "acquire"
+    )
+    if span_bits == 0:
+        return -1
+    span = ptr_add(null(), span_bits)
+    if load_i64(span, 0) != 1:
+        return -1
+    stride: i64 = load_i64(span, 8)
+    count: i64 = load_i64(span, 24)
+    if count <= 0 or stride <= 0:
+        return -1
+    base = load_ptr(span, 16)
+    if ptr_is_null(base) != 0 or (ptr_diff(base, null()) & 4095) != 0:
+        return -1
+    slab_offset: i64 = ptr_diff(ptr, base)
+    if slab_offset < 48 or slab_offset >= 65536:
+        return -1
+    carve_offset: i64 = slab_offset - 48
+    # A cached multiply-by-reciprocal was measured here and DENIED: 24
+    # alternating pairs split 12/12 with a paired median 1.4% against it, so
+    # the extra descriptor load and guard cost as much as the division saves.
+    # See docs/investigations/pcc1-stage2-emit-throughput-and-memory.md.
+    cell: i64 = carve_offset // stride
+    if cell * stride != carve_offset or cell >= count:
+        return -1
+    if atomic_load_i64(ptr, -48, "acquire") != 5783538902897647428:
+        return -1
+    return 1
+
+
+@c_abi_export("pcc_allocator_alloc_object")
+def pcc_allocator_alloc_object(size: i64) -> c_ptr:
+    """Object-family malloc (ARCH-P0 S1): same contract as `malloc`, but small
+    cells come from object slabs whose granules are registered, so exact
+    structural objecthood is answerable.  Large sizes fall back to the raw
+    mapping path; those objects keep per-object provenance registration."""
+    if size < 0:
+        return null()
+    usable: i64 = pcc_allocator_size_class(size)
+    if usable != 0:
+        pcc_allocator_lock_acquire()
+        user = pcc_allocator_take_small_object(usable)
+        if ptr_is_null(user):
+            user = pcc_allocator_refill_small_object(usable)
+        if ptr_is_null(user) == 0:
+            # Allocation reserves the slot but does not make it managed.
+            # pcc_gc_alloc initializes the complete PyObject header and only
+            # then publishes LIVE through pcc_gc_pointer_register.
+            atomic_store_i64(user, -48, 5783538902897647429, "release")
+        pcc_allocator_lock_release()
+        if ptr_is_null(user):
+            return null()
+        store_i64(user, -24, size)
+        pcc_allocator_account_allocate(size, usable, 0)
+        return user
+    return pcc_allocator_allocate_raw(size, 16)
+
+
 @c_abi_export("malloc")
 def pcc_malloc(size: i64) -> c_ptr:
     if size < 0:
@@ -367,7 +1342,20 @@ def pcc_malloc(size: i64) -> c_ptr:
     if usable != 0:
         pcc_allocator_lock_acquire()
         user = pcc_allocator_take_small(usable)
-        if ptr_is_null(user):
+        if ptr_is_null(user) == 0:
+            reclaim_span = pcc_gc_granule_span(user)
+            if ptr_is_null(reclaim_span) == 0:
+                reclaim_free: i64 = load_i64(reclaim_span, 32)
+                if reclaim_free == load_i64(reclaim_span, 24):
+                    atomic_rmw_i64(
+                        "sub",
+                        global_addr("pcc_allocator_fully_free_slabs"),
+                        0,
+                        1,
+                        "relaxed",
+                    )
+                store_i64(reclaim_span, 32, reclaim_free - 1)
+        else:
             user = pcc_allocator_refill_small(usable)
         pcc_allocator_lock_release()
         if ptr_is_null(user):
@@ -388,7 +1376,31 @@ def pcc_free(ptr) -> None:
     pcc_allocator_account_free(requested, usable)
     if mapping_size == 0:
         pcc_allocator_lock_acquire()
-        pcc_allocator_put_small(ptr, usable)
+        # Object-family cells must return to the object lists; the granule
+        # map (kind 1/6 = object slab) is the family authority.  Raw (kind 2)
+        # slabs carry a per-slab free counter in the same span descriptor so a
+        # fully-free slab can later be reclaimed; a fallback slab has no span
+        # and is simply not tracked.  This reuses the one span lookup free()
+        # already needed to route object vs raw, so it adds no extra lookup.
+        reclaim_span = pcc_gc_granule_span(ptr)
+        reclaim_kind: i64 = 0
+        if ptr_is_null(reclaim_span) == 0:
+            reclaim_kind = load_i64(reclaim_span, 0)
+        if reclaim_kind == 1:
+            pcc_allocator_put_small_object(ptr, usable)
+        else:
+            pcc_allocator_put_small(ptr, usable)
+            if ptr_is_null(reclaim_span) == 0:
+                reclaim_free: i64 = load_i64(reclaim_span, 32) + 1
+                store_i64(reclaim_span, 32, reclaim_free)
+                if reclaim_free == load_i64(reclaim_span, 24):
+                    atomic_rmw_i64(
+                        "add",
+                        global_addr("pcc_allocator_fully_free_slabs"),
+                        0,
+                        1,
+                        "relaxed",
+                    )
         pcc_allocator_lock_release()
         return
     base = load_ptr(ptr, -40)

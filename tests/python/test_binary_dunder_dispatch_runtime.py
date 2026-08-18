@@ -56,6 +56,40 @@ class AngryDiv:
         raise ValueError("floordiv-boom")
 
 
+class AngryBits:
+    def __and__(self, other):
+        raise ValueError("and-boom")
+
+    def __or__(self, other):
+        raise ValueError("or-boom")
+
+    def __xor__(self, other):
+        raise ValueError("xor-boom")
+
+    def __lshift__(self, other):
+        raise ValueError("lshift-boom")
+
+    def __rshift__(self, other):
+        raise ValueError("rshift-boom")
+
+
+class Rbits:
+    def __rand__(self, other):
+        return 81
+
+    def __ror__(self, other):
+        return 82
+
+    def __rxor__(self, other):
+        return 83
+
+    def __rlshift__(self, other):
+        return 84
+
+    def __rrshift__(self, other):
+        return 85
+
+
 class Rdiv:
     def __rtruediv__(self, other):
         return 7
@@ -131,6 +165,42 @@ def rdiv_case(lhs, r):
     return lhs / r
 
 
+def bit_take(a):
+    try:
+        _ = a & 1
+        print("and-ok")
+    except ValueError:
+        print("and-err")
+    try:
+        _ = a | 1
+        print("or-ok")
+    except ValueError:
+        print("or-err")
+    try:
+        _ = a ^ 1
+        print("xor-ok")
+    except ValueError:
+        print("xor-err")
+    try:
+        _ = a << 1
+        print("lshift-ok")
+    except ValueError:
+        print("lshift-err")
+    try:
+        _ = a >> 1
+        print("rshift-ok")
+    except ValueError:
+        print("rshift-err")
+
+
+def reflected_bits(lhs, rhs):
+    print(lhs & rhs)
+    print(lhs | rhs)
+    print(lhs ^ rhs)
+    print(lhs << rhs)
+    print(lhs >> rhs)
+
+
 def iadd_take(a):
     try:
         a += 1
@@ -181,6 +251,8 @@ def main() -> int:
     print(rmod_case(1, Rmod()))
     div_take(AngryDiv())
     print(rdiv_case(1, Rdiv()))
+    bit_take(AngryBits())
+    reflected_bits(1, Rbits())
     iadd_take(AngryIadd())
     iadd_use(GrowIadd())
     subscript_iadd_take(AngryIadd())
@@ -221,6 +293,16 @@ def test_binary_dunder_dispatch_and_err_check(tmp_path, monkeypatch, runtime_cc)
         "div-err",
         "floordiv-err",
         "7",
+        "and-err",
+        "or-err",
+        "xor-err",
+        "lshift-err",
+        "rshift-err",
+        "81",
+        "82",
+        "83",
+        "84",
+        "85",
         "iadd-err",
         "42",
         "sub-iadd-err",

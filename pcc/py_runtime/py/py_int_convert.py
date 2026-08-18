@@ -10,6 +10,9 @@ PyIntObject layout:
     offset 20   ndigits    (i32)
     offset 24   digits[]   (u32 little-endian)
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.extern import extern, c_abi_export, c_ptr, c_int64, c_void
 from pcc.py_runtime.py.py_abi_constants import (
     PYBYTESOBJECT_BYTE_LEN_OFFSET,
@@ -17,9 +20,12 @@ from pcc.py_runtime.py.py_abi_constants import (
     PYINTOBJECT_DIGITS_OFFSET,
     PYINTOBJECT_NDIGITS_OFFSET,
     PYINTOBJECT_SIGN_OFFSET,
+    PYMEMORYVIEWOBJECT_BASE_OFFSET,
     PYOBJECTHEADER_TYPE_TAG_OFFSET,
+    PY_TYPE_BYTEARRAY,
     PY_TYPE_BYTES,
     PY_TYPE_INT,
+    PY_TYPE_MEMORYVIEW,
 )
 from pcc.unsafe import (
     cstr,
@@ -28,6 +34,7 @@ from pcc.unsafe import (
     load_i32,
     load_i64,
     null,
+    ptr_add,
     ptr_is_null,
     store_i8,
     store_i32,
@@ -45,7 +52,10 @@ py_str_utf8 = extern("py_str_utf8", (c_ptr,), c_ptr)
 py_bytes_new = extern("py_bytes_new", (c_ptr, c_int64), c_ptr)
 py_bigint_alloc = extern("py_bigint_alloc", (c_int64,), c_ptr)
 py_bigint_to_pyobject = extern("py_bigint_to_pyobject", (c_ptr,), c_ptr)
+pcc_gc_load_ptr = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_ptr)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 
 
@@ -90,7 +100,22 @@ def _byteorder_is_big(byteorder) -> int:
 
 
 def _raise_int_bytes(kind: int, message) -> None:
-    py_raise(py_exc_new(kind, message))
+    py_raise_owned(py_exc_new(kind, message))
+
+
+def _int_bytes_like_base(value):
+    current = value
+    while not ptr_is_null(current) and not is_tagged_int(current):
+        tag: int = load_i32(current, PYOBJECTHEADER_TYPE_TAG_OFFSET)
+        if tag == PY_TYPE_BYTES or tag == PY_TYPE_BYTEARRAY:
+            return current
+        if tag != PY_TYPE_MEMORYVIEW:
+            return null()
+        current = pcc_gc_load_ptr(
+            current,
+            ptr_add(current, PYMEMORYVIEWOBJECT_BASE_OFFSET),
+        )
+    return null()
 
 
 @c_abi_export("py_int_to_i64")
@@ -240,15 +265,12 @@ def py_int_from_bytes(bytes_obj, byteorder):
             cstr("byteorder must be either 'little' or 'big'"),
         )
         return null()
-    if (
-        ptr_is_null(bytes_obj)
-        or is_tagged_int(bytes_obj)
-        or load_i32(bytes_obj, PYOBJECTHEADER_TYPE_TAG_OFFSET) != PY_TYPE_BYTES
-    ):
+    base = _int_bytes_like_base(bytes_obj)
+    if ptr_is_null(base):
         _raise_int_bytes(3, cstr("from_bytes expects a bytes object"))
         return null()
 
-    n: int = load_i64(bytes_obj, PYBYTESOBJECT_BYTE_LEN_OFFSET)
+    n: int = load_i64(base, PYBYTESOBJECT_BYTE_LEN_OFFSET)
     ndigits: int = (n + 3) // 4
     if ndigits < 1:
         ndigits = 1
@@ -260,7 +282,7 @@ def py_int_from_bytes(bytes_obj, byteorder):
         le: int = i
         if big != 0:
             le = n - 1 - i
-        byte: int = load_i8(bytes_obj, PYBYTESOBJECT_DATA_OFFSET + i) & 255
+        byte: int = load_i8(base, PYBYTESOBJECT_DATA_OFFSET + i) & 255
         offset: int = PYINTOBJECT_DIGITS_OFFSET + (le // 4) * 4
         limb: int = _load_u32(out, offset)
         _store_u32(out, offset, limb | (byte << ((le % 4) * 8)))

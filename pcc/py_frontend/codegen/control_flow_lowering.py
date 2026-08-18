@@ -156,6 +156,21 @@ class ControlFlowLoweringMixin:
                 if self._cpy_value_is_owned(selected_val):
                     return self._mark_owned_cpy_value(coerced)
                 return self._mark_cpy_value(coerced)
+            if (
+                isinstance(coerced.type, ir.PointerType)
+                and self._is_object(expr.ty)
+                and not self._expr_returns_unsafe_raw_pointer(selected)
+            ):
+                selected_is_owned = (
+                    self._value_is_owned_object(selected_val)
+                    or self._pcc_pointer_source_is_owned(selected)
+                )
+                if not selected_is_owned:
+                    coerced = self._gc_retain(
+                        coerced,
+                        name=self._fresh("ternary.static.retain"),
+                    )
+                self._note_owned_object_value(coerced)
             return coerced
 
         result_ty = expr.ty
@@ -247,6 +262,36 @@ class ControlFlowLoweringMixin:
                 )
                 else_exit = self.builder._block
 
+        pcc_owned_result = (
+            isinstance(phi_ty, ir.PointerType)
+            and not cpy_result
+            and self._is_object(result_ty)
+            and not self._expr_returns_unsafe_raw_pointer(expr)
+        )
+        if pcc_owned_result:
+            then_is_owned = (
+                self._value_is_owned_object(then_val)
+                or self._pcc_pointer_source_is_owned(expr.then_e)
+            )
+            if not then_is_owned:
+                self.builder.position_at_end(then_exit)
+                then_val = self._gc_retain(
+                    then_val,
+                    name=self._fresh("ternary.then.retain"),
+                )
+                then_exit = self.builder._block
+            else_is_owned = (
+                self._value_is_owned_object(else_val)
+                or self._pcc_pointer_source_is_owned(expr.else_e)
+            )
+            if not else_is_owned:
+                self.builder.position_at_end(else_exit)
+                else_val = self._gc_retain(
+                    else_val,
+                    name=self._fresh("ternary.else.retain"),
+                )
+                else_exit = self.builder._block
+
         self.builder.position_at_end(then_exit)
         self.builder.branch(join_bb)
         self.builder.position_at_end(else_exit)
@@ -258,6 +303,8 @@ class ControlFlowLoweringMixin:
         phi.add_incoming(else_val, else_exit)
         if cpy_result:
             return self._mark_owned_cpy_value(phi)
+        if pcc_owned_result:
+            self._note_owned_object_value(phi)
         return phi
 
     def _emit_if_expr_as_pcc_object(self, expr: IfExpr) -> ir.Value:

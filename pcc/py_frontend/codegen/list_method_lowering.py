@@ -11,6 +11,7 @@ from ..py_ast import (
     BinOp,
     BoolLit,
     Call,
+    ClassType,
     DynType,
     Expr,
     IntLit,
@@ -146,25 +147,21 @@ class ListMethodLoweringMixin:
         if name == "sort":
             if expr.args:
                 return None
+            working = self._begin_list_sort_transaction(recv)
             if sort_key_spec is not None:
-                self._emit_list_sort_by_key(recv, sort_key_spec)
-                if sort_reverse_const:
-                    self.builder.call(self.runtime["py_list_reverse"], [recv])
-                return self._emit_none_literal()
+                self._emit_list_sort_by_key(working, sort_key_spec)
+                return self._finish_list_sort_transaction(
+                    recv, working, sort_reverse_const
+                )
             sorted_list = self.builder.call(
                 self.runtime["py_obj_sorted"],
-                [recv],
+                [working],
                 name=self._fresh("dyn.list.sort.sorted"),
             )
-            if sort_reverse_const:
-                self.builder.call(self.runtime["py_list_reverse"], [sorted_list])
-            none_obj = self._emit_none_literal()
-            self.builder.call(
-                self.runtime["py_list_set_slice"],
-                [recv, none_obj, none_obj, none_obj, sorted_list],
+            self._gc_release(working)
+            return self._finish_list_sort_transaction(
+                recv, sorted_list, sort_reverse_const
             )
-            self._gc_release(sorted_list)
-            return none_obj
 
         if name == "append":
             if len(expr.args) != 1:
@@ -477,42 +474,33 @@ class ListMethodLoweringMixin:
             # sort(key=<supported inline callable>, reverse=<bool const>):
             # sort in place, then optionally reverse. Unsupported key callables
             # and non-constant reverse were already bounced by the kwargs guard.
+            working = self._begin_list_sort_transaction(recv)
             if sort_key_spec is not None:
-                self._emit_list_sort_by_key(recv, sort_key_spec)
-                if sort_reverse_const:
-                    self.builder.call(
-                        self.runtime["py_list_reverse"],
-                        [recv],
-                    )
-                return self._emit_none_literal()
+                self._emit_list_sort_by_key(working, sort_key_spec)
+                return self._finish_list_sort_transaction(
+                    recv, working, sort_reverse_const
+                )
             elem_hint = None
             if isinstance(attr.obj, Name):
                 elem_hint = self.env_list_elem_class_hint.get(attr.obj.ident)
-            if elem_hint is not None and not sort_reverse_const:
-                return self._emit_list_sort_with_dunder_lt(
-                    recv,
+            if elem_hint is not None:
+                self._emit_list_sort_with_dunder_lt(
+                    working,
                     elem_hint,
                     list_ty.elem,
                 )
-            if elem_hint is not None and sort_reverse_const:
-                return None  # custom-class element + reverse: rare, fall back
+                return self._finish_list_sort_transaction(
+                    recv, working, sort_reverse_const
+                )
             sorted_list = self.builder.call(
                 self.runtime["py_obj_sorted"],
-                [recv],
+                [working],
                 name=self._fresh("list.sort.sorted"),
             )
-            if sort_reverse_const:
-                self.builder.call(
-                    self.runtime["py_list_reverse"],
-                    [sorted_list],
-                )
-            none_obj = self._emit_none_literal()
-            self.builder.call(
-                self.runtime["py_list_set_slice"],
-                [recv, none_obj, none_obj, none_obj, sorted_list],
+            self._gc_release(working)
+            return self._finish_list_sort_transaction(
+                recv, sorted_list, sort_reverse_const
             )
-            self._gc_release(sorted_list)
-            return none_obj
 
         if name == "append":
             if len(expr.args) != 1:
@@ -527,11 +515,110 @@ class ListMethodLoweringMixin:
                         self._threading_list_elem_flags[attr.obj.ident] = item_kind
                     else:
                         self._threading_list_elem_flags.pop(attr.obj.ident, None)
-            item = _list_method_box(self, expr.args[0])
+            item_expr = expr.args[0]
+            self._last_fresh_direct_native_ctor_value = None
+            item = _list_method_box(self, item_expr)
+            fresh_ctor_value = self._last_fresh_direct_native_ctor_value
+            self._last_fresh_direct_native_ctor_value = None
+            fresh_ctor_admitted = item is fresh_ctor_value
+            ctor_info = None
+            ctor_name = ""
+            ctor_has_captures = False
+            ctor_has_custom_new = False
+            ctor_has_nonobject_base = False
+            if (
+                fresh_ctor_admitted
+                and isinstance(item_expr, Call)
+                and isinstance(item_expr.func, Name)
+                and not item_expr.kwargs
+                and isinstance(item_expr.ty, ClassType)
+                and not item_expr.ty.valueclass
+            ):
+                ctor_name = item_expr.func.ident
+                class_aliases = getattr(self, "_class_aliases", {})
+                ctor_is_alias = (
+                    ctor_name in class_aliases
+                    and class_aliases[ctor_name] != ctor_name
+                )
+                if ctor_name in self.class_lowering.classes:
+                    ctor_info = self.class_lowering.classes[ctor_name]
+                if ctor_info is not None:
+                    ctor_has_custom_new = "__new__" in ctor_info.methods
+                    for ctor_base in ctor_info.bases_ast:
+                        if not (
+                            isinstance(ctor_base, Name)
+                            and ctor_base.ident == "object"
+                        ):
+                            # Fail closed instead of walking an imported/local
+                            # MRO here.  The shared MRO helper still contains a
+                            # dict.get missing-key path known to mis-lower in
+                            # pcc1; a non-object base can also inherit __new__.
+                            ctor_has_nonobject_base = True
+                class_capture_map = getattr(
+                    self,
+                    "_hoisted_class_capture_params",
+                    {},
+                )
+                if ctor_name in class_capture_map:
+                    ctor_has_captures = bool(class_capture_map[ctor_name])
+                fresh_ctor_admitted = (
+                    not ctor_is_alias
+                    and ctor_info is not None
+                    and not getattr(ctor_info, "valueclass", False)
+                    and getattr(ctor_info, "metaclass_name", None) is None
+                    and getattr(ctor_info, "owning_module", None)
+                    in (None, self.ast_module.name)
+                    and not ctor_has_captures
+                    and not ctor_has_custom_new
+                    and not ctor_has_nonobject_base
+                )
+            else:
+                fresh_ctor_admitted = False
+            recv_slot = None
+            recv_is_cpy = False
+            if isinstance(attr.obj, Name):
+                if attr.obj.ident in self.env:
+                    recv_slot = self.env[attr.obj.ident]
+                cpy_env_flags = getattr(self, "_cpy_env_flags", {})
+                if attr.obj.ident in cpy_env_flags:
+                    recv_is_cpy = bool(cpy_env_flags[attr.obj.ident])
+            stable_rooted_recv = (
+                isinstance(attr.obj, Name)
+                and recv_slot is not None
+                and isinstance(recv_slot[1], ir.PointerType)
+                and attr.obj.ident in getattr(self, "_gc_rooted_local_names", set())
+                and attr.obj.ident not in getattr(self, "_current_global_names", set())
+                and not recv_is_cpy
+            )
             item_root = ir.Constant(_CSTR, None)
             item_for_call = item
-            if isinstance(item.type, ir.PointerType) and item not in getattr(
-                self, "_cpy_values", ()
+            item_needs_release = self._container_store_temp_needs_release(
+                expr.args[0],
+                expr.args[0].ty,
+                False,
+            )
+            if (
+                isinstance(item.type, ir.PointerType)
+                and item not in getattr(self, "_cpy_values", ())
+                # The root exists so the post-append RELEASE of an owned item
+                # temporary reloads a pointer the append may have relocated.
+                # A borrowed item (a rooted local, a module global) is never
+                # released here and stays alive through its own slot, so the
+                # root, its reload and the leave were pure protocol.
+                and item_needs_release
+                # A value already proven not to be a GC object -- a tagged
+                # small-int literal, recorded by literal lowering -- needs no
+                # temporary root: pin/unpin/store_root all begin by testing
+                # is_tagged_int and returning, so the calls are pure overhead.
+                # Measured: `lst.append(i)` emitted 23 GC operations per loop
+                # iteration for one append, and pin+unpin+store_root were 37%
+                # of the loop's samples against 5.6% for the append itself.
+                # Only covers literals; the variable case is handled by the
+                # tagged fast paths inside the runtime barriers themselves.
+                # This is NOT keyed on the static type being `int`: `int` is
+                # arbitrary-precision, so a large value is a heap bignum that
+                # must still be rooted.  Only the proven-tagged registry is safe.
+                and not self._value_is_never_gc_object(item)
             ):
                 item_root = self._enter_container_temp_root(item, "list.item")
                 item_for_call = self.builder.call(
@@ -545,9 +632,18 @@ class ListMethodLoweringMixin:
                     ],
                     name=self._fresh("list.item.current"),
                 )
+            append_recv = recv
+            append_runtime_name = "py_list_append"
+            if fresh_ctor_admitted and stable_rooted_recv:
+                # The constructor can safepoint and relocate the receiver.
+                # Reload the same stable local root after evaluating the item;
+                # non-local/compound receivers stay on the generic path rather
+                # than being re-evaluated out of Python's source order.
+                append_recv = self._emit_name(attr.obj)
+                append_runtime_name = "py_list_append_fresh_native_instance"
             self.builder.call(
-                self.runtime["py_list_append"],
-                [recv, item_for_call],
+                self.runtime[append_runtime_name],
+                [append_recv, item_for_call],
             )
             item_after_append = item_for_call
             if not isinstance(item_root, ir.Constant):
@@ -562,15 +658,11 @@ class ListMethodLoweringMixin:
                     ],
                     name=self._fresh("list.item.release.current"),
                 )
-            if self._container_store_temp_needs_release(
-                expr.args[0],
-                expr.args[0].ty,
-                False,
-            ):
+            if item_needs_release:
                 self._gc_release(item_after_append)
             self._leave_container_temp_root(item_root)
             self._gc_release_if_owned(recv, attr.obj)
-            return ir.Constant(_I1, 0)
+            return self._emit_none_literal()
         if name == "extend":
             if len(expr.args) != 1:
                 return None
@@ -578,7 +670,7 @@ class ListMethodLoweringMixin:
                 self.runtime["py_list_extend"],
                 [recv, _list_method_box(self, expr.args[0])],
             )
-            return ir.Constant(_I1, 0)
+            return self._emit_none_literal()
         if name == "insert":
             if len(expr.args) != 2:
                 return None
@@ -587,7 +679,7 @@ class ListMethodLoweringMixin:
                 self.runtime["py_list_insert"],
                 [recv, idx_val, _list_method_box(self, expr.args[1])],
             )
-            return ir.Constant(_I1, 0)
+            return self._emit_none_literal()
         if name == "pop":
             if len(expr.args) == 0:
                 idx_val = ir.Constant(_I64, -1)
@@ -617,12 +709,12 @@ class ListMethodLoweringMixin:
                 self.runtime["py_list_remove"],
                 [recv, _list_method_box(self, expr.args[0])],
             )
-            return ir.Constant(_I1, 0)
+            return self._emit_none_literal()
         if name == "clear":
             if len(expr.args) != 0:
                 return None
             self.builder.call(self.runtime["py_list_clear"], [recv])
-            return ir.Constant(_I1, 0)
+            return self._emit_none_literal()
         if name == "index":
             if len(expr.args) < 1 or len(expr.args) > 3:
                 return None
@@ -656,7 +748,7 @@ class ListMethodLoweringMixin:
             if len(expr.args) != 0:
                 return None
             self.builder.call(self.runtime["py_list_reverse"], [recv])
-            return ir.Constant(_I1, 0)
+            return self._emit_none_literal()
         if name == "copy":
             if len(expr.args) != 0:
                 return None
@@ -668,6 +760,72 @@ class ListMethodLoweringMixin:
             self._gc_release_if_owned(recv, attr.obj)
             return new_list
         return None
+
+    def _begin_list_sort_transaction(self, recv: ir.Value) -> ir.Value:
+        working = self.builder.call(
+            self.runtime["py_list_copy"],
+            [recv],
+            name=self._fresh("list.sort.working"),
+        )
+        # CPython exposes an empty receiver during key/comparison callbacks.
+        # The working copy owns the original elements, so clear cannot run an
+        # element finalizer before sorting begins.
+        self.builder.call(self.runtime["py_list_clear"], [recv])
+        return working
+
+    def _finish_list_sort_transaction(
+        self,
+        recv: ir.Value,
+        ordered: ir.Value,
+        reverse: bool,
+    ) -> ir.Value:
+        if reverse:
+            self.builder.call(self.runtime["py_list_reverse"], [ordered])
+        mutated_len = self.builder.call(
+            self.runtime["py_list_len"],
+            [recv],
+            name=self._fresh("list.sort.mutated.len"),
+        )
+        mutated = self.builder.icmp_signed(
+            "!=",
+            mutated_len,
+            ir.Constant(_I64, 0),
+            name=self._fresh("list.sort.mutated"),
+        )
+        none_obj = self._emit_none_literal()
+        self.builder.call(
+            self.runtime["py_list_set_slice"],
+            [recv, none_obj, none_obj, none_obj, ordered],
+        )
+        self._gc_release(ordered)
+
+        fn = self.current_function
+        mutated_bb = fn.append_basic_block(
+            name=self._fresh("list.sort.mutated.error")
+        )
+        ok_bb = fn.append_basic_block(name=self._fresh("list.sort.ok"))
+        self.builder.cbranch(mutated, mutated_bb, ok_bb)
+        self.builder.position_at_end(mutated_bb)
+        message = self._ptr_to_cstr(
+            self._cstr_global(
+                "list modified during sort",
+                ".list.sort.mutated.error",
+            )
+        )
+        exc = self.builder.call(
+            self.runtime["py_exc_new"],
+            [ir.Constant(_I64, 2), message],
+            name=self._fresh("list.sort.mutated.exc"),
+        )
+        self.builder.call(self.runtime["py_raise"], [exc])
+        self._gc_release(exc)
+        err_target = (
+            getattr(self, "_try_err_block", None)
+            or self._ensure_fn_err_exit()
+        )
+        self.builder.branch(err_target)
+        self.builder.position_at_end(ok_bb)
+        return none_obj
 
     def _emit_list_sort_with_dunder_lt(
         self,

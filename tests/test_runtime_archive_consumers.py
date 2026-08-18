@@ -13,6 +13,9 @@ import pytest
 from llvmlite import binding as llvm
 
 from pcc.py_frontend import pipeline
+from pcc.py_frontend.pipeline_runtime_archive import (
+    target_id as pipeline_runtime_target_id,
+)
 from pcc.tools.ir_to_obj import emit_object
 from pcc.tools.runtime_archive_provenance import (
     ProvenanceError,
@@ -96,6 +99,9 @@ def _configure_pcc_runtime_cache(
         "_pcc_runtime_source_key",
         lambda _pcc_bin: "test-source-key",
     )
+    key = runtime_build_cache._pcc_runtime_cache_key(
+        pcc_bin, variant="pcc-py"
+    )
     return (
         source_runtime,
         home
@@ -103,7 +109,7 @@ def _configure_pcc_runtime_cache(
         / "pcc"
         / "test-artifacts"
         / "runtime-builds"
-        / "test-source-key-pcc-py",
+        / key,
     )
 
 
@@ -288,11 +294,92 @@ def test_pcc_runtime_cache_reuses_only_a_bound_verified_entry(
         "archive_sha256",
         "manifest_sha256",
         "capi_inventory_sha256",
+        "target_sha256",
     }
-    assert marker["schema"] == "pcc.runtime-build-cache.v2"
+    assert marker["schema"] == "pcc.runtime-build-cache.v4"
     assert len(marker["archive_sha256"]) == 64
     assert len(marker["manifest_sha256"]) == 64
     assert len(marker["capi_inventory_sha256"]) == 64
+    assert len(marker["target_sha256"]) == 64
+    archive = first / "libpy_runtime_pcc_py.a"
+    manifest = verify_runtime_archive_manifest(archive, runtime_root=first)
+    target = Path(str(archive) + ".target")
+    assert target.read_text(encoding="utf-8") == (
+        pipeline_runtime_target_id(str(manifest["target_triple"])) + "\n"
+    )
+
+
+def test_pcc_runtime_cache_format_change_preserves_the_old_immutable_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, expected_runtime = _configure_pcc_runtime_cache(monkeypatch, tmp_path)
+    pcc_bin = runtime_build_cache._REPO_ROOT / ".venv" / "bin" / "pcc"
+    old_key = runtime_build_cache._pcc_runtime_source_key(pcc_bin) + "-pcc-py"
+    old_runtime = expected_runtime.parent / old_key
+    old_runtime.mkdir(parents=True)
+    sentinel = old_runtime / "immutable-v2-sentinel"
+    sentinel.write_text("old-cache\n", encoding="utf-8")
+    builds: list[Path] = []
+
+    def fake_make(command, **_kwargs):
+        work_runtime = Path(command[2])
+        builds.append(work_runtime)
+        _write_valid_runtime_archive(work_runtime)
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(
+        runtime_build_cache,
+        "subprocess",
+        SimpleNamespace(run=fake_make),
+    )
+
+    runtime = runtime_build_cache.cached_pcc_python_runtime()
+
+    assert runtime == expected_runtime
+    assert runtime != old_runtime
+    assert builds
+    assert sentinel.read_text(encoding="utf-8") == "old-cache\n"
+
+
+@pytest.mark.parametrize("replacement", [None, "wrong-target\n"])
+def test_pcc_runtime_cache_rebuilds_a_missing_or_replaced_target_stamp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement: str | None,
+) -> None:
+    _configure_pcc_runtime_cache(monkeypatch, tmp_path)
+    builds: list[Path] = []
+
+    def fake_make(command, **_kwargs):
+        work_runtime = Path(command[2])
+        builds.append(work_runtime)
+        _write_valid_runtime_archive(work_runtime, return_value=len(builds))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(
+        runtime_build_cache,
+        "subprocess",
+        SimpleNamespace(run=fake_make),
+    )
+
+    runtime = runtime_build_cache.cached_pcc_python_runtime()
+    target = Path(str(runtime / "libpy_runtime_pcc_py.a") + ".target")
+    if replacement is None:
+        target.unlink()
+    else:
+        target.write_text(replacement, encoding="utf-8")
+
+    rebuilt = runtime_build_cache.cached_pcc_python_runtime()
+
+    assert rebuilt == runtime
+    assert len(builds) == 2
+    manifest = verify_runtime_archive_manifest(
+        rebuilt / "libpy_runtime_pcc_py.a", runtime_root=rebuilt
+    )
+    assert target.read_text(encoding="utf-8") == (
+        pipeline_runtime_target_id(str(manifest["target_triple"])) + "\n"
+    )
 
 
 def test_pcc_runtime_cache_marker_binds_manifest_bytes(
@@ -453,11 +540,14 @@ def test_pcc_runtime_cache_does_not_copy_an_old_archive_sidecar(
         "PyRuntime_StaleCacheAnchor\n",
         encoding="ascii",
     )
+    stale_target = source_runtime / "libpy_runtime_pcc_py.a.target"
+    stale_target.write_text("stale-target\n", encoding="utf-8")
 
     def fake_make(command, **_kwargs):
         work_runtime = Path(command[2])
         assert not (work_runtime / stale_sidecar.name).exists()
         assert not (work_runtime / stale_capi_inventory.name).exists()
+        assert not (work_runtime / stale_target.name).exists()
         _write_valid_runtime_archive(work_runtime)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 

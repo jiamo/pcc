@@ -1,4 +1,7 @@
 """Small no-libpython C-API core symbols owned by pcc-Python."""
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_INT,
 )

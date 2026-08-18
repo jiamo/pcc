@@ -3,7 +3,23 @@ from __future__ import annotations
 
 from pcc.llvm_capi.compat import ir
 
-from ..py_ast import Call, DictType, Expr, FuncType, Lambda, Name
+from ..py_ast import (
+    BoolLit,
+    BytesLit,
+    Call,
+    DictExpr,
+    DictType,
+    Expr,
+    FloatLit,
+    FuncType,
+    IntLit,
+    Lambda,
+    ListExpr,
+    Name,
+    NoneLit,
+    StrLit,
+    TupleExpr,
+)
 
 
 _I8 = ir.IntType(8)
@@ -11,6 +27,70 @@ _I32 = ir.IntType(32)
 _I64 = ir.IntType(64)
 _CSTR = _I8.as_pointer()
 
+
+
+# Literal forms whose evaluation cannot raise.  Deliberately a WHITELIST: any
+# node not listed -- a call, an attribute, a subscript, a name that might be
+# unbound -- is treated as able to raise.
+_RAISE_FREE_LEAF_NODES = (IntLit, FloatLit, StrLit, BytesLit, BoolLit, NoneLit)
+_RAISE_FREE_CONTAINER_NODES = (TupleExpr, ListExpr)
+
+
+def _expr_cannot_raise(expr) -> bool:
+    """True when evaluating *expr* provably cannot raise.
+
+    NOT WIRED UP -- see the `[DENIED]` note below.  Kept because the predicate
+    itself is correct and unit-tested; what was wrong was the conclusion drawn
+    from it.
+
+    Container construction from raise-free elements allocates, and allocation
+    failure aborts rather than raising, so the whole literal is raise-free.
+
+    This exists because operand cleanup blocks were emitted unconditionally:
+    in the generated `_l1_codegen_static_methods` module -- a pure constant
+    table -- **63.1% of all 72100 basic blocks were cleanup or error blocks**
+    (39284 cleanup + 6224 err) that can never be entered, along with 46960
+    `pcc_gc_store_root` and 52579 `pcc_gc_unpin` calls guarding them.  That one
+    module became the largest emit shard of a self-hosted build.
+
+    `[DENIED]` Skipping the cleanup edge for such operands **breaks the build**:
+
+        self precise stack-map analysis in '_pcc_py_module_top_...':
+        managed root state disagrees at block ...
+
+    A cleanup block is not dead weight even when unreachable.  It carries
+    `pcc_gc_store_root(root, null)` and `pcc_gc_frame_leave_lifo`, so it
+    participates in the *managed root state* the precise stack-map analysis
+    reconciles at every join.  Dropping the edge leaves the join with two
+    disagreeing root states and the analysis refuses the function.
+
+    A follow-up guess -- "then just do not open a root for operands that cannot
+    raise" -- is ALSO wrong, and is recorded here so it is not tried again:
+    `_enter_container_temp_root` exists for **GC** safety, not exception
+    safety.  Its own docstring says a literal's container is a bare SSA
+    temporary while its elements are populated, and populating them ALLOCATES,
+    so a tracing backend on another thread can collect it.  Whether the
+    elements can raise has nothing to do with whether the root is needed.
+
+    So the 63% is not established to be removable at all.  Anyone attacking it
+    should first explain where ~240 blocks per literal element actually come
+    from, with IR evidence, rather than assuming the cleanup blocks are waste.
+    """
+    if isinstance(expr, _RAISE_FREE_LEAF_NODES):
+        return True
+    if isinstance(expr, _RAISE_FREE_CONTAINER_NODES):
+        for element in expr.elems:
+            if not _expr_cannot_raise(element):
+                return False
+        return True
+    if isinstance(expr, DictExpr):
+        for key_expr, value_expr in expr.pairs:
+            if not _expr_cannot_raise(key_expr):
+                return False
+            if not _expr_cannot_raise(value_expr):
+                return False
+        return True
+    return False
 
 class CpyCallLoweringMixin:
     def _require_supported_cpy_kw_mapping(self, kwargs_expr: Expr) -> None:

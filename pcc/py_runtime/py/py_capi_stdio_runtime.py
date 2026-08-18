@@ -1,5 +1,7 @@
 """pcc-Python owners for the two CPython-compatible snprintf wrappers."""
 
+__pcc_runtime_port__ = True
+
 from pcc.extern import (
     c_abi_typed_export,
     c_abi_variadic_export,

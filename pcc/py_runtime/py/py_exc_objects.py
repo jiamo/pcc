@@ -19,6 +19,9 @@ PyExceptionObject layout (from py_internal.h):
 Public object type tags come from the generated ``py_abi_constants`` module.
 The private exception-table code used here is ``PY_EXC_EXCEPTION``.
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_CLASS,
     PY_TYPE_EXC,
@@ -48,6 +51,9 @@ py_str_new           = extern("py_str_new",           (c_ptr, c_int64),         
 py_exc_builtin_class = extern("py_exc_builtin_class", (c_int64,),                  c_ptr)
 pcc_gc_alloc         = extern("pcc_gc_alloc",         (c_int64, c_int32, c_int32), c_ptr)
 pcc_gc_load_ptr      = extern("pcc_gc_load_ptr",      (c_ptr, c_ptr), c_ptr)
+pcc_gc_publish_initialized = extern(
+    "pcc_gc_publish_initialized", (c_ptr,), c_void
+)
 pcc_gc_store_ptr     = extern("pcc_gc_store_ptr",     (c_ptr, c_ptr, c_ptr), c_void)
 pcc_gc_free_object_memory = extern("pcc_gc_free_object_memory", (c_ptr,), c_void)
 pcc_runtime_log_event_code = extern(
@@ -84,6 +90,7 @@ def py_exc_alloc(cls, msg):
         pcc_gc_store_ptr(e, ptr_add(e, 24), none)
     # cause/context/traceback/n_frames/cap_frames already zeroed.
     pcc_runtime_log_event_code(6, 1, 12, 0, e)
+    pcc_gc_publish_initialized(e)
     return e
 
 

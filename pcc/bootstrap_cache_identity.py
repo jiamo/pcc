@@ -48,7 +48,6 @@ _FRONTEND_IRRELEVANT_PREFIXES = (
     "pcc/dist",          # distributed oracles
     "pcc/gpu_gc",        # GPU GC oracles
     "pcc/kernel_ir",     # GPU kernel IR thread
-    "pcc/web",
     "pcc/tools",
 )
 

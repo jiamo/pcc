@@ -14,6 +14,8 @@ inline most logic, and only call extern (C) helpers where the C side
 handles its own int width.
 """
 
+__pcc_runtime_port__ = True
+
 from pcc.extern import extern, c_abi_export, c_ptr, c_int32, c_int64, c_void
 from pcc.py_runtime.py.py_abi_constants import (
     C_POINTER_SIZE,
@@ -70,7 +72,10 @@ from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_VALUEBOX,
 )
 from pcc.unsafe import (
+    atomic_load_i32,
+    atomic_rmw_i32,
     cstr,
+    define_global_i32,
     call_ptr1,
     call_ptr2,
     call_ptr3,
@@ -99,6 +104,13 @@ from pcc.unsafe import (
     untag_int,
 )
 
+# Number of classes that ever had ``__del__`` installed (class body or a later
+# ``cls.__del__ = f``).  Never decremented: a stale nonzero count only costs
+# the lookup.  ``py_user_del_dispatch`` skips its per-dealloc MRO walk while
+# this is zero -- the common program, and every pcc1 compile.  Mirrors
+# ``pcc_class_del_defined_count`` in py_substrate.c / py_class.c.
+define_global_i32("pcc_class_del_defined_count", 0)
+
 py_incref = extern("py_incref", (c_ptr,), c_void)
 py_decref = extern("py_decref", (c_ptr,), c_void)
 py_str_utf8 = extern("py_str_utf8", (c_ptr,), c_ptr)
@@ -125,10 +137,19 @@ py_dict_del = extern("py_dict_del", (c_ptr, c_ptr), c_int64)
 py_list_len = extern("py_list_len", (c_ptr,), c_int64)
 py_list_get = extern("py_list_get", (c_ptr, c_int64), c_ptr)
 py_gc_track = extern("py_gc_track", (c_ptr,), c_void)
+py_gc_untrack = extern("py_gc_untrack", (c_ptr,), c_void)
+pcc_gc_note_object_freeing = extern(
+    "pcc_gc_note_object_freeing", (c_ptr,), c_void
+)
+pcc_gc_object_index_find = extern(
+    "pcc_gc_object_index_find", (c_ptr,), c_ptr
+)
 py_user_del_dispatch = extern("py_user_del_dispatch", (c_ptr,), c_void)
 py_weakref_invalidate = extern("py_weakref_invalidate", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_runtime_error_if_unset = extern(
     "py_runtime_error_if_unset", (c_ptr, c_ptr), c_ptr
 )
@@ -141,6 +162,9 @@ pcc_gc_store_ptr = extern("pcc_gc_store_ptr", (c_ptr, c_ptr, c_ptr), c_void)
 pcc_gc_load_ptr = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_ptr)
 pcc_gc_note_relocation_read = extern("pcc_gc_note_relocation_read", (c_ptr,), c_ptr)
 pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
+pcc_gc_publish_initialized = extern(
+    "pcc_gc_publish_initialized", (c_ptr,), c_void
+)
 pcc_gc_pointer_register = extern(
     "pcc_gc_pointer_register", (c_ptr,), c_int64
 )
@@ -252,11 +276,62 @@ def _ptr_can_have_header(o) -> bool:
     return pcc_gc_pointer_is_managed(o) != 0
 
 
+def _ptr_is_class_of_validated_instance(cls) -> bool:
+    """`_ptr_is_class` without the provenance probe, for a class pointer that
+    came out of an already-validated instance's `cls` slot.
+
+    The caller has just proved `o` is a managed object whose type tag says
+    instance.  `py_instance_new` only ever stores a validated class there, the
+    slot is documented as a borrowed uncounted class pointer, and classes carry
+    PY_FLAG_IMMORTAL -- so reading this header is safe on the strength of the
+    instance being valid.  Probing again cost a second lock plus hash probe on
+    the hottest path in the runtime: every attribute access and method dispatch
+    ran `_ptr_is_instance`, which paid the probe once for the instance and once
+    more for its class.
+
+    Note what this does NOT protect against either way: a stray over-release
+    that frees the class and lets the address be reused answers "managed" from
+    the index too (see the self-host over-release notes in AGENTS.md).  The
+    probe was not buying safety against that; it only excluded a genuinely
+    foreign pointer, which this slot cannot hold.  The relocation read is kept.
+    """
+    cls = pcc_gc_note_relocation_read(cls)
+    if ptr_is_null(cls) != 0:
+        return False
+    return load_i32(cls, PYOBJECTHEADER_TYPE_TAG_OFFSET) == PY_TYPE_CLASS
+
+
 def _ptr_is_class(o) -> bool:
     o = pcc_gc_note_relocation_read(o)
     if not _ptr_can_have_header(o):
         return False
     return load_i32(o, PYOBJECTHEADER_TYPE_TAG_OFFSET) == PY_TYPE_CLASS
+
+
+def _note_class_defines_del() -> None:
+    n: int = load_i32(global_addr("pcc_class_del_defined_count"), 0)
+    store_i32(global_addr("pcc_class_del_defined_count"), 0, n + 1)
+
+
+def _gc_backend_selected_fast() -> int:
+    if load_i32(global_addr("pcc_gc_config_initialized"), 0) == 0:
+        return pcc_gc_backend()
+    return load_i32(global_addr("pcc_gc_backend_selected"), 0)
+
+
+def _dealloc_ptr_is_instance(o) -> bool:
+    # ``_ptr_is_instance`` for an object whose header this thread is about to
+    # free: provenance is already established (we hold the last reference),
+    # so the radix-walk ``_ptr_can_have_header`` probe is skipped.
+    o = pcc_gc_note_relocation_read(o)
+    tag: int = load_i32(o, PYOBJECTHEADER_TYPE_TAG_OFFSET)
+    if tag != PY_TYPE_INSTANCE:
+        if tag < PY_TYPE_USER_CLASS_START:
+            return False
+    cls = pcc_gc_load_ptr(o, ptr_add(o, PYINSTANCEOBJECT_CLS_OFFSET))
+    if ptr_is_null(cls) != 0:
+        return False
+    return _ptr_is_class_of_validated_instance(cls)
 
 
 def _ptr_is_instance(o) -> bool:
@@ -270,7 +345,7 @@ def _ptr_is_instance(o) -> bool:
     cls = pcc_gc_load_ptr(o, ptr_add(o, PYINSTANCEOBJECT_CLS_OFFSET))
     if ptr_is_null(cls) != 0:
         return False
-    return _ptr_is_class(cls)
+    return _ptr_is_class_of_validated_instance(cls)
 
 
 def _class_note_borrowed_metadata_store(cls, value) -> None:
@@ -305,15 +380,26 @@ def _strs_eq(a, b) -> int:
         return 0
     if a1 == 0:
         return 1
-    n: int = strlen(a)
-    if strlen(b) != n:
-        return 0
-    i: int = 0
-    while i < n:
-        if (load_i8(a, i) & 0xFF) != (load_i8(b, i) & 0xFF):
-            return 0
-        i = i + 1
-    return 1
+    # One pass, comparing terminators, instead of strlen(a) + strlen(b) + a
+    # bounded byte loop.  Those three walked the name up to three times for
+    # every method and every field on every attribute access; the C mirror in
+    # py_class.c always did this in one pass because it calls strcmp.  Exactly
+    # equivalent: unequal lengths are caught when one side reaches its NUL
+    # while the other has not, and equal-length strings are decided at the
+    # first differing byte or at the shared terminator.  Bytes 0 and 1 are
+    # already known equal and nonzero, so the scan resumes at index 2.
+    result: int = -1
+    i: int = 2
+    while result < 0:
+        ca: int = load_i8(a, i) & 0xFF
+        cb: int = load_i8(b, i) & 0xFF
+        if ca != cb:
+            result = 0
+        elif ca == 0:
+            result = 1
+        else:
+            i = i + 1
+    return result
 
 
 def _cstr_is_dunder_name(s) -> int:
@@ -449,12 +535,15 @@ def _lookup_field_index(cls, name):
 
 
 def _class_attr_cache_epoch() -> int:
-    return load_i32(global_addr("py_class_attr_cache_epoch"), 0)
+    return atomic_load_i32(
+        global_addr("py_class_attr_cache_epoch"), 0, "acquire"
+    )
 
 
 def _bump_class_attr_cache_epoch() -> None:
-    slot = global_addr("py_class_attr_cache_epoch")
-    store_i32(slot, 0, load_i32(slot, 0) + 1)
+    atomic_rmw_i32(
+        "add", global_addr("py_class_attr_cache_epoch"), 0, 1, "release"
+    )
 
 
 @c_abi_export("py_class_attrs_dict")
@@ -487,6 +576,7 @@ def py_classmethod_new(func):
         func,
     )
     py_gc_track(descriptor)
+    pcc_gc_publish_initialized(descriptor)
     return descriptor
 
 
@@ -512,6 +602,7 @@ def py_property_new(fget, fset, fdel):
             descriptor, ptr_add(descriptor, PYPROPERTYOBJECT_FDEL_OFFSET), fdel
         )
     py_gc_track(descriptor)
+    pcc_gc_publish_initialized(descriptor)
     return descriptor
 
 
@@ -941,11 +1032,11 @@ def _dynamic_attr_slot(inst):
 @c_abi_export("py_instance_vars")
 def py_instance_vars(inst):
     if not _ptr_is_instance(inst):
-        py_raise(py_exc_new(3, cstr("vars() argument has no __dict__")))
+        py_raise_owned(py_exc_new(3, cstr("vars() argument has no __dict__")))
         return null()
     cls = pcc_gc_load_ptr(inst, ptr_add(inst, PYINSTANCEOBJECT_CLS_OFFSET))
     if not _ptr_is_class(cls):
-        py_raise(py_exc_new(3, cstr("vars() argument has no __dict__")))
+        py_raise_owned(py_exc_new(3, cstr("vars() argument has no __dict__")))
         return null()
     out = py_dict_new()
     if ptr_is_null(out) != 0:
@@ -983,10 +1074,10 @@ def py_instance_vars(inst):
 @c_abi_export("py_obj_vars")
 def py_obj_vars(o):
     if ptr_is_null(o) != 0:
-        py_raise(py_exc_new(3, cstr("vars() argument has no __dict__")))
+        py_raise_owned(py_exc_new(3, cstr("vars() argument has no __dict__")))
         return null()
     if is_tagged_int(o) != 0:
-        py_raise(py_exc_new(3, cstr("vars() argument has no __dict__")))
+        py_raise_owned(py_exc_new(3, cstr("vars() argument has no __dict__")))
         return null()
     if _ptr_is_instance(o):
         return py_instance_vars(o)
@@ -995,7 +1086,7 @@ def py_obj_vars(o):
         if ptr_is_null(attrs) == 0:
             py_incref(attrs)
             return attrs
-    py_raise(py_exc_new(3, cstr("vars() argument has no __dict__")))
+    py_raise_owned(py_exc_new(3, cstr("vars() argument has no __dict__")))
     return null()
 
 
@@ -1060,7 +1151,7 @@ def _descriptor_call_get(descriptor, obj, owner):
                     ptr_add(descriptor, PYPROPERTYOBJECT_FGET_OFFSET),
                 )
                 if ptr_is_null(fget) != 0:
-                    py_raise(py_exc_new(6, cstr("unreadable attribute")))
+                    py_raise_owned(py_exc_new(6, cstr("unreadable attribute")))
                     return null()
                 if ptr_eq(obj, global_load_ptr("py_None")) != 0:
                     py_incref(descriptor)
@@ -1113,7 +1204,7 @@ def _descriptor_call_set(descriptor, obj, value) -> int:
                     ptr_add(descriptor, PYPROPERTYOBJECT_FSET_OFFSET),
                 )
                 if ptr_is_null(fset) != 0:
-                    py_raise(py_exc_new(6, cstr("can't set attribute")))
+                    py_raise_owned(py_exc_new(6, cstr("can't set attribute")))
                     return -1
                 args = py_tuple_new(2)
                 if ptr_is_null(args) != 0:
@@ -1172,7 +1263,7 @@ def _descriptor_call_delete(descriptor, obj) -> int:
                     ptr_add(descriptor, PYPROPERTYOBJECT_FDEL_OFFSET),
                 )
                 if ptr_is_null(fdel) != 0:
-                    py_raise(py_exc_new(6, cstr("can't delete attribute")))
+                    py_raise_owned(py_exc_new(6, cstr("can't delete attribute")))
                     return -1
                 args = py_tuple_new(1)
                 if ptr_is_null(args) != 0:
@@ -1310,6 +1401,8 @@ def py_class_setattr_raw(cls, name, value) -> int:
     key = py_str_new(name, strlen(name))
     if ptr_is_null(key) != 0:
         return -1
+    if _strs_eq(name, cstr("__del__")) != 0:
+        _note_class_defines_del()
     py_dict_set(attrs, key, value)
     py_decref(key)
     _bump_class_attr_cache_epoch()
@@ -1419,6 +1512,8 @@ def py_class_lookup(cls, name):
 
 @c_abi_export("py_class_add_method")
 def py_class_add_method(cls, name, func) -> None:
+    # ABI contract mirrors py_internal.h: name is immutable/lifetime-borrowed,
+    # and callers serialize mutation of this realloc-backed method table.
     if not _ptr_is_class(cls):
         return
     if ptr_is_null(name) != 0:
@@ -1458,8 +1553,13 @@ def py_class_add_method(cls, name, func) -> None:
         # Borrowed update-only alias for GC forwarding.  py_user_del_dispatch
         # deliberately resolves through py_class_lookup rather than treating
         # this slot as a separate semantic cache.
+        _note_class_defines_del()
         store_ptr(cls, PYCLASSOBJECT_DEL_METHOD_OFFSET, func)
         _class_note_borrowed_metadata_slot_store(cls, ptr_add(cls, PYCLASSOBJECT_DEL_METHOD_OFFSET), func)
+    # A newly installed data descriptor can shadow an already-cached instance
+    # field. Release-publish only after the whole method-table/GC metadata
+    # transaction is complete, matching the C oracle.
+    _bump_class_attr_cache_epoch()
 
 
 @c_abi_export("py_class_set_metaclass")
@@ -1827,10 +1927,10 @@ def py_class_apply_namespace_dict(cls, ns) -> int:
     if not _ptr_is_class(cls):
         return -1
     if ptr_is_null(ns) != 0:
-        py_raise(py_exc_new(3, cstr("type.__new__() argument 3 must be dict")))
+        py_raise_owned(py_exc_new(3, cstr("type.__new__() argument 3 must be dict")))
         return -1
     if load_i32(ns, PYOBJECTHEADER_TYPE_TAG_OFFSET) != PY_TYPE_DICT:
-        py_raise(py_exc_new(3, cstr("type.__new__() argument 3 must be dict")))
+        py_raise_owned(py_exc_new(3, cstr("type.__new__() argument 3 must be dict")))
         return -1
     keys = py_dict_keys(ns)
     if ptr_is_null(keys) != 0:
@@ -1916,7 +2016,7 @@ def py_super_lookup(start_cls, from_cls, name):
             3,
             cstr("super(type, obj): obj must be an instance or subtype of type"),
         )
-        py_raise(exc)
+        py_raise_owned(exc)
         return null()
 
     j: int = start + 1
@@ -1940,7 +2040,7 @@ def py_super_lookup(start_cls, from_cls, name):
                 k = k + 1
         j = j + 1
     exc = py_exc_new(6, cstr("super object has no attribute"))
-    py_raise(exc)
+    py_raise_owned(exc)
     return null()
 
 
@@ -1999,8 +2099,19 @@ def py_instance_dealloc(o) -> None:
     py_user_del_dispatch(o)
     if load_i64(o, PYOBJECTHEADER_REFCOUNT_OFFSET) > 0:
         py_gc_track(o)
+        backend: int = _gc_backend_selected_fast()
+        metadata_valid: int = 1
+        if backend == 3 or backend == 4:
+            if pcc_gc_pointer_is_managed(o) == 0:
+                metadata_valid = 0
+            elif ptr_is_null(pcc_gc_object_index_find(o)) != 0:
+                metadata_valid = 0
+        if metadata_valid == 0:
+            return
+        flags: int = load_i32(o, PYOBJECTHEADER_FLAGS_OFFSET)
+        store_i32(o, PYOBJECTHEADER_FLAGS_OFFSET, flags & ~524288)
         return
-    if _ptr_is_instance(o):
+    if _dealloc_ptr_is_instance(o):
         cls = pcc_gc_load_ptr(o, ptr_add(o, PYINSTANCEOBJECT_CLS_OFFSET))
         n_fields: int = load_i32(cls, PYCLASSOBJECT_N_FIELDS_OFFSET)
         fields_base = ptr_add(o, PYINSTANCEOBJECT_FIELDS_OFFSET)
@@ -2024,7 +2135,19 @@ def py_instance_dealloc(o) -> None:
             if ptr_is_null(dyn) == 0:
                 store_ptr(dyn_slot, 0, null())
                 py_decref(dyn)
-    pcc_gc_free_object_memory(o)
+    delayed_zpage_note: int = 0
+    if _gc_backend_selected_fast() == 4:
+        if (load_i32(o, PYOBJECTHEADER_FLAGS_OFFSET) & 65536) != 0:
+            delayed_zpage_note = 1
+    if delayed_zpage_note == 0:
+        pcc_gc_note_object_freeing(o)
+        py_gc_untrack(o)
+        pcc_gc_free_object_memory(o)
+    else:
+        py_gc_untrack(o)
+        pcc_gc_free_object_memory(o)
+        if pcc_gc_pointer_is_managed(o) != 0:
+            pcc_gc_note_object_freeing(o)
 
 
 @c_abi_export("py_dataclass_replace")
@@ -2366,13 +2489,14 @@ def py_class_new(name, bases, n_bases: int, field_names, n_fields: int):
 
     if ptr_is_null(tail) == 0:
         free(tail)
+    pcc_gc_publish_initialized(c)
     return c
 
 
 @c_abi_export("py_class_new_from_objects")
 def py_class_new_from_objects(name_obj, bases_obj, namespace):
     if not _ptr_can_have_header(name_obj) or load_i32(name_obj, PYOBJECTHEADER_TYPE_TAG_OFFSET) != PY_TYPE_STR:
-        py_raise(py_exc_new(3, cstr("type.__new__() argument 1 must be str")))
+        py_raise_owned(py_exc_new(3, cstr("type.__new__() argument 1 must be str")))
         return null()
     name = py_str_utf8(name_obj)
     if ptr_is_null(name) != 0:
@@ -2389,10 +2513,10 @@ def py_class_new_from_objects(name_obj, bases_obj, namespace):
         n_bases = py_list_len(bases_obj)
         bases_kind = 2
     else:
-        py_raise(py_exc_new(3, cstr("type.__new__() argument 2 must be tuple")))
+        py_raise_owned(py_exc_new(3, cstr("type.__new__() argument 2 must be tuple")))
         return null()
     if n_bases < 0 or n_bases > 2147483647:
-        py_raise(py_exc_new(3, cstr("too many base classes")))
+        py_raise_owned(py_exc_new(3, cstr("too many base classes")))
         return null()
     base_array = null()
     if n_bases > 0:
@@ -2417,7 +2541,7 @@ def py_class_new_from_objects(name_obj, bases_obj, namespace):
             i = i + 1
         if valid == 0:
             free(base_array)
-            py_raise(py_exc_new(3, cstr("type.__new__() base must be class")))
+            py_raise_owned(py_exc_new(3, cstr("type.__new__() base must be class")))
             return null()
     cls = py_class_new_abi(name, base_array, n_bases, null(), 0)
     if ptr_is_null(base_array) == 0:

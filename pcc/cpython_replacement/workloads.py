@@ -17,7 +17,7 @@ from typing import Any, Mapping
 
 SCHEMA = "pcc.cpython-replacement.workloads.v1"
 LANGUAGE_BASELINE = "3.13"
-ORACLE_BASELINE = "CPython 3.13.2"
+ORACLE_BASELINE = "CPython 3.15.0rc1"
 TARGETS = ("arm64-apple-darwin", "x86_64-unknown-linux-gnu")
 LEVELS = (1, 2, 3)
 STATUS_UNVERIFIED = "unverified"

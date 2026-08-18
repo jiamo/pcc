@@ -5,6 +5,8 @@ Common string indexing and length helpers stay in ``py_str_accessors.py``.
 slicing implementation into executables that only index strings.
 """
 
+__pcc_runtime_port__ = True
+
 from pcc.extern import c_abi_export, c_int32, c_int64, c_ptr, extern
 from pcc.py_runtime.py.py_abi_constants import (
     PYOBJECTHEADER_TYPE_TAG_OFFSET,

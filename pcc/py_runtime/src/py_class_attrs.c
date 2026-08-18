@@ -613,6 +613,7 @@ PyObject *py_classmethod_new(PyObject *func) {
     cm->func = NULL;
     pcc_gc_store_ptr((PyObject *)cm, &cm->func, func);
     py_gc_track((PyObject *)cm);
+    pcc_gc_publish_initialized((PyObject *)cm);
     return (PyObject *)cm;
 }
 
@@ -636,6 +637,7 @@ PyObject *py_property_new(PyObject *fget, PyObject *fset, PyObject *fdel) {
         pcc_gc_store_ptr((PyObject *)prop, &prop->fdel, fdel);
     }
     py_gc_track((PyObject *)prop);
+    pcc_gc_publish_initialized((PyObject *)prop);
     return (PyObject *)prop;
 }
 
@@ -700,7 +702,7 @@ static PyObject *pcc_descriptor_call_get(
         PyPropertyObject *prop = (PyPropertyObject *)descriptor;
         PyObject *fget = pcc_gc_load_ptr(descriptor, &prop->fget);
         if (fget == NULL) {
-            py_raise(py_exc_new(PY_EXC_ATTRIBUTEERROR, "unreadable attribute"));
+            py_raise_owned(py_exc_new(PY_EXC_ATTRIBUTEERROR, "unreadable attribute"));
             return NULL;
         }
         if (obj == NULL || obj == py_None) {
@@ -741,7 +743,7 @@ static int64_t pcc_descriptor_call_set(
         PyPropertyObject *prop = (PyPropertyObject *)descriptor;
         PyObject *fset = pcc_gc_load_ptr(descriptor, &prop->fset);
         if (fset == NULL) {
-            py_raise(py_exc_new(PY_EXC_ATTRIBUTEERROR, "can't set attribute"));
+            py_raise_owned(py_exc_new(PY_EXC_ATTRIBUTEERROR, "can't set attribute"));
             return -1;
         }
         PyObject *out = pcc_class_attrs_call_binary_callable(fset, obj, value);
@@ -769,7 +771,7 @@ static int64_t pcc_descriptor_call_delete(PyObject *descriptor, PyObject *obj) {
         PyPropertyObject *prop = (PyPropertyObject *)descriptor;
         PyObject *fdel = pcc_gc_load_ptr(descriptor, &prop->fdel);
         if (fdel == NULL) {
-            py_raise(py_exc_new(PY_EXC_ATTRIBUTEERROR, "can't delete attribute"));
+            py_raise_owned(py_exc_new(PY_EXC_ATTRIBUTEERROR, "can't delete attribute"));
             return -1;
         }
         PyObject *out = pcc_class_attrs_call_unary_callable(fdel, obj);
@@ -950,9 +952,13 @@ int64_t py_class_setattr_raw(
     if (attrs == NULL) return -1;
     PyObject *key = py_str_new(name, (int64_t)strlen(name));
     if (key == NULL) return -1;
+    if (strcmp(name, "__del__") == 0) {
+        extern int32_t pcc_class_del_defined_count;
+        __atomic_add_fetch(&pcc_class_del_defined_count, 1, __ATOMIC_RELEASE);
+    }
     py_dict_set(attrs, key, value);
     py_decref(key);
-    py_class_attr_cache_epoch++;
+    __atomic_add_fetch(&py_class_attr_cache_epoch, 1, __ATOMIC_RELEASE);
     return 0;
 }
 
@@ -979,7 +985,7 @@ int64_t py_class_setattr(PyClassObject *cls, const char *name, PyObject *value) 
 int64_t py_class_apply_namespace_dict(PyClassObject *cls, PyObject *ns) {
     if (!pcc_class_attrs_is_class(cls)) return -1;
     if (ns == NULL || PY_IS_TAGGED_INT(ns) || py_type_of(ns) != PY_TYPE_DICT) {
-        py_raise(py_exc_new(
+        py_raise_owned(py_exc_new(
             PY_EXC_TYPEERROR,
             "type.__new__() argument 3 must be dict"
         ));
@@ -1021,7 +1027,7 @@ int64_t py_class_apply_namespace_dict(PyClassObject *cls, PyObject *ns) {
 
 PyObject *py_class_new_from_objects(PyObject *name_obj, PyObject *bases_obj, PyObject *ns) {
     if (name_obj == NULL || PY_IS_TAGGED_INT(name_obj) || py_type_of(name_obj) != PY_TYPE_STR) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "type.__new__() argument 1 must be str"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "type.__new__() argument 1 must be str"));
         return NULL;
     }
     const char *name = py_str_utf8(name_obj);
@@ -1037,11 +1043,11 @@ PyObject *py_class_new_from_objects(PyObject *name_obj, PyObject *bases_obj, PyO
     } else if (!PY_IS_TAGGED_INT(bases_obj) && py_type_of(bases_obj) == PY_TYPE_LIST) {
         n64 = py_list_len(bases_obj);
     } else {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "type.__new__() argument 2 must be tuple"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "type.__new__() argument 2 must be tuple"));
         return NULL;
     }
     if (n64 < 0 || n64 > 2147483647LL) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "too many base classes"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "too many base classes"));
         return NULL;
     }
 
@@ -1054,7 +1060,7 @@ PyObject *py_class_new_from_objects(PyObject *name_obj, PyObject *bases_obj, PyO
             if (!pcc_class_attrs_is_class((PyClassObject *)item)) {
                 free(bases);
                 if (item != NULL) py_decref(item);
-                py_raise(py_exc_new(PY_EXC_TYPEERROR, "type.__new__() base must be class"));
+                py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "type.__new__() base must be class"));
                 return NULL;
             }
             bases[i] = (PyClassObject *)item;
@@ -1092,6 +1098,11 @@ int64_t py_class_delattr(PyClassObject *cls, const char *name) {
     if (key == NULL) return -1;
     int64_t rc = py_dict_del(attrs, key);
     py_decref(key);
+    if (rc == 0) {
+        __atomic_add_fetch(
+            &py_class_attr_cache_epoch, 1, __ATOMIC_RELEASE
+        );
+    }
     return rc;
 }
 

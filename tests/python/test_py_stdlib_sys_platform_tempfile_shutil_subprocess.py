@@ -118,6 +118,11 @@ def test_subprocess_called_process_error_export_matches_raw_int_scaffold_abi():
 
     static_exports = _default_native_module_exports("pcc.cli_bootstrap")
     static_export = static_exports["subprocess"]["CalledProcessError"]
+    parallel_exports = _default_native_module_exports(
+        "pcc.py_frontend.pipeline_frontend_parallel"
+    )
+    assert parallel_exports is not None
+    assert parallel_exports["subprocess"]["CalledProcessError"] == static_export
     for key in ("class_name", "base_names", "field_names", "field_types"):
         assert static_export[key] == provider_export[key]
     static_init = static_export["methods"][0]

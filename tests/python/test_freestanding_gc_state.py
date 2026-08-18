@@ -20,6 +20,7 @@ from pcc.py_frontend.codegen.runtime_abi import (
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNTIME_DIR = REPO_ROOT / "pcc" / "py_runtime"
 STATE_SOURCE = RUNTIME_DIR / "py" / "freestanding_gc_state.py"
+SELECTOR_SOURCE = RUNTIME_DIR / "py" / "freestanding_gc_relocation_selector.py"
 SUBSTRATE_SOURCE = RUNTIME_DIR / "py" / "py_substrate.py"
 
 
@@ -143,7 +144,8 @@ def test_freestanding_gc_state_has_complete_raw_abi_and_initial_values(
     tmp_path: Path, emitter: str
 ):
     expected = _state_definitions(STATE_SOURCE)
-    assert len(expected) == 133
+    # Recycled GC-tracking nodes add one pointer plus one bounded-pool count.
+    assert len(expected) == 190
     assert expected["pcc_gc_backend4_deferred_recycle_pages"] == (
         "define_global_i64",
         0,
@@ -198,13 +200,17 @@ def test_production_archive_plan_includes_freestanding_gc_state():
 
 
 def test_gc_state_storage_types_are_registered_in_runtime_abi():
+    definitions = _state_definitions(STATE_SOURCE)
+    selector_definitions = _state_definitions(SELECTOR_SOURCE)
+    assert set(definitions).isdisjoint(selector_definitions)
+    definitions.update(selector_definitions)
     expected = {
         name: (
             "i32" if kind == "define_global_i32"
             else "i64" if kind == "define_global_i64"
             else "ptr"
         )
-        for name, (kind, _value) in _state_definitions(STATE_SOURCE).items()
+        for name, (kind, _value) in definitions.items()
     }
     registered = {name: "i32" for name in FREESTANDING_GC_I32_GLOBALS}
     registered.update({name: "i64" for name in FREESTANDING_GC_I64_GLOBALS})

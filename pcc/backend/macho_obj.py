@@ -48,7 +48,7 @@ class MachOEmitError(Exception):
     """
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class TextSymbol:
     """A defined symbol at `offset` into its section's payload.
 
@@ -63,7 +63,7 @@ class TextSymbol:
     private_external: bool = False
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Relocation:
     """One relocation at `offset` within its section's payload.
 
@@ -150,7 +150,7 @@ _DATA_IN_CODE_UNITS = {
 }
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, slots=True)
 class Section:
     """One section of the object: payload plus its symbols and relocations.
 
@@ -250,10 +250,12 @@ def _scan_stack_map_section(data: bytes) -> tuple[int, list[int]]:
 
 
 def _pad16(name: str) -> bytes:
-    raw = name.encode("ascii")
+    if not name.isascii():
+        raise MachOEmitError(f"segment/section name is not ASCII: {name!r}")
+    raw = name.encode()
     if len(raw) > 16:
         raise MachOEmitError(f"segment/section name too long: {name!r}")
-    return raw.ljust(16, b"\0")
+    return raw + b"\0" * (16 - len(raw))
 
 
 def _align_up(value: int, align_log2: int) -> int:
@@ -786,9 +788,13 @@ def emit_object(
                     f"section-target value {target_value} does not fit "
                     f"in {width} bytes"
                 )
-            payloads[source_index][r.offset:r.offset + width] = (
-                target_value.to_bytes(width, "little")
-            )
+            encoded_target = target_value.to_bytes(width, "little")
+            encoded_index = 0
+            while encoded_index < width:
+                payloads[source_index][r.offset + encoded_index] = encoded_target[
+                    encoded_index
+                ]
+                encoded_index += 1
 
     seg_size = spec.SEGMENT_COMMAND_64.size + len(sections) * spec.SECTION_64.size
     sizeofcmds = (
@@ -842,7 +848,7 @@ def emit_object(
     strx: dict[str, int] = {}
     for name in [pair[0].name for pair in defined] + undef_ordered:
         strx[name] = len(strtab)
-        strtab += name.encode("ascii") + b"\0"
+        strtab += name.encode() + b"\0"
     while len(strtab) % 8 != 0:
         strtab += b"\0"
 

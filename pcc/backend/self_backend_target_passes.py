@@ -21,12 +21,15 @@ from typing import Protocol
 from . import BackendUnavailable
 from .self_backend_analysis import instruction_used_values, terminator_used_values
 from .self_backend_ir import (
+    PARSED_INSTRUCTION_KINDS,
     ParsedFunction,
     ParsedInstr,
     _dot_numeric_text_key_id,
-    parsed_function_value_slot,
+    parsed_function_value_slot_offset,
     text_key_names_equal,
 )
+from .self_backend_kernel import TYPE_KIND_INT, get_indexed_function_kernel
+from .self_backend_value_arena import CompilerInt4
 
 
 PCC_SELF_TARGET_PASSES_ENV = "PCC_SELF_TARGET_PASSES"
@@ -75,6 +78,12 @@ class AArch64MaddFusion:
 
 def _aarch64_madd_instruction_is_barrier(instr: ParsedInstr) -> bool:
     return instr.is_volatile or instr.kind in _AARCH64_MADD_BARRIER_KINDS
+
+
+def _aarch64_madd_instruction_parts_are_barrier(
+    kind: str, is_volatile: bool
+) -> bool:
+    return is_volatile or kind in _AARCH64_MADD_BARRIER_KINDS
 
 
 def _aarch64_madd_operand_is_simple(value: str) -> bool:
@@ -136,6 +145,19 @@ def _aarch64_collect_value_use_counts(func: ParsedFunction) -> dict[str, int]:
     return counts
 
 
+def _aarch64_collect_indexed_value_use_counts(
+    func: ParsedFunction,
+) -> list[int]:
+    kernel = get_indexed_function_kernel(func)
+    counts = [0] * len(kernel.value_names)
+    use_index = 0
+    while use_index < len(kernel.used_value_ids):
+        value_id = kernel.used_value_ids.get_unchecked(use_index)
+        counts[value_id] += 1
+        use_index += 1
+    return counts
+
+
 def _aarch64_value_use_count(
     counts: dict,
     value_name: str,
@@ -162,6 +184,27 @@ def _aarch64_madd_consumer_shape(
         return "madd", result, accumulator
     # AArch64 MSUB computes accumulator - lhs*rhs.  The opposite source form
     # (product - accumulator) is not this instruction and stays unfused.
+    if op == "sub" and rhs_is_product and not lhs_is_product:
+        return "msub", result, lhs
+    return None
+
+
+def _aarch64_madd_consumer_shape_parts(
+    kind: str,
+    data: tuple,
+    has_arithmetic_flags: bool,
+    product: str,
+) -> tuple[str, str, str] | None:
+    if kind != "binop" or has_arithmetic_flags:
+        return None
+    op, result, value_type, lhs, rhs = data
+    if not (value_type.is_int and value_type.width == 64):
+        return None
+    lhs_is_product = text_key_names_equal(lhs, product)
+    rhs_is_product = text_key_names_equal(rhs, product)
+    if op == "add" and lhs_is_product != rhs_is_product:
+        accumulator = rhs if lhs_is_product else lhs
+        return "madd", result, accumulator
     if op == "sub" and rhs_is_product and not lhs_is_product:
         return "msub", result, lhs
     return None
@@ -200,45 +243,138 @@ def plan_aarch64_madd_fusions(
     if not enabled or func.is_vararg:
         return
 
+    kernel = get_indexed_function_kernel(func)
     fusions: list[AArch64MaddFusion] = []
-    use_counts = _aarch64_collect_value_use_counts(func)
-    for block in func.blocks:
-        if block.phis:
+    use_counts = _aarch64_collect_indexed_value_use_counts(func)
+    for block_id in range(len(kernel.block_names)):
+        block_name = kernel.block_names[block_id]
+        block_fact: CompilerInt4 = kernel.block_fact(block_id)
+        block_phi_fact: CompilerInt2 = kernel.block_phi_fact(block_id)
+        if block_phi_fact.second:
             continue
-        for producer_index, instr in enumerate(block.instructions):
-            if instr.kind != "binop" or instr.arithmetic_flags:
+        producer_index = 0
+        instruction_count = block_fact.second
+        while producer_index < instruction_count:
+            instruction_id = block_fact.first + producer_index
+            metadata: CompilerInt4 = kernel.instruction_metadata_by_id(
+                instruction_id
+            )
+            kind = PARSED_INSTRUCTION_KINDS[metadata.first]
+            has_arithmetic_flags = bool(metadata.fourth)
+            if kind != "binop" or has_arithmetic_flags:
+                producer_index += 1
                 continue
-            op, product, value_type, mul_lhs, mul_rhs = instr.data
+            producer_record: CompilerInt4 = kernel.instruction_record(
+                metadata.second
+            )
+            op = kernel.call_texts[producer_record.first]
+            producer_fact: CompilerInt4 = kernel.instruction_fact_by_id(
+                instruction_id
+            )
+            product_id = producer_fact.first
+            product = (
+                "" if product_id < 0 else kernel.value_name(product_id)
+            )
+            value_type: CompilerInt4 = kernel.type_header(
+                producer_record.second
+            )
+            mul_lhs = (
+                kernel.value_name(producer_record.third)
+                if producer_record.third >= 0
+                else kernel.call_texts[-producer_record.third - 1]
+            )
+            mul_rhs = (
+                kernel.value_name(producer_record.fourth)
+                if producer_record.fourth >= 0
+                else kernel.call_texts[-producer_record.fourth - 1]
+            )
             if (
                 op != "mul"
-                or not value_type.is_int
-                or value_type.width != 64
-                or _aarch64_value_use_count(use_counts, product) != 1
+                or value_type.first != TYPE_KIND_INT
+                or value_type.second != 64
+                or product_id < 0
+                or use_counts[product_id] != 1
                 or not _aarch64_madd_operand_is_simple(mul_lhs)
                 or not _aarch64_madd_operand_is_simple(mul_rhs)
             ):
+                producer_index += 1
                 continue
 
             crossed_barrier = False
             consumer_index = producer_index + 1
-            while consumer_index < len(block.instructions):
-                consumer = block.instructions[consumer_index]
-                if _aarch64_madd_instruction_is_barrier(consumer):
+            while consumer_index < instruction_count:
+                consumer_instruction_id = block_fact.first + consumer_index
+                consumer_metadata: CompilerInt4 = (
+                    kernel.instruction_metadata_by_id(
+                    consumer_instruction_id
+                    )
+                )
+                consumer_kind = PARSED_INSTRUCTION_KINDS[
+                    consumer_metadata.first
+                ]
+                if _aarch64_madd_instruction_parts_are_barrier(
+                    consumer_kind,
+                    bool(consumer_metadata.third),
+                ):
                     crossed_barrier = True
-                shape = _aarch64_madd_consumer_shape(consumer, product)
-                if shape is not None:
-                    mnemonic, result, accumulator = shape
+                if consumer_kind != "binop":
+                    consumer_index += 1
+                    continue
+                consumer_record: CompilerInt4 = kernel.instruction_record(
+                    consumer_metadata.second
+                )
+                consumer_type: CompilerInt4 = kernel.type_header(
+                    consumer_record.second
+                )
+                consumer_op = kernel.call_texts[consumer_record.first]
+                lhs_is_product = consumer_record.third == product_id
+                rhs_is_product = consumer_record.fourth == product_id
+                mnemonic = ""
+                accumulator_ref = -1
+                if (
+                    not consumer_metadata.fourth
+                    and consumer_type.first == TYPE_KIND_INT
+                    and consumer_type.second == 64
+                ):
+                    if consumer_op == "add" and lhs_is_product != rhs_is_product:
+                        mnemonic = "madd"
+                        accumulator_ref = (
+                            consumer_record.fourth
+                            if lhs_is_product
+                            else consumer_record.third
+                        )
+                    elif (
+                        consumer_op == "sub"
+                        and rhs_is_product
+                        and not lhs_is_product
+                    ):
+                        mnemonic = "msub"
+                        accumulator_ref = consumer_record.third
+                if mnemonic:
+                    consumer_fact: CompilerInt4 = kernel.instruction_fact_by_id(
+                        consumer_instruction_id
+                    )
+                    result_id = consumer_fact.first
+                    result = (
+                        "" if result_id < 0 else kernel.value_name(result_id)
+                    )
+                    accumulator = (
+                        kernel.value_name(accumulator_ref)
+                        if accumulator_ref >= 0
+                        else kernel.call_texts[-accumulator_ref - 1]
+                    )
                     if (
                         not crossed_barrier
+                        and result_id >= 0
                         and not _aarch64_madd_consumer_is_planned(
-                            fusions, block.name, consumer_index
+                            fusions, block_name, consumer_index
                         )
                         and _aarch64_madd_operand_is_simple(accumulator)
-                        and parsed_function_value_slot(func, result) is not None
+                        and kernel.value_slot_offset(result_id) >= 0
                     ):
                         fusions.append(
                             AArch64MaddFusion(
-                                block_name=block.name,
+                                block_name=block_name,
                                 producer_index=producer_index,
                                 consumer_index=consumer_index,
                                 product=product,
@@ -251,6 +387,7 @@ def plan_aarch64_madd_fusions(
                         )
                     break
                 consumer_index += 1
+            producer_index += 1
     func.aarch64_madd_fusions = fusions
 
 
@@ -393,6 +530,23 @@ def _pair_aarch64_transfer_lines(first_line: str, second_line: str) -> str | Non
     return f"  {pair_opcode} {first_reg}, {second_reg}, {address}"
 
 
+def advance_aarch64_memory_pair_barrier(depth: int, begin: bool) -> int:
+    if begin:
+        return depth + 1
+    if depth <= 0:
+        raise BackendUnavailable(
+            "self AArch64 memory-pair pass saw an unmatched barrier end"
+        )
+    return depth - 1
+
+
+def require_closed_aarch64_memory_pair_barrier(depth: int) -> None:
+    if depth != 0:
+        raise BackendUnavailable(
+            "self AArch64 memory-pair pass saw an unterminated barrier"
+        )
+
+
 def pair_adjacent_aarch64_64bit_memory_ops(
     lines: list[str],
     *,
@@ -414,15 +568,11 @@ def pair_adjacent_aarch64_64bit_memory_ops(
     while index < len(lines):
         line = lines[index]
         if line == AARCH64_MEMORY_PAIR_BARRIER_BEGIN:
-            barrier_depth += 1
+            barrier_depth = advance_aarch64_memory_pair_barrier(barrier_depth, True)
             index += 1
             continue
         if line == AARCH64_MEMORY_PAIR_BARRIER_END:
-            if barrier_depth <= 0:
-                raise BackendUnavailable(
-                    "self AArch64 memory-pair pass saw an unmatched barrier end"
-                )
-            barrier_depth -= 1
+            barrier_depth = advance_aarch64_memory_pair_barrier(barrier_depth, False)
             index += 1
             continue
 
@@ -452,10 +602,7 @@ def pair_adjacent_aarch64_64bit_memory_ops(
             exclusive_region = False
         index += 1
 
-    if barrier_depth != 0:
-        raise BackendUnavailable(
-            "self AArch64 memory-pair pass saw an unterminated barrier"
-        )
+    require_closed_aarch64_memory_pair_barrier(barrier_depth)
     return out
 
 
@@ -479,13 +626,31 @@ class VerifyPreparedModulePass:
         if not getattr(prepared, "triple", ""):
             raise BackendUnavailable("self target memory pass saw module without target triple")
         for func in getattr(prepared, "functions", ()):
-            if not getattr(func, "block_map", None):
+            kernel = getattr(func, "indexed_kernel", None)
+            has_indexed_blocks = bool(
+                kernel is not None
+                and len(kernel.block_names) > 0
+                and (
+                    not func.blocks
+                    or len(kernel.block_names) == len(func.blocks)
+                )
+            )
+            if not getattr(func, "block_map", None) and not has_indexed_blocks:
                 raise BackendUnavailable(
                     "self target memory pass saw unprepared function "
                     f"{getattr(func, 'name', '<unknown>')!r}"
                 )
             for arg in getattr(func, "args", ()):
-                if arg.name not in getattr(func, "value_types", {}):
+                has_indexed_type = False
+                if kernel is not None:
+                    value_id = kernel.value_id(arg.name)
+                    has_indexed_type = (
+                        value_id >= 0 and kernel.value_type_id(value_id) >= 0
+                    )
+                if (
+                    arg.name not in getattr(func, "value_types", {})
+                    and not has_indexed_type
+                ):
                     raise BackendUnavailable(
                         "self target memory pass saw missing argument type for "
                         f"{getattr(func, 'name', '<unknown>')!r}/{arg.name!r}"

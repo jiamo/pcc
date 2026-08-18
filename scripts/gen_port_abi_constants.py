@@ -307,6 +307,10 @@ def render(abi: dict[str, dict[str, int]]) -> str:
         "what stops a C-side layout change from silently missing the mirror",
         "(ARCH-P2-PORT-ABI-AUTOGEN).",
         '"""',
+        "",
+        "# Runtime ports keep raw pointers in the pointer lane; the frontend reads",
+        "# this directive from every module compiled into the runtime archive.",
+        "__pcc_runtime_port__ = True",
     ]
     for heading, items in _constant_groups(abi):
         out += ["", f"# --- {heading} ---"]

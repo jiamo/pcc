@@ -18,6 +18,9 @@ Owned surface (stable C ABI names):
 Public object type tags come from the generated ``py_abi_constants`` module.
 Method flags and private exception codes remain owned by this descriptor bridge.
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_TUPLE,
 )
@@ -59,6 +62,8 @@ py_str_new = extern("py_str_new", (c_ptr, c_int64), c_ptr)
 py_incref = extern("py_incref", (c_ptr,), c_void)
 py_decref = extern("py_decref", (c_ptr,), c_void)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 py_err_occurred = extern("py_err_occurred", (), c_int64)
 py_runtime_error_if_unset = extern(
@@ -77,11 +82,11 @@ define_global_null_ptr_array("pcc_capi_member_descriptors", 1024)
 define_global_null_ptr_array("pcc_capi_richcompare_descriptors", 768)
 
 def _type_error(message) -> None:
-    py_raise(py_exc_new(3, message))  # PY_EXC_TYPEERROR
+    py_raise_owned(py_exc_new(3, message))  # PY_EXC_TYPEERROR
 
 
 def _runtime_error(message) -> None:
-    py_raise(py_exc_new(7, message))  # PY_EXC_RUNTIMEERROR (6 is AttributeError)
+    py_raise_owned(py_exc_new(7, message))  # PY_EXC_RUNTIMEERROR (6 is AttributeError)
 
 
 def _descriptor_require_result(result):

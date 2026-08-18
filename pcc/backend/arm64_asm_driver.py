@@ -23,7 +23,7 @@ import struct
 from dataclasses import dataclass, field
 
 from . import macho_spec as spec
-from .arm64_encode import EncodeError, assemble_text
+from .arm64_encode import EncodeError, PackedAArch64TextBuilder, validate_emitted_label_name
 from .macho_obj import (
     COMPACT_UNWIND_SECTION_FLAGS,
     CSTRING_SECTION_FLAGS,
@@ -36,6 +36,7 @@ from .macho_obj import (
     TextSymbol,
     TEXT_SECTION_FLAGS,
 )
+from .self_backend_value_arena import CompilerIntArena
 
 _SECTION_FLAGS = {
     ("__TEXT", "__text", "regular,pure_instructions"): TEXT_SECTION_FLAGS,
@@ -61,15 +62,74 @@ class _SectionBuffer:
     sectname: str
     flags: int
     align_log2: int = 0
-    data: bytearray = field(default_factory=bytearray)
-    # text is assembled at the end so branches can cross .section switches
-    text_lines: list[str] = field(default_factory=list)
+    # Data sections accumulate chunks and join once: pcc's bytearray +=
+    # allocates a replacement buffer (PY-P0-BYTEARRAY-INPLACE-IDENTITY-
+    # MUTATION), so per-item appends were O(n^2) under pcc1.
+    chunks: list[bytes] = field(default_factory=list)
+    size: int = 0
+    # Keep one native text builder across repeated .section declarations so
+    # branches can cross them without retaining a second instruction-line list.
+    text_builder: PackedAArch64TextBuilder | None = None
+    # Text validation historically followed complete directive validation.
+    # Retain only its first failure until section finalization, never its input.
+    text_error: EncodeError | None = None
     symbols: list[TextSymbol] = field(default_factory=list)
     relocations: list[Relocation] = field(default_factory=list)
 
     @property
     def is_text(self) -> bool:
         return bool(self.flags & spec.S_ATTR_PURE_INSTRUCTIONS)
+
+    def append(self, raw: bytes) -> None:
+        self.chunks.append(raw)
+        self.size += len(raw)
+
+    def append_text_line(self, line: str) -> None:
+        if self.text_error is not None:
+            return
+        assert self.text_builder is not None
+        try:
+            self.text_builder.append_line(line)
+        except EncodeError as exc:
+            self.text_error = exc
+
+
+@dataclass(frozen=True, slots=True)
+class StructuredAArch64Module:
+    """Incremental structured-emitter transport consumed by this driver.
+
+    ``line_chunks`` is the exact compatibility/oracle lane for instruction and
+    directive families not migrated yet. ``structured_sections`` carries
+    final payload/relocation families and must never duplicate a line-owned
+    section.  One shell is created per module; records stay in their packed
+    arenas or final byte payloads rather than becoming transport objects.
+    """
+
+    line_chunks: list[str]
+    structured_sections: tuple[Section, ...] = ()
+    encoded_line_records: CompilerIntArena | None = None
+    structured_symbol_names: tuple[str, ...] = ()
+    structured_instruction_count: int = 0
+    fallback_instruction_count: int = 0
+    structured_unscaled_count: int = 0
+    structured_move_count: int = 0
+    structured_call_count: int = 0
+    direct_instruction_count: int = 0
+    native_finalized: bool = False
+    native_undefined: tuple[str, ...] = ()
+    # Counted residual encoder adapter. Normal supported PCO inputs must keep
+    # this empty; it is separate from direct and transient text-encoded words.
+    fallback_instruction_lines: tuple[str, ...] = ()
+    # Explicit word/label records replayed through native fragment handles.
+    native_fragment_record_count: int = 0
+
+    def assemble_sections(self) -> tuple[list[Section], list[str]]:
+        if self.native_finalized:
+            return list(self.structured_sections), list(self.native_undefined)
+        return assemble_lines(
+            self.line_chunks, self.structured_sections,
+            self.encoded_line_records, self.structured_symbol_names,
+        )
 
 
 def _parse_int(tok: str) -> int | None:
@@ -84,23 +144,117 @@ def _split_data_items(rest: str) -> list[str]:
     return [item.strip() for item in rest.split(",") if item.strip()]
 
 
-def assemble_file(asm_text: str) -> tuple[list[Section], list[str]]:
-    """Parse a full self-backend .s into (sections, undefined symbols)."""
-    buffers: dict[tuple[str, str], _SectionBuffer] = {}
-    order: list[tuple[str, str]] = []
-    globl: set[str] = set()
-    private_extern: set[str] = set()
-    current: _SectionBuffer | None = None
+class AArch64ModuleBuilder:
+    """One directive/section owner shared by streaming emission and text APIs.
 
-    def _pad(buf: _SectionBuffer, align_log2: int) -> None:
+    Each text section owns a packed text builder; data/symbol/section tables
+    retain their named phase lifetime. No module instruction list is retained.
+    """
+
+    def __init__(
+        self, structured_symbol_names: list[str] | tuple[str, ...] = (),
+    ) -> None:
+        self.buffers: dict[tuple[str, str], _SectionBuffer] = {}
+        self.order: list[tuple[str, str]] = []
+        self.globl: set[str] = set()
+        self.private_extern: set[str] = set()
+        self.current: _SectionBuffer | None = None
+        self.structured_symbol_names = structured_symbol_names
+        self.closed: bool = False
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        for buf in self.buffers.values():
+            if buf.text_builder is not None:
+                buf.text_builder.close()
+        self.closed = True
+
+    def append_encoded(self, word: int, relocation_kind: int, symbol_id: int) -> None:
+        if self.closed:
+            raise EncodeError("module builder is closed")
+        current = self.current
+        if current is None or not current.is_text:
+            self.close()
+            raise EncodeError("structured instruction outside __TEXT,__text")
+        if current.text_error is None:
+            assert current.text_builder is not None
+            try:
+                current.text_builder.append_encoded(word, relocation_kind, symbol_id)
+            except EncodeError as exc:
+                current.text_error = exc
+            except Exception:
+                self.close()
+                raise
+
+    def append_chunk(self, raw: str) -> None:
+        if self.closed:
+            raise EncodeError("module builder is closed")
+        try:
+            if "\n" in raw or "\r" in raw:
+                for line in raw.splitlines():
+                    self._append_line(line)
+            else:
+                self._append_line(raw)
+        except Exception:
+            self.close()
+            raise
+
+    def append_label(self, name: str) -> None:
+        if self.closed:
+            raise EncodeError("module builder is closed")
+        try:
+            validate_emitted_label_name(name)
+            self._define_label(name)
+        except Exception:
+            self.close()
+            raise
+
+    def _define_label(self, name: str) -> None:
+        current = self.current
+        if current is None:
+            raise EncodeError(f"label {name!r} before any .section")
+        if current.is_text:
+            if current.text_error is None:
+                assert current.text_builder is not None
+                try:
+                    current.text_builder.append_label(name)
+                except EncodeError as exc:
+                    current.text_error = exc
+            return
+        offset: int = current.size
+        current.symbols.append(TextSymbol(
+            name, offset,
+            external=(name in self.globl or name in self.private_extern),
+            private_external=(name in self.private_extern),
+        ))
+
+    def text_label_offsets(self) -> dict[str, int]:
+        buffer = self.buffers.get(("__TEXT", "__text"))
+        if buffer is None or buffer.text_builder is None:
+            return {}
+        if buffer.text_error is not None:
+            raise buffer.text_error
+        return buffer.text_builder.labels
+
+    def text_size(self) -> int:
+        buffer = self.buffers.get(("__TEXT", "__text"))
+        if buffer is None or buffer.text_builder is None:
+            return 0
+        if buffer.text_error is not None:
+            raise buffer.text_error
+        return buffer.text_builder.pc
+
+    def _pad(self, buf: _SectionBuffer, align_log2: int) -> None:
         mask = (1 << align_log2) - 1
-        while len(buf.data) & mask:
-            buf.data.append(0)
+        padding = (-buf.size) & mask
+        if padding:
+            buf.append(b"\0" * padding)
 
-    for raw in asm_text.splitlines():
+    def _append_line(self, raw: str) -> None:
         line = raw.split(";")[0].strip()
         if not line:
-            continue
+            return
         directive_name = line.split(None, 1)[0]
 
         if line.startswith(".section"):
@@ -110,86 +264,90 @@ def assemble_file(asm_text: str) -> tuple[list[Section], list[str]]:
             seg, sect = parts[0], parts[1]
             attrs = ",".join(parts[2:])
             key = (seg, sect)
-            if key not in buffers:
+            if key not in self.buffers:
                 flags = _SECTION_FLAGS.get((seg, sect, attrs))
                 if flags is None:
                     raise EncodeError(
                         f"section {seg},{sect} with attrs {attrs!r} not proven"
                     )
-                buffers[key] = _SectionBuffer(seg, sect, flags)
-                order.append(key)
-            current = buffers[key]
-            continue
+                self.buffers[key] = _SectionBuffer(seg, sect, flags)
+                self.order.append(key)
+            self.current = self.buffers[key]
+            if self.current.is_text and self.current.text_builder is None:
+                self.current.text_builder = PackedAArch64TextBuilder(
+                    structured_symbol_names=self.structured_symbol_names,
+                )
+            return
 
         if line.startswith(".p2align"):
-            if current is None:
+            if self.current is None:
                 raise EncodeError(".p2align before any .section")
             n = _parse_int(line.split()[1])
             if n is None or n < 0 or n > 4:
                 raise EncodeError(f"bad .p2align {line!r}")
-            current.align_log2 = max(current.align_log2, n)
-            if current.is_text:
+            self.current.align_log2 = max(self.current.align_log2, n)
+            if self.current.is_text:
                 if n > 2:
                     raise EncodeError(".p2align > 2 in __text not proven")
                 # The instruction assembler owns the running mixed
                 # instruction/data offset. Usually this is a no-op; inside a
                 # data region it may need to materialize padding bytes.
-                current.text_lines.append(line)
+                self.current.append_text_line(line)
             else:
-                _pad(current, n)
-            continue
+                self._pad(self.current, n)
+            return
 
         if line.startswith(".globl"):
-            globl.add(line.split()[1].strip())
-            continue
+            self.globl.add(line.split()[1].strip())
+            return
 
         if line.startswith(".private_extern"):
-            private_extern.add(line.split()[1].strip())
-            continue
+            self.private_extern.add(line.split()[1].strip())
+            return
 
         if line == ".subsections_via_symbols":
-            continue  # macho_obj always sets the header flag
+            return  # macho_obj always sets the header flag
 
         if directive_name in (".data_region", ".end_data_region"):
-            if current is None or not current.is_text:
+            if self.current is None or not self.current.is_text:
                 raise EncodeError(
                     f"data-region marker outside __text: {line!r}"
                 )
-            current.text_lines.append(line)
-            continue
+            self.current.append_text_line(line)
+            return
 
         if directive_name in (
             ".quad", ".long", ".short", ".byte", ".space",
             ".float", ".double",
         ):
-            if current is None:
+            if self.current is None:
                 raise EncodeError(f"data directive outside a data section: {line!r}")
-            if current.is_text:
-                current.text_lines.append(line)
-                continue
+            if self.current.is_text:
+                self.current.append_text_line(line)
+                return
             directive, _, rest = line.partition(" ")
             if directive == ".space":
                 count = _parse_int(rest)
                 if count is None or count < 0:
                     raise EncodeError(f"bad .space {line!r}")
-                current.data += b"\0" * count
-                continue
+                self.current.append(b"\0" * count)
+                return
             if directive in (".float", ".double"):
                 fmt = "<f" if directive == ".float" else "<d"
                 for item in _split_data_items(rest):
                     try:
-                        current.data += struct.pack(fmt, float(item))
+                        self.current.append(struct.pack(fmt, float(item)))
                     except (ValueError, OverflowError) as exc:
                         raise EncodeError(f"bad {directive} item {item!r}") from exc
-                continue
+                return
             width = {
                 ".quad": 8, ".long": 4, ".short": 2, ".byte": 1,
             }[directive]
             for item in _split_data_items(rest):
                 value = _parse_int(item)
                 if value is not None:
-                    current.data += (value & (1 << width * 8) - 1).to_bytes(
-                        width, "little"
+                    self.current.append(
+                        (value & (1 << width * 8) - 1).to_bytes(width, "little")
                     )
                     continue
                 # symbol [± offset] — only proven at pointer width (UNSIGNED)
@@ -208,177 +366,273 @@ def assemble_file(asm_text: str) -> tuple[list[Section], list[str]]:
                             offset = -offset
                         break
                 symbol = symbol.strip()
-                if len(current.data) % 8 != 0:
+                if self.current.size % 8 != 0:
                     raise EncodeError(
-                        f".quad {symbol} at unaligned offset {len(current.data)}"
+                        f".quad {symbol} at unaligned offset {self.current.size}"
                     )
-                current.relocations.append(Relocation(
-                    len(current.data), symbol,
+                self.current.relocations.append(Relocation(
+                    self.current.size, symbol,
                     spec.ARM64_RELOC_UNSIGNED, pcrel=False, length=3,
                 ))
                 # UNSIGNED embeds its addend in the pointer bytes
-                current.data += struct.pack("<q", offset)
-            continue
+                self.current.append(struct.pack("<q", offset))
+            return
 
         if line.startswith("."):
             raise EncodeError(f"directive {line.split()[0]!r} not proven")
 
         if line.endswith(":"):
             name = line[:-1].strip()
-            if current is None:
+            if self.current is None:
                 raise EncodeError(f"label {name!r} before any .section")
-            if current.is_text:
-                current.text_lines.append(line)
-                continue
+            if self.current.is_text:
+                # Text input retains the encoder's comment normalization;
+                # typed labels enter through append_label without parsing.
+                self.current.append_text_line(line)
+                return
             # Assembler-local L labels in data are padding-free markers; the
             # emitter does not use them, so any data label is a symbol.
-            current.symbols.append(TextSymbol(
-                name,
-                len(current.data),
-                external=(name in globl or name in private_extern),
-                private_external=(name in private_extern),
-            ))
-            continue
+            self._define_label(name)
+            return
 
         # instruction line
-        if current is None or not current.is_text:
+        if self.current is None or not self.current.is_text:
             raise EncodeError(f"instruction outside __text: {line!r}")
-        current.text_lines.append(line)
+        self.current.append_text_line(line)
 
-    # as(1) orders sections by segment (__TEXT before __DATA) regardless of
-    # where the .section directives appear; within a segment, first
-    # appearance wins. Match it — section order decides vmaddr layout and
-    # every symbol's n_sect/n_value, so this is load-bearing, not cosmetic.
-    seg_rank = {"__TEXT": 0, "__DATA": 1, "__LD": 2}
-    appearance = {key: i for i, key in enumerate(order)}
-    order.sort(key=lambda key: (seg_rank.get(key[0], 2), appearance[key]))
 
-    # Assemble each text buffer as one unit (branches may cross .section
-    # re-declarations of the same text section, never different sections).
-    sections: list[Section] = []
-    undefined: set[str] = set()
-    defined_names: set[str] = set()
-    for key in order:
-        buf = buffers[key]
-        if buf.is_text:
-            assembled = assemble_text("\n".join(buf.text_lines))
-            symbols = tuple(
-                TextSymbol(
-                    name,
-                    off,
-                    external=(name in globl or name in private_extern),
-                    private_external=(name in private_extern),
+    def finish(self, structured_sections=()) -> tuple[list[Section], list[str]]:
+        try:
+            if self.closed:
+                raise EncodeError("module builder is closed")
+            return self._finish_sections(structured_sections)
+        finally:
+            self.close()
+
+    def _finish_sections(self, structured_sections) -> tuple[list[Section], list[str]]:
+        # as(1) orders sections by segment (__TEXT before __DATA) regardless of
+        # where the .section directives appear; within a segment, first
+        # appearance wins. Match it — section order decides vmaddr layout and
+        # every symbol's n_sect/n_value, so this is load-bearing, not cosmetic.
+        seg_rank = {"__TEXT": 0, "__DATA": 1, "__LD": 2}
+        appearance = {key: i for i, key in enumerate(self.order)}
+        self.order.sort(key=lambda key: (seg_rank.get(key[0], 2), appearance[key]))
+
+        # Assemble each text buffer as one unit (branches may cross .section
+        # re-declarations of the same text section, never different sections).
+        sections: list[Section] = []
+        undefined: set[str] = set()
+        defined_names: set[str] = set()
+        for key in self.order:
+            buf = self.buffers[key]
+            if buf.is_text:
+                if buf.text_error is not None:
+                    raise buf.text_error
+                assert buf.text_builder is not None
+                assembled = buf.text_builder.finish()
+                symbols = tuple(
+                    TextSymbol(
+                        name,
+                        off,
+                        external=(name in self.globl or name in self.private_extern),
+                        private_external=(name in self.private_extern),
+                    )
+                    for name, off in assembled.labels.items()
+                    if not name.startswith("L")  # assembler-local, not symbols
                 )
-                for name, off in assembled.labels.items()
-                if not name.startswith("L")  # assembler-local, not symbols
-            )
-            sections.append(Section(
-                sectname=buf.sectname, segname=buf.segname,
-                data=assembled.code,
-                align_log2=max(buf.align_log2, 2),
-                flags=buf.flags,
-                symbols=symbols,
-                relocations=tuple(assembled.relocations),
-                data_in_code=tuple(assembled.data_in_code),
-            ))
-            undefined.update(assembled.undefined)
-            defined_names.update(s.name for s in symbols)
-        else:
-            symbols = tuple(
-                TextSymbol(
-                    symbol.name,
-                    symbol.offset,
-                    external=(
-                        symbol.name in globl
-                        or symbol.name in private_extern
-                    ),
-                    private_external=(symbol.name in private_extern),
+                sections.append(Section(
+                    sectname=buf.sectname, segname=buf.segname,
+                    data=assembled.code,
+                    align_log2=max(buf.align_log2, 2),
+                    flags=buf.flags,
+                    symbols=symbols,
+                    relocations=tuple(assembled.relocations),
+                    data_in_code=tuple(assembled.data_in_code),
+                ))
+                undefined.update(assembled.undefined)
+                defined_names.update(s.name for s in symbols)
+
+            else:
+                symbols = tuple(
+                    TextSymbol(
+                        symbol.name,
+                        symbol.offset,
+                        external=(
+                            symbol.name in self.globl
+                            or symbol.name in self.private_extern
+                        ),
+                        private_external=(symbol.name in self.private_extern),
+                    )
+                    for symbol in buf.symbols
                 )
-                for symbol in buf.symbols
-            )
-            sections.append(Section(
-                sectname=buf.sectname, segname=buf.segname,
-                data=bytes(buf.data),
-                align_log2=buf.align_log2,
-                flags=buf.flags,
-                symbols=symbols,
-                relocations=tuple(buf.relocations),
-            ))
-            undefined.update(
-                r.symbol for r in buf.relocations
-            )
-            defined_names.update(s.name for s in symbols)
-
-    missing_private = private_extern - defined_names
-    if missing_private:
-        raise EncodeError(
-            f"private-extern symbols were not defined: {sorted(missing_private)!r}"
-        )
-
-    # as(1) represents compact-unwind function pointers to functions defined
-    # by this object as section-target relocations, independent of the
-    # function symbol's visibility.  Undefined personality/LSDA references
-    # remain symbol relocations.  Encoding a defined function's section and
-    # offset also keeps the row valid if a local symbol is stripped later.
-    defined_targets: dict[str, tuple[tuple[str, str], int, int]] = {}
-    for section in sections:
-        key = (section.segname, section.sectname)
-        for symbol in section.symbols:
-            defined_targets[symbol.name] = (
-                key, symbol.offset, section.vm_size,
-            )
-    normalized_sections: list[Section] = []
-    for section in sections:
-        if (section.segname, section.sectname) != (
-            "__LD", "__compact_unwind"
-        ):
-            normalized_sections.append(section)
-            continue
-        payload = bytearray(section.data)
-        relocations: list[Relocation] = []
-        for relocation in section.relocations:
-            target = defined_targets.get(relocation.symbol)
-            if (
-                target is None
-                or relocation.type != spec.ARM64_RELOC_UNSIGNED
-                or relocation.pcrel
-                or relocation.length != 3
-            ):
-                relocations.append(relocation)
-                continue
-            target_section, symbol_offset, target_size = target
-            embedded = int.from_bytes(
-                payload[relocation.offset:relocation.offset + 8], "little"
-            )
-            if embedded & (1 << 63):
-                embedded -= 1 << 64
-            target_offset = symbol_offset + embedded
-            if not 0 <= target_offset < target_size:
+                sections.append(Section(
+                    sectname=buf.sectname, segname=buf.segname,
+                    data=b"".join(buf.chunks),
+                    align_log2=buf.align_log2,
+                    flags=buf.flags,
+                    symbols=symbols,
+                    relocations=tuple(buf.relocations),
+                ))
+                undefined.update(
+                    r.symbol for r in buf.relocations
+                )
+                defined_names.update(s.name for s in symbols)
+        existing_section_keys = {
+            (section.segname, section.sectname) for section in sections
+        }
+        for section in structured_sections:
+            if not isinstance(section, Section):
+                raise EncodeError("structured assembly section is not a Section")
+            key = (section.segname, section.sectname)
+            if key in existing_section_keys:
                 raise EncodeError(
-                    "compact-unwind local function relocation resolves "
-                    f"outside {target_section[0]},{target_section[1]}"
+                    "structured assembly duplicates section "
+                    + section.segname
+                    + ","
+                    + section.sectname
                 )
-            payload[relocation.offset:relocation.offset + 8] = b"\0" * 8
-            relocations.append(Relocation(
-                relocation.offset,
-                "",
-                relocation.type,
-                pcrel=False,
-                length=3,
-                section=target_section,
-                target_offset=target_offset,
-            ))
-        normalized_sections.append(Section(
-            sectname=section.sectname,
-            segname=section.segname,
-            data=bytes(payload),
-            align_log2=section.align_log2,
-            flags=section.flags,
-            symbols=section.symbols,
-            relocations=tuple(relocations),
-            zerofill_size=section.zerofill_size,
-            data_in_code=section.data_in_code,
-        ))
-    sections = normalized_sections
+            existing_section_keys.add(key)
+            sections.append(section)
+            for relocation in section.relocations:
+                if relocation.symbol:
+                    undefined.add(relocation.symbol)
+            for symbol in section.symbols:
+                defined_names.add(symbol.name)
+        # Parsed sections already have the correct stable intra-segment order.
+        # Structured sections are emitted later and therefore sort after parsed
+        # peers in the same segment, while __DATA still precedes __LD.
+        sections.sort(key=lambda section: seg_rank.get(section.segname, 2))
 
-    return sections, sorted(undefined - defined_names)
+        missing_private = self.private_extern - defined_names
+        if missing_private:
+            raise EncodeError(
+                f"private-extern symbols were not defined: {sorted(missing_private)!r}"
+            )
+
+        # as(1) represents compact-unwind function pointers to functions defined
+        # by this object as section-target relocations, independent of the
+        # function symbol's visibility.  Undefined personality/LSDA references
+        # remain symbol relocations.  Encoding a defined function's section and
+        # offset also keeps the row valid if a local symbol is stripped later.
+        defined_targets: dict[str, tuple[tuple[str, str], int, int]] = {}
+        for section in sections:
+            key = (section.segname, section.sectname)
+            for symbol in section.symbols:
+                defined_targets[symbol.name] = (
+                    key, symbol.offset, section.vm_size,
+                )
+        normalized_sections: list[Section] = []
+        for section in sections:
+            if (section.segname, section.sectname) != (
+                "__LD", "__compact_unwind"
+            ):
+                normalized_sections.append(section)
+                continue
+            payload = bytearray(section.data)
+            relocations: list[Relocation] = []
+            for relocation in section.relocations:
+                target = defined_targets.get(relocation.symbol)
+                if (
+                    target is None
+                    or relocation.type != spec.ARM64_RELOC_UNSIGNED
+                    or relocation.pcrel
+                    or relocation.length != 3
+                ):
+                    relocations.append(relocation)
+                    continue
+                target_section, symbol_offset, target_size = target
+                embedded = int.from_bytes(
+                    payload[relocation.offset:relocation.offset + 8], "little"
+                )
+                if embedded & (1 << 63):
+                    embedded -= 1 << 64
+                target_offset = symbol_offset + embedded
+                if not 0 <= target_offset < target_size:
+                    raise EncodeError(
+                        "compact-unwind local function relocation resolves "
+                        f"outside {target_section[0]},{target_section[1]}"
+                    )
+                clear_index = 0
+                while clear_index < 8:
+                    payload[relocation.offset + clear_index] = 0
+                    clear_index += 1
+                relocations.append(Relocation(
+                    relocation.offset,
+                    "",
+                    relocation.type,
+                    pcrel=False,
+                    length=3,
+                    section=target_section,
+                    target_offset=target_offset,
+                ))
+            normalized_sections.append(Section(
+                sectname=section.sectname,
+                segname=section.segname,
+                data=bytes(payload),
+                align_log2=section.align_log2,
+                flags=section.flags,
+                symbols=section.symbols,
+                relocations=tuple(relocations),
+                zerofill_size=section.zerofill_size,
+                data_in_code=section.data_in_code,
+            ))
+        sections = normalized_sections
+
+        return sections, sorted(undefined - defined_names)
+
+
+
+def assemble_lines(
+    asm_lines: list[str],
+    structured_sections=(),
+    encoded_line_records: CompilerIntArena | None = None,
+    structured_symbol_names: list[str] | tuple[str, ...] = (),
+) -> tuple[list[Section], list[str]]:
+    """Line adapter over the module builder; the caller owns the encoded arena."""
+    if encoded_line_records is not None and len(encoded_line_records) % 4:
+        raise EncodeError(
+            "structured instruction records need line/word/relocation/symbol"
+        )
+    record_count = 0 if encoded_line_records is None else len(encoded_line_records) // 4
+    record_index = 0
+    next_chunk_index = 0
+    # Preserve chunk-index preflight before any directive/text validation.
+    while record_index < record_count:
+        assert encoded_line_records is not None
+        encoded_index = encoded_line_records.get_unchecked(record_index * 4)
+        if next_chunk_index >= len(asm_lines):
+            raise EncodeError("structured instruction index exceeds assembly input")
+        if encoded_index < next_chunk_index:
+            raise EncodeError("structured instruction indices are not ordered")
+        if encoded_index >= len(asm_lines):
+            raise EncodeError("structured instruction index exceeds assembly input")
+        next_chunk_index = encoded_index + 1
+        record_index += 1
+    builder = AArch64ModuleBuilder(structured_symbol_names)
+    try:
+        record_index = 0
+        chunk_index = 0
+        while chunk_index < len(asm_lines):
+            if record_index < record_count:
+                assert encoded_line_records is not None
+                offset = record_index * 4
+                if encoded_line_records.get_unchecked(offset) == chunk_index:
+                    builder.append_encoded(
+                        encoded_line_records.get_unchecked(offset + 1),
+                        encoded_line_records.get_unchecked(offset + 2),
+                        encoded_line_records.get_unchecked(offset + 3),
+                    )
+                    record_index += 1
+                    chunk_index += 1
+                    continue
+            builder.append_chunk(asm_lines[chunk_index])
+            chunk_index += 1
+        return builder.finish(structured_sections)
+    finally:
+        builder.close()
+
+
+def assemble_file(asm_text: str) -> tuple[list[Section], list[str]]:
+    """Compatibility string projection for the full self-backend dialect."""
+
+    return assemble_lines(asm_text.splitlines())

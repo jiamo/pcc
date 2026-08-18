@@ -1,11 +1,20 @@
 """pcc-Python replacement for py_runtime/src/py_int_shift.c."""
+
+__pcc_runtime_port__ = True
+
 from pcc.extern import extern, c_abi_export, c_int64, c_ptr
 from pcc.py_runtime.py.py_abi_constants import (
     PYINTOBJECT_DIGITS_OFFSET,
     PYINTOBJECT_NDIGITS_OFFSET,
     PYINTOBJECT_SIGN_OFFSET,
 )
-from pcc.unsafe import free, load_i32, ptr_is_null, store_i32
+from pcc.unsafe import (
+    free,
+    load_i32,
+    logical_shift_left_i64,
+    ptr_is_null,
+    store_i32,
+)
 
 
 py_bigint_alloc = extern("py_bigint_alloc", (c_int64,), c_ptr)
@@ -56,7 +65,7 @@ def _shl_digits_and_bits(a, ndigits_shift: int, bit_shift: int):
         return r
     carry: int = 0
     i: int = 0
-    factor: int = 1 << bit_shift
+    factor: int = logical_shift_left_i64(1, bit_shift)
     while i < src_len:
         cur: int = _load_u32(a, PYINTOBJECT_DIGITS_OFFSET + i * 4) * factor + carry
         _store_u32(r, PYINTOBJECT_DIGITS_OFFSET + (i + ndigits_shift) * 4, cur & 4294967295)
@@ -115,7 +124,10 @@ def py_bigint_shr(a, bits: int):
             high = _load_u32(a, PYINTOBJECT_DIGITS_OFFSET + (i + nd + 1) * 4)
         cur: int = low
         if nb != 0:
-            cur = (low >> nb) | (high * (1 << (32 - nb)))
+            cur = (
+                (low >> nb)
+                | (high * logical_shift_left_i64(1, 32 - nb))
+            )
         _store_u32(mag, PYINTOBJECT_DIGITS_OFFSET + i * 4, cur & 4294967295)
         i = i + 1
     store_i32(mag, PYINTOBJECT_SIGN_OFFSET, 1)
@@ -126,7 +138,7 @@ def py_bigint_shr(a, bits: int):
 
     tail_nonzero: bool = False
     if nb != 0:
-        mask: int = (1 << nb) - 1
+        mask: int = logical_shift_left_i64(1, nb) - 1
         if (_load_u32(a, PYINTOBJECT_DIGITS_OFFSET + nd * 4) & mask) != 0:
             tail_nonzero = True
     i = 0

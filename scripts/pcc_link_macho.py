@@ -13,6 +13,7 @@ own linker.
 Usage:
     pcc_link_macho.py [--asm SELF.s ...] --out BINARY [--archive LIB.a]
                       [--native-object SELF.pco ...]
+                      [--internal-input-manifest ORDERED.txt]
                       [--object EXTRA.o ...] [--entry _main]
                       [--previous-output BINARY]
 
@@ -27,9 +28,11 @@ from __future__ import annotations
 
 import argparse
 import gc
+import json
 import os
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -43,6 +46,44 @@ def repo_root() -> Path:
 
 
 _PATCH_CHUNK_SIZE = 64 * 1024
+_INTERNAL_INPUT_MANIFEST_SCHEMA = "pcc.macho-internal-inputs.v1"
+
+
+def _link_profile_payload(
+    phase_ns: dict[str, int],
+    *,
+    total_ns: int,
+    asm_inputs: int,
+    native_inputs: int,
+    object_inputs: int,
+    archive_inputs: int,
+) -> dict[str, object]:
+    phases_ms = {
+        name: round(value / 1_000_000.0, 3)
+        for name, value in sorted(phase_ns.items())
+    }
+    return {
+        "schema": "pcc.macho-link-profile.v1",
+        "phases_ms": phases_ms,
+        "total_ms": round(total_ns / 1_000_000.0, 3),
+        "inputs": {
+            "asm": asm_inputs,
+            "native_object": native_inputs,
+            "object": object_inputs,
+            "archive": archive_inputs,
+        },
+    }
+
+
+def _write_link_profile(path: str, payload: dict[str, object]) -> None:
+    with open(path, "w", encoding="utf-8") as stream:
+        json.dump(payload, stream, indent=2, sort_keys=True)
+        stream.write("\n")
+    sys.stderr.write(
+        "PCC_LINK_PROFILE "
+        + json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        + "\n"
+    )
 
 
 def _assemble_asm_path_worker(path: str) -> bytes:
@@ -174,6 +215,30 @@ def _paths_alias(first: Path, second: Path) -> bool:
         return False
 
 
+def _read_internal_input_manifest(path: str) -> list[tuple[str, str]]:
+    try:
+        lines = Path(path).read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise ValueError("cannot read internal-input manifest: " + str(exc)) from exc
+    if len(lines) < 2 or lines[0] != _INTERNAL_INPUT_MANIFEST_SCHEMA:
+        raise ValueError("invalid internal-input manifest schema")
+    try:
+        expected = int(lines[1])
+    except ValueError as exc:
+        raise ValueError("invalid internal-input manifest count") from exc
+    if expected < 1 or len(lines) != expected + 2:
+        raise ValueError("internal-input manifest count mismatch")
+    inputs = []
+    for record in lines[2:]:
+        kind, separator, raw_path = record.partition("\t")
+        if separator != "\t" or kind not in ("ASM", "PCO") or not raw_path:
+            raise ValueError("invalid internal-input manifest record")
+        if "\t" in raw_path or "\n" in raw_path or "\r" in raw_path:
+            raise ValueError("invalid internal-input manifest path")
+        inputs.append((kind, raw_path))
+    return inputs
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="pcc_link_macho")
     parser.add_argument("--asm", action="append", default=[],
@@ -186,10 +251,18 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--native-object", action="append", default=[],
                         dest="native_objects",
                         help="indexed pcc-native object input")
+    parser.add_argument(
+        "--internal-input-manifest",
+        help="ordered ASM/PCO input manifest for mixed direct publication",
+    )
     parser.add_argument("--entry", default="_main")
     parser.add_argument(
         "--previous-output",
         help="previous complete artifact used as the incremental patch base",
+    )
+    parser.add_argument(
+        "--profile-json",
+        help="write assemble/decode/prepare-link/sign/write/validate timing JSON",
     )
     semantic_group = parser.add_mutually_exclusive_group()
     semantic_group.add_argument(
@@ -206,22 +279,48 @@ def main(argv: list[str] | None = None) -> int:
         ),
     )
     args = parser.parse_args(argv)
-    if not args.asm and not args.objects and not args.native_objects:
+    if args.internal_input_manifest and (args.asm or args.native_objects):
+        parser.error(
+            "--internal-input-manifest cannot be combined with --asm or "
+            "--native-object"
+        )
+    try:
+        ordered_internal_inputs = (
+            _read_internal_input_manifest(args.internal_input_manifest)
+            if args.internal_input_manifest
+            else (
+                [("ASM", path) for path in args.asm]
+                + [("PCO", path) for path in args.native_objects]
+            )
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    if not ordered_internal_inputs and not args.objects:
         parser.error(
             "at least one --asm, --native-object, or --object input is required"
         )
     out_path = Path(args.out)
     raw_input_paths = (
-        list(args.asm)
-        + list(args.native_objects)
+        [path for _kind, path in ordered_internal_inputs]
         + list(args.objects)
         + list(args.archive)
+        + ([args.internal_input_manifest] if args.internal_input_manifest else [])
         + ([args.semantic_layout_manifest] if args.semantic_layout_manifest else [])
         + ([args.semantic_layout_policy] if args.semantic_layout_policy else [])
     )
     input_paths = [Path(path) for path in raw_input_paths]
     if any(_paths_alias(out_path, path) for path in input_paths):
         parser.error("--out must not overwrite an input file")
+
+    profile_started_ns = time.perf_counter_ns()
+    phase_ns = {
+        "assemble_pool": 0,
+        "decode_pco": 0,
+        "prepare_link": 0,
+        "sign": 0,
+        "write": 0,
+        "validate": 0,
+    }
 
     sys.path.insert(0, str(repo_root()))
     from pcc.backend.macho_codesign import build_signature, parse_signature
@@ -235,8 +334,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     from pcc.backend.macho_parallel import ParallelLinkError, resolve_link_jobs
     from pcc.backend.native_object import (
-        NativeObject,
-        decode_native_object,
+        decode_packed_native_object,
         is_native_object_bytes,
     )
     # A cold self-host link builds millions of short-lived dataclass/tuple
@@ -273,11 +371,14 @@ def main(argv: list[str] | None = None) -> int:
     # Probe the incremental cache for every .s first, then assemble only the
     # misses — in parallel processes, since pure-Python assembly of a cold
     # stage1 (hundreds of .s, one 72k-block module top) dominates link time.
-    natives_by_index: dict[int, NativeObject] = {}
+    assemble_started_ns = time.perf_counter_ns()
+    natives_by_index: dict[int, object] = {}
     pending_paths: list[str] = []
     pending_indices: list[int] = []
     pending_store: list[tuple] = []
-    for index, path in enumerate(args.asm):
+    for index, (kind, path) in enumerate(ordered_internal_inputs):
+        if kind != "ASM":
+            continue
         if session is None:
             pending_paths.append(path)
             pending_indices.append(index)
@@ -285,7 +386,8 @@ def main(argv: list[str] | None = None) -> int:
         with open(path, "r", encoding="utf-8") as f:
             assembly = f.read()
         cache_path, cached, replace_valid = session.probe_assembly_cache(
-            assembly
+            assembly,
+            packed=True,
         )
         if cached is not None:
             natives_by_index[index] = cached
@@ -293,6 +395,7 @@ def main(argv: list[str] | None = None) -> int:
         pending_paths.append(path)
         pending_indices.append(index)
         pending_store.append((cache_path, replace_valid))
+    encoded_results: list[bytes] = []
     if pending_paths:
         jobs = resolve_link_jobs(
             len(pending_paths),
@@ -313,8 +416,12 @@ def main(argv: list[str] | None = None) -> int:
             encoded_results = [
                 _assemble_asm_path_worker(path) for path in pending_paths
             ]
+    phase_ns["assemble_pool"] += time.perf_counter_ns() - assemble_started_ns
+
+    decode_started_ns = time.perf_counter_ns()
+    if pending_paths:
         for position, encoded in enumerate(encoded_results):
-            native = decode_native_object(encoded)
+            native = decode_packed_native_object(encoded)
             if session is not None:
                 cache_path, replace_valid = pending_store[position]
                 session.store_assembled_native_object(
@@ -324,10 +431,15 @@ def main(argv: list[str] | None = None) -> int:
                     encoded=encoded,
                 )
             natives_by_index[pending_indices[position]] = native
-    objects = [natives_by_index[index] for index in range(len(args.asm))]
-    for path in args.native_objects:
+    for index, (kind, path) in enumerate(ordered_internal_inputs):
+        if kind != "PCO":
+            continue
         with open(path, "rb") as f:
-            objects.append(decode_native_object(f.read()))
+            payload = f.read()
+        natives_by_index[index] = decode_packed_native_object(payload)
+    objects = [
+        natives_by_index[index] for index in range(len(ordered_internal_inputs))
+    ]
     for path in args.objects:
         with open(path, "rb") as f:
             payload = f.read()
@@ -341,6 +453,7 @@ def main(argv: list[str] | None = None) -> int:
     for path in args.archive:
         with open(path, "rb") as f:
             archives.append(f.read())
+    phase_ns["decode_pco"] += time.perf_counter_ns() - decode_started_ns
 
     semantic_manifest = None
     semantic_policy = None
@@ -371,7 +484,7 @@ def main(argv: list[str] | None = None) -> int:
 
     identifier = b"pcc-linked"
 
-    def validate_image(candidate: bytes):
+    def _validate_image_impl(candidate: bytes):
         signature = parse_signature(candidate)
         if signature.identifier != identifier:
             raise RuntimeError(
@@ -397,7 +510,14 @@ def main(argv: list[str] | None = None) -> int:
             )
         return signature
 
-    def prepare_for_link(link_objects, *, archives=()):
+    def validate_image(candidate: bytes):
+        started_ns = time.perf_counter_ns()
+        try:
+            return _validate_image_impl(candidate)
+        finally:
+            phase_ns["validate"] += time.perf_counter_ns() - started_ns
+
+    def _prepare_for_link_impl(link_objects, *, archives=()):
         if semantic_policy is None:
             return prepare_executable_object(
                 link_objects,
@@ -412,19 +532,56 @@ def main(argv: list[str] | None = None) -> int:
             merged, exact_manifest
         ).native_object
 
-    if session is None and not semantic_identity:
+    def prepare_for_link(link_objects, *, archives=()):
+        started_ns = time.perf_counter_ns()
+        try:
+            return _prepare_for_link_impl(link_objects, archives=archives)
+        finally:
+            phase_ns["prepare_link"] += time.perf_counter_ns() - started_ns
+
+    sign_started_ns = 0
+
+    def link_phase_callback(event: str) -> None:
+        nonlocal sign_started_ns
+        if event == "sign_begin":
+            sign_started_ns = time.perf_counter_ns()
+        elif event == "sign_end" and sign_started_ns:
+            phase_ns["sign"] += time.perf_counter_ns() - sign_started_ns
+            sign_started_ns = 0
+
+    def finalize_for_link(merged, **kwargs):
+        sign_before = phase_ns["sign"]
+        started_ns = time.perf_counter_ns()
+        try:
+            return link_prepared_executable(
+                merged,
+                phase_callback=link_phase_callback,
+                **kwargs,
+            )
+        finally:
+            total_ns = time.perf_counter_ns() - started_ns
+            sign_ns = phase_ns["sign"] - sign_before
+            phase_ns["prepare_link"] += max(0, total_ns - sign_ns)
+
+    if session is None and not semantic_identity and not canonical_linker:
         # Preserve the ordinary cold-link API exactly when no semantic policy
         # was requested.  Tests and embedders may deliberately replace it.
-        image = link_executable(
-            objects,
-            archives=archives,
-            entry=args.entry,
-            identifier=identifier,
-        )
+        link_started_ns = time.perf_counter_ns()
+        try:
+            image = link_executable(
+                objects,
+                archives=archives,
+                entry=args.entry,
+                identifier=identifier,
+            )
+        finally:
+            phase_ns["prepare_link"] += (
+                time.perf_counter_ns() - link_started_ns
+            )
         validate_image(image)
     elif session is None:
         merged = prepare_for_link(objects, archives=archives)
-        image = link_prepared_executable(
+        image = finalize_for_link(
             merged,
             entry=args.entry,
             identifier=identifier,
@@ -438,7 +595,7 @@ def main(argv: list[str] | None = None) -> int:
             identifier=identifier,
             semantic_identity=semantic_identity,
             prepare=prepare_for_link,
-            finalize=link_prepared_executable,
+            finalize=finalize_for_link,
             validate=validate_image,
         )
     previous_path = (
@@ -446,7 +603,23 @@ def main(argv: list[str] | None = None) -> int:
     )
     gc.enable()
     gc.collect()
+    write_started_ns = time.perf_counter_ns()
     _publish_executable(out_path, image, previous_path)
+    phase_ns["write"] += time.perf_counter_ns() - write_started_ns
+    if args.profile_json:
+        payload = _link_profile_payload(
+            phase_ns,
+            total_ns=time.perf_counter_ns() - profile_started_ns,
+            asm_inputs=sum(
+                1 for kind, _path in ordered_internal_inputs if kind == "ASM"
+            ),
+            native_inputs=sum(
+                1 for kind, _path in ordered_internal_inputs if kind == "PCO"
+            ),
+            object_inputs=len(args.objects),
+            archive_inputs=len(args.archive),
+        )
+        _write_link_profile(args.profile_json, payload)
     return 0
 
 

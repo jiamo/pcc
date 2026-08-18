@@ -42,6 +42,9 @@ Owned surface (stable C ABI names):
   pcc_capi_cext_subtract,
   pcc_capi_type_object_is_callable
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_CLASS,
     PY_TYPE_FUNC,
@@ -91,6 +94,8 @@ py_runtime_error_if_unset = extern(
     "py_runtime_error_if_unset", (c_ptr, c_ptr), c_ptr
 )
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 PyErr_SetNone = extern("PyErr_SetNone", (c_ptr,), c_void)
 PyLong_AsLong = extern("PyLong_AsLong", (c_ptr,), c_int64)
@@ -120,15 +125,15 @@ PyUnicode_FromStringAndSize = extern("PyUnicode_FromStringAndSize", (c_ptr, c_in
 
 
 def _type_error(message) -> None:
-    py_raise(py_exc_new(3, message))  # PY_EXC_TYPEERROR
+    py_raise_owned(py_exc_new(3, message))  # PY_EXC_TYPEERROR
 
 
 def _runtime_error(message) -> None:
-    py_raise(py_exc_new(7, message))  # PY_EXC_RUNTIMEERROR
+    py_raise_owned(py_exc_new(7, message))  # PY_EXC_RUNTIMEERROR
 
 
 def _value_error(message) -> None:
-    py_raise(py_exc_new(2, message))  # PY_EXC_VALUEERROR
+    py_raise_owned(py_exc_new(2, message))  # PY_EXC_VALUEERROR
 
 
 def _signed_i32_result(value: int) -> int:
@@ -765,9 +770,10 @@ def pcc_capi_dealloc_cext_object(o, type_tag: int) -> int:
     if not ptr_is_null(type_obj):
         flags: int = load_i64(type_obj, 176)  # tp_flags
         dealloc = load_ptr(type_obj, 56)  # tp_dealloc
-        # 0x1000000 is pcc's managed-dealloc tp_flags bit. Keep the ABI value
-        # in the owner function so library mode never depends on module init.
-        if (flags & 0x1000000) != 0 and not ptr_is_null(dealloc):
+        # Public fake-Python.h/C-oracle ABI: PCC_TPFLAGS_MANAGED_DEALLOC is
+        # 1UL<<62. Keep the literal in the owner so library mode never depends
+        # on module initialization.
+        if (flags & 4611686018427387904) != 0 and not ptr_is_null(dealloc):
             call_void_ptr1(dealloc, o)
     pcc_gc_free_object_memory(o)
     return 1
@@ -921,7 +927,7 @@ def PyObject_GenericGetAttr(o, name) -> c_ptr:
         if not ptr_is_null(method):
             return pcc_capi_method_func_new(o, method)
         current = load_ptr(current, (264))
-    py_raise(py_exc_new(6, attr))  # PY_EXC_ATTRIBUTEERROR
+    py_raise_owned(py_exc_new(6, attr))  # PY_EXC_ATTRIBUTEERROR
     return null()
 
 
@@ -945,7 +951,7 @@ def PyObject_GenericSetAttr(o, name, value) -> int:
         if not ptr_is_null(getset):
             set_slot = load_ptr(getset, 16)
             if ptr_is_null(set_slot):
-                py_raise(py_exc_new(6, attr))  # PY_EXC_ATTRIBUTEERROR
+                py_raise_owned(py_exc_new(6, attr))  # PY_EXC_ATTRIBUTEERROR
                 return -1
             result = _signed_i32_result(
                 call_i64_ptr3(set_slot, o, value, load_ptr(getset, 32))
@@ -973,7 +979,7 @@ def PyObject_GenericSetAttr(o, name, value) -> int:
             pcc_gc_store_ptr(o, dict_slot, dict_obj)
         py_dict_set(dict_obj, name, value)
         return 0
-    py_raise(py_exc_new(6, attr))  # PY_EXC_ATTRIBUTEERROR
+    py_raise_owned(py_exc_new(6, attr))  # PY_EXC_ATTRIBUTEERROR
     return -1
 
 
@@ -987,7 +993,7 @@ def PyObject_GenericGetDict(o, context) -> c_ptr:
         return py_obj_getattr(o, cstr("__dict__"))
     dict_slot = pcc_capi_object_dict_slot(o, type_obj)
     if ptr_is_null(dict_slot):
-        py_raise(py_exc_new(6, cstr("object has no __dict__")))  # PY_EXC_ATTRIBUTEERROR
+        py_raise_owned(py_exc_new(6, cstr("object has no __dict__")))  # PY_EXC_ATTRIBUTEERROR
         return null()
     dict_obj = pcc_gc_load_ptr(o, dict_slot)
     if not ptr_is_null(dict_obj):
@@ -1040,13 +1046,13 @@ def pcc_capi_member_get(o, member) -> c_ptr:
     if member_type == 5:  # T_STRING
         value = load_ptr(address, 0)
         if ptr_is_null(value):
-            py_raise(py_exc_new(6, load_ptr(member, 0)))  # PY_EXC_ATTRIBUTEERROR
+            py_raise_owned(py_exc_new(6, load_ptr(member, 0)))  # PY_EXC_ATTRIBUTEERROR
             return null()
         return PyUnicode_FromString(value)
     if member_type == 6 or member_type == 16:  # T_OBJECT / T_OBJECT_EX
         value = pcc_gc_load_ptr(o, address)
         if ptr_is_null(value) and member_type == 16:
-            py_raise(py_exc_new(6, load_ptr(member, 0)))  # PY_EXC_ATTRIBUTEERROR
+            py_raise_owned(py_exc_new(6, load_ptr(member, 0)))  # PY_EXC_ATTRIBUTEERROR
             return null()
         if ptr_is_null(value):
             value = global_load_ptr("py_None")

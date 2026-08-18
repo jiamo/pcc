@@ -1,5 +1,7 @@
 """pcc-Python compiled-module registry and initialization ordering."""
 
+__pcc_runtime_port__ = True
+
 from pcc.extern import c_abi_export, c_int32, c_int64, c_ptr, c_void, extern
 from pcc.unsafe import (
     calloc,
@@ -38,6 +40,8 @@ py_incref = extern("py_incref", (c_ptr,), c_void)
 py_decref = extern("py_decref", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 
 
 define_global_ptr_null("pcc_runtime_module_class_cache")
@@ -80,7 +84,7 @@ def _duplicate_cstr(value):
 
 
 def _raise_no_memory() -> None:
-    py_raise(py_exc_new(10, cstr("out of memory")))
+    py_raise_owned(py_exc_new(10, cstr("out of memory")))
 
 
 @c_abi_export("pcc_runtime_module_class")

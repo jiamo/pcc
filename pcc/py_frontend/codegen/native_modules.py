@@ -3345,7 +3345,21 @@ class NativeModuleAliasMixin:
                     + str(getattr(getattr(arg_expr, "ty", None), "name", ""))
                     + "\n"
                 )
-            raw_v = self._emit_expr(arg_expr)
+            # An `int` field holds the OBJECT projection (the store below is
+            # `py_instance_set_field`, which takes a pointer), so emit the
+            # argument as an object rather than as an i64.  `_emit_expr` yields
+            # i64 for an int-typed expression, and i64 cannot carry a value
+            # above 2**63-1 -- which is exactly how the parser's
+            # `pa.IntLit(span, ty, int(e.text, 0))` stored 0 for every source
+            # literal beyond that range.  This dataclass fast path (no user
+            # `__init__`) bypasses every other constructor lowering, so the fix
+            # has to be here too.
+            raw_v = None
+            arg_ty = getattr(arg_expr, "ty", None)
+            if isinstance(arg_ty, IntType):
+                raw_v = self._maybe_emit_exact_int_object(arg_expr)
+            if raw_v is None:
+                raw_v = self._emit_expr(arg_expr)
             if str(
                 os.environ.get("PCC_DEBUG_BOOTSTRAP_TRACE", "") or ""
             ).strip().lower() in (

@@ -38,6 +38,12 @@ def pcc_gc_object_list_head() -> c_ptr:
 @c_abi_export("pcc_gc_object_set_list_head")
 def pcc_gc_object_set_list_head(head: c_ptr) -> None:
     global_store_ptr("pcc_gc_object_head", head)
+    revision: i64 = load_i64(global_addr("pcc_gc_object_list_revision"), 0)
+    if revision == 9223372036854775807:
+        revision = 1
+    else:
+        revision = revision + 1
+    store_i64(global_addr("pcc_gc_object_list_revision"), 0, revision)
 
 
 @c_abi_export("pcc_gc_trace_cursor_load")
@@ -140,6 +146,44 @@ def pcc_gc_object_node_set_young_prev(node: c_ptr, prev: c_ptr) -> None:
     store_ptr(node, 72, prev)
 
 
+@c_abi_export("pcc_gc_object_node_clear_promotion_state")
+def _clear_promotion_state(node: c_ptr) -> None:
+    if ptr_is_null(node) != 0:
+        return
+    store_ptr(node, 64, null())
+    store_ptr(node, 72, null())
+    store_i64(node, 56, 0)
+
+
+@c_abi_export("pcc_gc_backend3_promotion_unlink")
+def _promotion_unlink(node: c_ptr) -> None:
+    if ptr_is_null(node) != 0:
+        return
+    obj = load_ptr(node, 0)
+    if ptr_is_null(obj) != 0 or is_tagged_int(obj) != 0:
+        return
+    if (load_i32(obj, 12) & 128) != 0:
+        return
+    prev = load_ptr(node, 72)
+    nxt = load_ptr(node, 64)
+    if (
+        ptr_eq(global_load_ptr("pcc_gc_backend3_promotion_head"), node) == 0
+        and ptr_eq(global_load_ptr("pcc_gc_backend3_promotion_tail"), node) == 0
+        and ptr_is_null(prev) != 0
+        and ptr_is_null(nxt) != 0
+    ):
+        return
+    if ptr_is_null(prev) == 0:
+        store_ptr(prev, 64, nxt)
+    elif ptr_eq(global_load_ptr("pcc_gc_backend3_promotion_head"), node) != 0:
+        global_store_ptr("pcc_gc_backend3_promotion_head", nxt)
+    if ptr_is_null(nxt) == 0:
+        store_ptr(nxt, 72, prev)
+    elif ptr_eq(global_load_ptr("pcc_gc_backend3_promotion_tail"), node) != 0:
+        global_store_ptr("pcc_gc_backend3_promotion_tail", prev)
+    _clear_promotion_state(node)
+
+
 @c_abi_export("pcc_gc_object_node_alloc")
 def pcc_gc_object_node_alloc() -> c_ptr:
     head = global_load_ptr("pcc_gc_object_node_free_head")
@@ -148,14 +192,48 @@ def pcc_gc_object_node_alloc() -> c_ptr:
         count: i64 = load_i32(global_addr("pcc_gc_object_node_free_count"), 0)
         if count > 0:
             store_i32(global_addr("pcc_gc_object_node_free_count"), 0, count - 1)
+        _clear_promotion_state(head)
         return head
+    node = malloc(80)
+    _clear_promotion_state(node)
+    return node
+
+
+@c_abi_export("pcc_gc_object_node_prepare")
+def pcc_gc_object_node_prepare() -> c_ptr:
     return malloc(80)
+
+
+@c_abi_export("pcc_gc_object_node_plan_requires_prepare")
+def pcc_gc_object_node_plan_requires_prepare() -> i64:
+    if ptr_is_null(global_load_ptr("pcc_gc_object_node_free_head")) != 0:
+        return 1
+    return 0
+
+
+@c_abi_export("pcc_gc_object_node_take_prepared")
+def pcc_gc_object_node_take_prepared(prepared_io: c_ptr) -> c_ptr:
+    if ptr_is_null(prepared_io) != 0:
+        return null()
+    head = global_load_ptr("pcc_gc_object_node_free_head")
+    if ptr_is_null(head) == 0:
+        global_store_ptr("pcc_gc_object_node_free_head", load_ptr(head, 16))
+        count: i64 = load_i32(global_addr("pcc_gc_object_node_free_count"), 0)
+        if count > 0:
+            store_i32(global_addr("pcc_gc_object_node_free_count"), 0, count - 1)
+        _clear_promotion_state(head)
+        return head
+    node = load_ptr(prepared_io, 0)
+    store_ptr(prepared_io, 0, null())
+    _clear_promotion_state(node)
+    return node
 
 
 @c_abi_export("pcc_gc_object_node_release")
 def pcc_gc_object_node_release(node: c_ptr) -> None:
     if ptr_is_null(node) != 0:
         return
+    _clear_promotion_state(node)
     count: i64 = load_i32(global_addr("pcc_gc_object_node_free_count"), 0)
     if count >= 8192:
         free(node)
@@ -163,6 +241,15 @@ def pcc_gc_object_node_release(node: c_ptr) -> None:
     store_ptr(node, 16, global_load_ptr("pcc_gc_object_node_free_head"))
     global_store_ptr("pcc_gc_object_node_free_head", node)
     store_i32(global_addr("pcc_gc_object_node_free_count"), 0, count + 1)
+
+
+@c_abi_export("pcc_gc_object_node_finish_detached")
+def pcc_gc_object_node_finish_detached(nodes: c_ptr) -> None:
+    while ptr_is_null(nodes) == 0:
+        node = nodes
+        nodes = load_ptr(node, 16)
+        store_ptr(node, 16, null())
+        free(node)
 
 
 @c_abi_export("pcc_gc_backend3_young_link_head")
@@ -203,11 +290,28 @@ def pcc_gc_object_node_unlink(node: c_ptr) -> None:
     nxt = pcc_gc_object_node_next(node)
     if ptr_eq(pcc_gc_trace_cursor_load(), node) != 0:
         pcc_gc_trace_cursor_store(nxt)
+    if ptr_eq(
+        global_load_ptr("pcc_gc_backend4_reset_object_cursor"), node
+    ) != 0:
+        global_store_ptr("pcc_gc_backend4_reset_object_cursor", nxt)
+    if ptr_eq(
+        global_load_ptr("pcc_gc_backend3_remembered_scan_cursor"), node
+    ) != 0:
+        global_store_ptr("pcc_gc_backend3_remembered_scan_cursor", nxt)
+    _promotion_unlink(node)
     pcc_gc_backend3_young_unlink(node)
     if ptr_is_null(prev) != 0:
         pcc_gc_object_set_list_head(nxt)
     else:
         pcc_gc_object_node_set_next(prev, nxt)
+        revision: i64 = load_i64(
+            global_addr("pcc_gc_object_list_revision"), 0
+        )
+        if revision == 9223372036854775807:
+            revision = 1
+        else:
+            revision = revision + 1
+        store_i64(global_addr("pcc_gc_object_list_revision"), 0, revision)
     if ptr_is_null(nxt) == 0:
         pcc_gc_object_node_set_prev(nxt, prev)
 

@@ -2,13 +2,40 @@ from __future__ import annotations
 
 """Target-neutral value/liveness analysis helpers for the self backend."""
 
+from . import BackendUnavailable
 from .self_backend_ir import (
+    PARSED_INSTRUCTION_KIND_ALLOCA,
+    PARSED_INSTRUCTION_KIND_ATOMICRMW,
+    PARSED_INSTRUCTION_KIND_BINOP,
+    PARSED_INSTRUCTION_KIND_CALL,
+    PARSED_INSTRUCTION_KIND_CAST,
+    PARSED_INSTRUCTION_KIND_CMPXCHG,
+    PARSED_INSTRUCTION_KIND_EXTRACTELEMENT,
+    PARSED_INSTRUCTION_KIND_EXTRACTVALUE,
+    PARSED_INSTRUCTION_KIND_FBINOP,
+    PARSED_INSTRUCTION_KIND_FCMP,
+    PARSED_INSTRUCTION_KIND_FNEG,
+    PARSED_INSTRUCTION_KIND_FREEZE,
+    PARSED_INSTRUCTION_KIND_GEP,
+    PARSED_INSTRUCTION_KIND_ICMP,
+    PARSED_INSTRUCTION_KIND_INSERTELEMENT,
+    PARSED_INSTRUCTION_KIND_INSERTVALUE,
+    PARSED_INSTRUCTION_KIND_LOAD,
+    PARSED_INSTRUCTION_KIND_LOAD_ATOMIC,
+    PARSED_INSTRUCTION_KIND_SELECT,
+    PARSED_INSTRUCTION_KIND_SHUFFLEVECTOR,
+    PARSED_INSTRUCTION_KIND_STORE,
+    PARSED_INSTRUCTION_KIND_STORE_ATOMIC,
+    PARSED_INSTRUCTION_KIND_SYSCALL6,
+    PARSED_INSTRUCTION_KIND_VA_ARG,
+    PARSED_INSTRUCTION_KINDS,
+    ParsedBlock,
     ParsedFunction,
     ParsedInstr,
     _dot_numeric_text_key_id,
     text_key_names_equal,
 )
-from .self_backend_parse import (
+from .self_backend_literals import (
     const_int_from_value,
     is_aggregate_literal_value,
     is_float_literal,
@@ -76,6 +103,72 @@ def _is_local_value_ref_uncached(value: str) -> bool:
     )
 
 
+def _instruction_defined_value_from_parts(kind: str, data: tuple) -> str | None:
+    if kind in {"binop", "fbinop", "icmp", "fcmp", "cast"}:
+        # These instruction tuples start with an opcode/predicate; their SSA
+        # destination is the second field.  Treating the opcode as the
+        # definition silently disables block-local liveness and every target
+        # combine that depends on it.
+        return data[1]
+    if kind in {
+        "alloca",
+        "load",
+        "load_atomic",
+        "atomicrmw",
+        "cmpxchg",
+        "syscall6",
+        "fneg",
+        "select",
+        "freeze",
+        "insertelement",
+        "extractelement",
+        "shufflevector",
+        "extractvalue",
+        "insertvalue",
+        "va_arg",
+        "gep",
+    }:
+        return data[0]
+    if kind == "call":
+        return data[0]
+    return None
+
+
+def _instruction_defined_value_from_id_parts(
+    kind_id: int,
+    data: tuple,
+) -> str | None:
+    if kind_id in (
+        PARSED_INSTRUCTION_KIND_BINOP,
+        PARSED_INSTRUCTION_KIND_FBINOP,
+        PARSED_INSTRUCTION_KIND_ICMP,
+        PARSED_INSTRUCTION_KIND_FCMP,
+        PARSED_INSTRUCTION_KIND_CAST,
+    ):
+        return data[1]
+    if kind_id in (
+        PARSED_INSTRUCTION_KIND_ALLOCA,
+        PARSED_INSTRUCTION_KIND_LOAD,
+        PARSED_INSTRUCTION_KIND_LOAD_ATOMIC,
+        PARSED_INSTRUCTION_KIND_ATOMICRMW,
+        PARSED_INSTRUCTION_KIND_CMPXCHG,
+        PARSED_INSTRUCTION_KIND_SYSCALL6,
+        PARSED_INSTRUCTION_KIND_FNEG,
+        PARSED_INSTRUCTION_KIND_SELECT,
+        PARSED_INSTRUCTION_KIND_FREEZE,
+        PARSED_INSTRUCTION_KIND_INSERTELEMENT,
+        PARSED_INSTRUCTION_KIND_EXTRACTELEMENT,
+        PARSED_INSTRUCTION_KIND_SHUFFLEVECTOR,
+        PARSED_INSTRUCTION_KIND_EXTRACTVALUE,
+        PARSED_INSTRUCTION_KIND_INSERTVALUE,
+        PARSED_INSTRUCTION_KIND_VA_ARG,
+        PARSED_INSTRUCTION_KIND_GEP,
+        PARSED_INSTRUCTION_KIND_CALL,
+    ):
+        return data[0]
+    return None
+
+
 def instruction_defined_value(instr: ParsedInstr) -> str | None:
     if instr.kind in {"binop", "fbinop", "icmp", "fcmp", "cast"}:
         # These instruction tuples start with an opcode/predicate; their SSA
@@ -105,6 +198,114 @@ def instruction_defined_value(instr: ParsedInstr) -> str | None:
     if instr.kind == "call":
         return instr.data[0]
     return None
+
+
+def _instruction_used_values_from_parts(kind: str, data: tuple) -> list[str]:
+    values: list[str] = []
+    if kind == "store":
+        values = [data[1], data[3]]
+    elif kind == "load":
+        values = [data[3]]
+    elif kind == "load_atomic":
+        values = [data[3]]
+    elif kind == "store_atomic":
+        values = [data[1], data[3]]
+    elif kind == "atomicrmw":
+        values = [data[3], data[5]]
+    elif kind == "cmpxchg":
+        values = [data[3], data[5], data[6]]
+    elif kind == "syscall6":
+        values = list(data[1])
+    elif kind == "va_arg":
+        values = [data[2]]
+    elif kind in {"binop", "fbinop", "icmp", "fcmp"}:
+        values = [data[3], data[4]]
+    elif kind == "fneg":
+        values = [data[2]]
+    elif kind == "cast":
+        values = [data[3]]
+    elif kind == "select":
+        values = [data[2], data[3], data[4]]
+    elif kind == "freeze":
+        values = [data[2]]
+    elif kind == "insertelement":
+        values = [data[2], data[4], data[5]]
+    elif kind == "extractelement":
+        values = [data[2], data[3]]
+    elif kind == "shufflevector":
+        values = [data[2], data[3], data[5]]
+    elif kind == "extractvalue":
+        values = [data[2]]
+    elif kind == "insertvalue":
+        values = [data[2], data[4]]
+    elif kind == "gep":
+        values = [data[3]]
+        for index_pair in data[4]:
+            values.append(index_pair[1])
+    elif kind == "call":
+        if data[3]:
+            values.append(data[2])
+        for argument in data[4]:
+            values.append(argument[1])
+    return [value for value in values if is_local_value_ref(value)]
+
+
+def _instruction_used_values_from_id_parts(
+    kind_id: int,
+    data: tuple,
+) -> list[str]:
+    values: list[str] = []
+    if kind_id == PARSED_INSTRUCTION_KIND_STORE:
+        values = [data[1], data[3]]
+    elif kind_id == PARSED_INSTRUCTION_KIND_LOAD:
+        values = [data[3]]
+    elif kind_id == PARSED_INSTRUCTION_KIND_LOAD_ATOMIC:
+        values = [data[3]]
+    elif kind_id == PARSED_INSTRUCTION_KIND_STORE_ATOMIC:
+        values = [data[1], data[3]]
+    elif kind_id == PARSED_INSTRUCTION_KIND_ATOMICRMW:
+        values = [data[3], data[5]]
+    elif kind_id == PARSED_INSTRUCTION_KIND_CMPXCHG:
+        values = [data[3], data[5], data[6]]
+    elif kind_id == PARSED_INSTRUCTION_KIND_SYSCALL6:
+        values = list(data[1])
+    elif kind_id == PARSED_INSTRUCTION_KIND_VA_ARG:
+        values = [data[2]]
+    elif kind_id in (
+        PARSED_INSTRUCTION_KIND_BINOP,
+        PARSED_INSTRUCTION_KIND_FBINOP,
+        PARSED_INSTRUCTION_KIND_ICMP,
+        PARSED_INSTRUCTION_KIND_FCMP,
+    ):
+        values = [data[3], data[4]]
+    elif kind_id == PARSED_INSTRUCTION_KIND_FNEG:
+        values = [data[2]]
+    elif kind_id == PARSED_INSTRUCTION_KIND_CAST:
+        values = [data[3]]
+    elif kind_id == PARSED_INSTRUCTION_KIND_SELECT:
+        values = [data[2], data[3], data[4]]
+    elif kind_id == PARSED_INSTRUCTION_KIND_FREEZE:
+        values = [data[2]]
+    elif kind_id == PARSED_INSTRUCTION_KIND_INSERTELEMENT:
+        values = [data[2], data[4], data[5]]
+    elif kind_id == PARSED_INSTRUCTION_KIND_EXTRACTELEMENT:
+        values = [data[2], data[3]]
+    elif kind_id == PARSED_INSTRUCTION_KIND_SHUFFLEVECTOR:
+        values = [data[2], data[3], data[5]]
+    elif kind_id == PARSED_INSTRUCTION_KIND_EXTRACTVALUE:
+        values = [data[2]]
+    elif kind_id == PARSED_INSTRUCTION_KIND_INSERTVALUE:
+        values = [data[2], data[4]]
+    elif kind_id == PARSED_INSTRUCTION_KIND_GEP:
+        values = [data[3]]
+        for index_pair in data[4]:
+            values.append(index_pair[1])
+    elif kind_id == PARSED_INSTRUCTION_KIND_CALL:
+        if data[3]:
+            values.append(data[2])
+        for argument in data[4]:
+            values.append(argument[1])
+    return [value for value in values if is_local_value_ref(value)]
 
 
 def instruction_used_values(instr: ParsedInstr) -> list[str]:
@@ -223,11 +424,25 @@ def _stable_text_bucket_key(text: str) -> int:
         # Negative keys reserve a collision-free lane for the canonical
         # ``.N``/``%.N`` aliases while ordinary polynomial keys stay >= 0.
         return -numeric_id - 1
-    modulus = 1099511627776
+    # llvm_capi's function-wide name allocator gives every generated value and
+    # block a unique decimal suffix (``name.N``).  The suffix is already the
+    # dense provenance key; hashing the often-long diagnostic prefix one
+    # character at a time merely repeats work.  Equal suffixes remain safe:
+    # the open-addressed tables compare the full spelling before accepting an
+    # entry, exactly as they do for ordinary polynomial collisions.
+    suffix_at = text.rfind(".")
+    if 0 <= suffix_at < len(text) - 1:
+        suffix = text[suffix_at + 1 :]
+        if suffix.isdecimal():
+            return -int(suffix) - 1
+    # 1099511627776 is 2**40, so the modulo is a mask.  A `%` per character is
+    # the single most expensive operation in this loop, and under pcc1 an
+    # arbitrary-precision modulo is worse still; masking is bit-identical.
+    mask = 1099511627775
     value = 0
     index = 0
     while index < len(text):
-        value = (value * 131 + ord(text[index])) % modulus
+        value = (value * 131 + ord(text[index])) & mask
         index += 1
     return value
 
@@ -270,6 +485,14 @@ def _block_length_get(
     return None
 
 
+def _canonical_block_key(name: str):
+    """Key on which ``text_key_names_equal`` is plain equality."""
+    name_id = _dot_numeric_text_key_id(name)
+    if name_id >= 0:
+        return name_id
+    return name
+
+
 def _record_use_position(
     buckets: dict[
         int,
@@ -286,14 +509,18 @@ def _record_use_position(
             use_sites = existing_sites
             break
     if use_sites is None:
-        use_sites = []
+        use_sites = {}
         bucket.append((value_name, use_sites))
-    for index, (existing_block, existing_position) in enumerate(use_sites):
-        if text_key_names_equal(existing_block, block_name):
-            if position > existing_position:
-                use_sites[index] = (existing_block, position)
-            return
-    use_sites.append((block_name, position))
+    # Keyed on the canonical block key rather than scanned: a value used across
+    # B blocks paid B comparisons per record, so one giant function made this
+    # quadratic.  `text_key_names_equal` is plain equality on this key, so the
+    # dict lookup is exact -- see _canonical_block_key.
+    key = _canonical_block_key(block_name)
+    existing = use_sites.get(key)
+    if existing is None or position > existing[1]:
+        use_sites[key] = (existing[0] if existing is not None else block_name,
+                          position if existing is None or position > existing[1]
+                          else existing[1])
 
 
 def _use_sites_get(
@@ -307,8 +534,24 @@ def _use_sites_get(
         _stable_text_bucket_key(value_name), []
     ):
         if text_key_names_equal(existing_name, value_name):
-            return use_sites
+            # Insertion order is preserved by dict, so the single-use case the
+            # caller checks sees the same entry it saw when this was a list.
+            return list(use_sites.values())
     return None
+
+
+def _parsed_block_terminator_used_values(
+    func: ParsedFunction,
+    block_id: int,
+    block: ParsedBlock,
+) -> list[str]:
+    if block.terminator is not None:
+        return terminator_used_values(block.terminator)
+    seed = func.indexed_seed
+    if seed is None:
+        return []
+    value = seed.terminator_used_value(block_id)
+    return [] if value is None else [value]
 
 
 def collect_block_local_last_uses(func: ParsedFunction) -> dict[str, dict[str, int]]:
@@ -320,24 +563,39 @@ def collect_block_local_last_uses(func: ParsedFunction) -> dict[str, dict[str, i
     AArch64 caller-saved register escape its proven block/call boundary.
     """
 
+    if func.indexed_kernel is not None:
+        return func.indexed_kernel.legacy_block_last_uses()
+
     def_buckets: dict[int, list[tuple[str, str]]] = {}
     block_length_buckets: dict[int, list[tuple[str, int]]] = {}
-    for block in func.blocks:
+    for block_id, block in enumerate(func.blocks):
         _record_block_length(
             block_length_buckets, block.name, len(block.instructions)
         )
         for phi in block.phis:
             _record_definition(def_buckets, phi.dest, block.name)
-        for instr in block.instructions:
-            dest = instruction_defined_value(instr)
+        instructions = block.instructions
+        kind_ids = instructions._kind_ids
+        instruction_index = 0
+        instruction_count = len(kind_ids)
+        while instruction_index < instruction_count:
+            kind_id = kind_ids[instruction_index]
+            if not 0 <= kind_id < len(PARSED_INSTRUCTION_KINDS):
+                raise BackendUnavailable(
+                    f"corrupt parsed-instruction kind id {kind_id}"
+                )
+            kind = PARSED_INSTRUCTION_KINDS[kind_id]
+            data = instructions.instruction_data(instruction_index)
+            dest = _instruction_defined_value_from_parts(kind, data)
             if dest is not None:
                 _record_definition(def_buckets, dest, block.name)
+            instruction_index += 1
 
     use_buckets: dict[
         int,
         list[tuple[str, list[tuple[str, int]]]],
     ] = {}
-    for block in func.blocks:
+    for block_id, block in enumerate(func.blocks):
         term_pos = len(block.instructions)
         for phi in block.phis:
             for incoming in phi.incoming:
@@ -353,10 +611,22 @@ def collect_block_local_last_uses(func: ParsedFunction) -> dict[str, dict[str, i
                     incoming.label,
                     incoming_position,
                 )
-        for index, instr in enumerate(block.instructions):
-            for value in instruction_used_values(instr):
-                _record_use_position(use_buckets, value, block.name, index)
-        for value in terminator_used_values(block.terminator):
+        instructions = block.instructions
+        kind_ids = instructions._kind_ids
+        instruction_index = 0
+        instruction_count = len(kind_ids)
+        while instruction_index < instruction_count:
+            kind_id = kind_ids[instruction_index]
+            if not 0 <= kind_id < len(PARSED_INSTRUCTION_KINDS):
+                raise BackendUnavailable(
+                    f"corrupt parsed-instruction kind id {kind_id}"
+                )
+            kind = PARSED_INSTRUCTION_KINDS[kind_id]
+            data = instructions.instruction_data(instruction_index)
+            for value in _instruction_used_values_from_parts(kind, data):
+                _record_use_position(use_buckets, value, block.name, instruction_index)
+            instruction_index += 1
+        for value in _parsed_block_terminator_used_values(func, block_id, block):
             _record_use_position(use_buckets, value, block.name, term_pos)
 
     block_local_last_uses: dict[str, dict[str, int]] = {}
@@ -401,22 +671,40 @@ def collect_used_values(func: ParsedFunction) -> list[str]:
     # Keep the authoritative use collection hash-free. Native bootstrap can
     # produce equal SSA-name strings whose hashes disagree; set.add/update can
     # then lose the equality relationship that stack-slot assignment needs.
+    if func.indexed_kernel is not None:
+        return func.indexed_kernel.legacy_used_values()
+
     used: list[str] = []
-    for block in func.blocks:
+    for block_id, block in enumerate(func.blocks):
         for phi in block.phis:
             for incoming in phi.incoming:
                 if is_local_value_ref(incoming.value):
                     used.append(incoming.value)
-        for instr in block.instructions:
-            used.extend(instruction_used_values(instr))
-        used.extend(terminator_used_values(block.terminator))
+        instructions = block.instructions
+        kind_ids = instructions._kind_ids
+        instruction_index = 0
+        instruction_count = len(kind_ids)
+        while instruction_index < instruction_count:
+            kind_id = kind_ids[instruction_index]
+            if not 0 <= kind_id < len(PARSED_INSTRUCTION_KINDS):
+                raise BackendUnavailable(
+                    f"corrupt parsed-instruction kind id {kind_id}"
+                )
+            kind = PARSED_INSTRUCTION_KINDS[kind_id]
+            data = instructions.instruction_data(instruction_index)
+            used.extend(_instruction_used_values_from_parts(kind, data))
+            instruction_index += 1
+        used.extend(_parsed_block_terminator_used_values(func, block_id, block))
     return used
 
 
 def value_has_uses(func: ParsedFunction, value_name: str) -> bool:
+    if func.indexed_kernel is not None:
+        value_id = func.indexed_kernel.value_id(value_name)
+        return value_id >= 0 and func.indexed_kernel.value_is_used(value_id)
     if value_name in collect_used_values(func):
         return True
-    for block in func.blocks:
+    for block_id, block in enumerate(func.blocks):
         for phi in block.phis:
             for incoming in phi.incoming:
                 if incoming.value == value_name:
@@ -424,6 +712,10 @@ def value_has_uses(func: ParsedFunction, value_name: str) -> bool:
         for instr in block.instructions:
             if value_name in instruction_used_values(instr):
                 return True
-        if value_name in terminator_used_values(block.terminator):
+        if value_name in _parsed_block_terminator_used_values(
+            func,
+            block_id,
+            block,
+        ):
             return True
     return False

@@ -363,9 +363,14 @@ class StmtMiscLoweringMixin:
                 return boxed
         return value
 
-    def _is_walrus_sentinel(self, expr: Call) -> bool:
+    def _is_walrus_sentinel(self, expr) -> bool:
+        # Total over expressions on purpose.  Half the call sites guarded with
+        # isinstance(..., Call) first and half did not, so a Subscript reached
+        # the .func read and crashed the frontend.  One predicate that answers
+        # for any node beats four call-site guards a new caller can forget.
         return (
-            isinstance(expr.func, Name)
+            isinstance(expr, Call)
+            and isinstance(expr.func, Name)
             and expr.func.ident in ("_walrus", "__walrus__")
             and len(expr.args) == 2
         )

@@ -10,13 +10,13 @@ import sys
 from time import perf_counter
 
 import pcc
-from pcc.extern import c_int64, c_ptr, c_void, extern
+from pcc.extern import c_int64, c_ptr, c_void, extern, c_obj
 
 
 scalar_dot = extern(
     "py_i64_buffer_dot_scalar",
     (c_ptr, c_ptr, c_int64),
-    c_ptr,
+    c_obj,
 )
 release = extern("py_decref", (c_ptr,), c_void)
 

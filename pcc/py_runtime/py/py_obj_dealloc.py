@@ -4,6 +4,9 @@ Type-specific object deallocators. The refcount dispatch in py_obj.py
 still calls these symbols by name; the pcc-Python runtime archive
 replaces the C object with this module while preserving the ABI.
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.extern import extern, c_abi_export, c_int32, c_int64, c_ptr, c_void
 from pcc.py_runtime.py.py_abi_constants import (
     DICTENTRY_KEY_OFFSET,
@@ -330,6 +333,50 @@ def py_cpy_handle_get(o):
     if load_i32(o, PYOBJECTHEADER_TYPE_TAG_OFFSET) != PY_TYPE_CPY_HANDLE:
         return null()
     return load_ptr(o, 16)
+
+
+@c_abi_export("pcc_cpy_handle_move_owned_ref")
+def pcc_cpy_handle_move_owned_ref(from_obj, to_obj) -> None:
+    valid: bool = False
+    if (
+        not ptr_is_null(from_obj)
+        and not ptr_is_null(to_obj)
+        and not ptr_eq(from_obj, to_obj)
+        and not is_tagged_int(from_obj)
+        and not is_tagged_int(to_obj)
+    ):
+        valid = (
+            load_i32(from_obj, PYOBJECTHEADER_TYPE_TAG_OFFSET)
+            == PY_TYPE_CPY_HANDLE
+            and load_i32(to_obj, PYOBJECTHEADER_TYPE_TAG_OFFSET)
+            == PY_TYPE_CPY_HANDLE
+        )
+    if not valid:
+        _cpy_handle_tripwire(
+            cstr("pcc_cpy_handle_move_owned_ref: invalid native-handle move"),
+            258,
+        )
+        return
+    owned = load_ptr(from_obj, 16)
+    if ptr_is_null(owned):
+        _cpy_handle_tripwire(
+            cstr(
+                "pcc_cpy_handle_move_owned_ref: source has no owned foreign reference"
+            ),
+            268,
+        )
+        return
+    destination = load_ptr(to_obj, 16)
+    if not ptr_is_null(destination) and not ptr_eq(destination, owned):
+        _cpy_handle_tripwire(
+            cstr(
+                "pcc_cpy_handle_move_owned_ref: destination owns a different foreign reference"
+            ),
+            277,
+        )
+        return
+    store_ptr(from_obj, 16, null())
+    store_ptr(to_obj, 16, owned)
 
 
 @c_abi_export("py_dealloc_cpy_handle")

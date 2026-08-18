@@ -117,7 +117,7 @@ static PyObject *dispatch_call_method_with_args(
         py_decref(a2);
         return out;
     }
-    py_raise(py_exc_new(PY_EXC_TYPEERROR, "too many native method args"));
+    py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "too many native method args"));
     return NULL;
 }
 
@@ -163,7 +163,7 @@ int64_t py_obj_type_tag(PyObject *o) {
 
 PyObject *py_obj_add(PyObject *a, PyObject *b) {
     if (a == NULL || b == NULL) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "unsupported operand type(s) for +"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "unsupported operand type(s) for +"));
         return NULL;
     }
     int32_t at = py_type_of(a);
@@ -208,7 +208,7 @@ PyObject *py_obj_add(PyObject *a, PyObject *b) {
             a, b, "__add__", "__radd__",
             "unsupported operand type(s) for +");
     }
-    py_raise(py_exc_new(PY_EXC_TYPEERROR, "unsupported operand type(s) for +"));
+    py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "unsupported operand type(s) for +"));
     return NULL;
 }
 
@@ -216,7 +216,7 @@ PyObject *py_obj_sub(PyObject *a, PyObject *b) {
     /* Generic a - b (mirrors py_obj_add). int/bool -> py_int_sub; any float ->
      * py_float_sub. Subtraction is numeric-only in Python. */
     if (a == NULL || b == NULL) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "unsupported operand type(s) for -"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "unsupported operand type(s) for -"));
         return NULL;
     }
     int32_t at = py_type_of(a);
@@ -238,7 +238,7 @@ PyObject *py_obj_sub(PyObject *a, PyObject *b) {
             a, b, "__sub__", "__rsub__",
             "unsupported operand type(s) for -");
     }
-    py_raise(py_exc_new(PY_EXC_TYPEERROR, "unsupported operand type(s) for -"));
+    py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "unsupported operand type(s) for -"));
     return NULL;
 }
 
@@ -246,7 +246,7 @@ PyObject *py_obj_mul(PyObject *a, PyObject *b) {
     /* Generic a * b (mirrors py_obj_add). int/bool -> py_int_mul; any-float
      * numeric -> py_float_mul; sequence * int -> repetition. */
     if (a == NULL || b == NULL) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "unsupported operand type(s) for *"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "unsupported operand type(s) for *"));
         return NULL;
     }
     int32_t at = py_type_of(a);
@@ -286,13 +286,136 @@ PyObject *py_obj_mul(PyObject *a, PyObject *b) {
             a, b, "__mul__", "__rmul__",
             "unsupported operand type(s) for *");
     }
-    py_raise(py_exc_new(PY_EXC_TYPEERROR, "unsupported operand type(s) for *"));
+    py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "unsupported operand type(s) for *"));
     return NULL;
+}
+
+static PyObject *py_obj_bitwise_dispatch(
+    PyObject *a,
+    PyObject *b,
+    int64_t op
+) {
+    const char *name = op == 0 ? "__and__" : (op == 1 ? "__or__" : "__xor__");
+    const char *rname = op == 0 ? "__rand__" : (op == 1 ? "__ror__" : "__rxor__");
+    const char *message = op == 0
+        ? "unsupported operand type(s) for &"
+        : (op == 1
+            ? "unsupported operand type(s) for |"
+            : "unsupported operand type(s) for ^");
+    if (a == NULL || b == NULL) {
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, message));
+        return NULL;
+    }
+    int32_t at = py_type_of(a);
+    int32_t bt = py_type_of(b);
+    if (pcc_capi_is_cext_type_tag(at) || pcc_capi_is_cext_type_tag(bt)) {
+        int64_t cext_op = op == 0 ? 8 : (op == 1 ? 10 : 9);
+        return pcc_capi_cext_binary_number(a, b, cext_op);
+    }
+    if (
+        (at == PY_TYPE_INT || at == PY_TYPE_BOOL)
+        && (bt == PY_TYPE_INT || bt == PY_TYPE_BOOL)
+    ) {
+        if (op == 0) return py_int_and(a, b);
+        if (op == 1) return py_int_or(a, b);
+        return py_int_xor(a, b);
+    }
+    if (at == PY_TYPE_SET && bt == PY_TYPE_SET) {
+        if (op == 0) return py_set_intersection(a, b);
+        if (op == 2) return py_set_symmetric_difference(a, b);
+        PyObject *out = py_set_new();
+        if (out == NULL) return NULL;
+        py_set_update(out, a);
+        if (py_err_occurred()) {
+            py_decref(out);
+            return NULL;
+        }
+        py_set_update(out, b);
+        if (py_err_occurred()) {
+            py_decref(out);
+            return NULL;
+        }
+        return out;
+    }
+    if (op == 1 && at == PY_TYPE_DICT && bt == PY_TYPE_DICT) {
+        PyObject *out = py_dict_new();
+        if (out == NULL) return NULL;
+        py_dict_update(out, a);
+        if (py_err_occurred()) {
+            py_decref(out);
+            return NULL;
+        }
+        py_dict_update(out, b);
+        if (py_err_occurred()) {
+            py_decref(out);
+            return NULL;
+        }
+        return out;
+    }
+    if (at == PY_TYPE_INSTANCE || at >= PY_TYPE_USER_CLASS_START
+        || bt == PY_TYPE_INSTANCE || bt >= PY_TYPE_USER_CLASS_START) {
+        return py_user_binop_dispatch(a, b, name, rname, message);
+    }
+    py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, message));
+    return NULL;
+}
+
+PyObject *py_obj_and(PyObject *a, PyObject *b) {
+    return py_obj_bitwise_dispatch(a, b, 0);
+}
+
+PyObject *py_obj_or(PyObject *a, PyObject *b) {
+    return py_obj_bitwise_dispatch(a, b, 1);
+}
+
+PyObject *py_obj_xor(PyObject *a, PyObject *b) {
+    return py_obj_bitwise_dispatch(a, b, 2);
+}
+
+static PyObject *py_obj_shift_dispatch(
+    PyObject *a,
+    PyObject *b,
+    int64_t op
+) {
+    const char *name = op == 0 ? "__lshift__" : "__rshift__";
+    const char *rname = op == 0 ? "__rlshift__" : "__rrshift__";
+    const char *message = op == 0
+        ? "unsupported operand type(s) for <<"
+        : "unsupported operand type(s) for >>";
+    if (a == NULL || b == NULL) {
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, message));
+        return NULL;
+    }
+    int32_t at = py_type_of(a);
+    int32_t bt = py_type_of(b);
+    if (pcc_capi_is_cext_type_tag(at) || pcc_capi_is_cext_type_tag(bt)) {
+        return pcc_capi_cext_binary_number(a, b, op == 0 ? 6 : 7);
+    }
+    if (
+        (at == PY_TYPE_INT || at == PY_TYPE_BOOL)
+        && (bt == PY_TYPE_INT || bt == PY_TYPE_BOOL)
+    ) {
+        return op == 0 ? py_int_shl(a, b) : py_int_shr(a, b);
+    }
+    if (at == PY_TYPE_INSTANCE || at >= PY_TYPE_USER_CLASS_START
+        || bt == PY_TYPE_INSTANCE || bt >= PY_TYPE_USER_CLASS_START) {
+        return py_user_binop_dispatch(a, b, name, rname, message);
+    }
+    py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, message));
+    return NULL;
+}
+
+PyObject *py_obj_lshift(PyObject *a, PyObject *b) {
+    return py_obj_shift_dispatch(a, b, 0);
+}
+
+PyObject *py_obj_rshift(PyObject *a, PyObject *b) {
+    return py_obj_shift_dispatch(a, b, 1);
 }
 
 PyObject *py_obj_mod(PyObject *a, PyObject *b) {
     if (a == NULL || b == NULL) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "unsupported operand type(s) for %"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "unsupported operand type(s) for %"));
         return NULL;
     }
     int32_t at = py_type_of(a);
@@ -315,7 +438,7 @@ PyObject *py_obj_mod(PyObject *a, PyObject *b) {
             a, b, "__mod__", "__rmod__",
             "unsupported operand type(s) for %");
     }
-    py_raise(py_exc_new(PY_EXC_TYPEERROR, "unsupported operand type(s) for %"));
+    py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "unsupported operand type(s) for %"));
     return NULL;
 }
 
@@ -332,7 +455,7 @@ PyObject *py_obj_mod(PyObject *a, PyObject *b) {
  * classes that define it). */
 PyObject *py_obj_truediv(PyObject *a, PyObject *b) {
     if (a == NULL || b == NULL) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "unsupported operand type(s) for /"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "unsupported operand type(s) for /"));
         return NULL;
     }
     int32_t at = py_type_of(a);
@@ -342,7 +465,7 @@ PyObject *py_obj_truediv(PyObject *a, PyObject *b) {
     if (a_num && b_num) {
         double bd = py_float_to_f64(b);
         if (bd == 0.0) {
-            py_raise(py_exc_new(PY_EXC_ZERODIVISIONERROR, "division by zero"));
+            py_raise_owned(py_exc_new(PY_EXC_ZERODIVISIONERROR, "division by zero"));
             return NULL;
         }
         return py_float_from_f64(py_float_to_f64(a) / bd);
@@ -676,6 +799,67 @@ PyObject *py_obj_getitem_i64(PyObject *o, int64_t idx) {
             }
             return NULL;
     }
+}
+
+/* User-level ``o[k]`` and ``o[i]``.
+ *
+ * py_obj_getitem / py_obj_getitem_i64 keep their silent-NULL contract: tuple
+ * unpacking, argument splatting and the C-API shims rely on NULL-without-error
+ * for an absent key or index.  A frontend subscript expression must raise what
+ * CPython raises instead, so ``try`` sees KeyError/IndexError/TypeError and an
+ * uncaught failure carries a traceback rather than a NULL that later trips
+ * "unsupported operand type(s)".  Mirrored by py_obj_ops_dispatch.py. */
+static void py_obj_subscript_raise_missing(PyObject *o, PyObject *key) {
+    int32_t tag = py_type_of(o);
+    if (tag == PY_TYPE_DICT) {
+        py_raise_owned(py_exc_new_with_value(PY_EXC_KEYERROR, key));
+        return;
+    }
+    if (tag == PY_TYPE_LIST) {
+        py_raise_owned(py_exc_new(PY_EXC_INDEXERROR, "list index out of range"));
+        return;
+    }
+    if (tag == PY_TYPE_TUPLE) {
+        py_raise_owned(py_exc_new(PY_EXC_INDEXERROR, "tuple index out of range"));
+        return;
+    }
+    if (tag == PY_TYPE_STR) {
+        py_raise_owned(py_exc_new(PY_EXC_INDEXERROR, "string index out of range"));
+        return;
+    }
+    if (tag == PY_TYPE_BYTES || tag == PY_TYPE_BYTEARRAY || tag == PY_TYPE_MEMORYVIEW) {
+        py_raise_owned(py_exc_new(PY_EXC_INDEXERROR, "index out of range"));
+        return;
+    }
+    PyObject *name = py_obj_type_name(o);
+    PyObject *quote = py_str_new("'", 1);
+    PyObject *head = py_str_concat(quote, name);
+    PyObject *tail = py_str_new("' object is not subscriptable", 29);
+    PyObject *message = py_str_concat(head, tail);
+    py_decref(quote);
+    py_decref(name);
+    py_decref(head);
+    py_decref(tail);
+    py_raise_owned(py_exc_new_with_value(PY_EXC_TYPEERROR, message));
+    py_decref(message);
+}
+
+PyObject *py_obj_subscript(PyObject *o, PyObject *k) {
+    PyObject *out = py_obj_getitem(o, k);
+    if (out != NULL || o == NULL || k == NULL) return out;
+    if (py_err_occurred()) return NULL;
+    py_obj_subscript_raise_missing(o, k);
+    return NULL;
+}
+
+PyObject *py_obj_subscript_i64(PyObject *o, int64_t idx) {
+    PyObject *out = py_obj_getitem_i64(o, idx);
+    if (out != NULL || o == NULL) return out;
+    if (py_err_occurred()) return NULL;
+    PyObject *key = py_int_from_i64(idx);
+    py_obj_subscript_raise_missing(o, key);
+    py_decref(key);
+    return NULL;
 }
 
 PyObject *py_obj_slice(PyObject *o, PyObject *lo, PyObject *hi, PyObject *step) {
@@ -1234,6 +1418,45 @@ PyObject *py_obj_getattr(PyObject *o, const char *name) {
     return py_obj_missing_attr(name);
 }
 
+/* No-raise attribute probe for ``hasattr`` and 3-arg ``getattr``: identical
+ * probe order to py_obj_getattr, but a plain not-found terminal returns NULL
+ * WITHOUT constructing the AttributeError those callers immediately clear.
+ * User __getattr__ still runs and its real exceptions still surface (NULL
+ * with the error set).  Tags outside the fast terminals fall back to the
+ * raising py_obj_getattr, whose exception the callers clear exactly as
+ * before.  Motivation: one full exception lifecycle per miss measured at the
+ * top of pcc1 worker profiles (docs/investigations/
+ * pcc1-worker-object-protocol-tax.md, candidate 1). */
+PyObject *py_obj_getattr_maybe(PyObject *o, const char *name) {
+    if (!o || !name) return NULL;
+
+    if (strcmp(name, "__class__") == 0) {
+        return py_type_builtin(o);
+    }
+
+    if (PY_IS_TAGGED_INT(o)) return NULL;
+    int32_t tag = py_header(o)->type_tag;
+    pcc_runtime_log_event_code(7, 5, tag, 2, o);
+
+    PyObject *type_attr = pcc_capi_type_object_getattr(o, name);
+    if (type_attr != NULL || py_err_occurred()) return type_attr;
+
+    PyObject *builtin_attr = pcc_capi_builtin_object_getattr(o, name);
+    if (builtin_attr != NULL || py_err_occurred()) return builtin_attr;
+
+    if (pcc_capi_is_cext_type_tag((int64_t)tag) != 0) {
+        return pcc_capi_cext_object_getattr(o, name);
+    }
+
+    if (is_instance_tag_d(tag)) {
+        return py_instance_getattr((PyInstanceObject *)o, name);
+    }
+    if (tag == PY_TYPE_CLASS) {
+        return py_class_getattr((PyClassObject *)o, name);
+    }
+    return py_obj_getattr(o, name);
+}
+
 PyObject *py_obj_getattr_default(PyObject *o, const char *name) {
     if (!o || !name) return py_obj_missing_attr(name);
 
@@ -1610,24 +1833,24 @@ int64_t py_obj_isinstance(PyObject *o, PyObject *cls) {
 
 int64_t py_obj_issubclass(PyObject *derived, PyObject *cls) {
     if (!derived || PY_IS_TAGGED_INT(derived)) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR,
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR,
                             "issubclass() arg 1 must be a class"));
         return -1;
     }
     int64_t derived_is_capi_type = pcc_capi_is_type_object_value(derived);
     if (!derived_is_capi_type && py_header(derived)->type_tag != PY_TYPE_CLASS) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR,
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR,
                             "issubclass() arg 1 must be a class"));
         return -1;
     }
     if (!cls || PY_IS_TAGGED_INT(cls)) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR,
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR,
                             "issubclass() arg 2 must be a class"));
         return -1;
     }
     int64_t cls_is_capi_type = pcc_capi_is_type_object_value(cls);
     if (!cls_is_capi_type && py_header(cls)->type_tag != PY_TYPE_CLASS) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR,
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR,
                             "issubclass() arg 2 must be a class"));
         return -1;
     }

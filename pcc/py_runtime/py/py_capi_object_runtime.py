@@ -23,6 +23,9 @@ Private exception codes remain owned by this C-API contract:
   PY_EXC_TYPEERROR=3 KEYERROR=4 VALUEERROR=2 OSError=14
   Py_LT=0 LE=1 EQ=2 NE=3 GT=4 GE=5
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_BYTEARRAY,
     PY_TYPE_BYTES,
@@ -58,6 +61,8 @@ from pcc.unsafe import (
 py_incref = extern("py_incref", (c_ptr,), c_void)
 py_decref = extern("py_decref", (c_ptr,), c_void)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 py_clear_exception = extern("py_clear_exception", (), c_void)
 py_err_occurred = extern("py_err_occurred", (), c_int64)
@@ -88,7 +93,7 @@ PyObject_Free = extern("PyObject_Free", (c_ptr,), c_void)
 
 
 def _type_error(message) -> None:
-    py_raise(py_exc_new(3, message))  # PY_EXC_TYPEERROR
+    py_raise_owned(py_exc_new(3, message))  # PY_EXC_TYPEERROR
 
 
 @c_abi_typed_export("PyObject_Type", "ptr", ("ptr",))
@@ -147,7 +152,7 @@ def PyObject_Bytes(obj):
 def PyObject_Format(obj, format_spec):
     out = py_obj_format(obj, format_spec)
     if ptr_is_null(out) and py_err_occurred() == 0:
-        py_raise(py_exc_new(2, cstr("object cannot be formatted")))  # ValueError
+        py_raise_owned(py_exc_new(2, cstr("object cannot be formatted")))  # ValueError
     return out
 
 
@@ -182,7 +187,7 @@ def PyObject_GetItem(obj, key):
         return null()
     out = py_obj_getitem(obj, key)
     if ptr_is_null(out) and py_err_occurred() == 0:
-        py_raise(py_exc_new(4, cstr("item not found")))  # PY_EXC_KEYERROR
+        py_raise_owned(py_exc_new(4, cstr("item not found")))  # PY_EXC_KEYERROR
     return out
 
 
@@ -240,11 +245,17 @@ def PyObject_RichCompareBool(left, right, opid: int) -> int:
             return 1
         return 0
     if opid == 2:  # Py_EQ
-        if py_obj_eq(left, right) != 0:
+        eq_result: int = py_obj_eq(left, right)
+        if py_err_occurred() != 0:
+            return -1
+        if eq_result != 0:
             return 1
         return 0
     if opid == 3:  # Py_NE
-        if py_obj_eq(left, right) != 0:
+        ne_result: int = py_obj_eq(left, right)
+        if py_err_occurred() != 0:
+            return -1
+        if ne_result != 0:
             return 0
         return 1
     if opid == 4:  # Py_GT
@@ -255,7 +266,7 @@ def PyObject_RichCompareBool(left, right, opid: int) -> int:
         if py_obj_ge(left, right) != 0:
             return 1
         return 0
-    py_raise(py_exc_new(2, cstr("invalid rich-compare operation")))  # ValueError
+    py_raise_owned(py_exc_new(2, cstr("invalid rich-compare operation")))  # ValueError
     return -1
 
 
@@ -335,7 +346,7 @@ def _len_hint_value(obj, out_ptr) -> int:
 @c_abi_typed_export("PyObject_LengthHint", "i64", ("ptr", "i64"))
 def PyObject_LengthHint(obj, default_value: int) -> int:
     if default_value < 0:
-        py_raise(py_exc_new(2, cstr("default length hint must be non-negative")))
+        py_raise_owned(py_exc_new(2, cstr("default length hint must be non-negative")))
         return -1
     n_slot = stack_alloc(8)
     store_i64(n_slot, 0, 0)
@@ -343,6 +354,6 @@ def PyObject_LengthHint(obj, default_value: int) -> int:
         return default_value
     n: int = load_i64(n_slot, 0)
     if n < 0:
-        py_raise(py_exc_new(2, cstr("negative length hint")))
+        py_raise_owned(py_exc_new(2, cstr("negative length hint")))
         return -1
     return n

@@ -55,6 +55,8 @@ follow-up optimization, not a correctness requirement — see the module tests.
 
 import os
 
+from .self_backend_aarch64_darwin_mem import emitted_fixed_instruction_line
+
 _ENV_TOGGLE = "PCC_SELF_BRANCH_PROTECTION"
 _DISABLE_VALUES = {"0", "off", "false", "no", "none", "disable", "disabled"}
 
@@ -78,7 +80,7 @@ def prologue_sign_return_address(func) -> list[str]:
     ``func`` is accepted for future leaf-detection refinement; the current
     conservative slice signs every function.
     """
-    return ["  paciasp"]
+    return [emitted_fixed_instruction_line("paciasp")]
 
 
 def epilogue_authenticate_and_return(func) -> list[str]:
@@ -89,7 +91,10 @@ def epilogue_authenticate_and_return(func) -> list[str]:
     do not accept the combined return-and-authenticate mnemonic; the security
     guarantee is identical.
     """
-    return ["  autiasp", "  ret"]
+    return [
+        emitted_fixed_instruction_line("autiasp"),
+        emitted_fixed_instruction_line("ret"),
+    ]
 
 
 __all__ = [

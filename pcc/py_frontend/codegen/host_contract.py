@@ -11,6 +11,7 @@ from __future__ import annotations
 
 PROBE_POLICY_STANDALONE = "standalone"
 PROBE_POLICY_CONTEXTUAL_MIXIN = "contextual-mixin"
+PROBE_POLICY_CLOSED_WORLD = "closed-world"
 
 L1_CODEGEN_HOST_CLASS = "pcc.py_frontend.codegen.layer1.L1CodeGen"
 L1_CODEGEN_HOST_ATTRS = (
@@ -28,6 +29,7 @@ L1_CODEGEN_HOST_ATTRS = (
     "_class_type_export_cache",
     "_closure_boxed_params",
     "_cpy_env_flags",
+    "_cpy_init_emitted_fns",
     "_cpy_module_env",
     "_cpy_module_flags",
     "_owned_cpy_values",
@@ -44,12 +46,26 @@ L1_CODEGEN_HOST_ATTRS = (
     "_current_entry_block",
     "_current_param_names",
     "_debug_release_checks",
+    "_di_compile_unit",
+    "_di_file",
+    "_di_scope",
+    "_di_subprograms",
+    "_direct_indexed_module",
     "_duplicate_module_function_names",
     "_emitting_finally",
     "_exact_int_env_flags",
+    "_boxed_int_module_global_names",
     "_planned_exact_int_local_names",
     "_entry_alloca_insert_before_function",
     "_entry_alloca_insert_index",
+    "_entry_inline_edge_anchor_function",
+    "_entry_inline_edge_anchor_record",
+    "_direct_frame_landings",
+    "_tb_index_lines",
+    "_tb_index_sources",
+    "_tb_index_by_file",
+    "_tb_lines_global",
+    "_tb_sources_global",
     "_except_binding_names",
     "_extern_bindings",
     "_extern_decls",
@@ -90,18 +106,25 @@ L1_CODEGEN_HOST_ATTRS = (
     "_inspect_signature_aliases",
     "_lambda_counter",
     "_lambda_lexical_shadow_names",
+    "_last_call_arg_owned_temp",
+    "_last_fresh_direct_native_ctor_value",
     "_literal_dict_expr_bindings",
     "_virtual_literal_dict_expr_bindings",
+    "_module_del_target_names",
     "_module_globals",
     "_module_global_init_flags",
     "_module_source_path",
     "_target_triple",
+    "_method_mro_cache",
     "_module_block_func_defs",
     "_module_block_funcdef_ids",
     "_module_has_c_abi_export",
     "_module_uses_raw_int_scaffold",
+    "_native_class_export_index",
+    "_native_class_export_index_source",
     "_native_builtin_module_aliases",
     "_native_builtin_value_aliases",
+    "_native_extension_star_module_env",
     "_native_file_env_flags",
     "_native_fileinput_env_flags",
     "_native_fileinput_values",
@@ -119,6 +142,7 @@ L1_CODEGEN_HOST_ATTRS = (
     "_native_re_compile_aliases",
     "_native_re_compile_local_aliases",
     "_native_re_static_flag_aliases",
+    "_never_gc_object_values",
     "_owned_local_flag_allocas",
     "_owned_local_flag_slots",
     "_owned_local_has_value",
@@ -130,10 +154,12 @@ L1_CODEGEN_HOST_ATTRS = (
     "_printf",
     "_python_library",
     "_runtime_threads_enabled",
+    "_self_receiver_class_name_cache",
     "_sibling_module_inits",
     "_skip_program_main",
     "_source_file_lines_cache",
     "_freestanding_module",
+    "_runtime_port_module",
     "_suppress_borrowed_return_retain",
     "_suppress_implicit_gc_roots",
     "_codegen_current_expr_kind",
@@ -145,6 +171,7 @@ L1_CODEGEN_HOST_ATTRS = (
     "_codegen_trace_next",
     "_codegen_trace_ring",
     "_codegen_trace_capacity",
+    "_static_literal_init_fn",
     "_str_counter",
     "_str_obj_pool",
     "_str_pool",
@@ -235,9 +262,16 @@ L1_CODEGEN_HOST_METHODS = (
     "_emit_virtual_thread_dynamic_args_with_roots",
     "_emit_virtual_thread_rooted_args_tuple",
     "_emit_dynamic_call_kwargs_object",
+    "_binop_route_defers_pins",
+    "_emit_binop_value_routed",
     "_emit_dyn_tagged_int_object_binop",
     "_emit_empty_tuple",
     "_emit_entry_gc_frame_enter",
+    "_emit_post_call_error_cleanup",
+    "_direct_frame_landing",
+    "_finalize_traceback_index_tables",
+    "_traceback_index_for",
+    "_traceback_source_text",
     "_emit_exact_container_subscript_load_object",
     "_emit_exact_int_compare",
     "_emit_exact_int_operand_object",
@@ -258,6 +292,9 @@ L1_CODEGEN_HOST_METHODS = (
     "_emit_module_teardown",
     "_emit_module_teardown_call",
     "_emit_module_top_init",
+    "_emit_static_literal_init_call",
+    "_finalize_static_literal_init",
+    "_static_literal_init_function",
     "_emit_method_arg_as_pcc_object",
     "_emit_name",
     "_emit_native_builtin_callable_type_error",
@@ -410,6 +447,8 @@ L1_CODEGEN_HOST_METHODS = (
     "_native_builtin_module_for_name",
     "_native_builtin_value_for_name",
     "_native_re_call_returns_owned_object",
+    "_note_owned_object_value",
+    "_value_is_owned_object",
     "_note_owned_dynamic_call_value",
     "_value_is_owned_dynamic_call",
     "_native_re_compile_alias_for_name",
@@ -419,6 +458,7 @@ L1_CODEGEN_HOST_METHODS = (
     "_ordered_declare_extern_class_args",
     "_param_ir_and_bind_type",
     "_patch_fn_err_exit_gc_root_leave",
+    "_position_at_entry_hoist_point",
     "_prescan_function_module_globals",
     "_ptr_to_cstr",
     "_push_try_err_block",
@@ -511,6 +551,20 @@ def l1_codegen_lowering_host_contract():
 
 def per_module_probe_policy(module_name: str) -> str:
     """Return the semantic model for a per-module fallback probe."""
+    if module_name.startswith("pcc.backend.self_backend_") or module_name in (
+        "pcc.backend.arm64_asm_driver",
+        "pcc.backend.arm64_encode",
+        "pcc.backend.native_object",
+        "pcc.backend.macho_spec",
+    ):
+        # These Modules execute as one closed-world compiler and increasingly
+        # share typed kernel/value records across sibling files. A raw source
+        # probe has no sibling export schemas and therefore invents dynamic
+        # imports/calls that are absent from the production closure. They do
+        # not use the L1CodeGen mixin host model. The owned encoding/format
+        # siblings share those arena/relocation schemas across the same
+        # native closure, even though their filenames omit self_backend_.
+        return PROBE_POLICY_CLOSED_WORLD
     if module_name == "pcc.py_frontend.codegen.layer1":
         return PROBE_POLICY_CONTEXTUAL_MIXIN
     if module_name.startswith("pcc.py_frontend.codegen.native_"):
@@ -555,7 +609,7 @@ def contextual_host_for_module(module_name: str) -> str:
 def contextual_per_module_modules(module_names) -> list[str]:
     out = []
     for module_name in module_names:
-        if per_module_probe_policy(module_name) == PROBE_POLICY_CONTEXTUAL_MIXIN:
+        if per_module_probe_policy(module_name) != PROBE_POLICY_STANDALONE:
             out.append(module_name)
     return out
 
@@ -563,6 +617,7 @@ def contextual_per_module_modules(module_names) -> list[str]:
 __all__ = [
     "PROBE_POLICY_STANDALONE",
     "PROBE_POLICY_CONTEXTUAL_MIXIN",
+    "PROBE_POLICY_CLOSED_WORLD",
     "L1_CODEGEN_HOST_CLASS",
     "L1_CODEGEN_HOST_ATTRS",
     "L1_CODEGEN_HOST_METHODS",

@@ -4,6 +4,9 @@ The host-C oracle is ``src/py_format.c``.  This module deliberately builds
 text with pcc-owned buffers and the freestanding stdio numeric formatter; it
 does not replace the C helper with a call back into ``snprintf``.
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PYCLASSOBJECT_NAME_OFFSET,
     PY_TYPE_BOOL,
@@ -25,6 +28,7 @@ from pcc.unsafe import (
     call_i64_i64_ptr,
     cstr,
     define_global_ptr_null,
+    f64_bits,
     f64_signbit,
     free,
     global_load_ptr,
@@ -54,6 +58,8 @@ define_global_ptr_null("py_format_cpy_object_hook")
 py_incref = extern("py_incref", (c_ptr,), c_void)
 py_decref = extern("py_decref", (c_ptr,), c_void)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 py_runtime_error_if_unset = extern(
     "py_runtime_error_if_unset", (c_ptr, c_ptr), c_ptr
@@ -277,7 +283,7 @@ def py_float_value_of(value) -> float:
             parsed: float = strtod_c(text, end_slot)
             end = load_ptr(end_slot, 0)
             if ptr_eq(end, text) != 0:
-                py_raise(py_exc_new(2, cstr("could not convert string to float")))
+                py_raise_owned(py_exc_new(2, cstr("could not convert string to float")))
                 return 0.0
             while (
                 load_i8(end, 0) == 32
@@ -289,7 +295,7 @@ def py_float_value_of(value) -> float:
             ):
                 end = ptr_add(end, 1)
             if load_i8(end, 0) != 0:
-                py_raise(py_exc_new(2, cstr("could not convert string to float")))
+                py_raise_owned(py_exc_new(2, cstr("could not convert string to float")))
                 return 0.0
             return parsed
     return py_float_to_f64(value)
@@ -394,6 +400,140 @@ def _parse_decimal_exponent(text, start: int) -> int:
     return value * sign
 
 
+def _pow10_i64(exponent: int) -> int:
+    """A bounded power of ten used only for at most 17 repr digits."""
+    result: int = 1
+    while exponent > 0:
+        result = result * 10
+        exponent = exponent - 1
+    return result
+
+
+def _write_exact_digits(output, position: int, digits: int, count: int) -> int:
+    """Write exactly ``count`` decimal digits, including leading zeroes."""
+    end: int = position + count
+    cursor: int = end
+    while cursor > position:
+        cursor = cursor - 1
+        store_i8(output, cursor, 48 + (digits % 10))
+        digits = digits // 10
+    return end
+
+
+def _write_exact_exponent(output, position: int, exponent: int) -> int:
+    store_i8(output, position, 101)
+    position = position + 1
+    if exponent < 0:
+        store_i8(output, position, 45)
+        exponent = 0 - exponent
+    else:
+        store_i8(output, position, 43)
+    position = position + 1
+    if exponent >= 100:
+        return _write_exact_digits(output, position, exponent, 3)
+    return _write_exact_digits(output, position, exponent, 2)
+
+
+def _write_exact_scientific(
+    output,
+    negative: int,
+    digits: int,
+    significant: int,
+    exponent: int,
+) -> int:
+    position: int = 0
+    if negative != 0:
+        store_i8(output, position, 45)
+        position = position + 1
+    divisor: int = _pow10_i64(significant - 1)
+    store_i8(output, position, 48 + (digits // divisor))
+    position = position + 1
+    if significant > 1:
+        store_i8(output, position, 46)
+        position = position + 1
+        position = _write_exact_digits(
+            output,
+            position,
+            digits % divisor,
+            significant - 1,
+        )
+    position = _write_exact_exponent(output, position, exponent)
+    store_i8(output, position, 0)
+    return position
+
+
+def _write_exact_float_text(
+    output,
+    negative: int,
+    digits: int,
+    significant: int,
+    exponent: int,
+) -> int:
+    if exponent < -4 or exponent >= 16:
+        return _write_exact_scientific(
+            output,
+            negative,
+            digits,
+            significant,
+            exponent,
+        )
+
+    position: int = 0
+    if negative != 0:
+        store_i8(output, position, 45)
+        position = position + 1
+    integer_count: int = exponent + 1
+    if integer_count <= 0:
+        store_i8(output, position, 48)
+        store_i8(output, position + 1, 46)
+        position = position + 2
+        zeroes: int = 0 - integer_count
+        while zeroes > 0:
+            store_i8(output, position, 48)
+            position = position + 1
+            zeroes = zeroes - 1
+        position = _write_exact_digits(
+            output,
+            position,
+            digits,
+            significant,
+        )
+    elif significant <= integer_count:
+        position = _write_exact_digits(
+            output,
+            position,
+            digits,
+            significant,
+        )
+        zeroes = integer_count - significant
+        while zeroes > 0:
+            store_i8(output, position, 48)
+            position = position + 1
+            zeroes = zeroes - 1
+        store_i8(output, position, 46)
+        store_i8(output, position + 1, 48)
+        position = position + 2
+    else:
+        fractional_count: int = significant - integer_count
+        divisor = _pow10_i64(fractional_count)
+        position = _write_exact_digits(
+            output,
+            position,
+            digits // divisor,
+            integer_count,
+        )
+        store_i8(output, position, 46)
+        position = position + 1
+        position = _write_exact_digits(
+            output,
+            position,
+            digits % divisor,
+            fractional_count,
+        )
+    store_i8(output, position, 0)
+    return position
+
+
 @c_abi_export("py_float_repr_shortest")
 def py_float_repr_shortest(value_obj):
     value: float = py_float_to_f64(value_obj)
@@ -408,58 +548,100 @@ def py_float_repr_shortest(value_obj):
             return py_str_new(cstr("-0.0"), 4)
         return py_str_new(cstr("0.0"), 3)
 
-    probe = stack_alloc(96)
+    negative: int = 0
+    absolute: float = value
+    if value < 0.0:
+        negative = 1
+        absolute = 0.0 - value
+
+    # Recover the exact binary rational m * 2**exp2.  ``num`` and ``den``
+    # deliberately live in semantic Python-int projection: the denominator of
+    # the smallest subnormal is 1 << 1074 and cannot be represented by i64.
+    bits: int = f64_bits(absolute)
+    exponent_bits: int = (bits >> 52) & 2047
+    mantissa: int = bits & 4503599627370495
+    exp2: int = -1074
+    if exponent_bits != 0:
+        mantissa = mantissa + 4503599627370496
+        exp2 = exponent_bits - 1075
+    num: int = mantissa
+    den: int = 1
+    if exp2 >= 0:
+        num = mantissa << exp2
+    else:
+        shift_amount: int = 0 - exp2
+        den = 1 << shift_amount
+
+    # Exact floor(log10(value)) without floating-point normalisation.
+    exponent: int = 0
+    probe_num: int = num
+    probe_den: int = den
+    if probe_num >= probe_den:
+        while probe_num >= probe_den * 10:
+            probe_den = probe_den * 10
+            exponent = exponent + 1
+    else:
+        while probe_num < probe_den:
+            probe_num = probe_num * 10
+            exponent = exponent - 1
+
+    # Scale once for a one-significant-digit candidate.  Each failed
+    # round-trip adds one exact decimal digit by multiplying the numerator by
+    # ten.  Round-half-even matches conversion semantics; strtod is used only
+    # as the independent acceptance oracle, never to generate digits.
+    scaled_num: int = num
+    scaled_den: int = den
+    scale: int = 0 - exponent
+    while scale > 0:
+        scaled_num = scaled_num * 10
+        scale = scale - 1
+    while scale < 0:
+        scaled_den = scaled_den * 10
+        scale = scale + 1
+
+    candidate = stack_alloc(96)
     significant: int = 1
     found: int = 0
+    digits: int = 0
+    candidate_exponent: int = exponent
     while significant <= 17 and found == 0:
-        pcc_stdio_format_float_raw(
-            probe, value, 101, significant - 1, 0, 0, 0
+        quotient: int = scaled_num // scaled_den
+        remainder: int = scaled_num % scaled_den
+        twice: int = remainder * 2
+        if twice > scaled_den or (
+            twice == scaled_den and (quotient & 1) != 0
+        ):
+            quotient = quotient + 1
+        digits = quotient
+        candidate_exponent = exponent
+        digit_limit: int = _pow10_i64(significant)
+        if digits >= digit_limit:
+            digits = digits // 10
+            candidate_exponent = candidate_exponent + 1
+        _write_exact_scientific(
+            candidate,
+            negative,
+            digits,
+            significant,
+            candidate_exponent,
         )
-        parsed: float = strtod_c(probe, null())
+        parsed: float = strtod_c(candidate, null())
         if parsed == value:
             found = 1
         else:
+            scaled_num = scaled_num * 10
             significant = significant + 1
+
     if significant > 17:
         significant = 17
-        pcc_stdio_format_float_raw(probe, value, 101, 16, 0, 0, 0)
-    exponent_pos: int = _find_byte(probe, 101)
-    exponent: int = 0
-    if exponent_pos >= 0:
-        exponent = _parse_decimal_exponent(probe, exponent_pos + 1)
     output = stack_alloc(800)
-    if exponent >= -4 and exponent < 16:
-        decimals: int = significant - 1 - exponent
-        if decimals < 0:
-            decimals = 0
-        length: int = pcc_stdio_format_float_raw(
-            output, value, 102, decimals, 0, 0, 0
-        )
-        if _find_byte(output, 46) < 0:
-            store_i8(output, length, 46)
-            store_i8(output, length + 1, 48)
-            store_i8(output, length + 2, 0)
-            length = length + 2
-        return py_str_new(output, length)
-
-    length = pcc_stdio_format_float_raw(
-        output, value, 101, significant - 1, 0, 0, 0
+    length: int = _write_exact_float_text(
+        output,
+        negative,
+        digits,
+        significant,
+        candidate_exponent,
     )
-    exponent_pos = _find_byte(output, 101)
-    if exponent_pos > 0:
-        dot_pos: int = _find_byte(output, 46)
-        trim: int = exponent_pos - 1
-        while trim > dot_pos and load_i8(output, trim) == 48:
-            trim = trim - 1
-        if trim == dot_pos:
-            trim = trim - 1
-        keep: int = trim + 1
-        source: int = exponent_pos
-        while source <= length:
-            store_i8(output, keep, load_i8(output, source))
-            keep = keep + 1
-            source = source + 1
-        length = keep - 1
     return py_str_new(output, length)
 
 
@@ -936,7 +1118,7 @@ def py_obj_format(value, spec):
         result = _format_float_builtin(value, text)
     if ptr_is_null(result) == 0:
         return result
-    py_raise(py_exc_new(2, cstr("unsupported format specifier")))
+    py_raise_owned(py_exc_new(2, cstr("unsupported format specifier")))
     return null()
 
 
@@ -946,7 +1128,7 @@ def _percent_next_argument(arguments, state):
         store_i64(state, 8, 1)
         length: int = py_tuple_len(arguments)
         if index >= length:
-            py_raise(py_exc_new(3, cstr("not enough arguments for format string")))
+            py_raise_owned(py_exc_new(3, cstr("not enough arguments for format string")))
             return null()
         item = py_tuple_get(arguments, index)
         store_i64(state, 0, index + 1)
@@ -954,7 +1136,7 @@ def _percent_next_argument(arguments, state):
         return item
     store_i64(state, 8, 0)
     if index != 0:
-        py_raise(py_exc_new(3, cstr("not enough arguments for format string")))
+        py_raise_owned(py_exc_new(3, cstr("not enough arguments for format string")))
         return null()
     store_i64(state, 0, 1)
     store_i64(state, 16, 0)
@@ -1027,7 +1209,7 @@ def _percent_has_flag(data, start: int, conversion_pos: int, flag: int) -> int:
 def _append_percent_text(state, rendered, data, start: int, conversion_pos: int) -> int:
     if ptr_is_null(rendered) != 0 or _type_of(rendered) != PY_TYPE_STR:
         if py_err_occurred() == 0:
-            py_raise(py_exc_new(3, cstr("format argument cannot be converted to string")))
+            py_raise_owned(py_exc_new(3, cstr("format argument cannot be converted to string")))
         return -1
     text = py_str_utf8(rendered)
     length: int = py_str_byte_len(rendered)
@@ -1088,7 +1270,7 @@ def _i64_render(value: int, base: int, uppercase: int, alternate: int):
 def _append_percent_integer(state, argument, data, start: int, conversion_pos: int, conversion: int) -> int:
     tag: int = _type_of(argument)
     if tag != PY_TYPE_BOOL and tag != PY_TYPE_INT:
-        py_raise(py_exc_new(3, cstr("integer format requires a number")))
+        py_raise_owned(py_exc_new(3, cstr("integer format requires a number")))
         return -1
     integer: int = 0
     if tag == PY_TYPE_BOOL:
@@ -1215,7 +1397,7 @@ def _bytes_payload_length(value) -> int:
 
 def _mapping_argument(arguments, data, key_start: int, key_length: int, bytes_key: int):
     if _type_of(arguments) != PY_TYPE_DICT:
-        py_raise(py_exc_new(3, cstr("format requires a mapping")))
+        py_raise_owned(py_exc_new(3, cstr("format requires a mapping")))
         return null()
     key = null()
     if bytes_key != 0:
@@ -1227,14 +1409,14 @@ def _mapping_argument(arguments, data, key_start: int, key_length: int, bytes_ke
     value = py_dict_get(arguments, key)
     py_decref(key)
     if ptr_is_null(value) != 0:
-        py_raise(py_exc_new(4, cstr("format key not found")))
+        py_raise_owned(py_exc_new(4, cstr("format key not found")))
     return value
 
 
 def _format_percent(data, length: int, arguments, bytes_mode: int):
     output = _buffer_new(length + 64)
     if ptr_is_null(output) != 0:
-        py_raise(py_exc_new(7, cstr("out of memory")))
+        py_raise_owned(py_exc_new(7, cstr("out of memory")))
         return null()
     arg_state = stack_alloc(24)
     store_i64(arg_state, 0, 0)
@@ -1263,7 +1445,7 @@ def _format_percent(data, length: int, arguments, bytes_mode: int):
                 while key_end < length and load_i8(data, key_end) != 41:
                     key_end = key_end + 1
                 if key_end >= length:
-                    py_raise(py_exc_new(2, cstr("incomplete format key")))
+                    py_raise_owned(py_exc_new(2, cstr("incomplete format key")))
                     failed = 1
                 else:
                     argument = _mapping_argument(
@@ -1275,7 +1457,7 @@ def _format_percent(data, length: int, arguments, bytes_mode: int):
             if failed == 0:
                 conversion_pos = _scan_percent_conversion(data, scan_start, length)
                 if conversion_pos >= length:
-                    py_raise(py_exc_new(2, cstr("incomplete format")))
+                    py_raise_owned(py_exc_new(2, cstr("incomplete format")))
                     failed = 1
             if failed == 0 and ptr_is_null(argument) != 0:
                 argument = _percent_next_argument(arguments, arg_state)
@@ -1290,7 +1472,7 @@ def _format_percent(data, length: int, arguments, bytes_mode: int):
                         payload = _bytes_payload(argument)
                         payload_length: int = _bytes_payload_length(argument)
                         if ptr_is_null(payload) != 0:
-                            py_raise(py_exc_new(3, cstr("%b requires a bytes-like object")))
+                            py_raise_owned(py_exc_new(3, cstr("%b requires a bytes-like object")))
                             failed = 1
                         else:
                             width: int = _percent_width(data, scan_start, conversion_pos)
@@ -1338,28 +1520,28 @@ def _format_percent(data, length: int, arguments, bytes_mode: int):
                     payload_length = _bytes_payload_length(argument)
                     if bytes_mode != 0 and ptr_is_null(payload) == 0:
                         if payload_length != 1:
-                            py_raise(py_exc_new(3, cstr("%c requires a single byte")))
+                            py_raise_owned(py_exc_new(3, cstr("%c requires a single byte")))
                             failed = 1
                         else:
                             _buffer_char(output, load_i8(payload, 0))
                     elif bytes_mode == 0 and _type_of(argument) == PY_TYPE_STR:
                         if py_str_byte_len(argument) != 1:
-                            py_raise(py_exc_new(3, cstr("%c requires int or char")))
+                            py_raise_owned(py_exc_new(3, cstr("%c requires int or char")))
                             failed = 1
                         else:
                             _buffer_char(output, load_i8(py_str_utf8(argument), 0))
                     elif _type_of(argument) == PY_TYPE_BOOL or _type_of(argument) == PY_TYPE_INT:
                         integer: int = py_int_value_i64(argument)
                         if bytes_mode != 0 and (integer < 0 or integer > 255):
-                            py_raise(py_exc_new(2, cstr("%c arg not in range(256)")))
+                            py_raise_owned(py_exc_new(2, cstr("%c arg not in range(256)")))
                             failed = 1
                         else:
                             _buffer_char(output, integer & 255)
                     else:
-                        py_raise(py_exc_new(3, cstr("%c requires int or char")))
+                        py_raise_owned(py_exc_new(3, cstr("%c requires int or char")))
                         failed = 1
                 else:
-                    py_raise(py_exc_new(2, cstr("unsupported format character")))
+                    py_raise_owned(py_exc_new(2, cstr("unsupported format character")))
                     failed = 1
                 position = conversion_pos + 1
             if owned != 0 and ptr_is_null(argument) == 0:
@@ -1369,7 +1551,7 @@ def _format_percent(data, length: int, arguments, bytes_mode: int):
     if failed == 0:
         if load_i64(arg_state, 8) != 0 and _type_of(arguments) == PY_TYPE_TUPLE:
             if load_i64(arg_state, 0) < py_tuple_len(arguments):
-                py_raise(py_exc_new(3, cstr("not all arguments converted during formatting")))
+                py_raise_owned(py_exc_new(3, cstr("not all arguments converted during formatting")))
                 failed = 1
     if failed == 0:
         if bytes_mode != 0:
@@ -1383,7 +1565,7 @@ def _format_percent(data, length: int, arguments, bytes_mode: int):
 @c_abi_export("py_str_mod")
 def py_str_mod(format_obj, arguments):
     if ptr_is_null(format_obj) != 0 or _type_of(format_obj) != PY_TYPE_STR:
-        py_raise(py_exc_new(3, cstr("left operand of % must be str")))
+        py_raise_owned(py_exc_new(3, cstr("left operand of % must be str")))
         return null()
     return _format_percent(
         py_str_utf8(format_obj), py_str_byte_len(format_obj), arguments, 0
@@ -1394,7 +1576,7 @@ def py_str_mod(format_obj, arguments):
 def py_bytes_mod(format_obj, arguments):
     format_tag: int = _type_of(format_obj)
     if format_tag != PY_TYPE_BYTES and format_tag != PY_TYPE_BYTEARRAY:
-        py_raise(py_exc_new(3, cstr("left operand of % must be bytes or bytearray")))
+        py_raise_owned(py_exc_new(3, cstr("left operand of % must be bytes or bytearray")))
         return null()
     result = _format_percent(
         ptr_add(format_obj, 24), load_i64(format_obj, 16), arguments, 1

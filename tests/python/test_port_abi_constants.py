@@ -88,8 +88,6 @@ PUBLIC_TYPE_TAG_VALUES = set(PUBLIC_TYPE_TAGS.values())
 # a new private numeric domain needs explicit review rather than silently
 # weakening the scanner.
 PRIVATE_TAG_DOMAINS: set[tuple[str, str]] = {
-    ("pcc_gui_style.py", "_mark_class_dependency"),
-    ("pcc_gui_style.py", "_retire_old_class_dependencies"),
     ("py_exc_table.py", "py_exc_builtin_class"),
 }
 
@@ -521,7 +519,6 @@ class _RawPublicTagVisitor(ast.NodeVisitor):
                 and (self.path.name, self.function)
                 not in {
                     ("freestanding_re_engine.py", "_compile"),
-                    ("pcc_gui_commands.py", "_clear_command"),
                 }
             ):
                 self._record(node.args[2], node.args[2].value)

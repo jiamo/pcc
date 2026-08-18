@@ -56,6 +56,27 @@ static PyObject *file_bytes_or_str(PyFileObject *f, const char *buf, int64_t n) 
     return py_str_new(buf, n);
 }
 
+static const char *file_bytes_payload(PyObject *obj, int64_t *n) {
+    *n = 0;
+    while (obj != NULL && !PY_IS_TAGGED_INT(obj)) {
+        int32_t tag = py_type_of(obj);
+        if (tag == PY_TYPE_BYTES) {
+            PyBytesObject *bytes = (PyBytesObject *)obj;
+            *n = bytes->byte_len;
+            return bytes->data;
+        }
+        if (tag == PY_TYPE_BYTEARRAY) {
+            PyByteArrayObject *bytes = (PyByteArrayObject *)obj;
+            *n = bytes->byte_len;
+            return bytes->data;
+        }
+        if (tag != PY_TYPE_MEMORYVIEW) return NULL;
+        PyMemoryViewObject *view = (PyMemoryViewObject *)obj;
+        obj = pcc_gc_load_ptr(obj, &view->base);
+    }
+    return NULL;
+}
+
 PyObject *py_file_open(PyObject *path, PyObject *mode) {
     PyObject *path_owned = NULL;
     PyObject *mode_owned = NULL;
@@ -175,6 +196,25 @@ PyObject *py_file_write(PyObject *file, PyObject *text) {
     if (file == NULL || py_type_of(file) != PY_TYPE_FILE) return NULL;
     PyFileObject *f = (PyFileObject *)file;
     if (f->closed || f->fp == NULL) return NULL;
+
+    if (f->binary) {
+        int64_t n = 0;
+        const char *data = file_bytes_payload(text, &n);
+        if (data == NULL) {
+            py_raise_owned(py_exc_new(
+                PY_EXC_TYPEERROR,
+                "a bytes-like object is required for binary write"
+            ));
+            return NULL;
+        }
+        size_t wrote = 0;
+        if (n > 0) {
+            PyObject *vt = py_file_pin_current_vthread("file.write");
+            wrote = fwrite(data, 1, (size_t)n, f->fp);
+            py_file_unpin_current_vthread(vt);
+        }
+        return py_int_from_i64((int64_t)wrote);
+    }
 
     PyObject *owned = NULL;
     PyObject *s = coerce_str(text, &owned);

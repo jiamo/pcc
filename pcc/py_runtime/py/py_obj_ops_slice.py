@@ -4,6 +4,9 @@ Keep ``py_obj_slice`` in its own archive member so generic getitem/len/truthy
 dispatch does not force list/tuple/str/bytes slicing helpers into ordinary
 executables.
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_BYTEARRAY,
     PY_TYPE_BYTES,

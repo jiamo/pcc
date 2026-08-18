@@ -9,6 +9,9 @@ Owned surface (stable C ABI names):
 
   PyFloat_FromString, PyLong_FromUnicodeObject
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_STR,
 )
@@ -28,6 +31,8 @@ from pcc.unsafe import (
 
 py_str_utf8 = extern("py_str_utf8", (c_ptr,), c_ptr)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 py_int_from_i64 = extern("py_int_from_i64", (c_int64,), c_ptr)
 py_float_from_f64 = extern("py_float_from_f64", (c_double,), c_ptr)
@@ -35,11 +40,11 @@ PyUnicode_AsUTF8 = extern("PyUnicode_AsUTF8", (c_ptr,), c_ptr)
 
 
 def _type_error(message) -> None:
-    py_raise(py_exc_new(3, message))  # PY_EXC_TYPEERROR
+    py_raise_owned(py_exc_new(3, message))  # PY_EXC_TYPEERROR
 
 
 def _value_error(message) -> None:
-    py_raise(py_exc_new(2, message))  # PY_EXC_VALUEERROR
+    py_raise_owned(py_exc_new(2, message))  # PY_EXC_VALUEERROR
 
 
 def _digit_value(c: int) -> int:

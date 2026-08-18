@@ -14,6 +14,9 @@ Public object type tags come from the generated ``py_abi_constants`` module.
 Private method flags remain owned by the C-function contract:
   METH_VARARGS = 0x0001
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_FUNC,
 )

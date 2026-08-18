@@ -12,6 +12,8 @@ the generated C-header-derived ``py_abi_constants`` module.  Numeric copies do
 not belong in this prose because the generator cannot update them.
 """
 
+__pcc_runtime_port__ = True
+
 from pcc.extern import extern, c_abi_export, c_int32, c_int64, c_ptr, c_void
 from pcc.py_runtime.py.py_abi_constants import (
     PYLISTOBJECT_ITEMS_OFFSET,
@@ -28,12 +30,29 @@ from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_COMPLEX,
     PY_TYPE_CONTINUATION,
     PY_TYPE_CPY_HANDLE,
+    PY_TYPE_EXC,
     PY_TYPE_FLOAT,
     PY_TYPE_FUNC,
+    PY_TYPE_GEN,
     PY_TYPE_INT,
+    PY_TYPE_ITER,
+    PY_TYPE_MEMORYVIEW,
+    PY_TYPE_STATICMETHOD,
+    PY_TYPE_TASK,
+    PY_TYPE_COROUTINE,
+    PY_TYPE_INSTANCE,
+    PY_TYPE_LIST,
+    PY_TYPE_CLASS,
+    PY_TYPE_CLASSMETHOD,
     PY_TYPE_NONE,
+    PY_TYPE_DICT,
+    PY_TYPE_SET,
+    PY_TYPE_PROPERTY,
     PY_TYPE_STR,
+    PY_TYPE_TUPLE,
+    PY_TYPE_WEAKREF,
     PY_TYPE_USER,
+    PY_TYPE_USER_CLASS_START,
     PY_TYPE_VIRTUAL_THREAD,
     PY_TYPE_VTHREAD_CHANNEL,
 )
@@ -54,6 +73,7 @@ from pcc.unsafe import (
     ptr_diff,
     ptr_eq,
     ptr_is_null,
+    stack_alloc,
     store_ptr,
     store_i32,
     store_i64,
@@ -84,6 +104,13 @@ py_dealloc_thread_thread = extern("py_dealloc_thread_thread", (c_ptr,), c_void)
 py_dealloc_virtual_thread = extern("py_dealloc_virtual_thread", (c_ptr,), c_void)
 py_class_dealloc = extern("py_class_dealloc", (c_ptr,), c_void)
 py_instance_dealloc = extern("py_instance_dealloc", (c_ptr,), c_void)
+# Dynamic C-extension type tags live above the builtin range; strict
+# incref/decref must accept registry-proven ones so their refcount
+# lifecycle and tp_dealloc dispatch match the C owner (which already
+# exempts them). The registry stays the single acceptance authority.
+pcc_capi_is_cext_type_tag = extern(
+    "pcc_capi_is_cext_type_tag", (c_int64,), c_int64
+)
 py_dealloc_exc = extern("py_dealloc_exc", (c_ptr,), c_void)
 pcc_dealloc_with_trash = extern(
     "pcc_dealloc_with_trash",
@@ -108,6 +135,7 @@ py_dict_new = extern("py_dict_new", (), c_ptr)
 py_str_new = extern("py_str_new", (c_ptr, c_int64), c_ptr)
 py_obj_call = extern("py_obj_call", (c_ptr, c_ptr, c_ptr), c_ptr)
 py_obj_eq = extern("py_obj_eq", (c_ptr, c_ptr), c_int64)
+py_err_occurred = extern("py_err_occurred", (), c_int64)
 py_clear_exception = extern("py_clear_exception", (), c_void)
 py_weakref_invalidate = extern("py_weakref_invalidate", (c_ptr,), c_void)
 pcc_gc_note_alloc = extern("pcc_gc_note_alloc", (c_int64,), c_void)
@@ -127,6 +155,9 @@ pcc_gc_pointer_register = extern(
     c_int64,
 )
 pcc_gc_try_minor_alloc = extern("pcc_gc_try_minor_alloc", (c_int64,), c_ptr)
+pcc_allocator_alloc_object = extern(
+    "pcc_allocator_alloc_object", (c_int64,), c_ptr
+)
 pcc_gc_backend4_try_zpage_alloc = extern(
     "pcc_gc_backend4_try_zpage_alloc",
     (c_int64, c_int32),
@@ -190,6 +221,7 @@ pcc_gc_backend4_slot_needs_resolve = extern(
 )
 pcc_gc_object_is_known = extern("pcc_gc_object_is_known", (c_ptr,), c_int64)
 pcc_gc_has_tracing_sweep = extern("pcc_gc_has_tracing_sweep", (), c_int64)
+pcc_gc_sweep_owed = extern("pcc_gc_sweep_owed", (), c_int64)
 pcc_gc_collect_tracing = extern("pcc_gc_collect_tracing", (), c_int64)
 pcc_gc_begin_explicit_tracing_collect = extern(
     "pcc_gc_begin_explicit_tracing_collect",
@@ -304,6 +336,30 @@ def pcc_gc_alloc(size: int, type_tag: int, flags: int):
     backend: int = _gc_backend_fast()
     obj = null()
     stored_flags: int = flags
+    if backend == 4:
+        if (
+            type_tag == PY_TYPE_LIST
+            or type_tag == PY_TYPE_TUPLE
+            or type_tag == PY_TYPE_DICT
+            or type_tag == PY_TYPE_SET
+            or type_tag == PY_TYPE_PROPERTY
+            or type_tag == PY_TYPE_CLASSMETHOD
+            or type_tag == PY_TYPE_WEAKREF
+            # Every remaining tag the colored-relocation accept predicate
+            # admits (GC-P1-BACKEND4-RELOCATABLE-TAGS-LACK-FRESH-ALLOC);
+            # mirrors py_obj.c exactly.  Constructors publish on success.
+            or type_tag == PY_TYPE_FUNC
+            or type_tag == PY_TYPE_ITER
+            or type_tag == PY_TYPE_GEN
+            or type_tag == PY_TYPE_COROUTINE
+            or type_tag == PY_TYPE_CONTINUATION
+            or type_tag == PY_TYPE_TASK
+            or type_tag == PY_TYPE_EXC
+            or type_tag == PY_TYPE_CLASS
+            or type_tag == PY_TYPE_STATICMETHOD
+            or type_tag == PY_TYPE_MEMORYVIEW
+        ):
+            stored_flags = stored_flags | 16384
     if backend == 3:
         obj = pcc_gc_try_minor_alloc(size)
     elif backend == 4:
@@ -316,8 +372,11 @@ def pcc_gc_alloc(size: int, type_tag: int, flags: int):
     if ptr_is_null(obj) != 0:
         # Mirror the C tier's calloc (py_obj.c): fresh objects are
         # GC-visible before their constructor fills the body; visitors
-        # must see NULL slots, not malloc garbage.
-        obj = malloc(size)
+        # must see NULL slots, not malloc garbage.  Objects draw from the
+        # allocator's OBJECT slab family (ARCH-P0 S1) so their granules are
+        # registered for exact structural provenance; raw allocations keep
+        # using plain malloc and never share these slabs.
+        obj = pcc_allocator_alloc_object(size)
         if ptr_is_null(obj) == 0:
             memset(obj, 0, size)
             if backend == 4:
@@ -338,6 +397,18 @@ def pcc_gc_alloc(size: int, type_tag: int, flags: int):
     if load_i32(global_addr("pcc_runtime_log_fast_state"), 0) != 0:
         pcc_runtime_log_event_code(1, 2, size, type_tag, obj)
     return obj
+
+
+@c_abi_export("pcc_gc_publish_initialized")
+def pcc_gc_publish_initialized(obj) -> None:
+    if ptr_is_null(obj) != 0 or is_tagged_int(obj) != 0:
+        return
+    if _gc_backend_fast() != 4:
+        return
+    pcc_py_gc_minor_graph_lock()
+    flags: int = load_i32(obj, PYOBJECTHEADER_FLAGS_OFFSET)
+    store_i32(obj, PYOBJECTHEADER_FLAGS_OFFSET, flags & ~16384)
+    pcc_py_gc_minor_graph_unlock()
 
 
 @c_abi_export("pcc_gc_retain")
@@ -456,6 +527,39 @@ def pcc_gc_resolve_owned_ptr(value):
     return value
 
 
+def _gc_incref_fresh_native_instance(o) -> None:
+    if ptr_is_null(o) != 0:
+        return
+    if is_tagged_int(o) != 0:
+        return
+    tag: int = load_i32(o, PYOBJECTHEADER_TYPE_TAG_OFFSET)
+    if tag != PY_TYPE_INSTANCE and (tag < PY_TYPE_USER_CLASS_START or tag > 500):
+        # Keep an accidental future caller safe; the optimized frontend lane
+        # proves this exact tag and therefore never takes the generic query.
+        py_incref(o)
+        return
+    backend: int = _gc_backend_fast()
+    flags: int = load_i32(o, PYOBJECTHEADER_FLAGS_OFFSET)
+    if (backend == 1 or backend == 2) and flags == 0:
+        return
+    if backend == 4 and _gc_forwarding_population() > 0 and (flags & 2048) != 0:
+        resolved = pcc_gc_note_relocation_read(o)
+        if ptr_is_null(resolved) == 0 and ptr_eq(resolved, o) == 0:
+            o = resolved
+            tag = load_i32(o, PYOBJECTHEADER_TYPE_TAG_OFFSET)
+            flags = load_i32(o, PYOBJECTHEADER_FLAGS_OFFSET)
+    if (flags & PY_FLAG_IMMORTAL) != 0:
+        return
+    if backend == 3 and (flags & 4096) != 0 and (flags & 256) != 0:
+        if load_i64(o, PYOBJECTHEADER_REFCOUNT_OFFSET) <= 0:
+            return
+    if load_i64(o, PYOBJECTHEADER_REFCOUNT_OFFSET) < 0:
+        return
+    new_rc: int = pcc_refcount_incref(o)
+    if load_i32(global_addr("pcc_runtime_log_fast_state"), 0) != 0:
+        pcc_runtime_log_event_code(3, 1, new_rc, tag, o)
+
+
 @c_abi_export("pcc_gc_store_ptr")
 def pcc_gc_store_ptr(owner, slot, value) -> None:
     if ptr_is_null(slot):
@@ -465,6 +569,27 @@ def pcc_gc_store_ptr(owner, slot, value) -> None:
         backend = pcc_gc_backend()
     else:
         backend = load_i32(global_addr("pcc_gc_backend_selected"), 0)
+    if backend == 0:
+        if load_i32(global_addr("pcc_runtime_log_fast_state"), 0) != 0:
+            pcc_runtime_log_event_code(2, 3, backend, 0, owner)
+        old = load_ptr(slot, 0)
+        py_incref(value)
+        store_ptr(slot, 0, value)
+        py_decref(old)
+        return
+    plan = stack_alloc(128)
+    pcc_gc_store_ptr_plan_init(plan, owner, backend)
+    pcc_py_gc_minor_graph_lock()
+    pcc_gc_store_ptr_plan_commit_locked(plan, owner, slot, value)
+    pcc_py_gc_minor_graph_unlock()
+    pcc_gc_store_ptr_plan_finish(plan)
+
+
+@c_abi_export("pcc_gc_store_ptr_fresh_native_instance")
+def pcc_gc_store_ptr_fresh_native_instance(owner, slot, value) -> None:
+    if ptr_is_null(slot):
+        return
+    backend: int = _gc_backend_fast()
     if backend == 1 or backend == 2 or backend == 3 or backend == 4:
         pcc_gc_note_store()
     if backend == 4:
@@ -478,9 +603,91 @@ def pcc_gc_store_ptr(owner, slot, value) -> None:
     if load_i32(global_addr("pcc_runtime_log_fast_state"), 0) != 0:
         pcc_runtime_log_event_code(2, 3, backend, 0, owner)
     old = load_ptr(slot, 0)
-    py_incref(value)
+    _gc_incref_fresh_native_instance(value)
     store_ptr(slot, 0, value)
     py_decref(old)
+
+
+@c_abi_export("pcc_gc_store_root_plan_init")
+def pcc_gc_store_root_plan_init(plan, backend: int) -> None:
+    if ptr_is_null(plan) != 0:
+        return
+    memset(plan, 0, 128)
+    store_i64(plan, 112, backend)
+    store_i32(plan, 120, 0)
+
+
+@c_abi_export("pcc_gc_store_ptr_plan_init")
+def pcc_gc_store_ptr_plan_init(plan, owner, backend: int) -> None:
+    pcc_gc_store_root_plan_init(plan, backend)
+    if load_i32(global_addr("pcc_runtime_log_fast_state"), 0) != 0:
+        pcc_runtime_log_event_code(2, 3, backend, 0, owner)
+
+
+def _pcc_gc_store_plan_commit_locked(plan, owner, slot, value) -> int:
+    if ptr_is_null(plan) != 0 or ptr_is_null(slot) != 0:
+        return 0
+    if load_i32(plan, 124) != 0:
+        return 0
+    store_i32(plan, 124, 1)
+    backend: int = load_i64(plan, 112)
+    if backend == 1 or backend == 2 or backend == 3 or backend == 4:
+        pcc_gc_note_store()
+    if backend == 3 or backend == 4:
+        if _gc_forwarding_population() > 0 and _gc_relocation_candidate(value) != 0:
+            value = pcc_gc_note_relocation_read(value)
+    _py_incref_prepare(value, plan)
+    if backend == 1 or backend == 2 or backend == 3 or backend == 4:
+        pcc_gc_note_slot_write_barrier(
+            owner, slot, load_ptr(plan, 0)
+        )
+    old = load_ptr(slot, 0)
+    store_ptr(slot, 0, load_ptr(plan, 0))
+    if ptr_is_null(old) == 0 and is_tagged_int(old) == 0:
+        if backend == 4 and pcc_gc_object_is_known_no_lock(old) == 0:
+            old = null()
+    _py_decref_prepare(old, ptr_add(plan, 56))
+    store_i32(plan, 124, 3)
+    return 1
+
+
+@c_abi_export("pcc_gc_store_root_plan_commit_locked")
+def pcc_gc_store_root_plan_commit_locked(plan, slot, value) -> int:
+    return _pcc_gc_store_plan_commit_locked(plan, null(), slot, value)
+
+
+@c_abi_export("pcc_gc_store_ptr_plan_commit_locked")
+def pcc_gc_store_ptr_plan_commit_locked(plan, owner, slot, value) -> int:
+    return _pcc_gc_store_plan_commit_locked(plan, owner, slot, value)
+
+
+def _pcc_gc_store_plan_finish(plan, emit_store_log: int) -> None:
+    if ptr_is_null(plan) != 0:
+        return
+    state: int = load_i32(plan, 124)
+    if (state & 1) == 0 or (state & 4) != 0:
+        return
+    store_i32(plan, 124, state | 4)
+    if (
+        emit_store_log != 0
+        and load_i32(global_addr("pcc_runtime_log_fast_state"), 0) != 0
+    ):
+        pcc_runtime_log_event_code(
+            2, 3, load_i64(plan, 112), 0, null()
+        )
+    _py_incref_finish(plan)
+    if (state & 2) != 0:
+        _py_decref_finish(ptr_add(plan, 56))
+
+
+@c_abi_export("pcc_gc_store_root_plan_finish")
+def pcc_gc_store_root_plan_finish(plan) -> None:
+    _pcc_gc_store_plan_finish(plan, 1)
+
+
+@c_abi_export("pcc_gc_store_ptr_plan_finish")
+def pcc_gc_store_ptr_plan_finish(plan) -> None:
+    _pcc_gc_store_plan_finish(plan, 0)
 
 
 @c_abi_export("pcc_gc_store_root")
@@ -492,32 +699,51 @@ def pcc_gc_store_root(slot, value) -> None:
         if load_i32(global_addr("pcc_runtime_log_fast_state"), 0) != 0:
             pcc_runtime_log_event_code(2, 3, backend, 0, null())
         old = load_ptr(slot, 0)
-        py_incref(value)
+        # Skip the refcount calls for values that cannot be refcounted.  A
+        # tagged immediate and NULL both make py_incref/py_decref return
+        # immediately, so the calls are pure overhead -- and codegen emits
+        # ~47000 store_root sites, with `pcc_gc_store_root` measuring 17.5% of a
+        # list-append loop against 5.6% for the append itself.  The slot store
+        # still happens either way; only the no-op refcount calls are elided.
+        if is_tagged_int(value) == 0 and ptr_is_null(value) == 0:
+            py_incref(value)
         store_ptr(slot, 0, value)
-        py_decref(old)
+        if is_tagged_int(old) == 0 and ptr_is_null(old) == 0:
+            py_decref(old)
         return
+    plan = stack_alloc(128)
+    pcc_gc_store_root_plan_init(plan, backend)
     pcc_py_gc_minor_graph_lock()
-    if ptr_is_null(slot) == 0:
-        if backend == 1 or backend == 2 or backend == 3 or backend == 4:
-            pcc_gc_note_store()
-        if backend == 4:
-            if _gc_forwarding_population() > 0 and _gc_relocation_candidate(value) != 0:
-                value = pcc_gc_note_relocation_read(value)
-        elif backend == 3:
-            if _gc_forwarding_population() > 0 and _gc_relocation_candidate(value) != 0:
-                value = pcc_gc_note_relocation_read(value)
-        if backend == 1 or backend == 2 or backend == 3 or backend == 4:
-            pcc_gc_note_slot_write_barrier(null(), slot, value)
+    pcc_gc_store_root_plan_commit_locked(plan, slot, value)
+    pcc_py_gc_minor_graph_unlock()
+    pcc_gc_store_root_plan_finish(plan)
+
+
+@c_abi_export("pcc_gc_store_root_take")
+def pcc_gc_store_root_take(slot, value) -> None:
+    # Ownership-transferring root store: the caller's reference to ``value``
+    # moves into ``slot`` (no retain), the previous slot owner is released.
+    # Replaces codegen's ``pin(v); store_root(slot, v); unpin(v); release(v)``
+    # on every exact-int assignment (four calls, two of them no-ops for
+    # tagged immediates).  Mirrors pcc_gc_store_root_take in py_obj.c.
+    if ptr_is_null(slot) != 0:
+        return
+    backend: int = _gc_backend_fast()
+    if backend == 0:
         if load_i32(global_addr("pcc_runtime_log_fast_state"), 0) != 0:
             pcc_runtime_log_event_code(2, 3, backend, 0, null())
         old = load_ptr(slot, 0)
-        py_incref(value)
         store_ptr(slot, 0, value)
-        if ptr_is_null(old) == 0 and is_tagged_int(old) == 0:
-            if backend == 4 and pcc_gc_object_is_known_no_lock(old) == 0:
-                old = null()
-        py_decref(old)
-    pcc_py_gc_minor_graph_unlock()
+        if is_tagged_int(old) == 0 and ptr_is_null(old) == 0:
+            py_decref(old)
+        return
+    # Moving/tracing backends: commit through the relocation-aware plan (which
+    # retains the stored value), then release the caller's reference through
+    # the slot so a relocated address is never touched.
+    pcc_gc_store_root(slot, value)
+    stored = pcc_gc_load_ptr(null(), slot)
+    if is_tagged_int(stored) == 0 and ptr_is_null(stored) == 0:
+        py_decref(stored)
 
 
 @c_abi_export("pcc_gc_frame_enter")
@@ -612,7 +838,10 @@ def py_gc_callbacks_remove(callback) -> None:
     i: int = 0
     while i < length:
         existing = pcc_gc_load_ptr(callbacks, ptr_add(items, i * 8))
-        if _pcc_gc_callback_eq(existing, callback) != 0:
+        equal: int = _pcc_gc_callback_eq(existing, callback)
+        if py_err_occurred() != 0:
+            return
+        if equal != 0:
             if i < length - 1:
                 src = ptr_add(items, (i + 1) * 8)
                 dst = ptr_add(items, i * 8)
@@ -701,12 +930,35 @@ def pcc_gc_collect(reason: int) -> int:
             pcc_thread_safepoint()
             stw = pcc_stop_the_world()
         pcc_gc_begin_explicit_tracing_collect()
-        while True:
-            stepped: int = pcc_gc_step(1024)
-            if stepped == 0:
-                break
-        if pcc_gc_has_tracing_sweep() != 0:
-            collected = collected + pcc_gc_collect_tracing()
+        # Sweep only when a mark cycle has actually finished.  The gate is
+        # pcc_gc_sweep_owed(), not pcc_gc_has_tracing_sweep(): the latter
+        # ignores mark_active, so candidates left over from a previous
+        # unfinished sweep read true mid-mark, and sweeping there frees live
+        # objects (measured).
+        #
+        # The round bound is a LIVENESS backstop only and is not load bearing
+        # for correctness: a step legitimately reports zero progress at a phase
+        # boundary (measured 1, 0, 6 on backend 1), so breaking on the first
+        # zero returns with work outstanding, while looping unbounded would spin
+        # if the collector never converges.  Sweeping stays gated either way.
+        idle_rounds: int = 0
+        draining: int = 1
+        while draining != 0:
+            if pcc_gc_sweep_owed() != 0:
+                swept: int = pcc_gc_collect_tracing()
+                collected = collected + swept
+                if swept == 0 and pcc_gc_sweep_owed() != 0:
+                    draining = 0
+                else:
+                    idle_rounds = 0
+            else:
+                stepped: int = pcc_gc_step(1024)
+                if stepped > 0:
+                    idle_rounds = 0
+                else:
+                    idle_rounds = idle_rounds + 1
+                    if idle_rounds >= 4:
+                        draining = 0
         pcc_gc_end_explicit_tracing_collect()
         pcc_resume_world()
     # Release callbacks run after the tracing world is resumed. The shared
@@ -759,8 +1011,18 @@ def pcc_gc_immortalize(o) -> None:
 _pcc_debug_bad_incref = extern("pcc_debug_bad_incref", (c_ptr, c_int32), c_void)
 
 
-@c_abi_export("py_incref")
-def py_incref(o) -> None:
+def _py_refcount_prepared_reset(prepared, o) -> None:
+    store_ptr(prepared, 0, o)
+    store_i64(prepared, 8, -1)
+    store_i64(prepared, 16, 0)
+    store_i64(prepared, 24, -1)
+    store_i64(prepared, 32, 0)
+    store_i64(prepared, 40, 0)
+    store_i64(prepared, 48, 0)
+
+
+def _py_incref_prepare(o, prepared) -> None:
+    _py_refcount_prepared_reset(prepared, o)
     if ptr_is_null(o) != 0:
         return
     if is_tagged_int(o) != 0:
@@ -776,13 +1038,17 @@ def py_incref(o) -> None:
     if (
         tag < PY_TYPE_NONE
         or (tag > PY_TYPE_CPY_HANDLE and tag < PY_TYPE_USER)
-        or tag > 500
+        or (tag > 500 and pcc_capi_is_cext_type_tag(tag) == 0)
     ):
         return
     flags: int = load_i32(o, PYOBJECTHEADER_FLAGS_OFFSET)
     if (backend == 1 or backend == 2) and flags == 0:
         return
-    if backend == 4 and _gc_forwarding_population() > 0 and (flags & 2048) != 0:
+    if (
+        backend == 4
+        and _gc_forwarding_population() > 0
+        and (flags & 2048) != 0
+    ):
         # Count-on-NEW model (gc4 remap design): after relocation the
         # outstanding refcount lives on the NEW copy; resolve first.
         resolved = pcc_gc_note_relocation_read(o)
@@ -790,6 +1056,10 @@ def py_incref(o) -> None:
             o = resolved
             tag = load_i32(o, PYOBJECTHEADER_TYPE_TAG_OFFSET)
             flags = load_i32(o, PYOBJECTHEADER_FLAGS_OFFSET)
+    store_ptr(prepared, 0, o)
+    store_i64(prepared, 8, tag)
+    store_i64(prepared, 16, flags)
+    store_i64(prepared, 24, backend)
     if (
         (
             tag == PY_TYPE_CONTINUATION
@@ -808,12 +1078,48 @@ def py_incref(o) -> None:
     if load_i64(o, PYOBJECTHEADER_REFCOUNT_OFFSET) < 0:
         return  # already freed (poisoned); stray reference, skip
     new_rc: int = pcc_refcount_incref(o)
+    store_i64(prepared, 32, new_rc)
+    store_i64(prepared, 40, 1)
+
+
+def _py_incref_finish(prepared) -> None:
+    if load_i64(prepared, 40) == 0:
+        return
     if load_i32(global_addr("pcc_runtime_log_fast_state"), 0) != 0:
-        pcc_runtime_log_event_code(3, 1, new_rc, tag, o)
+        pcc_runtime_log_event_code(
+            3,
+            1,
+            load_i64(prepared, 32),
+            load_i64(prepared, 8),
+            load_ptr(prepared, 0),
+        )
 
 
-@c_abi_export("py_decref")
-def py_decref(o) -> None:
+@c_abi_export("pcc_gc_retain_plan_prepare_locked")
+def pcc_gc_retain_plan_prepare_locked(plan, value):
+    if ptr_is_null(plan) != 0:
+        return null()
+    _py_incref_prepare(value, plan)
+    return load_ptr(plan, 0)
+
+
+@c_abi_export("pcc_gc_retain_plan_finish")
+def pcc_gc_retain_plan_finish(plan) -> None:
+    if ptr_is_null(plan) != 0:
+        return
+    _py_incref_finish(plan)
+    _py_refcount_prepared_reset(plan, null())
+
+
+@c_abi_export("py_incref")
+def py_incref(o) -> None:
+    prepared = stack_alloc(56)
+    _py_incref_prepare(o, prepared)
+    _py_incref_finish(prepared)
+
+
+def _py_decref_prepare(o, prepared) -> None:
+    _py_refcount_prepared_reset(prepared, o)
     if ptr_is_null(o) != 0:
         return
     if is_tagged_int(o) != 0:
@@ -829,13 +1135,17 @@ def py_decref(o) -> None:
     if (
         tag_dbg < PY_TYPE_NONE
         or (tag_dbg > PY_TYPE_CPY_HANDLE and tag_dbg < PY_TYPE_USER)
-        or tag_dbg > 500
+        or (tag_dbg > 500 and pcc_capi_is_cext_type_tag(tag_dbg) == 0)
     ):
         return
     flags: int = load_i32(o, PYOBJECTHEADER_FLAGS_OFFSET)
     if (backend == 1 or backend == 2) and flags == 0:
         return
-    if backend == 4 and _gc_forwarding_population() > 0 and (flags & 2048) != 0:
+    if (
+        backend == 4
+        and _gc_forwarding_population() > 0
+        and (flags & 2048) != 0
+    ):
         # Count-on-NEW model (gc4 remap design): resolve before
         # decrementing; old copies are immortal shells so an
         # unresolvable stray decref is a no-op below.
@@ -844,6 +1154,10 @@ def py_decref(o) -> None:
             o = resolved
             tag_dbg = load_i32(o, PYOBJECTHEADER_TYPE_TAG_OFFSET)
             flags = load_i32(o, PYOBJECTHEADER_FLAGS_OFFSET)
+    store_ptr(prepared, 0, o)
+    store_i64(prepared, 8, tag_dbg)
+    store_i64(prepared, 16, flags)
+    store_i64(prepared, 24, backend)
     if (
         (
             tag_dbg == PY_TYPE_CONTINUATION
@@ -865,17 +1179,35 @@ def py_decref(o) -> None:
         and pcc_gc_object_is_known(o) == 0
     ):
         return
-    # Guard against a stray second release of an already-freed object: the
-    # free path poisons the header (refcount = -1) but leaves the memory in
-    # place long enough for a stale pointer to reach this code.  A negative
-    # pre-decref refcount means the object is gone; skip instead of crashing.
+    # Match the C owner: never mutate a non-positive counter under a graph/root
+    # lock.  Capture the underflow token here and fail-stop from finish after
+    # the caller has released that lock.
     pre_rc: int = load_i64(o, PYOBJECTHEADER_REFCOUNT_OFFSET)
-    if pre_rc < 0:
+    if pre_rc <= 0:
+        store_i64(prepared, 48, 1)
         return
     new_rc: int = pcc_refcount_decref(o)
+    store_i64(prepared, 32, new_rc)
+    store_i64(prepared, 40, 1)
+    if new_rc == 0:
+        # Publish terminal ownership under the root/graph lock.  The
+        # potentially reentrant finalizer/deallocator tail runs in finish.
+        store_i32(o, PYOBJECTHEADER_FLAGS_OFFSET, flags | 524288)
+
+
+def _py_decref_finish(prepared) -> None:
+    if load_i64(prepared, 48) != 0:
+        _pcc_debug_bad_incref(load_ptr(prepared, 0), load_i64(prepared, 8))
+        return
+    if load_i64(prepared, 40) == 0:
+        return
+    o = load_ptr(prepared, 0)
+    tag_dbg: int = load_i64(prepared, 8)
+    flags: int = load_i64(prepared, 16)
+    backend: int = load_i64(prepared, 24)
+    new_rc: int = load_i64(prepared, 32)
     if new_rc < 0:
-        if load_i32(global_addr("pcc_runtime_log_fast_state"), 0) != 0:
-            _pcc_debug_bad_incref(o, tag_dbg)
+        _pcc_debug_bad_incref(o, tag_dbg)
         return
     if new_rc > 0:
         if load_i32(global_addr("pcc_runtime_log_fast_state"), 0) != 0:
@@ -884,10 +1216,9 @@ def py_decref(o) -> None:
     delay_zpage_freeing_note: int = 0
     if backend == 4 and (flags & 65536) != 0:
         delay_zpage_freeing_note = 1
-    # Dedicated deallocation state.  Do not infer it from refcount zero because
-    # backend-3 forwarding shells can legitimately carry a zero count.
-    flags = flags | 524288
-    store_i32(o, PYOBJECTHEADER_FLAGS_OFFSET, flags)
+    delay_instance_metadata: int = 0
+    if tag_dbg == PY_TYPE_INSTANCE or tag_dbg >= PY_TYPE_USER_CLASS_START:
+        delay_instance_metadata = 1
     if load_i32(global_addr("pcc_runtime_log_fast_state"), 0) != 0:
         pcc_runtime_log_event_code(3, 2, new_rc, tag_dbg, o)
     pcc_refcount_forget(o)
@@ -895,13 +1226,21 @@ def py_decref(o) -> None:
         pcc_runtime_log_event_code(3, 3, 0, tag_dbg, o)
 
     py_weakref_invalidate(o)
-    if delay_zpage_freeing_note == 0:
+    if delay_zpage_freeing_note == 0 and delay_instance_metadata == 0:
         pcc_gc_note_object_freeing(o)
-    py_gc_untrack(o)
-    tag: int = load_i32(o, PYOBJECTHEADER_TYPE_TAG_OFFSET)
-    pcc_dealloc_with_trash(o, tag)
+    if delay_instance_metadata == 0:
+        py_gc_untrack(o)
+    pcc_dealloc_with_trash(o, tag_dbg)
     if (
         delay_zpage_freeing_note != 0
+        and delay_instance_metadata == 0
         and pcc_gc_pointer_is_managed(o) != 0
     ):
         pcc_gc_note_object_freeing(o)
+
+
+@c_abi_export("py_decref")
+def py_decref(o) -> None:
+    prepared = stack_alloc(56)
+    _py_decref_prepare(o, prepared)
+    _py_decref_finish(prepared)

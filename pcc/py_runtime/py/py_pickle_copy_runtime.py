@@ -4,6 +4,9 @@ This preserves the intentionally narrow ABI of ``src/py_pickle_copy.c``.
 The pickle payload is a process-local registry token, not CPython pickle wire
 compatibility.  The C source remains a host-C oracle.
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     C_POINTER_SIZE,
     PYCLASSOBJECT_N_FIELDS_OFFSET,
@@ -64,6 +67,8 @@ py_decref = extern("py_decref", (c_ptr,), c_void)
 py_err_occurred = extern("py_err_occurred", (), c_int64)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_runtime_error_if_unset = extern(
     "py_runtime_error_if_unset", (c_ptr, c_ptr), c_ptr
 )
@@ -267,7 +272,7 @@ def _call_method_with_args(method, self_obj, args):
     py_decref(a0)
     py_decref(a1)
     py_decref(a2)
-    py_raise(py_exc_new(3, cstr("too many native method args")))
+    py_raise_owned(py_exc_new(3, cstr("too many native method args")))
     return null()
 
 
@@ -672,7 +677,7 @@ def _pickle_clone_from_reduce(obj):
         return null()
     if _is_heap_obj(reduced) == 0 or _type_of(reduced) != PY_TYPE_TUPLE or py_tuple_len(reduced) < 2:
         py_decref(reduced)
-        py_raise(py_exc_new(3, cstr("invalid __reduce__ result")))
+        py_raise_owned(py_exc_new(3, cstr("invalid __reduce__ result")))
         return null()
     callable_obj = py_tuple_get(reduced, 0)
     args = py_tuple_get(reduced, 1)
@@ -682,7 +687,7 @@ def _pickle_clone_from_reduce(obj):
         if ptr_is_null(args) == 0:
             py_decref(args)
         py_decref(reduced)
-        py_raise(py_exc_new(3, cstr("invalid __reduce__ args")))
+        py_raise_owned(py_exc_new(3, cstr("invalid __reduce__ args")))
         return null()
     out = _pickle_call_class(callable_obj, args)
     py_decref(callable_obj)
@@ -749,7 +754,7 @@ def py_pickle_dumps(obj, protocol):
     identifier: int = _pickle_store_payload(payload)
     py_decref(payload)
     if identifier == 0:
-        py_raise(py_exc_new(7, cstr("pickle registry allocation failed")))
+        py_raise_owned(py_exc_new(7, cstr("pickle registry allocation failed")))
         return null()
     buffer = stack_alloc(80)
     memcpy(buffer, cstr("PCCPICKLE:"), 10)
@@ -796,10 +801,10 @@ def py_pickle_loads(data):
     id_out = stack_alloc(8)
     store_i64(id_out, 0, 0)
     if _pickle_parse_id(data, id_out) != 0:
-        py_raise(py_exc_new(2, cstr("unsupported pickle payload")))
+        py_raise_owned(py_exc_new(2, cstr("unsupported pickle payload")))
         return null()
     node = _pickle_find_payload(load_i64(id_out, 0))
     if ptr_is_null(node) != 0 or ptr_is_null(load_ptr(node, 8)) != 0:
-        py_raise(py_exc_new(2, cstr("unknown pickle payload")))
+        py_raise_owned(py_exc_new(2, cstr("unknown pickle payload")))
         return null()
     return py_copy_deepcopy(load_ptr(node, 8))

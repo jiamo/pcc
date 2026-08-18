@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import sys
 
-from pcc.extern import c_int, c_int64, c_ptr, c_size_t, c_uint32, extern
+from pcc.extern import c_int, c_int64, c_ptr, c_size_t, c_uint32, extern, c_obj, c_rawptr
 from pcc.unsafe import free, load_i32, load_ptr, malloc, null, ptr_is_null, store_ptr
 
 
@@ -27,8 +27,8 @@ _getpwnam_r: "extern" = extern(
     (c_ptr, c_ptr, c_ptr, c_size_t, c_ptr),
     c_int,
 )
-_py_str_utf8: "extern" = extern("py_str_utf8", (c_ptr,), c_ptr)
-_py_str_new: "extern" = extern("py_str_new", (c_ptr, c_int64), c_ptr)
+_py_str_utf8: "extern" = extern("py_str_utf8", (c_ptr,), c_rawptr)
+_py_str_new: "extern" = extern("py_str_new", (c_ptr, c_int64), c_obj)
 _strlen: "extern" = extern("strlen", (c_ptr,), c_size_t)
 
 

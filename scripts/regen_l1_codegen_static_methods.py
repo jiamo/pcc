@@ -22,7 +22,6 @@ The output is committed; the runtime never invokes this script.
 from __future__ import annotations
 
 import inspect
-import os
 import sys
 from pathlib import Path
 
@@ -31,62 +30,40 @@ _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT))
 
 
-def _arg_dict_literal(name: str, kind: str, has_default: bool) -> str:
-    """Return the source-text of an inline ``_export_arg``-shaped dict.
-
-    Inline form (no helper-call) avoids a circular import between
-    ``layer1_support.py`` (which defines ``_export_arg``) and this
-    generated module (which is imported back into ``layer1_support``).
-    Mirrors ``layer1_support._export_arg``'s return shape exactly.
-    """
-    return (
-        "        {"
-        f"'name': {name!r}, 'kind': {kind!r}, "
-        "'annotation': ('dyn',), 'default': None, "
-        f"'has_default': {'True' if has_default else 'False'}"
-        "},"
-    )
-
-
-def _format_param(p: inspect.Parameter, kw_only_emitted: list) -> str:
-    """Return the source-text of one or more inline param dicts."""
+def _format_param(
+    p: inspect.Parameter,
+    kw_only_emitted: list,
+) -> list[tuple[str, str, bool]]:
+    """Return compact ``(name, kind, has_default)`` parameter specs."""
     kind = p.kind
     if kind is inspect.Parameter.VAR_POSITIONAL:
-        return _arg_dict_literal(p.name, "*args", False)
+        return [(p.name, "*args", False)]
     if kind is inspect.Parameter.VAR_KEYWORD:
-        return _arg_dict_literal(p.name, "**kwargs", False)
+        return [(p.name, "**kwargs", False)]
     if kind is inspect.Parameter.KEYWORD_ONLY:
-        lines = []
+        specs = []
         if not kw_only_emitted[0]:
-            lines.append(_arg_dict_literal("", "kw_only", False))
+            specs.append(("", "kw_only", False))
             kw_only_emitted[0] = True
         has_default = p.default is not inspect.Parameter.empty
-        lines.append(_arg_dict_literal(p.name, "pos", has_default))
-        return "\n".join(lines)
+        specs.append((p.name, "pos", has_default))
+        return specs
     has_default = p.default is not inspect.Parameter.empty
-    return _arg_dict_literal(p.name, "pos", has_default)
+    return [(p.name, "pos", has_default)]
 
 
 def _format_method_entry(name: str, sig: inspect.Signature) -> str:
     kw_only_emitted = [False]
-    param_lines = []
-    n_params = 0
+    param_specs: list[tuple[str, str, bool]] = []
     for p in sig.parameters.values():
-        n_params += 1
-        param_lines.append(_format_param(p, kw_only_emitted))
-    param_types_repr = "(" + ", ".join(['("dyn",)'] * n_params) + (",)" if n_params == 1 else ")")
-    return (
-        "    {\n"
-        f"        'name': {name!r},\n"
-        "        'kind': 'instance',\n"
-        "        'return_ty': ('dyn',),\n"
-        f"        'param_types': {param_types_repr},\n"
-        "        'call_sig': (\n"
-        f"{chr(10).join(param_lines)}\n"
-        "        ),\n"
-        "        'box_int_abi': False,\n"
-        "    },"
-    )
+        param_specs.extend(_format_param(p, kw_only_emitted))
+    return f"    _append_method(out, {name!r}, {tuple(param_specs)!r})"
+
+
+# Keep each generated function comfortably below the self-backend's 1 MB
+# target.  The compact specs make eight entries small while still avoiding a
+# giant module-top constructor.
+_CHUNK_SIZE = 8
 
 
 def main() -> int:
@@ -114,7 +91,69 @@ def main() -> int:
         / "codegen"
         / "_l1_codegen_static_methods.py"
     )
-    body = "\n".join(method_entries)
+    # Emit the table in per-function chunks instead of one module-level
+    # literal.  A 301-entry nested literal lowered to ONE module-top function
+    # with 72100 basic blocks and ~234000 GC barrier calls -- 41 MB of IR, the
+    # single largest shard of a self-hosted build, and the reason the emit
+    # phase serialises onto one oversized worker (measured: 53.8% of stage2).
+    #
+    # Splitting the *statement* would not help: block count follows the
+    # enclosing function, so each chunk has to be its own function.  Tuple
+    # elements are independent literals, so concatenating the chunks is
+    # exactly the original tuple -- the regeneration gate compares the two
+    # for equality.
+    chunk_size = _CHUNK_SIZE
+    chunks: list[list[str]] = []
+    index = 0
+    while index < len(method_entries):
+        chunks.append(method_entries[index : index + chunk_size])
+        index += chunk_size
+
+    part_defs: list[str] = []
+    part_calls: list[str] = []
+    part_index = 0
+    while part_index < len(chunks):
+        chunk_body = "\n".join(chunks[part_index])
+        part_defs.append(
+            f"def _part_{part_index}(out):\n{chunk_body}\n"
+        )
+        part_calls.append(f"    _part_{part_index}(out)")
+        part_index += 1
+    parts_text = "\n\n".join(part_defs)
+    joined = "\n".join(part_calls)
+    body = (
+        "_DYN_TYPE = ('dyn',)\n\n"
+        "def _append_method(out, method_name, param_specs):\n"
+        "    param_types = []\n"
+        "    call_sig = []\n"
+        "    for param_spec in param_specs:\n"
+        "        param_name = param_spec[0]\n"
+        "        param_kind = param_spec[1]\n"
+        "        has_default = param_spec[2]\n"
+        "        call_sig.append({\n"
+        "            'name': param_name,\n"
+        "            'kind': param_kind,\n"
+        "            'annotation': _DYN_TYPE,\n"
+        "            'default': None,\n"
+        "            'has_default': has_default,\n"
+        "        })\n"
+        "        if param_kind != 'kw_only':\n"
+        "            param_types.append(_DYN_TYPE)\n"
+        "    out.append({\n"
+        "        'name': method_name,\n"
+        "        'kind': 'instance',\n"
+        "        'return_ty': _DYN_TYPE,\n"
+        "        'param_types': tuple(param_types),\n"
+        "        'call_sig': tuple(call_sig),\n"
+        "        'box_int_abi': False,\n"
+        "    })\n\n"
+        + parts_text
+        + "\n\ndef _build_static_methods():\n"
+        "    out = []\n"
+        + joined
+        + "\n    return tuple(out)\n\n"
+        "L1_CODEGEN_STATIC_METHODS = _build_static_methods()\n"
+    )
     content = (
         '"""Auto-generated pure-data static method entries for L1CodeGen.\n'
         "\n"
@@ -123,19 +162,33 @@ def main() -> int:
         "``host_contract.L1_CODEGEN_HOST_METHODS`` or a mixin source\n"
         "signature.\n"
         "\n"
-        "This file lives in the no-libpython bootstrap closure for pcc1\n"
-        "so it must be parseable as pure data (only tuples, dicts,\n"
-        "string literals, and the ``_export_arg`` helper call).  See\n"
-        "``scripts/regen_l1_codegen_static_methods.py`` for context.\n"
+        "This file lives in the no-libpython bootstrap closure for pcc1,\n"
+        "so it stays restricted to tuples, lists, dicts, string literals,\n"
+        "and the eager chunk functions below.\n"
+        "\n"
+        "The generated source stores compact parameter triples and inflates\n"
+        "the original tuple-of-dicts schema eagerly.  Repeating that schema\n"
+        "inline made the previous parts total tens of megabytes of IR.\n"
+        "Chunk functions append into one list, avoiding repeated tuple\n"
+        "concatenation while keeping each lowering unit bounded.\n"
         '"""\n'
         "from __future__ import annotations\n"
         "\n"
-        "L1_CODEGEN_STATIC_METHODS = (\n"
-        f"{body}\n"
-        ")\n"
+        f"{body}"
     )
-    out_path.write_text(content, encoding="utf-8")
-    print(f"wrote {out_path}", file=sys.stderr)
+    args = sys.argv[1:]
+    if args not in ([], ["--check"]):
+        print("usage: regen_l1_codegen_static_methods.py [--check]", file=sys.stderr)
+        return 2
+    if args == ["--check"]:
+        current = out_path.read_text(encoding="utf-8") if out_path.exists() else ""
+        if current != content:
+            print(f"stale generated file: {out_path}", file=sys.stderr)
+            return 1
+        print(f"current {out_path}", file=sys.stderr)
+    else:
+        out_path.write_text(content, encoding="utf-8")
+        print(f"wrote {out_path}", file=sys.stderr)
     print(f"  {len(method_entries)} method entries", file=sys.stderr)
     if skipped:
         print(f"  {len(skipped)} skipped:", file=sys.stderr)

@@ -146,14 +146,22 @@ def _mem2reg_function(lines: list[str]) -> list[str]:
         return lines
 
     for index, line in enumerate(lines):
+        # Only the candidates this line actually mentions can change state, and
+        # `_ssa_names_in` returns exactly the names `_contains_ssa_name` would
+        # accept.  Candidates never interact, so visiting them in the line's
+        # token order rather than in insertion order cannot change the outcome.
+        names = _ssa_names_in(line)
+        if not names:
+            continue
         store = _parse_store(line)
         load = _parse_load(line)
-        for name, candidate in candidates.items():
+        for name in names:
+            if name not in candidates:
+                continue
+            candidate = candidates[name]
             if not candidate["safe"]:
                 continue
             if index == candidate["line"]:
-                continue
-            if not _contains_ssa_name(line, name):
                 continue
             if block_ids[index] != candidate["block"]:
                 candidate["safe"] = False
@@ -593,6 +601,41 @@ def _contains_ssa_name(text: str, name: str) -> bool:
         if end >= len(text) or text[end] not in _SSA_NAME_CHARS:
             return True
         index = end
+
+
+def _ssa_names_in(text: str) -> list[str]:
+    """Every maximal ``%name`` token in *text*, in order, without duplicates.
+
+    This is exactly the set of names for which ``_contains_ssa_name(text,
+    name)`` is True: that helper accepts ``%name`` only when the following
+    character is outside ``_SSA_NAME_CHARS``, which is the same thing as the
+    token being maximal.  ``%s1`` therefore does not answer for ``s``, and the
+    prefix families real IR is full of (``%s1`` / ``%s10`` / ``%s100``) stay
+    distinct -- the exact case a plain substring scan gets wrong.
+
+    `_mem2reg_function` uses this to look up only the candidates a line
+    actually mentions.  It used to walk every candidate for every line: on one
+    real emitted module that was 38.5M (line, candidate) pairs against 252k
+    lines, a 152x amplification, and under a self-hosted pcc1 each pair is a
+    dict lookup plus a provenance-checked object touch.
+    """
+    names: list[str] = []
+    seen: dict[str, int] = {}
+    index = 0
+    limit = len(text)
+    while index < limit:
+        if text[index] != "%":
+            index = index + 1
+            continue
+        end = index + 1
+        while end < limit and text[end] in _SSA_NAME_CHARS:
+            end = end + 1
+        name = text[index + 1 : end]
+        if name != "" and name not in seen:
+            seen[name] = 1
+            names.append(name)
+        index = end
+    return names
 
 
 def _replace_ssa_names(text: str, replacements: dict[str, str]) -> str:

@@ -7,6 +7,7 @@ from __future__ import annotations
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import textwrap
 import unittest
@@ -58,12 +59,18 @@ class MultiFileCompileTests(unittest.TestCase):
         provider = os.path.join(td, "provider.py")
         consumer = os.path.join(td, "consumer.py")
         with open(provider, "w", encoding="utf-8") as fh:
-            fh.write("FLAG = 1 << 1\n")
+            fh.write(
+                "BASE = 1 << 2\n"
+                "EXTRA = 1 << 3\n"
+                "FLAG = BASE | EXTRA\n"
+                "__all__ = ['BASE', 'EXTRA', 'FLAG']\n"
+            )
         with open(consumer, "w", encoding="utf-8") as fh:
             fh.write(
-                "from pcc.provider import FLAG\n"
+                "from pcc.provider import BASE, EXTRA, FLAG\n"
+                "COMBINED = FLAG | BASE | EXTRA\n"
                 "def read() -> int:\n"
-                "    return FLAG\n"
+                "    return COMBINED\n"
             )
 
         out_ll = os.path.join(td, "pair.ll")
@@ -81,7 +88,29 @@ class MultiFileCompileTests(unittest.TestCase):
             ir_text = fh.read()
 
         self.assertIn("@.modvar.pcc_provider.FLAG = global i64 0", ir_text)
+        self.assertIn("@.modvar.pcc_provider.BASE = global i64 0", ir_text)
+        self.assertIn("@.modvar.pcc_provider.EXTRA = global i64 0", ir_text)
         self.assertIn("@.modvar.pcc_consumer.FLAG = global i64 0", ir_text)
+        self.assertIn("@.modvar.pcc_consumer.COMBINED = global i64 0", ir_text)
+        binding_functions = []
+        for function_match in re.finditer(r"(?m)^define [^{]+ \{", ir_text):
+            function_body = ir_text[function_match.start() :]
+            function_body = function_body[: function_body.index("\n}")]
+            if "@.modvar.pcc_consumer.COMBINED" not in function_body:
+                continue
+            if "store i64" not in function_body and "@pcc_gc_store_root" not in function_body:
+                continue
+            binding_functions.append(function_body)
+        self.assertEqual(len(binding_functions), 1)
+        binding_function = binding_functions[0]
+        binding = binding_function.rindex("@.modvar.pcc_consumer.COMBINED")
+        binding_window = binding_function[max(0, binding - 800) : binding + 400]
+        self.assertNotIn("@pcc_gc_pin", binding_window)
+        self.assertNotIn("@pcc_gc_store_root", binding_window)
+        self.assertRegex(
+            binding_window,
+            r"store i64 [^,]+, ptr @\.modvar\.pcc_consumer\.COMBINED",
+        )
         consumer_fini = ir_text.index(
             "define void @_pcc_py_module_fini_pcc_consumer"
         )
@@ -177,6 +206,225 @@ class MultiFileCompileTests(unittest.TestCase):
 
         self_link.assert_called_once()
         clang_link.assert_not_called()
+
+    def test_multi_compile_direct_indexed_assembly_runs(self):
+        from pcc.py_frontend.pipeline import compile_python_multi
+
+        td = tempfile.mkdtemp(prefix="pcc_multi_direct_indexed_")
+        self.addCleanup(self._rmtree, td)
+        src = os.path.join(td, "entry.py")
+        lib = os.path.join(td, "lib.py")
+        with open(src, "w", encoding="utf-8") as fh:
+            fh.write("from .lib import add\nprint(add(2, 3))\n")
+        with open(lib, "w", encoding="utf-8") as fh:
+            fh.write(
+                "def add(left: int, right: int) -> int:\n"
+                "    return left + right\n"
+                "\n"
+                "def deferred(value):\n"
+                "    return locals()\n"
+            )
+        exe = os.path.join(td, "a.out")
+        profile = {}
+        direct_env = {
+            "PCC_DIRECT_INDEXED_KERNEL_CAPTURE": "1",
+            "PCC_DIRECT_INDEXED_KERNEL_EMIT": "1",
+            "PCC_DIRECT_INDEXED_KERNEL_REQUIRE_ZERO_FALLBACK": "1",
+            "PCC_DIRECT_INDEXED_KERNEL_FUSE_USES": "1",
+            "PCC_DIRECT_INDEXED_KERNEL_RELEASE_FRONTEND": "1",
+            "PCC_PYTHON_IR_PASSES": "off",
+            "PCC_SELF_LINK": "pcc",
+            "PCC_RUNTIME_ARCHIVE": os.path.abspath(
+                "pcc/py_runtime/libpy_runtime.a"
+            ),
+        }
+        with mock.patch.dict(os.environ, direct_env):
+            compile_python_multi(
+                [src, lib],
+                exe,
+                entry_module="pkg.entry",
+                module_names=["pkg.entry", "pkg.lib"],
+                backend="self",
+                libpython_mode="off",
+                ir_scaffold_mode="on",
+                profile=profile,
+            )
+        result = subprocess.run(
+            [exe],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "5\n")
+        self.assertEqual(profile["counters"]["multi_direct_native_object_modules"], 2)
+        self.assertGreater(profile["counters"]["multi_direct_native_object_bytes"], 0)
+        self.assertEqual(profile["counters"]["multi_direct_ir_text_bytes"], 0)
+        for phase in (
+            "assemble_pool",
+            "decode_pco",
+            "prepare_link",
+            "sign",
+            "write",
+            "validate",
+        ):
+            self.assertIn("link_macho_" + phase + "_ms", profile["counters"])
+
+    def test_multi_compile_direct_assembly_path_handoff_runs(self):
+        from pcc.py_frontend.pipeline import compile_python_multi
+
+        td = tempfile.mkdtemp(prefix="pcc_multi_direct_asm_path_")
+        self.addCleanup(self._rmtree, td)
+        src = os.path.join(td, "entry.py")
+        lib = os.path.join(td, "lib.py")
+        with open(src, "w", encoding="utf-8") as fh:
+            fh.write("from .lib import add\nprint(add(20, 22))\n")
+        with open(lib, "w", encoding="utf-8") as fh:
+            fh.write(
+                "def add(left: int, right: int) -> int:\n"
+                "    return left + right\n"
+            )
+        exe = os.path.join(td, "a.out")
+        profile = {}
+        direct_env = {
+            "PCC_DIRECT_INDEXED_KERNEL_CAPTURE": "1",
+            "PCC_DIRECT_INDEXED_KERNEL_EMIT": "1",
+            "PCC_DIRECT_INDEXED_KERNEL_REQUIRE_ZERO_FALLBACK": "1",
+            "PCC_DIRECT_INDEXED_KERNEL_FUSE_USES": "1",
+            "PCC_DIRECT_INDEXED_KERNEL_RELEASE_FRONTEND": "1",
+            "PCC_DIRECT_INDEXED_NATIVE_OBJECT": "0",
+            "PCC_PYTHON_IR_PASSES": "off",
+            "PCC_SELF_LINK": "pcc",
+            "PCC_RUNTIME_ARCHIVE": os.path.abspath(
+                "pcc/py_runtime/libpy_runtime.a"
+            ),
+        }
+        with mock.patch.dict(os.environ, direct_env):
+            compile_python_multi(
+                [src, lib],
+                exe,
+                entry_module="pkg.entry",
+                module_names=["pkg.entry", "pkg.lib"],
+                backend="self",
+                libpython_mode="off",
+                ir_scaffold_mode="on",
+                profile=profile,
+            )
+
+        result = subprocess.run(
+            [exe],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "42\n")
+        self.assertEqual(profile["counters"]["multi_direct_assembly_modules"], 2)
+        self.assertEqual(profile["counters"]["multi_direct_native_object_modules"], 0)
+        self.assertEqual(profile["counters"]["multi_direct_ir_text_bytes"], 0)
+
+    def test_multi_compile_deferred_direct_link_runs(self):
+        from pcc.py_frontend.pipeline import compile_python_multi
+
+        td = tempfile.mkdtemp(prefix="pcc_multi_deferred_link_")
+        self.addCleanup(self._rmtree, td)
+        src = os.path.join(td, "entry.py")
+        lib = os.path.join(td, "lib.py")
+        with open(src, "w", encoding="utf-8") as fh:
+            fh.write("from .lib import add\nprint(add(20, 22))\n")
+        with open(lib, "w", encoding="utf-8") as fh:
+            fh.write(
+                "def add(left: int, right: int) -> int:\n"
+                "    return left + right\n"
+            )
+        exe = os.path.join(td, "a.out")
+        plan = os.path.join(td, "a.out.pcc-link-plan")
+        direct_env = {
+            "PCC_DIRECT_INDEXED_KERNEL_CAPTURE": "1",
+            "PCC_DIRECT_INDEXED_KERNEL_EMIT": "1",
+            "PCC_DIRECT_INDEXED_KERNEL_REQUIRE_ZERO_FALLBACK": "1",
+            "PCC_DIRECT_INDEXED_KERNEL_FUSE_USES": "1",
+            "PCC_DIRECT_INDEXED_KERNEL_RELEASE_FRONTEND": "1",
+            "PCC_DIRECT_INDEXED_NATIVE_OBJECT": "0",
+            "PCC_DEFER_SELF_LINK_PLAN": plan,
+            "PCC_PYTHON_IR_PASSES": "off",
+            "PCC_SELF_LINK": "pcc",
+            "PCC_RUNTIME_ARCHIVE": os.path.abspath(
+                "pcc/py_runtime/libpy_runtime.a"
+            ),
+        }
+        with mock.patch.dict(os.environ, direct_env):
+            compile_python_multi(
+                [src, lib],
+                exe,
+                entry_module="pkg.entry",
+                module_names=["pkg.entry", "pkg.lib"],
+                backend="self",
+                libpython_mode="off",
+                ir_scaffold_mode="on",
+            )
+
+        self.assertFalse(os.path.exists(exe))
+        self.assertTrue(os.path.isfile(plan))
+        helper = os.path.abspath("scripts/run_pcc_deferred_link.py")
+        linked = subprocess.run(
+            [sys.executable, helper, "--timeout", "30", plan],
+            capture_output=True,
+            text=True,
+            timeout=40,
+        )
+        self.assertEqual(linked.returncode, 0, linked.stderr)
+        result = subprocess.run(
+            [exe],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "42\n")
+
+    def test_single_compile_direct_indexed_assembly_runs(self):
+        from pcc.py_frontend.pipeline import compile_python
+
+        td = tempfile.mkdtemp(prefix="pcc_single_direct_indexed_")
+        self.addCleanup(self._rmtree, td)
+        src = os.path.join(td, "entry.py")
+        with open(src, "w", encoding="utf-8") as fh:
+            fh.write(
+                "def add(left: int, right: int) -> int:\n"
+                "    return left + right\n"
+                "\n"
+                "print(add(20, 22))\n"
+            )
+        exe = os.path.join(td, "a.out")
+        direct_env = {
+            "PCC_DIRECT_INDEXED_KERNEL_CAPTURE": "1",
+            "PCC_DIRECT_INDEXED_KERNEL_EMIT": "1",
+            "PCC_DIRECT_INDEXED_KERNEL_REQUIRE_ZERO_FALLBACK": "1",
+            "PCC_DIRECT_INDEXED_KERNEL_FUSE_USES": "1",
+            "PCC_DIRECT_INDEXED_KERNEL_RELEASE_FRONTEND": "1",
+            "PCC_PYTHON_IR_PASSES": "off",
+            "PCC_SELF_LINK": "pcc",
+            "PCC_RUNTIME_ARCHIVE": os.path.abspath(
+                "pcc/py_runtime/libpy_runtime.a"
+            ),
+        }
+        with mock.patch.dict(os.environ, direct_env):
+            compile_python(
+                src,
+                exe,
+                backend="self",
+                libpython_mode="off",
+                ir_scaffold_mode="on",
+            )
+        result = subprocess.run(
+            [exe],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "42\n")
 
     def test_unimported_sibling_top_init_does_not_run(self):
         _, out, code = self._run_multi(
@@ -373,9 +621,29 @@ class MultiFileCompileTests(unittest.TestCase):
             flags=re.S,
         )
         self.assertIsNotNone(borrowed_rebind)
+        # The retained borrowed value is now transferred directly into the
+        # frame-registered slot.  pcc_gc_store_root_take releases the old slot
+        # value but does not retain the new one: ownership of the explicit
+        # pcc_gc_retain result moves into the slot, so releasing that same temp
+        # after the call would be an over-release.  Pin the transfer call, its
+        # exact value, and the owned flag at equal strictness.
+        body = borrowed_rebind.group("body")
+        rooted_store = re.search(
+            r"%(?P<gcptr>gc\.ptr\.[^ ]+) = bitcast ptr %pending\.addr[^\n]*\n"
+            r"\s*call void \(ptr, ptr\) @pcc_gc_store_root_take\(ptr "
+            r"%(?P=gcptr), ptr (?P<temp>%pending\.local\.copy\.retain[^)\n]+)\)",
+            body,
+        )
+        self.assertIsNotNone(rooted_store, body)
+        temp = re.escape(rooted_store.group("temp"))
+        after_store = body[rooted_store.end():]
+        self.assertNotRegex(
+            after_store,
+            r"call void \(ptr\) @pcc_gc_release\(ptr " + temp + r"\)",
+        )
         self.assertRegex(
-            borrowed_rebind.group("body"),
-            r"store ptr %pending\.owned\.resolve[^\n]+, ptr %pending\.addr",
+            after_store,
+            r"store i1 1, ptr %pending\.owned",
         )
         self.assertNotIn("@pcc_gc_frame_leave", borrowed_rebind.group("body"))
 
@@ -618,6 +886,69 @@ class MultiFileCompileTests(unittest.TestCase):
         r = subprocess.run([exe], capture_output=True, text=True, timeout=20)
         self.assertEqual(r.returncode, 0, msg=r.stderr)
         self.assertEqual(r.stdout, "42\n")
+
+    def test_native_module_constant_class_constructor_arg_uses_static_export(self):
+        """A native sibling constant passed to a sibling class constructor
+        must not become getattr(module-name-string, constant-name).
+        """
+        from pcc.py_frontend import pipeline
+
+        td = tempfile.mkdtemp(prefix="pcc_multi_module_constant_ctor_arg_")
+        self.addCleanup(self._rmtree, td)
+        files = {
+            "entry.py": (
+                "from . import spec as constants\n"
+                "from .model import Record\n\n"
+                "value = Record(constants.KIND)\n"
+                "print(value.kind)\n"
+            ),
+            "spec.py": "KIND = 0\n",
+            "model.py": (
+                "class Record:\n"
+                "    def __init__(self, kind: int) -> None:\n"
+                "        self.kind = kind\n"
+            ),
+        }
+        src_paths = []
+        for rel, source in files.items():
+            dst = os.path.join(td, rel)
+            with open(dst, "w", encoding="utf-8") as fh:
+                fh.write(source)
+            src_paths.append(dst)
+        module_names = ["pkg.entry", "pkg.spec", "pkg.model"]
+
+        out_ll = os.path.join(td, "module_constant_ctor_arg.ll")
+        pipeline.compile_python_multi(
+            src_paths,
+            out_ll,
+            entry_module="pkg.entry",
+            module_names=module_names,
+            emit_llvm_only=True,
+            libpython_mode="off",
+            ir_scaffold_mode="on",
+            backend="self",
+        )
+        with open(out_ll, "r", encoding="utf-8") as fh:
+            ir_text = fh.read()
+        self.assertNotIn("classgen.arg.KIND", ir_text)
+        self.assertNotRegex(
+            ir_text,
+            r"py_obj_getattr\([^\n]*@\.pyattr\.KIND",
+        )
+
+        exe = os.path.join(td, "module_constant_ctor_arg.out")
+        pipeline.compile_python_multi(
+            src_paths,
+            exe,
+            entry_module="pkg.entry",
+            module_names=module_names,
+            libpython_mode="off",
+            ir_scaffold_mode="on",
+            backend="self",
+        )
+        result = subprocess.run([exe], capture_output=True, text=True, timeout=20)
+        self.assertEqual(result.returncode, 0, msg=result.stderr)
+        self.assertEqual(result.stdout, "0\n")
 
     def test_native_module_class_unbound_method_call_uses_explicit_receiver(self):
         from pcc.py_frontend import pipeline

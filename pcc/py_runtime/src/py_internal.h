@@ -254,10 +254,68 @@ void pcc_gc_note_slot_write_barrier(
     PyObject **slot,
     PyObject *value
 );
+/* Internal trusted-provenance store.  The caller must prove that value is the
+ * current pointer for a freshly allocated native PY_TYPE_INSTANCE.  The
+ * generic slot barrier and borrowed-value retain semantics are unchanged. */
+void pcc_gc_store_ptr_fresh_native_instance(
+    PyObject *owner,
+    PyObject **slot,
+    PyObject *value
+);
+/* Internal split-phase root publication.  The plan owns every scalar and
+ * refcount token needed after the caller releases its outermost graph lock;
+ * it is deliberately absent from the public py_runtime.h ABI. */
+typedef struct {
+    uint64_t opaque[16];
+} PccGcStoreRootPlan;
+typedef struct {
+    uint64_t opaque[7];
+} PccGcRetainPlan;
+PyObject *pcc_gc_retain_plan_prepare_locked(
+    PccGcRetainPlan *plan,
+    PyObject *value
+);
+void pcc_gc_retain_plan_finish(PccGcRetainPlan *plan);
+void pcc_gc_store_root_plan_init(
+    PccGcStoreRootPlan *plan,
+    int64_t backend
+);
+void pcc_gc_store_ptr_plan_init(
+    PccGcStoreRootPlan *plan,
+    PyObject *owner,
+    int64_t backend
+);
+int64_t pcc_gc_store_root_plan_commit_locked(
+    PccGcStoreRootPlan *plan,
+    PyObject **slot,
+    PyObject *value
+);
+void pcc_gc_store_root_plan_finish(PccGcStoreRootPlan *plan);
+int64_t pcc_gc_store_ptr_plan_commit_locked(
+    PccGcStoreRootPlan *plan,
+    PyObject *owner,
+    PyObject **slot,
+    PyObject *value
+);
+void pcc_gc_store_ptr_plan_finish(PccGcStoreRootPlan *plan);
+void pcc_gc_publish_initialized(PyObject *obj);
+int64_t pcc_gc_backend4_retarget_mutator_payload_locked(
+    PyObject *owner,
+    void *old_base,
+    int64_t old_size_bytes,
+    void *new_base,
+    int64_t new_size_bytes,
+    void *slot_pairs,
+    int64_t pair_count
+);
+int64_t pcc_gc_backend4_remap_and_retire_stopped_world(void);
+int64_t pcc_gc_backend4_step_remembered_roots(int64_t budget);
+int64_t pcc_gc_backend4_relocation_set_add(PyObject *obj);
 void pcc_gc_thread_unregister_buffers(void);
 int64_t pcc_gc_frame_node_tls_pool_cached_count(void);
 void pcc_gc_frame_node_tls_pool_drain(void);
 int64_t pcc_gc_has_tracing_sweep(void);
+int64_t pcc_gc_sweep_owed(void);
 int64_t pcc_gc_collect_tracing(void);
 void pcc_gc_begin_explicit_tracing_collect(void);
 void pcc_gc_end_explicit_tracing_collect(void);
@@ -308,6 +366,35 @@ void pcc_runtime_log_event_code(int32_t category, int32_t event, int64_t value0,
  * the abort path reuses the single logging entrypoint rather than inventing
  * a second one. */
 void pcc_runtime_tripwire_fail(const char *msg, const char *file, int32_t line);
+/* One cross-TU mixed-tripwire seam for helper files whose checks can fire
+ * while their caller owns the GC graph lock: armed builds defer the fatal
+ * report to the outer unlock and return 1; unlocked callers fail directly
+ * and do not return.  Unarmed builds compile every call site out. */
+int pcc_gc_tripwire_defer_or_fail(
+    const char *msg,
+    const char *file,
+    int32_t line
+);
+
+#ifdef PCC_RUNTIME_TRIPWIRES
+/* Cross-TU mixed tripwire for helper files whose checks can fire while
+ * their caller owns the GC graph lock.  Same shape as PCC_RT_TRIPWIRE but
+ * a graph-lock owner records the violation in the deferred slot and the
+ * enclosing VOID function returns instead of entering the log sink while
+ * locked; unlocked callers fail immediately.  Unarmed builds compile the
+ * macro out entirely. */
+#define PCC_GC_OWNER_TRIPWIRE(cond, msg)                                   \
+    do {                                                                   \
+        if (!(cond)                                                        \
+            && pcc_gc_tripwire_defer_or_fail(                              \
+                (msg), __FILE__, __LINE__                                  \
+            )) {                                                           \
+            return;                                                        \
+        }                                                                  \
+    } while (0)
+#else
+#define PCC_GC_OWNER_TRIPWIRE(cond, msg) ((void)0)
+#endif
 
 #ifdef PCC_RUNTIME_TRIPWIRES
 #define PCC_RT_TRIPWIRE(cond, msg)                                           \
@@ -359,8 +446,16 @@ int64_t py_gc_index_insert(PyObject *obj, PyGcNode *node);
 PyGcNode *py_gc_index_remove(PyObject *obj);
 void *pcc_gc_object_index_find(PyObject *obj);
 int64_t pcc_gc_object_index_insert(PyObject *obj, void *node);
+int64_t pcc_gc_object_index_plan_capacity(int64_t extra);
+int64_t pcc_gc_object_index_plan_commit(
+    void **prepared_slots_io, int64_t prepared_cap, int64_t extra
+);
+int64_t pcc_gc_object_index_insert_preallocated(PyObject *obj, void *node);
 void *pcc_gc_object_index_remove(PyObject *obj);
 void pcc_gc_object_index_clear(void);
+void *pcc_gc_object_node_prepare(void);
+int64_t pcc_gc_object_node_plan_requires_prepare(void);
+void *pcc_gc_object_node_take_prepared(void **prepared_io);
 int64_t pcc_gc_managed_pointer_index_contains(PyObject *obj);
 int64_t pcc_gc_managed_pointer_index_insert(PyObject *obj);
 int64_t pcc_gc_managed_pointer_index_remove(PyObject *obj);
@@ -381,6 +476,14 @@ typedef void (*PccPyObjSlotVisitorI64)(
     void *ctx
 );
 int py_obj_visit_slots(PyObject *o, PyObjSlotVisitor visit, void *ctx);
+int64_t pcc_gc_visit_object_slots_slice(
+    PyObject *o,
+    int64_t cursor,
+    int64_t limit,
+    PyObjSlotVisitor visit,
+    void *ctx,
+    int64_t *state_out
+);
 void py_obj_update_slot(PyObject **slot);
 int pcc_capi_visit_cext_object_slots(
     PyObject *o,
@@ -409,15 +512,55 @@ void *pcc_gc_identity_index_find(PyObject *obj);
 int64_t pcc_gc_identity_index_insert(PyObject *obj, void *node);
 void *pcc_gc_identity_index_remove(PyObject *obj);
 void pcc_gc_identity_index_clear(void);
+int64_t pcc_gc_forwarding_plan_index_capacity(int64_t kind, int64_t extra);
+int64_t pcc_gc_forwarding_plan_index_commit(
+    int64_t kind,
+    void **prepared_slots_io,
+    int64_t prepared_cap,
+    int64_t extra
+);
+int64_t pcc_gc_forwarding_plan_index_insert(
+    int64_t kind,
+    PyObject *obj,
+    void *node
+);
 void *pcc_gc_frame_index_find(void *slots);
 int64_t pcc_gc_frame_index_insert(void *slots, void *node);
+int64_t pcc_gc_frame_index_plan_capacity(int64_t extra);
+int64_t pcc_gc_frame_index_plan_commit(
+    void **prepared_slots_io,
+    int64_t prepared_cap,
+    int64_t extra
+);
 void *pcc_gc_frame_index_replace(void *slots, void *node);
+void *pcc_gc_frame_index_replace_preallocated(void *slots, void *node);
 void *pcc_gc_frame_index_remove(void *slots);
 void pcc_gc_frame_index_clear(void);
 extern int32_t pcc_gc_read_barrier_enabled;
 void *pcc_gc_zpage_owner_index_find(PyObject *obj);
 int64_t pcc_gc_zpage_owner_index_insert(PyObject *obj, void *node);
 int64_t pcc_gc_zpage_owner_index_upsert(PyObject *obj, void *node);
+int64_t pcc_gc_zpage_owner_index_plan_capacity(int64_t extra);
+int64_t pcc_gc_zpage_owner_index_plan_commit(
+    void **prepared_slots_io, int64_t prepared_cap, int64_t extra
+);
+int64_t pcc_gc_zpage_owner_index_upsert_preallocated(
+    PyObject *obj, void *node
+);
+void *pcc_gc_backend4_zpage_node_prepare(void);
+int64_t pcc_gc_backend4_zpage_node_plan_requires_prepare(void);
+void *pcc_gc_backend4_zpage_node_take_prepared(void **prepared_io);
+int64_t pcc_gc_backend4_zpage_link_node_preallocated(void *node);
+void *pcc_gc_backend4_zpage_track_page_prepare(
+    void *page, PyObject *owner, int64_t size
+);
+void *pcc_gc_backend4_zpage_track_alloc_preallocated(
+    PyObject *owner,
+    int64_t size,
+    void **prepared_node_io,
+    void **prepared_page_io,
+    int64_t prepared_page_from_free
+);
 void *pcc_gc_zpage_owner_index_remove(PyObject *obj);
 void pcc_gc_zpage_owner_index_clear(void);
 void *pcc_gc_zpage_page_index_find(void *page);
@@ -920,9 +1063,11 @@ void py_class_mark_dict_subclass(PyClassObject *cls);
 PyObject *py_dict_subclass_getattr(PyObject *o, const char *name);
 PyObject *py_dict_subclass_getitem(PyObject *o, PyObject *key);
 
-/* Install a method on the class. `func` is borrowed (caller retains
- * ownership). Methods added after py_class_new are visible to subsequent
- * lookups but not to earlier instances — normal Python behavior. */
+/* Install a method on the class. `name` is borrowed and must remain immutable
+ * and alive for the class lifetime; `func` is borrowed (caller retains
+ * ownership). Class construction/mutation is externally serialized and must
+ * not race with lookup. Methods added after py_class_new are visible to
+ * subsequent lookups. */
 void py_class_add_method(PyClassObject *cls, const char *name, PyObject *func);
 void py_class_set_metaclass(PyClassObject *cls, PyClassObject *metaclass);
 
@@ -1064,6 +1209,11 @@ int64_t   py_obj_contains(PyObject *container, PyObject *item);
 PyObject *py_obj_add(PyObject *a, PyObject *b);
 PyObject *py_obj_sub(PyObject *a, PyObject *b);
 PyObject *py_obj_mul(PyObject *a, PyObject *b);
+PyObject *py_obj_and(PyObject *a, PyObject *b);
+PyObject *py_obj_or(PyObject *a, PyObject *b);
+PyObject *py_obj_xor(PyObject *a, PyObject *b);
+PyObject *py_obj_lshift(PyObject *a, PyObject *b);
+PyObject *py_obj_rshift(PyObject *a, PyObject *b);
 PyObject *py_obj_truediv(PyObject *a, PyObject *b);
 PyObject *py_obj_floordiv(PyObject *a, PyObject *b);
 PyObject *py_obj_inplace_op(PyObject *a, PyObject *b, int64_t op_code);

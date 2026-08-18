@@ -86,6 +86,13 @@ def _ir_type_text(ty) -> str:
         return ""
 
 
+def _builder_function_name(builder) -> str:
+    try:
+        return str(builder._block.function.name)
+    except Exception:
+        return "<unknown>"
+
+
 def _ir_int_width(ty) -> int:
     try:
         if isinstance(ty, ir.IntType):
@@ -386,7 +393,8 @@ def marshal_to_object(
         raise NotImplementedError(
             "marshal_to_object: DynType with IR "
             + _ir_type_text(value_ty)
-            + " not supported"
+            + " not supported in "
+            + _builder_function_name(builder)
         )
     if isinstance(ty, Type) or ty_name == "Type":
         # ``Type`` is the base class for pcc's type-description objects.
@@ -447,9 +455,42 @@ def marshal_from_object(
         # object so an immediate re-box can hand it back instead of a truncated
         # i64: above 2**63-1 `py_int_to_i64` yields 0.
         ov_slot = _stash_overflow_slot(builder)
-        unboxed = builder.call(
-            runtime["py_int_to_i64"], [pyobj, ov_slot], name="m.int_unbox"
+        fn = builder._block.function
+        if fn is None:
+            return builder.call(
+                runtime["py_int_to_i64"], [pyobj, ov_slot], name="m.int_unbox"
+            )
+        # A tagged small int is its own payload: shift the bits inline and
+        # call the runtime only for a boxed (bignum) object.  Every indexed
+        # load ``xs[i & 63]`` paid this call on a value the caller had just
+        # produced as a tagged immediate.
+        one = ir.Constant(_I64, 1)
+        bits = builder.ptrtoint(pyobj, _I64, name="m.int.bits")
+        is_tagged = builder.icmp_signed(
+            "==", builder.and_(bits, one, name="m.int.low"), one, name="m.int.tagged"
         )
+        # Block names must be unique per function here, not merely per
+        # module scope: the self-hosted compiler does not rename duplicate
+        # block labels the way the host builder does, and two unboxes in one
+        # function then fail the self IR verifier (phi-predecessors /
+        # ssa-dominance).  Value names are deduplicated on both sides.
+        tag = str(len(fn.blocks))
+        fast_bb = fn.append_basic_block(name="m.int.unbox.fast." + tag)
+        slow_bb = fn.append_basic_block(name="m.int.unbox.slow." + tag)
+        join_bb = fn.append_basic_block(name="m.int.unbox.join." + tag)
+        builder.cbranch(is_tagged, fast_bb, slow_bb)
+        builder.position_at_end(fast_bb)
+        fast = builder.ashr(bits, one, name="m.int.untag")
+        builder.branch(join_bb)
+        builder.position_at_end(slow_bb)
+        slow = builder.call(
+            runtime["py_int_to_i64"], [pyobj, ov_slot], name="m.int_unbox.slow"
+        )
+        builder.branch(join_bb)
+        builder.position_at_end(join_bb)
+        unboxed = builder.phi(_I64, name="m.int_unbox")
+        unboxed.add_incoming(fast, fast_bb)
+        unboxed.add_incoming(slow, slow_bb)
         return unboxed
     if isinstance(target_ty, FloatType) or target_name == "float":
         if isinstance(pyobj.type, ir.DoubleType):

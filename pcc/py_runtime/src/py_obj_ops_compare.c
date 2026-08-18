@@ -218,7 +218,7 @@ static int64_t valuebox_classes_eq(PyClassObject *ca, PyClassObject *cb) {
 
 PyObject *py_obj_abs(PyObject *o) {
     if (o == NULL) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "bad operand type for abs()"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "bad operand type for abs()"));
         return NULL;
     }
     if (PY_IS_TAGGED_INT(o)) {
@@ -248,7 +248,7 @@ PyObject *py_obj_abs(PyObject *o) {
         PyObject *r = py_user_abs_dispatch(o);
         if (r != NULL || py_err_occurred()) return r;
     }
-    py_raise(py_exc_new(PY_EXC_TYPEERROR, "bad operand type for abs()"));
+    py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "bad operand type for abs()"));
     return NULL;
 }
 
@@ -390,6 +390,15 @@ int64_t py_obj_eq(PyObject *a, PyObject *b) {
 
     if (ta == PY_TYPE_NONE || tb == PY_TYPE_NONE) return 0;
 
+    /* User instances: honor __eq__ for container key lookup and ``==``.
+     * Tri-state: -1 = no user __eq__ (or NotImplemented) -> keep the
+     * identity fallback this fallthrough used to end with. */
+    if (ta == PY_TYPE_INSTANCE || ta >= PY_TYPE_USER_CLASS_START
+        || tb == PY_TYPE_INSTANCE || tb >= PY_TYPE_USER_CLASS_START) {
+        int64_t dispatched = py_user_eq_dispatch(a, b);
+        if (dispatched >= 0) return dispatched;
+    }
+
     return 0;
 }
 
@@ -412,14 +421,55 @@ static int64_t py_valuebox_hash(PyValueBoxObject *box) {
     return (h == -1) ? -2 : h;
 }
 
+/* CPython's numeric hash (long_hash / _Py_HashDouble): reduce modulo the
+ * Mersenne prime P = 2**61 - 1 so x == y implies hash(x) == hash(y) across
+ * int, bool and float.  Mirrors _hash_i64 / _hash_f64_bits in the
+ * py_obj_ops_compare.py port. */
+#define PCC_HASH_MODULUS ((int64_t)2305843009213693951LL)
+
+static int64_t pcc_hash_i64(int64_t v) {
+    if (v == INT64_MIN) return -4;  /* 2**63 mod P == 4 */
+    int64_t mag = v < 0 ? -v : v;
+    int64_t x = mag % PCC_HASH_MODULUS;
+    if (v < 0) x = -x;
+    return (x == -1) ? -2 : x;
+}
+
+static int64_t pcc_hash_double_bits(uint64_t bits, const void *o) {
+    int64_t sign = (bits >> 63) ? -1 : 1;
+    int64_t exp = (int64_t)((bits >> 52) & 2047u);
+    uint64_t frac = bits & 0xFFFFFFFFFFFFFull;
+    if (exp == 2047) {
+        if (frac == 0) return 314159 * sign;
+        uint64_t p = (uint64_t)(uintptr_t)o;
+        int64_t h = (int64_t)((p >> 4) | (p << 60));
+        return (h == -1) ? -2 : h;
+    }
+    uint64_t mant = frac;
+    int64_t e;
+    if (exp == 0) {
+        if (frac == 0) return 0;
+        e = -1074;
+    } else {
+        mant = frac | (1ull << 52);
+        e = exp - 1075;
+    }
+    int64_t k = ((e % 61) + 61) % 61;
+    uint64_t x = mant;
+    if (k != 0) {
+        x = ((x << k) & (uint64_t)PCC_HASH_MODULUS) | (x >> (61 - k));
+    }
+    int64_t out = (int64_t)x * sign;
+    return (out == -1) ? -2 : out;
+}
+
 static int py_obj_hash_leaf_fast(PyObject *o, int64_t *out) {
     if (o == NULL) {
         *out = 0;
         return 1;
     }
     if (PY_IS_TAGGED_INT(o)) {
-        int64_t v = py_untag_int(o);
-        *out = (v == -1) ? -2 : v;
+        *out = pcc_hash_i64(py_untag_int(o));
         return 1;
     }
     int32_t tag = py_header(o)->type_tag;
@@ -431,8 +481,7 @@ static int py_obj_hash_leaf_fast(PyObject *o, int64_t *out) {
             *out = (o == py_True) ? 1 : 0;
             return 1;
         case PY_TYPE_INT: {
-            int64_t v = py_int_value_i64(o);
-            *out = (v == -1) ? -2 : v;
+            *out = pcc_hash_i64(py_int_value_i64(o));
             return 1;
         }
         case PY_TYPE_STR: {
@@ -454,8 +503,7 @@ static int py_obj_hash_leaf_fast(PyObject *o, int64_t *out) {
 int64_t py_obj_hash(PyObject *o) {
     if (o == NULL) return 0;
     if (PY_IS_TAGGED_INT(o)) {
-        int64_t v = py_untag_int(o);
-        return (v == -1) ? -2 : v;
+        return pcc_hash_i64(py_untag_int(o));
     }
     int32_t tag = py_header(o)->type_tag;
     switch (tag) {
@@ -463,20 +511,13 @@ int64_t py_obj_hash(PyObject *o) {
             return 0;
         case PY_TYPE_BOOL:
             return (o == py_True) ? 1 : 0;
-        case PY_TYPE_INT: {
-            int64_t v = py_int_value_i64(o);
-            return (v == -1) ? -2 : v;
-        }
+        case PY_TYPE_INT:
+            return pcc_hash_i64(py_int_value_i64(o));
         case PY_TYPE_FLOAT: {
             double d = ((PyFloatObject *)o)->value;
-            int64_t as_i = (int64_t)d;
-            if ((double)as_i == d) {
-                return (as_i == -1) ? -2 : as_i;
-            }
             uint64_t bits;
             memcpy(&bits, &d, sizeof bits);
-            int64_t out = (int64_t)bits;
-            return (out == -1) ? -2 : out;
+            return pcc_hash_double_bits(bits, o);
         }
         case PY_TYPE_STR: {
             PyStrObject *s = (PyStrObject *)o;
@@ -587,7 +628,19 @@ int64_t py_obj_ge(PyObject *a, PyObject *b) {
 
 PyObject *py_obj_sorted(PyObject *x) {
     if (x == NULL) return NULL;
+    PyObject *x_root = x;
+    void *x_handle = NULL;
+    int64_t moving_backend = pcc_gc_backend();
+    if (
+        moving_backend == PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR
+        || moving_backend == PCC_GC_KIND_COLORED_RELOCATING
+    ) {
+        x_handle = pcc_gc_scheduler_root_register_handle(&x_root);
+        if (x_handle == NULL) return NULL;
+        x = pcc_gc_load_ptr(NULL, &x_root);
+    }
     int64_t n = py_obj_len(x);
+    if (x_handle != NULL) x = pcc_gc_load_ptr(NULL, &x_root);
     /* py_obj_len is only a sizing hint here. A custom iterator (user class
      * with __iter__/__next__ but no __len__) raises from py_obj_len; left
      * pending, that aborts the iterator loop below and yields []. Clear it —
@@ -597,10 +650,18 @@ PyObject *py_obj_sorted(PyObject *x) {
         n = 0;
     }
     PyObject *out = py_list_new(n);
-    if (out == NULL) return NULL;
+    if (out == NULL) {
+        if (x_handle != NULL) {
+            pcc_gc_scheduler_root_unregister_handle(x_handle);
+        }
+        return NULL;
+    }
+    pcc_gc_pin(out);
     if (py_type_of(x) == PY_TYPE_SET) {
-        PySetObject *s = (PySetObject *)x;
-        for (int64_t i = 0; i < s->capacity; i++) {
+        for (int64_t i = 0;; i++) {
+            if (x_handle != NULL) x = pcc_gc_load_ptr(NULL, &x_root);
+            PySetObject *s = (PySetObject *)x;
+            if (i >= s->capacity) break;
             PyObject *key = cmp_set_key(s, &s->entries[i]);
             if (key == NULL || key == py_set_dummy) continue;
             py_list_append(out, key);
@@ -614,8 +675,28 @@ PyObject *py_obj_sorted(PyObject *x) {
          * the pcc-Python port has no such branch and routes list/tuple here.) */
         PyObject *it = py_obj_iter(x);
         if (it != NULL) {
+            PyObject *it_root = it;
+            void *it_handle = NULL;
+            if (
+                moving_backend == PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR
+                || moving_backend == PCC_GC_KIND_COLORED_RELOCATING
+            ) {
+                it_handle = pcc_gc_scheduler_root_register_handle(&it_root);
+                if (it_handle == NULL) {
+                    py_decref(it);
+                    pcc_gc_unpin(out);
+                    py_decref(out);
+                    if (x_handle != NULL) {
+                        pcc_gc_scheduler_root_unregister_handle(x_handle);
+                    }
+                    return NULL;
+                }
+                it = pcc_gc_load_ptr(NULL, &it_root);
+            }
             for (;;) {
+                if (it_handle != NULL) it = pcc_gc_load_ptr(NULL, &it_root);
                 PyObject *el = py_obj_next(it);
+                if (it_handle != NULL) it = pcc_gc_load_ptr(NULL, &it_root);
                 if (el == NULL) {
                     if (py_err_occurred()) {
                         PyObject *cur = py_current_exception();
@@ -627,6 +708,10 @@ PyObject *py_obj_sorted(PyObject *x) {
                 }
                 py_list_append(out, el);
                 py_decref(el);
+            }
+            if (it_handle != NULL) {
+                it = pcc_gc_load_ptr(NULL, &it_root);
+                pcc_gc_scheduler_root_unregister_handle(it_handle);
             }
             py_decref(it);
         }
@@ -645,6 +730,7 @@ PyObject *py_obj_sorted(PyObject *x) {
          * the right run only wins when strictly smaller. */
         PyObject *scratch = py_list_new(m);
         if (scratch != NULL) {
+            pcc_gc_pin(scratch);
             PyObject *src_list = out;
             PyObject *dst_list = scratch;
             for (int64_t width = 1; width < m; width *= 2) {
@@ -672,9 +758,15 @@ PyObject *py_obj_sorted(PyObject *x) {
                         PyObject *eb =
                             pcc_gc_load_ptr(src_list, &src->items[j]);
                         if (py_obj_cmp_threeway(eb, ea) < 0) {
+                            eb = pcc_gc_load_ptr(
+                                src_list, &src->items[j]
+                            );
                             py_list_append(dst_list, eb);
                             j++;
                         } else {
+                            ea = pcc_gc_load_ptr(
+                                src_list, &src->items[i]
+                            );
                             py_list_append(dst_list, ea);
                             i++;
                         }
@@ -720,7 +812,12 @@ PyObject *py_obj_sorted(PyObject *x) {
                 }
                 so->length = 0;
             }
+            pcc_gc_unpin(scratch);
             py_decref(scratch);
+            pcc_gc_unpin(out);
+            if (x_handle != NULL) {
+                pcc_gc_scheduler_root_unregister_handle(x_handle);
+            }
             return out;
         }
         /* malloc-failure fallback: original insertion sort. */
@@ -736,6 +833,10 @@ PyObject *py_obj_sorted(PyObject *x) {
             py_list_set(out, j, cur);
         }
     }
+    pcc_gc_unpin(out);
+    if (x_handle != NULL) {
+        pcc_gc_scheduler_root_unregister_handle(x_handle);
+    }
     return out;
 }
 
@@ -748,7 +849,10 @@ int64_t py_obj_contains(PyObject *container, PyObject *item) {
             int64_t n = py_tuple_len(container);
             for (int64_t i = 0; i < n; i++) {
                 PyObject *el = py_tuple_get(container, i);
-                if (py_obj_eq(el, item)) return 1;
+                int equal = py_obj_eq(el, item) != 0;
+                py_decref(el);
+                if (py_err_occurred()) return 0;
+                if (equal) return 1;
             }
             return 0;
         }

@@ -19,6 +19,7 @@ from pcc.unsafe import (
     ptr_add,
     ptr_eq,
     ptr_is_null,
+    stack_alloc,
     store_i32,
     store_i64,
     store_ptr,
@@ -37,11 +38,20 @@ define_thread_local_i32("pcc_gc_frame_node_pool_total", 0)
 pcc_py_gc_minor_graph_lock = extern("pcc_py_gc_minor_graph_lock", (), c_void)
 pcc_py_gc_minor_graph_unlock = extern("pcc_py_gc_minor_graph_unlock", (), c_void)
 pcc_gc_cycle_requested_store_release = extern("pcc_gc_cycle_requested_store_release", (c_int64,), c_void)
+
 pcc_gc_root_slot_count_from_map = extern("pcc_gc_root_slot_count_from_map", (c_ptr,), c_int64)
 pcc_gc_root_map_is_borrowed = extern("pcc_gc_root_map_is_borrowed", (c_ptr,), c_int64)
+pcc_gc_root_registry_note_mutation_locked = extern(
+    "pcc_gc_root_registry_note_mutation_locked", (), c_void
+)
 pcc_gc_frame_index_find = extern("pcc_gc_frame_index_find", (c_ptr,), c_ptr)
-pcc_gc_frame_index_insert = extern("pcc_gc_frame_index_insert", (c_ptr, c_ptr), c_int64)
-pcc_gc_frame_index_replace = extern("pcc_gc_frame_index_replace", (c_ptr, c_ptr), c_ptr)
+pcc_gc_frame_index_plan_capacity = extern(
+    "pcc_gc_frame_index_plan_capacity", (c_int64,), c_int64
+)
+pcc_gc_frame_index_plan_commit = extern("pcc_gc_frame_index_plan_commit", (c_ptr, c_int64, c_int64), c_int64)
+pcc_gc_frame_index_replace_preallocated = extern(
+    "pcc_gc_frame_index_replace_preallocated", (c_ptr, c_ptr), c_ptr
+)
 pcc_gc_frame_index_remove = extern("pcc_gc_frame_index_remove", (c_ptr,), c_ptr)
 
 
@@ -160,10 +170,6 @@ def pcc_gc_frame_node_create(
         pcc_gc_root_map_is_borrowed(frame_map) | extra_flags,
     )
     store_ptr(node, 56, ptr_add(node, 64))
-    old_head = load_ptr(node, 16)
-    if ptr_is_null(old_head) == 0:
-        store_ptr(old_head, 24, node)
-    global_store_ptr("pcc_gc_frame_head", node)
     return node
 
 
@@ -173,6 +179,13 @@ def pcc_gc_frame_node_unlink(node) -> None:
         return
     prev = load_ptr(node, 24)
     nxt = load_ptr(node, 16)
+    if ptr_eq(
+        global_load_ptr("pcc_gc_backend3_frame_root_scan_cursor"), node
+    ) != 0:
+        global_store_ptr("pcc_gc_backend3_frame_root_scan_cursor", nxt)
+        store_i64(
+            global_addr("pcc_gc_backend3_frame_root_scan_slot"), 0, 0
+        )
     if ptr_is_null(prev) != 0:
         global_store_ptr("pcc_gc_frame_head", nxt)
     else:
@@ -182,6 +195,7 @@ def pcc_gc_frame_node_unlink(node) -> None:
     store_ptr(node, 16, null())
     store_ptr(node, 24, null())
     store_ptr(node, 32, null())
+    pcc_gc_root_registry_note_mutation_locked()
 
 
 @c_abi_export("pcc_gc_frame_node_release")
@@ -256,20 +270,81 @@ def pcc_gc_note_frame_enter(frame_map, slots) -> None:
     root_count: i64 = pcc_gc_root_slot_count_from_map(frame_map)
     if root_count <= 0:
         return
-    pcc_py_gc_minor_graph_lock()
     node = pcc_gc_frame_node_create(frame_map, slots, root_count, 0)
     if ptr_is_null(node) != 0:
-        pcc_py_gc_minor_graph_unlock()
         return
-    duplicate = pcc_gc_frame_index_replace(slots, node)
-    if ptr_eq(duplicate, node) != 0:
-        pcc_gc_frame_node_unlink(node)
-        pcc_gc_frame_node_release(node)
+    prepared = null()
+    prepared_cap: i64 = 0
+    prepared_slot = stack_alloc(8)
+    while True:
+        pcc_py_gc_minor_graph_lock()
+        required: i64 = pcc_gc_frame_index_plan_capacity(1)
+        if required < 0:
+            pcc_py_gc_minor_graph_unlock()
+            if ptr_is_null(prepared) == 0:
+                free(prepared)
+            pcc_gc_frame_node_release(node)
+            return
+        if required > 0 and (
+            ptr_is_null(prepared) != 0 or prepared_cap < required
+        ):
+            pcc_py_gc_minor_graph_unlock()
+            if ptr_is_null(prepared) == 0:
+                free(prepared)
+            prepared = malloc(required * 24)
+            if ptr_is_null(prepared) != 0:
+                pcc_gc_frame_node_release(node)
+                return
+            memset(prepared, 0, required * 24)
+            prepared_cap = required
+            continue
+        if required > 0:
+            store_ptr(prepared_slot, 0, prepared)
+            if (
+                pcc_gc_frame_index_plan_commit(
+                    prepared_slot, prepared_cap, 1
+                )
+                < 0
+            ):
+                pcc_py_gc_minor_graph_unlock()
+                free(prepared)
+                prepared = null()
+                prepared_cap = 0
+                continue
+            prepared = load_ptr(prepared_slot, 0)
+        old_head = global_load_ptr("pcc_gc_frame_head")
+        store_ptr(node, 16, old_head)
+        if ptr_is_null(old_head) == 0:
+            store_ptr(old_head, 24, node)
+        global_store_ptr("pcc_gc_frame_head", node)
+        pcc_gc_root_registry_note_mutation_locked()
+        duplicate = pcc_gc_frame_index_replace_preallocated(slots, node)
+        if ptr_eq(duplicate, node) != 0:
+            pcc_gc_frame_node_unlink(node)
+            pcc_py_gc_minor_graph_unlock()
+            if ptr_is_null(prepared) == 0:
+                free(prepared)
+            pcc_gc_frame_node_release(node)
+            return
+        store_ptr(node, 32, duplicate)
+        # A frame enter or leave genuinely is new tracing work for an incremental
+        # marker, so requesting a cycle is right for a mutator.  It is wrong for the
+        # collector itself: pcc_gc_collect stops the world and drains with
+        # `while pcc_gc_step(...) != 0`, and every call inside that drain enters and
+        # leaves a GC frame because this runtime is compiled pcc-Python.  Each such
+        # transition re-armed pcc_gc_cycle_requested, so completing a cycle
+        # immediately requested the next one and the drain never terminated -- the
+        # gray count was measured oscillating 0 -> 3 -> 0 forever with no mutator
+        # running, both halves reporting progress.  The C runtime never hits this
+        # because its collector is C and registers no GC frames.  The world is
+        # stopped for the whole explicit window, so a frame transition seen there is
+        # always the collector's own.
+        if load_i32(global_addr("pcc_gc_explicit_collect_active"), 0) == 0:
+            pcc_gc_cycle_requested_store_release(1)
         pcc_py_gc_minor_graph_unlock()
+        if ptr_is_null(prepared) == 0:
+            free(prepared)
         return
-    store_ptr(node, 32, duplicate)
-    pcc_gc_cycle_requested_store_release(1)
-    pcc_py_gc_minor_graph_unlock()
 
 
 @c_abi_export("pcc_gc_note_frame_enter_lifo")
@@ -284,12 +359,20 @@ def pcc_gc_note_frame_enter_lifo(frame_map, slots) -> None:
     root_count: i64 = pcc_gc_root_slot_count_from_map(frame_map)
     if root_count <= 0:
         return
-    pcc_py_gc_minor_graph_lock()
     node = pcc_gc_frame_node_create(frame_map, slots, root_count, 2)
     if ptr_is_null(node) != 0:
-        pcc_py_gc_minor_graph_unlock()
         return
-    pcc_gc_cycle_requested_store_release(1)
+    pcc_py_gc_minor_graph_lock()
+    old_head = global_load_ptr("pcc_gc_frame_head")
+    store_ptr(node, 16, old_head)
+    if ptr_is_null(old_head) == 0:
+        store_ptr(old_head, 24, node)
+    global_store_ptr("pcc_gc_frame_head", node)
+    pcc_gc_root_registry_note_mutation_locked()
+    # Collector-internal frame transitions must not re-arm the cycle; see the
+    # note on the first of these four sites.
+    if load_i32(global_addr("pcc_gc_explicit_collect_active"), 0) == 0:
+        pcc_gc_cycle_requested_store_release(1)
     pcc_py_gc_minor_graph_unlock()
 
 
@@ -300,17 +383,21 @@ def pcc_gc_note_frame_leave_lifo(slots) -> None:
     gc_backend_current()
     if pcc_gc_should_track_frame_roots() == 0 or ptr_is_null(slots) != 0:
         return
+    released = null()
     pcc_py_gc_minor_graph_lock()
     node = global_load_ptr("pcc_gc_frame_head")
     while ptr_is_null(node) == 0:
         if ptr_eq(load_ptr(node, 8), slots) != 0 and (load_i32(node, 48) & 2) != 0:
             pcc_gc_frame_node_unlink(node)
-            pcc_gc_frame_node_release(node)
-            pcc_gc_cycle_requested_store_release(1)
-            pcc_py_gc_minor_graph_unlock()
-            return
+            # Collector-internal frame transitions must not re-arm the cycle; see the
+            # note on the first of these four sites.
+            if load_i32(global_addr("pcc_gc_explicit_collect_active"), 0) == 0:
+                pcc_gc_cycle_requested_store_release(1)
+            released = node
+            break
         node = load_ptr(node, 16)
     pcc_py_gc_minor_graph_unlock()
+    pcc_gc_frame_node_release(released)
 
 
 @c_abi_export("pcc_gc_note_frame_leave")
@@ -320,6 +407,7 @@ def pcc_gc_note_frame_leave(slots) -> None:
     backend: i64 = gc_backend_current()
     if pcc_gc_should_track_frame_roots() == 0 or ptr_is_null(slots) != 0:
         return
+    released = null()
     pcc_py_gc_minor_graph_lock()
     if backend == 0 and ptr_is_null(global_load_ptr("pcc_gc_frame_head")) != 0:
         pcc_py_gc_minor_graph_unlock()
@@ -332,12 +420,16 @@ def pcc_gc_note_frame_leave(slots) -> None:
         duplicate = load_ptr(indexed, 32)
         pcc_gc_frame_node_unlink(indexed)
         if ptr_is_null(duplicate) == 0:
-            pcc_gc_frame_index_replace(slots, duplicate)
+            pcc_gc_frame_index_replace_preallocated(slots, duplicate)
         else:
             pcc_gc_frame_index_remove(slots)
-        pcc_gc_frame_node_release(indexed)
-        pcc_gc_cycle_requested_store_release(1)
+        released = indexed
+        # Collector-internal frame transitions must not re-arm the cycle; see the
+        # note on the first of these four sites.
+        if load_i32(global_addr("pcc_gc_explicit_collect_active"), 0) == 0:
+            pcc_gc_cycle_requested_store_release(1)
     else:
         pcc_gc_frame_index_remove(slots)
-        pcc_gc_frame_index_insert(load_ptr(indexed, 8), indexed)
+        pcc_gc_frame_index_replace_preallocated(load_ptr(indexed, 8), indexed)
     pcc_py_gc_minor_graph_unlock()
+    pcc_gc_frame_node_release(released)

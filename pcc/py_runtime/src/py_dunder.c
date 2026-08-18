@@ -155,7 +155,7 @@ static PyObject *py_int_based_repr(PyObject *o, unsigned base, char prefix_ch) {
                 return r;
             }
         } else {
-            py_raise(py_exc_new(
+            py_raise_owned(py_exc_new(
                 PY_EXC_TYPEERROR,
                 "'object' cannot be interpreted as an integer"));
             return NULL;
@@ -355,7 +355,7 @@ int64_t py_user_hash_dispatch(PyObject *o, int64_t *handled) {
     if (func == NULL) return 0;
     if (func == py_None) {
         if (handled != NULL) *handled = 1;
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "unhashable type"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "unhashable type"));
         return 0;
     }
     PyObject *result = pcc_call_user_unary_method(func, o);
@@ -390,6 +390,12 @@ void py_user_del_dispatch(PyObject *o) {
     int32_t tag = h->type_tag;
     if (tag != PY_TYPE_INSTANCE && tag < PY_TYPE_USER_CLASS_START) return;
     if (pcc_capi_is_cext_type_tag((int64_t)tag) != 0) return;
+    /* No class ever defined __del__: the MRO lookup cannot find one.  Mirrors
+     * the port's pcc_class_del_defined_count gate. */
+    {
+        extern int32_t pcc_class_del_defined_count;
+        if (__atomic_load_n(&pcc_class_del_defined_count, __ATOMIC_ACQUIRE) == 0) return;
+    }
     if ((h->flags & PY_FLAG_FINALIZED) != 0) {
         pcc_runtime_log_event("finalizer", "skipped", tag, 1, o);
         return;

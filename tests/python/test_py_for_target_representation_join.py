@@ -76,9 +76,12 @@ def test_zero_iteration_preserves_prior_target_and_owned_root(tmp_path):
     body = _function_body(ir_text, "last")
     assert re.search(r"%item\.addr(?:\.\d+)? = alloca ptr", body), body
     assert "item.for.obj.addr" not in body, body
-    assert "@py_int_from_i64" in body, body
+    # ``item: int = 7`` is boxed on the object slot: either the historical
+    # ``py_int_from_i64`` call or, since the exact-int tagged lane, a tagged
+    # immediate handed to the ownership-transferring root store.
+    assert re.search(r"@py_int_from_i64\(|%int\.lit\.tagged", body), body
     assert "@pcc_gc_frame_enter" in body, body
-    assert "@pcc_gc_store_root" in body, body
+    assert re.search(r"@pcc_gc_store_root(?:_take)?\(", body), body
     # The slot is always owned in this shape, so the optimizer may fold the
     # dynamic ownership flag to a literal true.  Either representation must
     # retain the error-exit release; requiring the pre-folded SSA name made
@@ -118,13 +121,13 @@ def test_for_target_root_store_is_the_only_old_owner_release(tmp_path):
     assert transfer_match is not None, body
     loop_body = transfer_match.group(0)
     assert "item.owned.release" not in loop_body, loop_body
-    assert re.search(
-        r"(?s)call void @pcc_gc_pin.*?"
-        r"call void @pcc_gc_store_root.*?"
-        r"call void @pcc_gc_unpin.*?"
-        r"call void @pcc_gc_release",
-        loop_body,
-    ), loop_body
+    # The incoming element's reference moves into the slot with one
+    # ownership-transferring root store; the former pin / store_root / unpin
+    # / release quartet is gone (per-op row ``for_over_list``).
+    assert "@pcc_gc_store_root_take(" in loop_body, loop_body
+    assert "@pcc_gc_store_root(" not in loop_body, loop_body
+    assert "@pcc_gc_pin(" not in loop_body, loop_body
+    assert "@pcc_gc_release(" not in loop_body, loop_body
 
 
 def test_enumerate_then_dyn_list_and_reversed_reuse_one_valid_target_slot(tmp_path):

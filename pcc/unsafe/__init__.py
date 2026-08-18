@@ -133,6 +133,11 @@ def logical_shift_right_i64(value: int, bits: int) -> int:
     _trap("logical_shift_right_i64")
 
 
+def logical_shift_left_i64(value: int, bits: int) -> int:
+    """Return a raw i64 left shift; caller proves ``0 <= bits < 64``."""
+    _trap("logical_shift_left_i64")
+
+
 def unsigned_div_i64(value: int, divisor: int) -> int:
     """Return raw i64 unsigned division; caller proves divisor is nonzero."""
     _trap("unsigned_div_i64")
@@ -225,6 +230,16 @@ def untag_int(ptr: Any) -> int:
 
 def load_i64(ptr: Any, offset: int) -> int:
     _trap("load_i64")
+
+
+def load_i64x4(ptr: Any, offset: int) -> Any:
+    """Load four adjacent raw i64 lanes as one compiler-owned value."""
+    _trap("load_i64x4")
+
+
+def load_i64x4_strided(ptr: Any, offset: int, stride: int) -> Any:
+    """Load four raw i64 lanes separated by a byte stride."""
+    _trap("load_i64x4_strided")
 
 
 def load_i32(ptr: Any, offset: int) -> int:
@@ -1047,6 +1062,7 @@ __all__ = [
     "ptr_to_int",
     "wrapping_mul_i64",
     "logical_shift_right_i64",
+    "logical_shift_left_i64",
     "unsigned_div_i64",
     "unsigned_rem_i64",
     "unsigned_greater_i64",

@@ -18,6 +18,9 @@ Layout constants are imported from the generated ABI module.  Closed-world
 native constant exports keep these as compile-time values in library objects;
 there is no module-init dependency.
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.extern import extern, c_abi_export, c_ptr, c_int32, c_int64, c_void
 from pcc.py_runtime.py.py_abi_constants import (
     PYLISTOBJECT_ITEMS_OFFSET,
@@ -76,9 +79,21 @@ py_err_occurred   = extern("py_err_occurred",  (),                              
 py_gc_track       = extern("py_gc_track",       (c_ptr,),                             c_void)
 py_exc_new        = extern("py_exc_new",        (c_int64, c_ptr),                     c_ptr)
 py_raise          = extern("py_raise",          (c_ptr,),                             c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 pcc_gc_store_ptr  = extern("pcc_gc_store_ptr",  (c_ptr, c_ptr, c_ptr),                c_void)
 pcc_gc_load_ptr   = extern("pcc_gc_load_ptr",   (c_ptr, c_ptr),                       c_ptr)
+pcc_gc_backend = extern("pcc_gc_backend", (), c_int64)
+pcc_gc_scheduler_root_register_handle = extern(
+    "pcc_gc_scheduler_root_register_handle", (c_ptr,), c_ptr
+)
+pcc_gc_scheduler_root_unregister_handle = extern(
+    "pcc_gc_scheduler_root_unregister_handle", (c_ptr,), c_void
+)
 pcc_gc_alloc      = extern("pcc_gc_alloc",      (c_int64, c_int32, c_int32),          c_ptr)
+pcc_gc_publish_initialized = extern(
+    "pcc_gc_publish_initialized", (c_ptr,), c_void
+)
 _pcc_debug_bad_incref = extern("pcc_debug_bad_incref", (c_ptr, c_int32), c_void)
 getenv = extern("pcc_platform_getenv", (c_ptr,), c_ptr)
 
@@ -167,6 +182,8 @@ def py_tuple_new(n: int):
     if n > 0:
         items_ptr = ptr_add(t, PYTUPLEOBJECT_ITEMS_OFFSET)
         memset(items_ptr, 0, n * 8)
+    else:
+        pcc_gc_publish_initialized(t)
     return t
 
 
@@ -208,7 +225,7 @@ def py_tuple_from_splat(seq):
         if py_err_occurred() != 0:
             return null()
     if n < 0:
-        py_raise(py_exc_new(6, cstr("tuple() argument is not iterable")))  # PY_EXC_TYPEERROR
+        py_raise_owned(py_exc_new(6, cstr("tuple() argument is not iterable")))  # PY_EXC_TYPEERROR
         return null()
 
     out = py_tuple_new(n)
@@ -263,6 +280,23 @@ def py_tuple_set_item(tuple_ptr, i: int, item) -> None:
         flags = load_i32(tuple_ptr, PYOBJECTHEADER_FLAGS_OFFSET)
         if (flags & PY_FLAG_GC_TRACKED) == 0:
             py_gc_track(tuple_ptr)
+    # Only colored relocation waits for complete payload publication.
+    # Keep the store/ownership/tracking work above for every collector.
+    if pcc_gc_backend() != 4:
+        return
+    complete: int = 1
+    slot_index: int = 0
+    while slot_index < tuple_len:
+        if ptr_is_null(pcc_gc_load_ptr(
+            tuple_ptr,
+            ptr_add(tuple_ptr, PYTUPLEOBJECT_ITEMS_OFFSET + slot_index * 8),
+        )) != 0:
+            complete = 0
+            slot_index = tuple_len
+        else:
+            slot_index = slot_index + 1
+    if complete != 0:
+        pcc_gc_publish_initialized(tuple_ptr)
 
 
 @c_abi_export("py_tuple_get")
@@ -310,7 +344,7 @@ def py_tuple_getitem(tuple_ptr, i: int):
     if i < 0:
         i = i + tuple_len
     if i < 0 or i >= tuple_len:
-        py_raise(py_exc_new(5, cstr("tuple index out of range")))  # PY_EXC_INDEXERROR
+        py_raise_owned(py_exc_new(5, cstr("tuple index out of range")))  # PY_EXC_INDEXERROR
         return null()
     slot_offset: int = PYTUPLEOBJECT_ITEMS_OFFSET + i * 8
     v = pcc_gc_load_ptr(tuple_ptr, ptr_add(tuple_ptr, slot_offset))
@@ -325,51 +359,67 @@ def py_tuple_len(tuple_ptr) -> int:
     return load_i64(tuple_ptr, PYTUPLEOBJECT_LEN_OFFSET)
 
 
-@c_abi_export("py_tuple_count")
-def py_tuple_count(tuple_ptr, item) -> int:
-    if ptr_is_null(tuple_ptr) != 0:
+def _tuple_method_prepare_root(slot, value, backend: int):
+    store_ptr(slot, 0, value)
+    if (
+        (backend == 3 or backend == 4)
+        and ptr_is_null(value) == 0
+        and is_tagged_int(value) == 0
+    ):
+        handle = pcc_gc_scheduler_root_register_handle(slot)
+        if ptr_is_null(handle) == 0:
+            store_ptr(slot, 0, pcc_gc_load_ptr(null(), slot))
+        return handle
+    return null()
+
+
+def _tuple_method_root_failed(value, backend: int, handle) -> int:
+    if backend != 3 and backend != 4:
         return 0
+    if ptr_is_null(value) != 0 or is_tagged_int(value) != 0:
+        return 0
+    return ptr_is_null(handle)
+
+
+def _tuple_method_reload_root(slot, handle):
+    value = load_ptr(slot, 0)
+    if ptr_is_null(handle) == 0:
+        value = pcc_gc_load_ptr(null(), slot)
+        store_ptr(slot, 0, value)
+    return value
+
+
+def _tuple_method_finish_root(handle) -> None:
+    if ptr_is_null(handle) == 0:
+        pcc_gc_scheduler_root_unregister_handle(handle)
+
+
+def _tuple_method_scan(tuple_ptr, item, start, stop, want_first: int) -> int:
+    if ptr_is_null(tuple_ptr) != 0:
+        return -1 if want_first != 0 else 0
+    backend: int = pcc_gc_backend()
+    tuple_slot = stack_alloc(8)
+    query_slot = stack_alloc(8)
+    element_slot = stack_alloc(8)
+    tuple_handle = _tuple_method_prepare_root(tuple_slot, tuple_ptr, backend)
+    if _tuple_method_root_failed(tuple_ptr, backend, tuple_handle) != 0:
+        return -1 if want_first != 0 else 0
+    query_handle = _tuple_method_prepare_root(query_slot, item, backend)
+    if _tuple_method_root_failed(item, backend, query_handle) != 0:
+        _tuple_method_finish_root(tuple_handle)
+        return -1 if want_first != 0 else 0
+
+    tuple_ptr = _tuple_method_reload_root(tuple_slot, tuple_handle)
     length: int = py_tuple_len(tuple_ptr)
-    count: int = 0
-    i: int = 0
-    while i < length:
-        element = py_tuple_get(tuple_ptr, i)
-        equal: int = py_obj_eq(element, item)
-        py_decref(element)
-        if equal != 0:
-            count = count + 1
-        i = i + 1
-    return count
-
-
-@c_abi_export("py_tuple_index")
-def py_tuple_index(tuple_ptr, item) -> int:
-    if ptr_is_null(tuple_ptr) == 0:
-        length: int = py_tuple_len(tuple_ptr)
-        i: int = 0
-        while i < length:
-            element = py_tuple_get(tuple_ptr, i)
-            equal: int = py_obj_eq(element, item)
-            py_decref(element)
-            if equal != 0:
-                return i
-            i = i + 1
-    py_raise(py_exc_new(2, cstr("tuple.index(x): x not in tuple")))
-    return -1
-
-
-@c_abi_export("py_tuple_index_range")
-def py_tuple_index_range(tuple_ptr, item, start, stop) -> int:
-    if ptr_is_null(tuple_ptr) == 0:
-        length: int = py_tuple_len(tuple_ptr)
+    lo: int = 0
+    hi: int = length
+    if ptr_is_null(start) == 0 or ptr_is_null(stop) == 0:
         overflow = stack_alloc(4)
-        lo: int = 0
         if ptr_is_null(start) == 0:
             store_i32(overflow, 0, 0)
             lo = py_int_to_i64(start, overflow)
             if load_i32(overflow, 0) != 0:
                 lo = 0
-        hi: int = length
         if ptr_is_null(stop) == 0:
             store_i32(overflow, 0, 0)
             hi = py_int_to_i64(stop, overflow)
@@ -385,15 +435,68 @@ def py_tuple_index_range(tuple_ptr, item, start, stop) -> int:
                 hi = 0
         if hi > length:
             hi = length
-        i: int = lo
-        while i < hi:
-            element = py_tuple_get(tuple_ptr, i)
-            equal: int = py_obj_eq(element, item)
+
+    count: int = 0
+    i: int = lo
+    while i < hi:
+        tuple_ptr = _tuple_method_reload_root(tuple_slot, tuple_handle)
+        item = _tuple_method_reload_root(query_slot, query_handle)
+        element = py_tuple_get(tuple_ptr, i)
+        store_ptr(element_slot, 0, element)
+        element_handle = _tuple_method_prepare_root(
+            element_slot, element, backend
+        )
+        if _tuple_method_root_failed(element, backend, element_handle) != 0:
             py_decref(element)
-            if equal != 0:
+            break
+        equal: int = py_obj_eq(element, item)
+        tuple_ptr = _tuple_method_reload_root(tuple_slot, tuple_handle)
+        item = _tuple_method_reload_root(query_slot, query_handle)
+        element = _tuple_method_reload_root(element_slot, element_handle)
+        _tuple_method_finish_root(element_handle)
+        py_decref(element)
+        if py_err_occurred() != 0:
+            _tuple_method_finish_root(query_handle)
+            _tuple_method_finish_root(tuple_handle)
+            return -1 if want_first != 0 else 0
+        if equal != 0:
+            if want_first != 0:
+                _tuple_method_finish_root(query_handle)
+                _tuple_method_finish_root(tuple_handle)
                 return i
-            i = i + 1
-    py_raise(py_exc_new(2, cstr("tuple.index(x): x not in tuple")))
+            count = count + 1
+        i = i + 1
+    _tuple_method_finish_root(query_handle)
+    _tuple_method_finish_root(tuple_handle)
+    if want_first != 0:
+        return -1
+    return count
+
+
+@c_abi_export("py_tuple_count")
+def py_tuple_count(tuple_ptr, item) -> int:
+    return _tuple_method_scan(tuple_ptr, item, null(), null(), 0)
+
+
+@c_abi_export("py_tuple_index")
+def py_tuple_index(tuple_ptr, item) -> int:
+    result: int = _tuple_method_scan(tuple_ptr, item, null(), null(), 1)
+    if result >= 0:
+        return result
+    if py_err_occurred() != 0:
+        return -1
+    py_raise_owned(py_exc_new(2, cstr("tuple.index(x): x not in tuple")))
+    return -1
+
+
+@c_abi_export("py_tuple_index_range")
+def py_tuple_index_range(tuple_ptr, item, start, stop) -> int:
+    result: int = _tuple_method_scan(tuple_ptr, item, start, stop, 1)
+    if result >= 0:
+        return result
+    if py_err_occurred() != 0:
+        return -1
+    py_raise_owned(py_exc_new(2, cstr("tuple.index(x): x not in tuple")))
     return -1
 
 

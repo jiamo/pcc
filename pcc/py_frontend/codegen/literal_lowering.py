@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import sys
 import os
+
 from pcc.llvm_capi.compat import ir
 
 from ..py_ast import (
@@ -10,6 +11,7 @@ from ..py_ast import (
     BytesType,
     Call,
     DictExpr,
+    DictType,
     DynType,
     Expr,
     FloatType,
@@ -22,9 +24,15 @@ from ..py_ast import (
     StrLit,
     StrType,
     TupleExpr,
+    TupleType,
     Type,
 )
 from . import marshal
+from .freestanding_abi_constants import (
+    PY_TYPE_DICT,
+    PY_TYPE_LIST,
+    PY_TYPE_TUPLE,
+)
 from .runtime_abi import declare_runtime_global
 
 
@@ -35,6 +43,70 @@ _CSTR = _I8.as_pointer()
 
 
 class LiteralLoweringMixin:
+    def _static_literal_init_function(self) -> ir.Function:
+        """``void _pcc_py_static_literals_<mod>()``: registers every pooled
+        static ``str`` object with the GC provenance index.
+
+        Static literals live in the data segment, so the allocator's granule
+        check cannot vouch for them and every ``py_incref`` / ``py_decref`` /
+        pin of a literal (``if op == 'add'``, ``d['key']``, ``x == 'ret'``)
+        fell through the whole locked provenance chain -- including the
+        linear builtin-type scan -- before answering "not managed" and
+        skipping the refcount.  That chain was the top self-time leaf of the
+        ``str_eq_dispatch`` per-op row (12% ``_is_type_object``).  Registering
+        the literals once at module start turns each of those queries into
+        one hash probe.  The body is filled in by
+        ``_finalize_static_literal_init`` once the pool is complete.
+        """
+        fn = self._static_literal_init_fn
+        if fn is not None:
+            return fn
+        mod_name = self.ast_module.name or "mod"
+        sanitised = mod_name.replace(".", "_").replace("-", "_")
+        fn = ir.Function(
+            self.module,
+            ir.FunctionType(ir.VoidType(), []),
+            name=f"_pcc_py_static_literals_{sanitised}",
+        )
+        fn.linkage = "internal"
+        self._static_literal_init_fn = fn
+        return fn
+
+    def _emit_static_literal_init_call(self) -> None:
+        if self._freestanding_module:
+            return
+        self.builder.call(self._static_literal_init_function(), [])
+
+    def _finalize_static_literal_init(self) -> None:
+        fn = self._static_literal_init_fn
+        if fn is None:
+            return
+        mod_name = self.ast_module.name or "mod"
+        sanitised = mod_name.replace(".", "_").replace("-", "_")
+        guard = ir.GlobalVariable(
+            self.module, _I32, name=f".pcc.static.literals.init.{sanitised}"
+        )
+        guard.linkage = "internal"
+        guard.initializer = ir.Constant(_I32, 0)
+        entry = fn.append_basic_block("entry")
+        body_bb = fn.append_basic_block("body")
+        done_bb = fn.append_basic_block("done")
+        builder = ir.IRBuilder(entry)
+        seen = builder.load(guard, name="static.literals.seen")
+        builder.cbranch(
+            builder.icmp_signed("!=", seen, ir.Constant(_I32, 0), name="static.literals.done"),
+            done_bb,
+            body_bb,
+        )
+        builder.position_at_end(body_bb)
+        builder.store(ir.Constant(_I32, 1), guard)
+        register = self.runtime["pcc_gc_pointer_register"]
+        for gv in self._str_obj_pool.values():
+            builder.call(register, [builder.bitcast(gv, _CSTR)])
+        builder.branch(done_bb)
+        builder.position_at_end(done_bb)
+        builder.ret_void()
+
     def _emit_str_literal(self, value: str) -> ir.Value:
         existing = self._str_obj_pool.get(value)
         if existing is None:
@@ -438,7 +510,13 @@ class LiteralLoweringMixin:
                 name=self._fresh("list.new"),
             )
             self._emit_post_call_err_check()
-            lst_root = self._enter_container_temp_root(lst, "list")
+            # The root protects the container while its elements are built;
+            # an empty literal builds nothing.
+            lst_root = (
+                self._enter_container_temp_root(lst, "list")
+                if expr.elems
+                else ir.Constant(_CSTR, None)
+            )
             for el in expr.elems:
                 previous_preference = self._prefer_native_callable_values
                 if prefer_native_callables:
@@ -716,38 +794,132 @@ class LiteralLoweringMixin:
         d = self.builder.call(
             self.runtime["py_dict_new"], [], name=self._fresh("dict.new")
         )
+        self._emit_post_call_err_check()
         dict_root = self._enter_container_temp_root(d, "dict")
         for k_expr, v_expr in expr.pairs:
             if isinstance(k_expr, Name) and k_expr.ident == "**":
-                m_obj = self._emit_expr_as_pcc_object(v_expr)
+                m_obj = self._emit_expr_with_cpy_operand_cleanup(
+                    v_expr,
+                    (),
+                    ((d, dict_root),),
+                    (),
+                    True,
+                )
+                mapping_owned = self._container_store_temp_needs_release(
+                    v_expr,
+                    v_expr.ty,
+                    False,
+                )
+                mapping_pinned = (
+                    isinstance(m_obj.type, ir.PointerType)
+                    and self._pcc_pointer_source_needs_pin(v_expr)
+                )
+                mapping_pin_cleanup = ()
+                if mapping_pinned:
+                    self._gc_pin(m_obj)
+                    mapping_pin_cleanup = ((m_obj, mapping_owned),)
                 self.builder.call(
                     self.runtime["py_dict_update"],
                     [d, m_obj],
                     name=self._fresh("dict.splat.update"),
                 )
-                if self._container_store_temp_needs_release(
-                    v_expr, v_expr.ty, False
-                ):
+                self._emit_post_call_err_check(
+                    getattr(v_expr, "span", None),
+                    release_on_error=(
+                        (m_obj,) if mapping_owned and not mapping_pinned else ()
+                    ),
+                    rooted_release_on_error=((d, dict_root),),
+                    pinned_release_on_error=mapping_pin_cleanup,
+                )
+                if mapping_pinned:
+                    self._gc_unpin(m_obj)
+                if mapping_owned:
                     self._gc_release(
                         m_obj,
                         self._release_expr_label("container", v_expr),
                     )
             else:
-                k_obj = self._emit_expr_as_pcc_object(k_expr)
-                v_obj = self._emit_expr_as_pcc_object(v_expr)
-                self.builder.call(self.runtime["py_dict_set"], [d, k_obj, v_obj])
+                k_obj = self._emit_expr_with_cpy_operand_cleanup(
+                    k_expr,
+                    (),
+                    ((d, dict_root),),
+                    (),
+                    True,
+                )
+                key_owned = self._container_store_temp_needs_release(
+                    k_expr,
+                    k_expr.ty,
+                    False,
+                )
+                key_pinned = (
+                    isinstance(k_obj.type, ir.PointerType)
+                    and self._pcc_pointer_source_needs_pin(k_expr)
+                )
+                if key_pinned:
+                    self._gc_pin(k_obj)
+                key_pin_cleanup = ((k_obj, key_owned),) if key_pinned else ()
+                self._emit_post_call_err_check(
+                    getattr(k_expr, "span", None),
+                    release_on_error=(
+                        (k_obj,) if key_owned and not key_pinned else ()
+                    ),
+                    rooted_release_on_error=((d, dict_root),),
+                    pinned_release_on_error=key_pin_cleanup,
+                )
+                v_obj = self._emit_expr_with_cpy_operand_cleanup(
+                    v_expr,
+                    (),
+                    ((d, dict_root),),
+                    key_pin_cleanup,
+                    True,
+                )
+                value_owned = self._container_store_temp_needs_release(
+                    v_expr,
+                    v_expr.ty,
+                    False,
+                )
+                value_pinned = (
+                    isinstance(v_obj.type, ir.PointerType)
+                    and self._pcc_pointer_source_needs_pin(v_expr)
+                )
+                if value_pinned:
+                    self._gc_pin(v_obj)
+                pinned_on_error = key_pin_cleanup
+                if value_pinned:
+                    pinned_on_error = pinned_on_error + ((v_obj, value_owned),)
+                release_on_error = []
+                if key_owned and not key_pinned:
+                    release_on_error.append(k_obj)
+                if value_owned and not value_pinned:
+                    release_on_error.append(v_obj)
+                self._emit_post_call_err_check(
+                    getattr(v_expr, "span", None),
+                    release_on_error=tuple(release_on_error),
+                    rooted_release_on_error=((d, dict_root),),
+                    pinned_release_on_error=pinned_on_error,
+                )
+                self.builder.call(
+                    self.runtime["py_dict_set"],
+                    [d, k_obj, v_obj],
+                )
+                self._emit_post_call_err_check(
+                    getattr(v_expr, "span", None),
+                    release_on_error=tuple(release_on_error),
+                    rooted_release_on_error=((d, dict_root),),
+                    pinned_release_on_error=pinned_on_error,
+                )
                 # py_dict_set borrows (balanced store); owned key/value
                 # temps must be released here, mirroring py_list_append.
-                if self._container_store_temp_needs_release(
-                    k_expr, k_expr.ty, False
-                ):
+                if key_pinned:
+                    self._gc_unpin(k_obj)
+                if key_owned:
                     self._gc_release(
                         k_obj,
                         self._release_expr_label("container", k_expr),
                     )
-                if self._container_store_temp_needs_release(
-                    v_expr, v_expr.ty, False
-                ):
+                if value_pinned:
+                    self._gc_unpin(v_obj)
+                if value_owned:
                     self._gc_release(
                         v_obj,
                         self._release_expr_label("container", v_expr),
@@ -781,7 +953,11 @@ class LiteralLoweringMixin:
                 name=self._fresh("dict.new"),
             )
             self._emit_post_call_err_check()
-            dict_root = self._enter_container_temp_root(d, "dict")
+            dict_root = (
+                self._enter_container_temp_root(d, "dict")
+                if expr.pairs
+                else ir.Constant(_CSTR, None)
+            )
             for k_expr, v_expr in expr.pairs:
                 k_obj = self._emit_expr_with_cpy_operand_cleanup(
                     k_expr,
@@ -1206,6 +1382,17 @@ class LiteralLoweringMixin:
             raise NotImplementedError(
                 f"dict() takes at most 1 positional arg at L2; got {len(expr.args)}"
             )
+        if len(expr.args) == 1 and not expr.kwargs:
+            if isinstance(expr.args[0].ty, DictType):
+                # ``dict(mapping)`` is a shallow COPY, not a walk over
+                # (key, value) pairs.  The generic loop below indexes the
+                # source positionally, and for a dict that is a KEY lookup
+                # for 0, 1, 2 …, so ``dict(d)`` silently returned an EMPTY
+                # dict.  `_maybe_emit_dict_builtin` already implements the
+                # copy correctly via py_dict_keys + py_dict_get.
+                copied = self._maybe_emit_dict_builtin(expr)
+                if copied is not None:
+                    return copied
         out = self.builder.call(
             self.runtime["py_dict_new"],
             [],
@@ -1245,6 +1432,128 @@ class LiteralLoweringMixin:
             src_val,
             src_expr.ty,
         )
+        fn = self.current_function
+        src_is_dyn = isinstance(src_expr.ty, DynType)
+        if not src_is_dyn and not isinstance(
+            src_expr.ty, (DictType, ListType, TupleType)
+        ):
+            # The walk below indexes the source positionally, which only a
+            # list or tuple of pairs supports.  Every other statically known
+            # type either cannot hold pairs (int, str, ...) or cannot be
+            # indexed positionally (set), and previously fell through to
+            # py_obj_len's silent 0 / py_obj_getitem's silent NULL and
+            # produced an empty or corrupt dict with no error.  Fail closed
+            # at runtime (a set of pairs is CPython-legal but unimplemented
+            # here — the diagnostic is the documented interim).
+            self._leave_container_temp_root(out_root)
+            self._gc_release(out, self._release_context_label("dict.new"))
+            message = self._ptr_to_cstr(
+                self._cstr_global(
+                    "dict() argument must be a mapping or a "
+                    "list/tuple of pairs",
+                    ".dict.dyn.typeerror",
+                )
+            )
+            exc = self.builder.call(
+                self.runtime["py_exc_new"],
+                [ir.Constant(_I64, 3), message],
+                name=self._fresh("dict.static.exc"),
+            )
+            self.builder.call(self.runtime["py_raise"], [exc])
+            err_target = (
+                self._current_try_err_block() or self._ensure_fn_err_exit()
+            )
+            self.builder.branch(err_target)
+            cont_bb = fn.append_basic_block(
+                name=self._fresh("dict.static.badtype.cont")
+            )
+            # Unreachable continuation: the enclosing statement emitter
+            # keeps building here and terminates the block as usual.
+            self.builder.position_at_end(cont_bb)
+            return out
+        cond_bb = fn.append_basic_block(name=self._fresh("dict.from.cond"))
+        body_bb = fn.append_basic_block(name=self._fresh("dict.from.body"))
+        step_bb = fn.append_basic_block(name=self._fresh("dict.from.step"))
+        end_bb = fn.append_basic_block(name=self._fresh("dict.from.end"))
+        if src_is_dyn:
+            # The positional pairs walk below silently mis-handles a
+            # dyn-held source: for a runtime dict, py_obj_getitem(d, i) is a
+            # KEY lookup (raising KeyError mid-walk with no check); for a
+            # non-iterable, py_obj_len returns 0 WITHOUT raising and the
+            # result was a silent empty dict.  Dispatch on the runtime tag:
+            # dict -> shallow copy (CPython semantics, via the moving-GC-safe
+            # py_dict_update); list/tuple -> the pairs walk; anything else ->
+            # fail closed with TypeError.
+            tag = self.builder.call(
+                self.runtime["py_obj_type_tag"],
+                [src_obj],
+                name=self._fresh("dict.src.tag"),
+            )
+            copy_bb = fn.append_basic_block(
+                name=self._fresh("dict.dyn.copy")
+            )
+            notdict_bb = fn.append_basic_block(
+                name=self._fresh("dict.dyn.notdict")
+            )
+            pairs_bb = fn.append_basic_block(
+                name=self._fresh("dict.dyn.pairs")
+            )
+            bad_bb = fn.append_basic_block(
+                name=self._fresh("dict.dyn.notiterable")
+            )
+            is_dict = self.builder.icmp_signed(
+                "==",
+                tag,
+                ir.Constant(_I64, PY_TYPE_DICT),
+                name=self._fresh("dict.src.is.dict"),
+            )
+            self.builder.cbranch(is_dict, copy_bb, notdict_bb)
+            self.builder.position_at_end(notdict_bb)
+            is_list = self.builder.icmp_signed(
+                "==",
+                tag,
+                ir.Constant(_I64, PY_TYPE_LIST),
+                name=self._fresh("dict.src.is.list"),
+            )
+            is_tuple = self.builder.icmp_signed(
+                "==",
+                tag,
+                ir.Constant(_I64, PY_TYPE_TUPLE),
+                name=self._fresh("dict.src.is.tuple"),
+            )
+            pairs_ok = self.builder.or_(
+                is_list,
+                is_tuple,
+                name=self._fresh("dict.src.pairs.ok"),
+            )
+            self.builder.cbranch(pairs_ok, pairs_bb, bad_bb)
+            self.builder.position_at_end(bad_bb)
+            self._leave_container_temp_root(out_root)
+            self._gc_release(out, self._release_context_label("dict.new"))
+            message = self._ptr_to_cstr(
+                self._cstr_global(
+                    "dict() argument must be a mapping or a "
+                    "list/tuple of pairs",
+                    ".dict.dyn.typeerror",
+                )
+            )
+            exc = self.builder.call(
+                self.runtime["py_exc_new"],
+                [ir.Constant(_I64, 3), message],
+                name=self._fresh("dict.dyn.exc"),
+            )
+            self.builder.call(self.runtime["py_raise"], [exc])
+            err_target = (
+                self._current_try_err_block() or self._ensure_fn_err_exit()
+            )
+            self.builder.branch(err_target)
+            self.builder.position_at_end(copy_bb)
+            self.builder.call(
+                self.runtime["py_dict_update"],
+                [out, src_obj],
+            )
+            self.builder.branch(end_bb)
+            self.builder.position_at_end(pairs_bb)
         n_val = self.builder.call(
             self.runtime["py_obj_len"],
             [src_obj],
@@ -1252,12 +1561,6 @@ class LiteralLoweringMixin:
         )
         idx_slot = self._alloca_in_entry(_I64, name="dict.src.idx.addr")
         self.builder.store(ir.Constant(_I64, 0), idx_slot)
-
-        fn = self.current_function
-        cond_bb = fn.append_basic_block(name=self._fresh("dict.from.cond"))
-        body_bb = fn.append_basic_block(name=self._fresh("dict.from.body"))
-        step_bb = fn.append_basic_block(name=self._fresh("dict.from.step"))
-        end_bb = fn.append_basic_block(name=self._fresh("dict.from.end"))
         self.builder.branch(cond_bb)
 
         self.builder.position_at_end(cond_bb)
@@ -1301,10 +1604,87 @@ class LiteralLoweringMixin:
             [pair_obj, one_box],
             name=self._fresh("dict.pair.val"),
         )
+        loop_temps = (
+            val_obj,
+            key_obj,
+            pair_obj,
+            one_box,
+            zero_box,
+            idx_box,
+        )
+        if src_is_dyn:
+            # A dyn pair element can be a user-class object whose __getitem__
+            # raises; the loop temps and the dict under construction are live
+            # owned references on that edge.
+            self._emit_post_call_err_check(
+                src_expr.span,
+                release_on_error=loop_temps,
+                rooted_release_on_error=((out, out_root),),
+            )
+            # py_obj_getitem returns NULL WITHOUT raising for unsupported
+            # tags (py_obj_ops_dispatch.c), so a non-pair element (e.g.
+            # dict([(1, 2), 3])) produced NULL key/value here and previously
+            # fed them straight into py_dict_set.  Fail closed.
+            key_null = self.builder.icmp_unsigned(
+                "==",
+                key_obj,
+                ir.Constant(key_obj.type, None),
+                name=self._fresh("dict.pair.key.null"),
+            )
+            val_null = self.builder.icmp_unsigned(
+                "==",
+                val_obj,
+                ir.Constant(val_obj.type, None),
+                name=self._fresh("dict.pair.val.null"),
+            )
+            pair_bad = self.builder.or_(
+                key_null,
+                val_null,
+                name=self._fresh("dict.pair.bad"),
+            )
+            badpair_bb = fn.append_basic_block(
+                name=self._fresh("dict.pair.notpair")
+            )
+            pair_ok_bb = fn.append_basic_block(
+                name=self._fresh("dict.pair.ok")
+            )
+            self.builder.cbranch(pair_bad, badpair_bb, pair_ok_bb)
+            self.builder.position_at_end(badpair_bb)
+            for temp in loop_temps:
+                self._gc_release(
+                    temp, self._release_context_label("dict.pair.bad")
+                )
+            self._leave_container_temp_root(out_root)
+            self._gc_release(out, self._release_context_label("dict.new"))
+            message = self._ptr_to_cstr(
+                self._cstr_global(
+                    "dict() iterable element is not a pair",
+                    ".dict.pair.typeerror",
+                )
+            )
+            exc = self.builder.call(
+                self.runtime["py_exc_new"],
+                [ir.Constant(_I64, 3), message],
+                name=self._fresh("dict.pair.exc"),
+            )
+            self.builder.call(self.runtime["py_raise"], [exc])
+            err_target = (
+                self._current_try_err_block() or self._ensure_fn_err_exit()
+            )
+            self.builder.branch(err_target)
+            self.builder.position_at_end(pair_ok_bb)
         self.builder.call(
             self.runtime["py_dict_set"],
             [out, key_obj, val_obj],
         )
+        # py_dict_set RETAINS what it stores; every loop temp above is a NEW
+        # ref (py_obj_getitem, py_int_from_i64), so without these releases
+        # dict(pairs) leaked pair/key/value per entry — on the NORMAL path.
+        # pcc_gc_release is NULL- and tagged-int-safe.
+        for temp in loop_temps:
+            self._gc_release(
+                temp, self._release_context_label("dict.pair.temp")
+            )
         if not self._builder_block_is_terminated():
             self.builder.branch(step_bb)
 
@@ -1383,7 +1763,11 @@ class LiteralLoweringMixin:
                     name=self._fresh("tup.new"),
                 )
                 self._emit_post_call_err_check()
-                tup_root = self._enter_container_temp_root(tup, "tuple")
+                tup_root = (
+                    self._enter_container_temp_root(tup, "tuple")
+                    if expr.elems
+                    else ir.Constant(_CSTR, None)
+                )
                 for i, el in enumerate(expr.elems):
                     v_obj = self._emit_expr_with_cpy_operand_cleanup(
                         el,

@@ -15,6 +15,9 @@ Layout offsets (LP64, pcc int64_t = long):
     16: len      (int64)
     24: items[0], items[1], ...      (ptr each, 8 bytes)
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_TUPLE,
 )

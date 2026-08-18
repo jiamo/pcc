@@ -395,7 +395,7 @@ def test_current_pcc1_replaces_cpython_for_frozen_pproxy_service(
         check=True,
         timeout=30,
     )
-    assert oracle_version.stdout.strip() == "3.13.2"
+    assert oracle_version.stdout.strip() == "3.15.0rc1"
 
     pcc_env = os.environ.copy()
     for name in ("LC_ALL", "PYTHONPATH", "PCC_PACKAGE_SITE", "PCC_DATA_HOME"):

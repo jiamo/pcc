@@ -7,9 +7,12 @@ from pcc.unsafe import (
     global_load_ptr,
     load_i32,
     load_ptr,
+    null,
     ptr_eq,
     ptr_is_null,
+    stack_alloc,
     store_i32,
+    store_ptr,
 )
 
 
@@ -17,14 +20,11 @@ __pcc_freestanding__ = True
 
 
 pcc_gc_backend = extern("pcc_gc_backend", (), c_int64)
-pcc_gc_backend4_relocate_copy_unlocked = extern(
-    "pcc_gc_backend4_relocate_copy_unlocked", (c_ptr, c_int64), c_ptr
+pcc_gc_backend4_remap_and_retire_stopped_world = extern(
+    "pcc_gc_backend4_remap_and_retire_stopped_world", (), c_int64
 )
-pcc_gc_backend4_remap_and_retire_unlocked = extern(
-    "pcc_gc_backend4_remap_and_retire_unlocked", (), c_void
-)
-pcc_gc_backend4_zpage_page_for_owner = extern(
-    "pcc_gc_backend4_zpage_page_for_owner", (c_ptr,), c_ptr
+pcc_gc_backend4_zpage_find = extern(
+    "pcc_gc_backend4_zpage_find", (c_ptr,), c_ptr
 )
 pcc_gc_config_ensure = extern("pcc_gc_config_ensure", (), c_int64)
 pcc_gc_object_known_size = extern(
@@ -63,35 +63,56 @@ def _note_incomplete_batch(moved: i64) -> None:
     )
 
 
-@c_abi_export("pcc_gc_relocation_drain_remap_if_drained_unlocked")
-def _remap_if_drained_unlocked() -> None:
-    if ptr_is_null(_relocation_set_head()) == 0:
-        return
-    if load_i32(global_addr("pcc_gc_forwarding_population"), 0) > 0:
-        pcc_gc_backend4_remap_and_retire_unlocked()
-
-
 @c_abi_export("pcc_gc_relocation_drain_selected")
 def _relocate_selected(budget: i64) -> i64:
     if pcc_gc_backend() != 4 or budget <= 0:
         return 0
+    if load_i32(global_addr("pcc_gc_backend4_remap_active"), 0) != 0:
+        return 0
     moved: i64 = 0
-    node = _relocation_set_head()
-    while ptr_is_null(node) == 0 and moved < budget:
-        nxt = load_ptr(node, 8)
-        obj = load_ptr(node, 0)
-        to_obj = pcc_gc_relocate_copy(obj, pcc_gc_object_known_size(obj))
-        if ptr_is_null(to_obj) == 0:
-            py_decref(to_obj)
-            moved = moved + 1
-            if (moved & 15) == 0:
-                pcc_thread_safepoint()
-        node = nxt
-    _note_incomplete_batch(moved)
-    if ptr_is_null(_relocation_set_head()) != 0:
+    stalled: i64 = 0
+    sources = stack_alloc(128)
+    while moved < budget and stalled == 0:
+        capacity: i64 = budget - moved
+        if capacity > 16:
+            capacity = 16
+        captured: i64 = 0
         pcc_py_gc_minor_graph_lock()
-        _remap_if_drained_unlocked()
+        node = _relocation_set_head()
+        while ptr_is_null(node) == 0 and captured < capacity:
+            store_ptr(sources, captured * 8, load_ptr(node, 0))
+            captured = captured + 1
+            node = load_ptr(node, 8)
         pcc_py_gc_minor_graph_unlock()
+
+        batch_moved: i64 = 0
+        index: i64 = 0
+        while index < captured:
+            obj = load_ptr(sources, index * 8)
+            to_obj = pcc_gc_relocate_copy(
+                obj, pcc_gc_object_known_size(obj)
+            )
+            if ptr_is_null(to_obj) == 0:
+                py_decref(to_obj)
+                moved = moved + 1
+                batch_moved = batch_moved + 1
+            index = index + 1
+        if captured == 16:
+            pcc_thread_safepoint()
+        if captured <= 0 or batch_moved <= 0:
+            stalled = 1
+
+    pcc_py_gc_minor_graph_lock()
+    _note_incomplete_batch(moved)
+    should_remap: i64 = 0
+    if (
+        ptr_is_null(_relocation_set_head()) != 0
+        and load_i32(global_addr("pcc_gc_forwarding_population"), 0) > 0
+    ):
+        should_remap = 1
+    pcc_py_gc_minor_graph_unlock()
+    if should_remap != 0:
+        pcc_gc_backend4_remap_and_retire_stopped_world()
     return moved
 
 
@@ -106,21 +127,56 @@ def _relocate_selected_page(page) -> i64:
     if ptr_is_null(page) != 0:
         return 0
     moved: i64 = 0
-    node = _relocation_set_head()
-    while ptr_is_null(node) == 0:
-        nxt = load_ptr(node, 8)
-        obj = load_ptr(node, 0)
-        owner_page = pcc_gc_backend4_zpage_page_for_owner(obj)
-        if ptr_eq(owner_page, page) != 0:
-            to_obj = pcc_gc_backend4_relocate_copy_unlocked(
+    sources = stack_alloc(128)
+    page_complete: i64 = 0
+    stalled: i64 = 0
+    while page_complete == 0 and stalled == 0:
+        captured: i64 = 0
+        examined: i64 = 0
+        pcc_py_gc_minor_graph_lock()
+        node = _relocation_set_head()
+        while (
+            ptr_is_null(node) == 0
+            and examined < 16
+            and captured < 16
+        ):
+            nxt = load_ptr(node, 8)
+            obj = load_ptr(node, 0)
+            examined = examined + 1
+            znode = pcc_gc_backend4_zpage_find(obj)
+            if (
+                ptr_is_null(znode) == 0
+                and ptr_eq(load_ptr(znode, 8), page) != 0
+            ):
+                store_ptr(sources, captured * 8, obj)
+                captured = captured + 1
+            node = nxt
+        pcc_py_gc_minor_graph_unlock()
+
+        batch_moved: i64 = 0
+        index: i64 = 0
+        while index < captured:
+            obj = load_ptr(sources, index * 8)
+            to_obj = pcc_gc_relocate_copy(
                 obj, pcc_gc_object_known_size(obj)
             )
             if ptr_is_null(to_obj) == 0:
                 py_decref(to_obj)
                 moved = moved + 1
-                if (moved & 15) == 0:
-                    pcc_thread_safepoint()
-        node = nxt
+                batch_moved = batch_moved + 1
+            index = index + 1
+        if captured == 16:
+            pcc_thread_safepoint()
+
+        pcc_py_gc_minor_graph_lock()
+        head = _evacuation_page_head()
+        if ptr_is_null(head) != 0:
+            page_complete = 1
+        elif ptr_eq(load_ptr(head, 0), page) == 0:
+            page_complete = 1
+        pcc_py_gc_minor_graph_unlock()
+        if captured <= 0 or batch_moved <= 0:
+            stalled = 1
     return moved
 
 
@@ -129,20 +185,32 @@ def pcc_gc_backend4_evacuation_page_drain(page_budget: i64) -> i64:
     backend: i64 = pcc_gc_config_ensure()
     if backend != 4 or page_budget <= 0:
         return 0
+    if load_i32(global_addr("pcc_gc_backend4_remap_active"), 0) != 0:
+        return 0
     moved: i64 = 0
     pages: i64 = 0
-    pcc_py_gc_minor_graph_lock()
     while pages < page_budget:
+        pcc_py_gc_minor_graph_lock()
         head = _evacuation_page_head()
         if ptr_is_null(head) != 0:
+            pcc_py_gc_minor_graph_unlock()
             break
         page = load_ptr(head, 0)
+        pcc_py_gc_minor_graph_unlock()
         page_moved: i64 = _relocate_selected_page(page)
         if page_moved <= 0:
             break
         moved = moved + page_moved
         pages = pages + 1
+    pcc_py_gc_minor_graph_lock()
     _note_incomplete_batch(moved)
-    _remap_if_drained_unlocked()
+    should_remap: i64 = 0
+    if (
+        ptr_is_null(_relocation_set_head()) != 0
+        and load_i32(global_addr("pcc_gc_forwarding_population"), 0) > 0
+    ):
+        should_remap = 1
     pcc_py_gc_minor_graph_unlock()
+    if should_remap != 0:
+        pcc_gc_backend4_remap_and_retire_stopped_world()
     return moved

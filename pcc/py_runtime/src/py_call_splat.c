@@ -55,7 +55,7 @@ PyObject *py_call_merge_posargs(PyObject *base_tuple, PyObject *star_args) {
             );
         }
     } else if (py_type_of(base_tuple) != PY_TYPE_TUPLE) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "call args base must be tuple"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "call args base must be tuple"));
         return NULL;
     } else {
         py_incref(base_tuple);
@@ -69,7 +69,7 @@ PyObject *py_call_merge_posargs(PyObject *base_tuple, PyObject *star_args) {
     int64_t star_len = pcc_sequence_len_for_splat(star_args);
     if (star_len < 0) {
         py_decref(base_tuple);
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "*args must be tuple or list"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "*args must be tuple or list"));
         return NULL;
     }
 
@@ -133,7 +133,7 @@ PyObject *py_zip_star(PyObject *rows) {
     }
     int64_t nrows = pcc_sequence_len_for_splat(rows);
     if (nrows < 0) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR,
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR,
                             "zip(*x): x must be a tuple or list"));
         return NULL;
     }
@@ -249,7 +249,7 @@ static PyObject *pcc_dict_clone(PyObject *src) {
     if (src != NULL && src != py_None) {
         if (py_type_of(src) != PY_TYPE_DICT) {
             py_decref(out);
-            py_raise(py_exc_new(PY_EXC_TYPEERROR, "kwargs base must be dict"));
+            py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "kwargs base must be dict"));
             return NULL;
         }
         py_dict_update(out, src);
@@ -271,7 +271,7 @@ PyObject *py_call_merge_kwargs(PyObject *base_kwargs, PyObject *star_kwargs) {
     }
     if (py_type_of(star_kwargs) != PY_TYPE_DICT) {
         py_decref(out);
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "**kwargs must be dict"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "**kwargs must be dict"));
         return NULL;
     }
     py_dict_update(out, star_kwargs);

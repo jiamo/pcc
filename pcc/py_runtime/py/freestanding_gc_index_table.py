@@ -411,6 +411,10 @@ def pcc_gc_index_py_remove(
         return null()
     if reject_tagged != 0 and is_tagged_int(key):
         return null()
+    # An empty index cannot hold the key; every object free probes the
+    # identity index this way, and almost no program registers identities.
+    if load_i64(count_cell, 0) <= 0:
+        return null()
     cap: i64 = load_i64(cap_cell, 0)
     result: i64 = pcc_gc_index_py_find_slot(slots, cap, key)
     if result < 0:
@@ -637,6 +641,101 @@ def pcc_gc_object_index_insert(obj: c_ptr, node: c_ptr) -> i64:
     )
 
 
+@c_abi_export("pcc_gc_object_index_plan_capacity")
+def pcc_gc_object_index_plan_capacity(extra: i64) -> i64:
+    if extra <= 0:
+        return -1
+    cap: i64 = load_i64(global_addr("pcc_py_gc_object_cap"), 0)
+    count: i64 = load_i64(global_addr("pcc_py_gc_object_count"), 0)
+    used: i64 = load_i64(global_addr("pcc_py_gc_object_used"), 0)
+    if cap > 0 and used + extra <= logical_shift_right_i64(cap, 1):
+        return 0
+    wanted: i64 = count + extra
+    desired: i64 = wanted * 4
+    if desired < 16384:
+        desired = 16384
+    capacity: i64 = pcc_gc_index_py_next_pow2(desired)
+    if cap > 0 and wanted > logical_shift_right_i64(cap, 1):
+        grown: i64 = cap * 2
+        if grown > capacity:
+            capacity = grown
+    return capacity
+
+
+@c_abi_export("pcc_gc_object_index_plan_commit")
+def pcc_gc_object_index_plan_commit(
+    prepared_slots_io: c_ptr, prepared_cap: i64, extra: i64
+) -> i64:
+    if ptr_is_null(prepared_slots_io) != 0:
+        return -1
+    required: i64 = pcc_gc_object_index_plan_capacity(extra)
+    if required < 0:
+        return -1
+    if required == 0:
+        return 0
+    new_slots = load_ptr(prepared_slots_io, 0)
+    if ptr_is_null(new_slots) != 0 or prepared_cap < required:
+        return -1
+
+    old_slots = global_load_ptr("pcc_py_gc_object_slots")
+    old_cap: i64 = load_i64(global_addr("pcc_py_gc_object_cap"), 0)
+    new_used: i64 = 0
+    index: i64 = 0
+    while index < old_cap:
+        old_offset: i64 = index * 24
+        if load_i8(old_slots, old_offset + 16) == 1:
+            key = load_ptr(old_slots, old_offset)
+            result: i64 = pcc_gc_index_py_find_slot(
+                new_slots, prepared_cap, key
+            )
+            new_offset: i64 = (-result - 1) * 24
+            store_ptr(new_slots, new_offset, key)
+            store_ptr(
+                new_slots,
+                new_offset + 8,
+                load_ptr(old_slots, old_offset + 8),
+            )
+            store_i8(new_slots, new_offset + 16, 1)
+            new_used = new_used + 1
+        index = index + 1
+    global_store_ptr("pcc_py_gc_object_slots", new_slots)
+    store_i64(global_addr("pcc_py_gc_object_cap"), 0, prepared_cap)
+    store_i64(global_addr("pcc_py_gc_object_used"), 0, new_used)
+    store_ptr(prepared_slots_io, 0, old_slots)
+    return 1
+
+
+@c_abi_export("pcc_gc_object_index_insert_preallocated")
+def pcc_gc_object_index_insert_preallocated(obj: c_ptr, node: c_ptr) -> i64:
+    if (
+        ptr_is_null(obj) != 0
+        or is_tagged_int(obj) != 0
+        or ptr_is_null(node) != 0
+    ):
+        return -1
+    slots = global_load_ptr("pcc_py_gc_object_slots")
+    if ptr_is_null(slots) != 0:
+        return -1
+    cap: i64 = load_i64(global_addr("pcc_py_gc_object_cap"), 0)
+    result: i64 = pcc_gc_index_py_find_slot(slots, cap, obj)
+    if result >= 0:
+        return 0
+    used: i64 = load_i64(global_addr("pcc_py_gc_object_used"), 0)
+    if used + 1 > logical_shift_right_i64(cap, 1):
+        return -1
+    offset: i64 = (-result - 1) * 24
+    store_ptr(slots, offset, obj)
+    store_ptr(slots, offset + 8, node)
+    store_i8(slots, offset + 16, 1)
+    store_i64(
+        global_addr("pcc_py_gc_object_count"),
+        0,
+        load_i64(global_addr("pcc_py_gc_object_count"), 0) + 1,
+    )
+    store_i64(global_addr("pcc_py_gc_object_used"), 0, used + 1)
+    return 1
+
+
 @c_abi_export("pcc_gc_object_index_remove")
 def pcc_gc_object_index_remove(obj: c_ptr) -> c_ptr:
     return pcc_gc_index_py_remove(
@@ -657,6 +756,154 @@ def pcc_gc_object_index_clear() -> None:
         global_addr("pcc_py_gc_object_count"),
         global_addr("pcc_py_gc_object_used"),
     )
+
+
+@c_abi_export("pcc_gc_forwarding_plan_index_capacity")
+def pcc_gc_forwarding_plan_index_capacity(kind: i64, extra: i64) -> i64:
+    if extra <= 0:
+        return -1
+    cap: i64 = 0
+    count: i64 = 0
+    used: i64 = 0
+    if kind == 0:
+        cap = load_i64(global_addr("pcc_py_gc_forwarding_cap"), 0)
+        count = load_i64(global_addr("pcc_py_gc_forwarding_count"), 0)
+        used = load_i64(global_addr("pcc_py_gc_forwarding_used"), 0)
+    elif kind == 1:
+        cap = load_i64(global_addr("pcc_py_gc_forwarding_target_cap"), 0)
+        count = load_i64(global_addr("pcc_py_gc_forwarding_target_count"), 0)
+        used = load_i64(global_addr("pcc_py_gc_forwarding_target_used"), 0)
+    elif kind == 2:
+        cap = load_i64(global_addr("pcc_py_gc_identity_cap"), 0)
+        count = load_i64(global_addr("pcc_py_gc_identity_count"), 0)
+        used = load_i64(global_addr("pcc_py_gc_identity_used"), 0)
+    else:
+        return -1
+    if cap > 0 and used + extra <= logical_shift_right_i64(cap, 1):
+        return 0
+    wanted: i64 = count + extra
+    desired: i64 = wanted * 4
+    if desired < 256:
+        desired = 256
+    capacity: i64 = pcc_gc_index_py_next_pow2(desired)
+    if cap > 0 and wanted > logical_shift_right_i64(cap, 1):
+        grown: i64 = cap * 2
+        if grown > capacity:
+            capacity = grown
+    return capacity
+
+
+@c_abi_export("pcc_gc_forwarding_plan_index_commit")
+def pcc_gc_forwarding_plan_index_commit(
+    kind: i64,
+    prepared_slots_io: c_ptr,
+    prepared_cap: i64,
+    extra: i64,
+) -> i64:
+    if ptr_is_null(prepared_slots_io) != 0:
+        return -1
+    slots_cell = null()
+    cap_cell = null()
+    used_cell = null()
+    if kind == 0:
+        slots_cell = global_addr("pcc_py_gc_forwarding_slots")
+        cap_cell = global_addr("pcc_py_gc_forwarding_cap")
+        used_cell = global_addr("pcc_py_gc_forwarding_used")
+    elif kind == 1:
+        slots_cell = global_addr("pcc_py_gc_forwarding_target_slots")
+        cap_cell = global_addr("pcc_py_gc_forwarding_target_cap")
+        used_cell = global_addr("pcc_py_gc_forwarding_target_used")
+    elif kind == 2:
+        slots_cell = global_addr("pcc_py_gc_identity_slots")
+        cap_cell = global_addr("pcc_py_gc_identity_cap")
+        used_cell = global_addr("pcc_py_gc_identity_used")
+    else:
+        return -1
+    required: i64 = pcc_gc_forwarding_plan_index_capacity(kind, extra)
+    if required < 0:
+        return -1
+    if required == 0:
+        return 0
+    new_slots = load_ptr(prepared_slots_io, 0)
+    if ptr_is_null(new_slots) != 0 or prepared_cap < required:
+        return -1
+
+    old_slots = load_ptr(slots_cell, 0)
+    old_cap: i64 = load_i64(cap_cell, 0)
+    new_used: i64 = 0
+    index: i64 = 0
+    while index < old_cap:
+        old_offset: i64 = index * 24
+        if load_i8(old_slots, old_offset + 16) == 1:
+            key = load_ptr(old_slots, old_offset)
+            result: i64 = pcc_gc_index_py_find_slot(
+                new_slots, prepared_cap, key
+            )
+            new_offset: i64 = (-result - 1) * 24
+            store_ptr(new_slots, new_offset, key)
+            store_ptr(
+                new_slots,
+                new_offset + 8,
+                load_ptr(old_slots, old_offset + 8),
+            )
+            store_i8(new_slots, new_offset + 16, 1)
+            new_used = new_used + 1
+        index = index + 1
+    store_ptr(slots_cell, 0, new_slots)
+    store_i64(cap_cell, 0, prepared_cap)
+    store_i64(used_cell, 0, new_used)
+    store_ptr(prepared_slots_io, 0, old_slots)
+    return 1
+
+
+@c_abi_export("pcc_gc_forwarding_plan_index_insert")
+def pcc_gc_forwarding_plan_index_insert(
+    kind: i64, obj: c_ptr, node: c_ptr
+) -> i64:
+    if (
+        ptr_is_null(obj) != 0
+        or is_tagged_int(obj) != 0
+        or ptr_is_null(node) != 0
+    ):
+        return -1
+    slots_cell = null()
+    cap_cell = null()
+    count_cell = null()
+    used_cell = null()
+    if kind == 0:
+        slots_cell = global_addr("pcc_py_gc_forwarding_slots")
+        cap_cell = global_addr("pcc_py_gc_forwarding_cap")
+        count_cell = global_addr("pcc_py_gc_forwarding_count")
+        used_cell = global_addr("pcc_py_gc_forwarding_used")
+    elif kind == 1:
+        slots_cell = global_addr("pcc_py_gc_forwarding_target_slots")
+        cap_cell = global_addr("pcc_py_gc_forwarding_target_cap")
+        count_cell = global_addr("pcc_py_gc_forwarding_target_count")
+        used_cell = global_addr("pcc_py_gc_forwarding_target_used")
+    elif kind == 2:
+        slots_cell = global_addr("pcc_py_gc_identity_slots")
+        cap_cell = global_addr("pcc_py_gc_identity_cap")
+        count_cell = global_addr("pcc_py_gc_identity_count")
+        used_cell = global_addr("pcc_py_gc_identity_used")
+    else:
+        return -1
+    slots = load_ptr(slots_cell, 0)
+    if ptr_is_null(slots) != 0:
+        return -1
+    cap: i64 = load_i64(cap_cell, 0)
+    result: i64 = pcc_gc_index_py_find_slot(slots, cap, obj)
+    if result >= 0:
+        return 0
+    used: i64 = load_i64(used_cell, 0)
+    if used + 1 > logical_shift_right_i64(cap, 1):
+        return -1
+    offset: i64 = (-result - 1) * 24
+    store_ptr(slots, offset, obj)
+    store_ptr(slots, offset + 8, node)
+    store_i8(slots, offset + 16, 1)
+    store_i64(count_cell, 0, load_i64(count_cell, 0) + 1)
+    store_i64(used_cell, 0, used + 1)
+    return 1
 
 
 @c_abi_export("pcc_gc_forwarding_index_find")
@@ -824,6 +1071,75 @@ def pcc_gc_frame_index_find(slots: c_ptr) -> c_ptr:
     )
 
 
+@c_abi_export("pcc_gc_frame_index_plan_capacity")
+def pcc_gc_frame_index_plan_capacity(extra: i64) -> i64:
+    if extra <= 0:
+        return -1
+    cap: i64 = load_i64(global_addr("pcc_py_gc_frame_cap"), 0)
+    count: i64 = load_i64(global_addr("pcc_py_gc_frame_count"), 0)
+    used: i64 = load_i64(global_addr("pcc_py_gc_frame_used"), 0)
+    if cap > 0 and used + extra <= logical_shift_right_i64(cap, 1):
+        return 0
+    wanted: i64 = count + extra
+    desired: i64 = wanted * 4
+    if desired < 256:
+        desired = 256
+    capacity: i64 = pcc_gc_index_py_next_pow2(desired)
+    if cap > 0 and wanted > logical_shift_right_i64(cap, 1):
+        grown: i64 = cap * 2
+        if grown > capacity:
+            capacity = grown
+    return capacity
+
+
+@c_abi_export("pcc_gc_frame_index_plan_commit")
+def pcc_gc_frame_index_plan_commit(
+    prepared_slots_io: c_ptr,
+    prepared_cap: i64,
+    extra: i64,
+) -> i64:
+    if ptr_is_null(prepared_slots_io) != 0:
+        return -1
+    required: i64 = pcc_gc_frame_index_plan_capacity(extra)
+    if required < 0:
+        return -1
+    if required == 0:
+        return 0
+    new_slots = load_ptr(prepared_slots_io, 0)
+    if ptr_is_null(new_slots) != 0 or prepared_cap < required:
+        return -1
+
+    slots_cell = global_addr("pcc_py_gc_frame_slots")
+    cap_cell = global_addr("pcc_py_gc_frame_cap")
+    used_cell = global_addr("pcc_py_gc_frame_used")
+    old_slots = load_ptr(slots_cell, 0)
+    old_cap: i64 = load_i64(cap_cell, 0)
+    new_used: i64 = 0
+    index: i64 = 0
+    while index < old_cap:
+        old_offset: i64 = index * 24
+        if load_i8(old_slots, old_offset + 16) == 1:
+            key = load_ptr(old_slots, old_offset)
+            result: i64 = pcc_gc_index_py_find_slot(
+                new_slots, prepared_cap, key
+            )
+            new_offset: i64 = (-result - 1) * 24
+            store_ptr(new_slots, new_offset, key)
+            store_ptr(
+                new_slots,
+                new_offset + 8,
+                load_ptr(old_slots, old_offset + 8),
+            )
+            store_i8(new_slots, new_offset + 16, 1)
+            new_used = new_used + 1
+        index = index + 1
+    store_ptr(slots_cell, 0, new_slots)
+    store_i64(cap_cell, 0, prepared_cap)
+    store_i64(used_cell, 0, new_used)
+    store_ptr(prepared_slots_io, 0, old_slots)
+    return 1
+
+
 @c_abi_export("pcc_gc_frame_index_insert")
 def pcc_gc_frame_index_insert(slots: c_ptr, node: c_ptr) -> i64:
     return pcc_gc_index_py_insert(
@@ -850,6 +1166,35 @@ def pcc_gc_frame_index_replace(slots: c_ptr, node: c_ptr) -> c_ptr:
         node,
         256,
     )
+
+
+@c_abi_export("pcc_gc_frame_index_replace_preallocated")
+def pcc_gc_frame_index_replace_preallocated(
+    slots: c_ptr, node: c_ptr
+) -> c_ptr:
+    if ptr_is_null(slots) != 0 or ptr_is_null(node) != 0:
+        return node
+    table = global_load_ptr("pcc_py_gc_frame_slots")
+    if ptr_is_null(table) != 0:
+        return node
+    cap: i64 = load_i64(global_addr("pcc_py_gc_frame_cap"), 0)
+    result: i64 = pcc_gc_index_py_find_slot(table, cap, slots)
+    if result >= 0:
+        offset: i64 = result * 24
+        old = load_ptr(table, offset + 8)
+        store_ptr(table, offset + 8, node)
+        return old
+    used: i64 = load_i64(global_addr("pcc_py_gc_frame_used"), 0)
+    if used + 1 > logical_shift_right_i64(cap, 1):
+        return node
+    count: i64 = load_i64(global_addr("pcc_py_gc_frame_count"), 0)
+    offset = (-result - 1) * 24
+    store_ptr(table, offset, slots)
+    store_ptr(table, offset + 8, node)
+    store_i8(table, offset + 16, 1)
+    store_i64(global_addr("pcc_py_gc_frame_used"), 0, used + 1)
+    store_i64(global_addr("pcc_py_gc_frame_count"), 0, count + 1)
+    return null()
 
 
 @c_abi_export("pcc_gc_frame_index_remove")
@@ -911,6 +1256,105 @@ def pcc_gc_zpage_owner_index_upsert(obj: c_ptr, node: c_ptr) -> i64:
         1,
         256,
     )
+
+
+@c_abi_export("pcc_gc_zpage_owner_index_plan_capacity")
+def pcc_gc_zpage_owner_index_plan_capacity(extra: i64) -> i64:
+    if extra <= 0:
+        return -1
+    cap: i64 = load_i64(global_addr("pcc_py_gc_zpage_owner_cap"), 0)
+    count: i64 = load_i64(global_addr("pcc_py_gc_zpage_owner_count"), 0)
+    used: i64 = load_i64(global_addr("pcc_py_gc_zpage_owner_used"), 0)
+    if cap > 0 and used + extra <= logical_shift_right_i64(cap, 1):
+        return 0
+    wanted: i64 = count + extra
+    desired: i64 = wanted * 4
+    if desired < 256:
+        desired = 256
+    capacity: i64 = pcc_gc_index_py_next_pow2(desired)
+    if cap > 0 and wanted > logical_shift_right_i64(cap, 1):
+        grown: i64 = cap * 2
+        if grown > capacity:
+            capacity = grown
+    return capacity
+
+
+@c_abi_export("pcc_gc_zpage_owner_index_plan_commit")
+def pcc_gc_zpage_owner_index_plan_commit(
+    prepared_slots_io: c_ptr, prepared_cap: i64, extra: i64
+) -> i64:
+    if ptr_is_null(prepared_slots_io) != 0:
+        return -1
+    required: i64 = pcc_gc_zpage_owner_index_plan_capacity(extra)
+    if required < 0:
+        return -1
+    if required == 0:
+        return 0
+    new_slots = load_ptr(prepared_slots_io, 0)
+    if ptr_is_null(new_slots) != 0 or prepared_cap < required:
+        return -1
+    old_slots = global_load_ptr("pcc_py_gc_zpage_owner_slots")
+    old_cap: i64 = load_i64(global_addr("pcc_py_gc_zpage_owner_cap"), 0)
+    new_used: i64 = 0
+    index: i64 = 0
+    while index < old_cap:
+        old_offset: i64 = index * 24
+        if load_i8(old_slots, old_offset + 16) == 1:
+            key = load_ptr(old_slots, old_offset)
+            result: i64 = pcc_gc_index_py_find_slot(
+                new_slots, prepared_cap, key
+            )
+            new_offset: i64 = (-result - 1) * 24
+            store_ptr(new_slots, new_offset, key)
+            store_ptr(
+                new_slots,
+                new_offset + 8,
+                load_ptr(old_slots, old_offset + 8),
+            )
+            store_i8(new_slots, new_offset + 16, 1)
+            new_used = new_used + 1
+        index = index + 1
+    global_store_ptr("pcc_py_gc_zpage_owner_slots", new_slots)
+    store_i64(global_addr("pcc_py_gc_zpage_owner_cap"), 0, prepared_cap)
+    store_i64(global_addr("pcc_py_gc_zpage_owner_used"), 0, new_used)
+    store_ptr(prepared_slots_io, 0, old_slots)
+    return 1
+
+
+@c_abi_export("pcc_gc_zpage_owner_index_upsert_preallocated")
+def pcc_gc_zpage_owner_index_upsert_preallocated(
+    obj: c_ptr, node: c_ptr
+) -> i64:
+    if (
+        ptr_is_null(obj) != 0
+        or is_tagged_int(obj) != 0
+        or ptr_is_null(node) != 0
+    ):
+        return -1
+    slots = global_load_ptr("pcc_py_gc_zpage_owner_slots")
+    if ptr_is_null(slots) != 0:
+        return -1
+    cap: i64 = load_i64(global_addr("pcc_py_gc_zpage_owner_cap"), 0)
+    result: i64 = pcc_gc_index_py_find_slot(slots, cap, obj)
+    offset: i64 = 0
+    if result >= 0:
+        offset = result * 24
+        store_ptr(slots, offset + 8, node)
+        return 0
+    used: i64 = load_i64(global_addr("pcc_py_gc_zpage_owner_used"), 0)
+    if used + 1 > logical_shift_right_i64(cap, 1):
+        return -1
+    offset = (-result - 1) * 24
+    store_ptr(slots, offset, obj)
+    store_ptr(slots, offset + 8, node)
+    store_i8(slots, offset + 16, 1)
+    store_i64(
+        global_addr("pcc_py_gc_zpage_owner_count"),
+        0,
+        load_i64(global_addr("pcc_py_gc_zpage_owner_count"), 0) + 1,
+    )
+    store_i64(global_addr("pcc_py_gc_zpage_owner_used"), 0, used + 1)
+    return 1
 
 
 @c_abi_export("pcc_gc_zpage_owner_index_remove")

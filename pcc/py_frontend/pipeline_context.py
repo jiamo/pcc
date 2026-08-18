@@ -8,12 +8,18 @@ public facade names so existing callers keep a stable API.
 from __future__ import annotations
 
 import os
+import sys
 from typing import Optional
 
 from .codegen.host_contract import L1_CODEGEN_HOST_ATTRS
 from .codegen.layer1_support import _default_native_module_exports
 from .codegen.vthread_effect_analysis import (
+    annotate_closed_world_vthread_effect_summaries,
     annotate_closed_world_vthread_effects,
+    build_closed_world_vthread_effect_summary,
+    closed_world_vthread_effect_export_surface,
+    read_closed_world_vthread_effect_summary,
+    write_closed_world_vthread_effect_summary,
 )
 from .export_meta import encode_type
 from .pipeline_ast_wire import (
@@ -25,6 +31,7 @@ from .pipeline_closed_world import (
     _closed_world_dyn_module_global_export,
     _closed_world_function_object_exports,
     _closed_world_is_identity_decorator,
+    _flatten_closed_world_class_export_fields,
     _closed_world_module_block_assign_targets,
     _closed_world_shallow_lift_module,
     _mark_closed_world_function_object_exports,
@@ -32,10 +39,13 @@ from .pipeline_closed_world import (
     _repair_closed_world_default_global_owners,
 )
 from .pipeline_exports import (
+    instance_field_assignment_statements,
     _class_is_dataclass,
+    _class_is_valueclass,
     _closed_world_is_node,
     _export_annotation_or_none,
     _export_call_sig,
+    _expand_local_valueclass_export_refs,
     _export_func_uses_unboxed_typed_int_abi,
     _export_literal_value_or_none,
     _export_method_symbol,
@@ -77,6 +87,7 @@ def build_closed_world_context(
     from .py_ast import Attr as _Attr
     from .py_ast import BinOp as _BinOp
     from .py_ast import BoolLit as _BoolLit
+    from .py_ast import BoolType as _BoolType
     from .py_ast import Call as _Call
     from .py_ast import ClassDef as _ClassDef
     from .py_ast import ClassType as _ClassType
@@ -85,12 +96,39 @@ def build_closed_world_context(
     from .py_ast import Import as _Import
     from .py_ast import ImportFrom as _ImportFrom
     from .py_ast import IntLit as _IntLit
+    from .py_ast import IntType as _IntType
     from .py_ast import ListExpr as _ListExpr
     from .py_ast import Name as _Name
     from .py_ast import NoneLit as _NoneLit
     from .py_ast import StrLit as _StrLit
     from .py_ast import Subscript as _Subscript
     from .py_ast import TupleExpr as _TupleExpr
+
+    def known_module_int_expr(expr, known_names) -> bool:
+        if _closed_world_is_node(expr, (_IntLit, _BoolLit)):
+            return True
+        if _closed_world_is_node(expr, _Name):
+            return _py_ast_field_value(expr, "ident", "") in known_names
+        if not _closed_world_is_node(expr, _BinOp):
+            return False
+        if _py_ast_field_value(expr, "op", "") not in (
+            "+",
+            "-",
+            "*",
+            "//",
+            "%",
+            "&",
+            "|",
+            "^",
+            "<<",
+            ">>",
+        ):
+            return False
+        return known_module_int_expr(
+            _py_ast_field_value(expr, "lhs", None), known_names
+        ) and known_module_int_expr(
+            _py_ast_field_value(expr, "rhs", None), known_names
+        )
 
     _profile_end(profile, "build_closed_world_context_import_py_ast", import_t)
     import_t = _profile_begin(profile)
@@ -137,7 +175,9 @@ def build_closed_world_context(
         _profile_end(profile, "build_closed_world_context_lift", lift_t, mod_name)
         parsed_modules.append(ast_mod)
         exports = {}
+        known_int_names = set()
         class_field_defs = {}
+        class_init_field_defs = {}
         class_field_names = {}
         top_level_func_names = set()
         top_level_class_names = set()
@@ -363,6 +403,16 @@ def build_closed_world_context(
                     continue
                 target_name = _py_ast_field_value(stmt_targets[0], "ident", "")
                 value = _py_ast_field_value(stmt, "value", None)
+                static_value_ty = _export_static_literal_type(value)
+                if static_value_ty is None and known_module_int_expr(
+                    value, known_int_names
+                ):
+                    static_value_ty = _IntType("int")
+                known_int_names.discard(target_name)
+                if _closed_world_is_node(
+                    static_value_ty, (_IntType, _BoolType)
+                ):
+                    known_int_names.add(target_name)
                 annotation = _py_ast_field_value(stmt, "annotation", None)
                 annotation_name = _py_ast_field_value(annotation, "name", "")
                 if typing_metadata_bindings.get(
@@ -417,7 +467,7 @@ def build_closed_world_context(
                         "value": None,
                     }
                 else:
-                    value_ty = _export_static_literal_type(value)
+                    value_ty = static_value_ty
                     if value_ty is None and value is not None:
                         # Computed module-top binding (e.g. ``V = 5 + 3``,
                         # ``V = f() + 8``).  pcc cannot statically type the RHS,
@@ -464,8 +514,53 @@ def build_closed_world_context(
             stmt_bases = _py_ast_field_value(stmt, "bases", ())
             stmt_body = _py_ast_field_value(stmt, "body", ())
             class_is_dataclass = _class_is_dataclass(stmt)
+            class_is_valueclass = _class_is_valueclass(stmt)
+            class_uses_declared_fields = (
+                class_is_dataclass or class_is_valueclass
+            )
             field_names = []
             field_defs = []
+            init_field_defs = []
+            constructor_field_names = set()
+            declared_field_annotations = {}
+            for declared_stmt in stmt_body:
+                if (
+                    _closed_world_is_node(declared_stmt, _FuncDef)
+                    and _py_ast_field_value(declared_stmt, "name", "") == "__init__"
+                ):
+                    constructor_body = _py_ast_field_value(declared_stmt, "body", ())
+                    for constructor_stmt in instance_field_assignment_statements(constructor_body):
+                        constructor_targets = _py_ast_field_value(constructor_stmt, "targets", ())
+                        if not constructor_targets:
+                            constructor_target = _py_ast_field_value(constructor_stmt, "target", None)
+                            constructor_targets = (constructor_target,) if constructor_target is not None else ()
+                        pending_constructor_targets = list(constructor_targets)
+                        while pending_constructor_targets:
+                            constructor_target = pending_constructor_targets.pop()
+                            if _closed_world_is_node(constructor_target, (_TupleExpr, _ListExpr)):
+                                pending_constructor_targets.extend(
+                                    _py_ast_field_value(constructor_target, "elems", ())
+                                )
+                                continue
+                            constructor_obj = _py_ast_field_value(constructor_target, "obj", None)
+                            if (
+                                _closed_world_is_node(constructor_target, _Attr)
+                                and _closed_world_is_node(constructor_obj, _Name)
+                                and _py_ast_field_value(constructor_obj, "ident", "") == "self"
+                            ):
+                                constructor_field_names.add(
+                                    _py_ast_field_value(constructor_target, "name", "")
+                                )
+                    continue
+                if not _closed_world_is_node(declared_stmt, _Assign):
+                    continue
+                declared_ann = _export_annotation_or_none(declared_stmt)
+                if declared_ann is None:
+                    continue
+                for declared_target in _py_ast_field_value(declared_stmt, "targets", ()):
+                    if _closed_world_is_node(declared_target, _Name):
+                        declared_name = _py_ast_field_value(declared_target, "ident", "")
+                        declared_field_annotations[declared_name] = declared_ann
             for base_expr in stmt_bases:
                 if not _closed_world_is_node(base_expr, _Name):
                     continue
@@ -475,6 +570,8 @@ def build_closed_world_context(
                         field_names.append(inherited_name)
                 for inherited in class_field_defs.get(base_ident, ()):
                     field_defs.append(inherited)
+                for inherited_init in class_init_field_defs.get(base_ident, ()):
+                    init_field_defs.append(inherited_init)
 
             methods = []
             for body_stmt in stmt_body:
@@ -511,19 +608,27 @@ def build_closed_world_context(
                                     and slot_name not in field_names
                                 ):
                                     field_names.append(slot_name)
-                        if class_is_dataclass and _closed_world_is_node(target, _Name):
+                        if class_uses_declared_fields and _closed_world_is_node(
+                            target, _Name
+                        ):
                             target_ident = _py_ast_field_value(target, "ident", "")
+                            body_ann = _export_annotation_or_none(body_stmt)
+                            if class_is_dataclass and body_ann is None:
+                                # Dataclasses only turn annotated class-body
+                                # assignments into instance fields. Preserve
+                                # unannotated constants as class attributes in
+                                # the exported constructor/schema too.
+                                continue
                             if target_ident not in field_names:
                                 field_names.append(target_ident)
-                            body_ann = _export_annotation_or_none(body_stmt)
-                            field_defs.append(
-                                {
-                                    "name": target_ident,
-                                    "annotation": body_ann,
-                                    "default": body_value,
-                                    "has_default": body_value is not None,
-                                }
-                            )
+                            declared_field_def = {
+                                "name": target_ident,
+                                "annotation": body_ann,
+                                "default": body_value,
+                                "has_default": body_value is not None,
+                            }
+                            field_defs.append(declared_field_def)
+                            init_field_defs.append(declared_field_def)
                     continue
 
                 if not _closed_world_is_node(body_stmt, _FuncDef):
@@ -534,7 +639,7 @@ def build_closed_world_context(
                 body_stmt_body = _py_ast_field_value(body_stmt, "body", ())
                 body_stmt_decorators = _py_ast_field_value(body_stmt, "decorators", ())
 
-                if body_stmt_name == "__init__":
+                if body_stmt_args and _py_ast_field_value(body_stmt_args[0], "name", "") == "self":
                     init_param_anns = {}
                     for arg in body_stmt_args:
                         arg_name = _py_ast_field_value(arg, "name", "")
@@ -543,9 +648,7 @@ def build_closed_world_context(
                         arg_ann = _export_annotation_or_none(arg)
                         if arg_ann is not None:
                             init_param_anns[arg_name] = arg_ann
-                    for init_stmt in body_stmt_body:
-                        if not _closed_world_is_node(init_stmt, _Assign):
-                            continue
+                    for init_stmt in instance_field_assignment_statements(body_stmt_body):
                         init_value = _py_ast_field_value(init_stmt, "value", None)
                         inferred_ann = _export_annotation_or_none(init_stmt)
                         if (
@@ -575,11 +678,11 @@ def build_closed_world_context(
                                         (),
                                         (),
                                     )
-                        pending_targets = list(
-                            reversed(
-                                _py_ast_field_value(init_stmt, "targets", ())
-                            )
-                        )
+                        assignment_targets = _py_ast_field_value(init_stmt, "targets", ())
+                        if not assignment_targets:
+                            single_target = _py_ast_field_value(init_stmt, "target", None)
+                            assignment_targets = (single_target,) if single_target is not None else ()
+                        pending_targets = list(reversed(assignment_targets))
                         while pending_targets:
                             target = pending_targets.pop()
                             if _closed_world_is_node(
@@ -603,23 +706,45 @@ def build_closed_world_context(
                             target_name = _py_ast_field_value(target, "name", "")
                             if target_name not in field_names:
                                 field_names.append(target_name)
-                            if inferred_ann is None:
+                            # Constructor ownership is independent of method
+                            # source order and of whether exports can infer its
+                            # RHS type. Unknown constructor types stay unknown.
+                            if (
+                                body_stmt_name != "__init__"
+                                and target_name in constructor_field_names
+                                and target_name not in declared_field_annotations
+                            ):
                                 continue
+                            # An ordinary class annotation supplies a type only
+                            # after an instance write discovers the field; it
+                            # does not turn every class attribute into a slot.
+                            field_ann = declared_field_annotations.get(target_name, inferred_ann)
+                            if field_ann is None:
+                                continue
+                            field_def = {
+                                "name": target_name,
+                                "annotation": field_ann,
+                                "default": None,
+                                "has_default": False,
+                            }
                             field_already_defined = False
-                            for field_def in field_defs:
-                                if field_def["name"] == target_name:
+                            for existing_field_def in field_defs:
+                                if existing_field_def["name"] == target_name:
                                     field_already_defined = True
                                     break
-                            if field_already_defined:
-                                continue
-                            field_defs.append(
-                                {
-                                    "name": target_name,
-                                    "annotation": inferred_ann,
-                                    "default": None,
-                                    "has_default": False,
-                                }
-                            )
+                            if not field_already_defined:
+                                field_defs.append(field_def)
+                            # Runtime field metadata includes every method's
+                            # writes. Synthetic dataclass constructor metadata
+                            # includes only declarations and constructor fields.
+                            if body_stmt_name == "__init__":
+                                init_field_known = False
+                                for init_field_def in init_field_defs:
+                                    if init_field_def["name"] == target_name:
+                                        init_field_known = True
+                                        break
+                                if not init_field_known:
+                                    init_field_defs.append(field_def)
 
                 kind = "instance"
                 for dec in body_stmt_decorators:
@@ -661,13 +786,14 @@ def build_closed_world_context(
                 )
 
             class_field_defs[stmt_name] = tuple(field_defs)
+            class_init_field_defs[stmt_name] = tuple(init_field_defs)
             class_field_names[stmt_name] = tuple(field_names)
             init_method_exists = False
             for method in methods:
                 if method["name"] == "__init__":
                     init_method_exists = True
                     break
-            if class_is_dataclass and field_defs and not init_method_exists:
+            if class_is_dataclass and init_field_defs and not init_method_exists:
                 init_sig = [
                     {
                         "name": "self",
@@ -678,7 +804,7 @@ def build_closed_world_context(
                     }
                 ]
                 init_param_types = [("dyn",)]
-                for field in field_defs:
+                for field in init_field_defs:
                     field_ann = field.get("annotation")
                     init_sig.append(
                         {
@@ -786,8 +912,10 @@ def build_closed_world_context(
                 "field_names": tuple(field_names),
                 "field_types": tuple(field_types_table),
                 "methods": tuple(methods),
+                "valueclass": class_is_valueclass,
                 "box_int_abi": module_box_int_abi,
             }
+        _expand_local_valueclass_export_refs(mod_name, exports)
         native_exports[mod_name] = exports
         _profile_end(profile, "build_closed_world_context_module", module_t, mod_name)
         module_index += 1
@@ -799,9 +927,20 @@ def build_closed_world_context(
             src_paths,
             native_exports,
         )
+        _flatten_closed_world_class_export_fields(native_exports)
         _repair_closed_world_default_global_owners(native_exports)
         _merge_l1_mixin_stack_methods(native_exports)
         _merge_l1_codegen_methods(native_exports)
+        # Imported annotation shells cannot be expanded until re-export
+        # bindings have converged.  The defining module's first pass handles
+        # local classes; this second idempotent pass resolves provider methods
+        # that annotate returns/arguments with a valueclass imported from a
+        # sibling module while preserving that class's real owning module.
+        for visible_module_name, visible_exports in native_exports.items():
+            _expand_local_valueclass_export_refs(
+                visible_module_name,
+                visible_exports,
+            )
 
     # Effect discovery must see the final public binding graph.  In
     # particular, ``from package import parked`` resolves only after package
@@ -902,6 +1041,32 @@ def _merge_l1_codegen_methods(native_exports):
     l1_info["methods"] = tuple(methods)
 
 
+def _contextual_host_export_surface(native_exports):
+    """Return the compact schema needed to compile L1CodeGen mixin methods."""
+
+    host_module = "pcc.py_frontend.codegen.layer1"
+    host_name = "L1CodeGen"
+    host_exports = native_exports.get(host_module)
+    class_exports = native_exports.get("pcc.py_frontend.codegen.class_gen")
+    if not isinstance(host_exports, dict) or not isinstance(class_exports, dict):
+        raise ValueError("contextual codegen host exports are unavailable")
+    host_info = host_exports.get(host_name)
+    class_info = class_exports.get("ClassInfo")
+    lowering_info = class_exports.get("ClassLowering")
+    for info in (host_info, class_info, lowering_info):
+        if not isinstance(info, dict) or info.get("kind") != "class":
+            raise ValueError("contextual codegen host class export is unavailable")
+    host_surface = {}
+    host_surface[host_name] = host_info
+    class_surface = {}
+    class_surface["ClassInfo"] = class_info
+    class_surface["ClassLowering"] = lowering_info
+    out = {}
+    out[host_module] = host_surface
+    out["pcc.py_frontend.codegen.class_gen"] = class_surface
+    return out
+
+
 def _contextual_host_params_for_module(ast_mod, module_name: str):
     """Return helper-function host params that should type as L1CodeGen.
 
@@ -967,10 +1132,10 @@ def compile_contextual_per_module_fallback_counts(
     """Return ``py_cpy_*`` call counts for modules under closed-world context.
 
     This is the diagnostic counterpart to ``compile_python_multi``. It
-    compiles selected modules one at a time, but with the same export table
-    and mixin self-type context as the full closed-world compile. Use this
-    for mixin modules; raw single-file probing gives their ``self`` the
-    wrong type.
+    compiles selected modules one at a time with the same export table as the
+    full closed-world compile. Contextual mixin Modules additionally receive
+    their real host self-type; ordinary closed-world Modules receive sibling
+    schemas without any host binding. Raw single-file probing lacks both.
     """
     from .type_infer import infer_module as _infer_module
     from .codegen.layer1 import L1CodeGen as _L1CodeGen
@@ -1046,6 +1211,12 @@ def compile_contextual_per_module_fallback_counts(
                     encoding="utf-8",
                 ) as f:
                     f.write(ir_text)
-        except Exception:
+        except Exception as exc:
             out[mod_name] = -1
+            detail = type(exc).__name__ + ": " + (str(exc) or type(exc).__name__)
+            sys.stderr.write("pcc contextual failure " + mod_name + ": " + detail + "\n")
+            if emit_ir_dir is not None:
+                error_name = mod_name.replace(".", "_") + ".error.txt"
+                with open(os.path.join(emit_ir_dir, error_name), "w", encoding="utf-8") as stream:
+                    stream.write(detail + "\n")
     return out

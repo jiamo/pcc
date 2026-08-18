@@ -71,6 +71,11 @@ def test_installed_runtime_bundle_is_selected_without_host_provenance_process(
         "_runtime_archive_provenance_valid",
         forbidden_host_verifier,
     )
+    monkeypatch.setattr(
+        pipeline,
+        "_runtime_archive_codegen_stale",
+        forbidden_host_verifier,
+    )
 
     assert pipeline._ensure_runtime(False, needs_libpython=False) == str(archive)
 

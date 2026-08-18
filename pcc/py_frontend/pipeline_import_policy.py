@@ -18,14 +18,11 @@ COMPILE_TIME_ONLY_IMPORT_MODULES = frozenset(
 
 TEST_FACADE_IMPORT_MODULES = ("pytest", "pcc.test_runner")
 
-# First-class pcc product components are ordinary closed-world source modules,
-# not compiler builtin dispatch and not host packages.  Dependency discovery
-# resolves these prefixes from the pcc source/install root even when the user
-# application lives outside that tree (the normal ``pcc1 app.py`` shape).
-PCC_OWNED_COMPONENT_IMPORT_PREFIXES = (
-    "pcc.gateway",
-    "pcc.web",
-)
+# pcc-owned product components resolved from the pcc source/install root even
+# when the application lives outside that tree.  Empty since the gateway and
+# web framework moved to https://github.com/allstoalls/pcc-gateway; external
+# packages are resolved through the package site (PCC_PACKAGE_SITE) instead.
+PCC_OWNED_COMPONENT_IMPORT_PREFIXES: tuple[str, ...] = ()
 
 ANNOTATION_ONLY_IMPORT_MODULES = frozenset(
     {"llvmlite.binding", "llvmlite.ir"}

@@ -7,6 +7,7 @@ from ..py_ast import (
     Assign,
     AugAssign,
     Call,
+    DictType,
     DynType,
     Expr,
     For,
@@ -89,16 +90,34 @@ class ForNormalizationLoweringMixin:
         return False
 
     def _for_iter_is_zip(self, stmt: For) -> bool:
-        """``for <...> in zip(xs, ys, ...):`` — optionally with
-        ``strict=True``, which we accept and drop."""
+        """``for <...> in zip(xs, ys, ...):`` — plain positional zips only.
+
+        Any kwarg (in practice ``strict=``) declines the rewrite: this
+        indexed-loop form has nowhere to put the equal-length enforcement,
+        so the generic ``zip`` builtin — the single owner of the strict
+        semantics — materialises the pairs and raises ValueError on
+        mismatch."""
         it = stmt.iter
         if not (
             _for_is_call_name(it, "zip")
             and len(it.args) >= 2
         ):
             return False
-        for kwn, _ in it.kwargs:
-            if kwn != "strict":
+        if it.kwargs:
+            return False
+        for source in it.args:
+            source_ty = source.ty
+            if isinstance(source_ty, DictType) or getattr(
+                source_ty, "name", ""
+            ) == "dict":
+                # This rewrite indexes every source positionally as
+                # ``source[i]``, and for a mapping that is a KEY lookup for
+                # 0, 1, 2 …  Iterating a mapping yields its keys, so
+                # ``zip(d, ...)`` raised KeyError here.  Wrapping the source
+                # in ``list(...)`` would rebuild the key list on every
+                # iteration, so decline the rewrite instead and let the
+                # generic ``zip`` builtin — which normalises mappings once —
+                # materialise the pairs.
                 return False
         return True
 

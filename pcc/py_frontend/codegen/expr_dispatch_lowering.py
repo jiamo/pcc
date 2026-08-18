@@ -15,6 +15,7 @@ from ..py_ast import (
     Compare,
     ComplexLit,
     DictExpr,
+    DynType,
     Expr,
     FloatLit,
     FloatType,
@@ -153,6 +154,25 @@ def _expr_is_slice(expr: Expr, kind: str) -> bool:
     )
 
 
+def _fold_str_literal_concat(expr: Expr):
+    """``StrLit + StrLit`` -> one ``StrLit``, else ``None``.
+
+    Deliberately narrow: both sides must already be string literals, so there
+    is no user ``__add__`` to honour and no runtime type to discover. Chained
+    literals fold left-to-right because the inner ``BinOp`` is folded first by
+    the same check on the way down.
+    """
+    if getattr(expr, "op", None) != "+":
+        return None
+    lhs = getattr(expr, "lhs", None)
+    rhs = getattr(expr, "rhs", None)
+    if not isinstance(lhs, StrLit) or not isinstance(rhs, StrLit):
+        return None
+    # Keep the left literal's span and its already-inferred StrType: the folded
+    # node stands where the expression started and its type cannot change.
+    return StrLit(span=lhs.span, ty=lhs.ty, value=lhs.value + rhs.value)
+
+
 def _expr_is_binop(expr: Expr, kind: str) -> bool:
     if isinstance(expr, BinOp) or kind == "BinOp":
         return True
@@ -162,6 +182,31 @@ def _expr_is_binop(expr: Expr, kind: str) -> bool:
         and _expr_has_attr(expr, "op")
     ):
         return False
+
+
+def _dynamic_binop_needs_exact_int_operand(expr: BinOp, operand: Expr) -> bool:
+    """Whether a dynamic object operation must consume an exact int object.
+
+    The ordinary ``int`` projection may exceed i64 even when this particular
+    nested expression is statically typed as ``IntType``.  Once its parent is
+    a dynamic object operation, emitting the child to raw i64 and boxing it
+    afterwards loses overflow before the runtime ever sees the value.  Raw
+    ``pcc.i64``/``pcc.u64`` lanes deliberately keep their machine semantics.
+    """
+    if expr.op not in (
+        "+", "-", "*", "/", "//", "%", "&", "|", "^", "<<", ">>"
+    ):
+        return False
+    if not (
+        isinstance(expr.ty, DynType)
+        or isinstance(expr.lhs.ty, DynType)
+        or isinstance(expr.rhs.ty, DynType)
+    ):
+        return False
+    operand_ty = operand.ty
+    if isinstance(operand_ty, BoolType):
+        return True
+    return isinstance(operand_ty, IntType) and operand_ty.name == "int"
     try:
         return expr.op not in (
             "==",
@@ -294,6 +339,16 @@ class ExprDispatchLoweringMixin:
         if _expr_is_attr(expr, expr_kind):
             return self._emit_attr(expr)
         if _expr_is_binop(expr, expr_kind):
+            # Fold ``"a" + "b"`` to one literal.  CPython's peephole does this,
+            # so a loop containing a literal concatenation costs it nothing
+            # while pcc allocated and concatenated on every iteration:
+            # measured 7 ms on CPython against 95 ms under pcc1 for 300k
+            # iterations of `"item" + "x"`, the widest gap of any operation in
+            # the per-operation benchmark. Folding is only valid for two string
+            # literals -- anything else can have a __add__ or a runtime type.
+            folded = _fold_str_literal_concat(expr)
+            if folded is not None:
+                return self._emit_expr(folded)
             # Class-based arithmetic dunder fast path: ``a + b`` on a
             # hinted class with ``__add__`` dispatches there before
             # falling back to numeric coercion. Mirrors the compare
@@ -413,7 +468,17 @@ class ExprDispatchLoweringMixin:
             if dict_keys_result is not None:
                 return dict_keys_result
 
-            lhs = self._emit_expr(expr.lhs)
+            lhs_as_exact_object = _dynamic_binop_needs_exact_int_operand(
+                expr, expr.lhs
+            )
+            rhs_as_exact_object = _dynamic_binop_needs_exact_int_operand(
+                expr, expr.rhs
+            )
+            lhs = (
+                self._emit_as_object(expr.lhs)
+                if lhs_as_exact_object
+                else self._emit_expr(expr.lhs)
+            )
             lhs_cpy_owned = False
             if lhs in getattr(self, "_cpy_values", ()):
                 self._guard_cpy_value_not_null(lhs)
@@ -427,29 +492,48 @@ class ExprDispatchLoweringMixin:
                 isinstance(lhs.type, ir.PointerType)
                 and lhs not in getattr(self, "_cpy_values", ())
             )
-            if lhs_pin:
+            # A GC-quiet rhs (literal, bound name, slot read) cannot allocate,
+            # raise or move anything, so the lhs needs no pin across its
+            # evaluation.  An inline tagged-int route pins its operands only
+            # inside the slow block; the caller then defers every pin to it.
+            # Measured on ``for x in xs: total += x``: the unconditional
+            # lhs/rhs/result pin+unpin were 24% of the loop's samples.
+            rhs_quiet = self._exact_int_operand_is_gc_quiet(expr.rhs)
+            defer_pins = (
+                not lhs_cpy_owned
+                and self._binop_route_defers_pins(
+                    expr.op, expr.lhs.ty, expr.rhs.ty, expr.ty
+                )
+            )
+            lhs_pinned_early = lhs_pin and not rhs_quiet and not defer_pins
+            if lhs_pinned_early:
                 # The RHS is evaluated before binary dispatch.  Pin even a
                 # borrowed native lhs: a moving collector updates its rooted
                 # slot, not this already-loaded SSA pointer.  Cleanup releases
                 # only fresh values; borrowed pointers are merely unpinned.
                 self._gc_pin(lhs)
             lhs_pinned_cleanup = (
-                ((lhs, lhs_release_owned),) if lhs_pin else ()
+                ((lhs, lhs_release_owned),) if lhs_pinned_early else ()
             )
             if expr.op == "%" and self._is_valueclass_payload_type(expr.rhs.ty):
                 # direct valueclass constructors in %-format operands project
                 # to boxed valueboxes, not identity instances
                 rhs = self._emit_expr_as_pcc_object(expr.rhs)
             else:
-                if lhs_cpy_owned or lhs_pin:
+                if lhs_cpy_owned or lhs_pinned_early:
                     rhs = self._emit_expr_with_cpy_operand_cleanup(
                         expr.rhs,
                         (lhs,) if lhs_cpy_owned else (),
                         (),
                         lhs_pinned_cleanup,
+                        as_object=rhs_as_exact_object,
                     )
                 else:
-                    rhs = self._emit_expr(expr.rhs)
+                    rhs = (
+                        self._emit_as_object(expr.rhs)
+                        if rhs_as_exact_object
+                        else self._emit_expr(expr.rhs)
+                    )
             if rhs in getattr(self, "_cpy_values", ()):
                 self._guard_cpy_value_not_null(
                     rhs,
@@ -466,9 +550,22 @@ class ExprDispatchLoweringMixin:
                 isinstance(rhs.type, ir.PointerType)
                 and rhs not in getattr(self, "_cpy_values", ())
             )
-            if rhs_pin:
-                self._gc_pin(rhs)
-            pinned_pcc_on_error = lhs_pinned_cleanup
+            if defer_pins and rhs in getattr(self, "_cpy_values", ()):
+                defer_pins = False
+            slow_pins: tuple[ir.Value, ...] = ()
+            if defer_pins:
+                if lhs_pin:
+                    slow_pins = slow_pins + (lhs,)
+                if rhs_pin:
+                    slow_pins = slow_pins + (rhs,)
+            else:
+                if lhs_pin and not lhs_pinned_early:
+                    self._gc_pin(lhs)
+                if rhs_pin:
+                    self._gc_pin(rhs)
+            pinned_pcc_on_error: tuple[tuple[ir.Value, bool], ...] = ()
+            if lhs_pin:
+                pinned_pcc_on_error = pinned_pcc_on_error + ((lhs, lhs_release_owned),)
             if rhs_pin:
                 pinned_pcc_on_error = pinned_pcc_on_error + (
                     (rhs, rhs_release_owned),
@@ -481,22 +578,27 @@ class ExprDispatchLoweringMixin:
                 expr.rhs.ty,
                 result_ty=expr.ty,
                 pinned_pcc_on_error=pinned_pcc_on_error,
+                slow_pins=slow_pins,
             )
+            # The result pin guards the fresh result only while an owned
+            # operand is released below (a release may run a finalizer or a
+            # collection); without a release there is nothing to guard.
             result_pin = False
             if (
-                isinstance(result.type, ir.PointerType)
+                (lhs_release_owned or rhs_release_owned)
+                and isinstance(result.type, ir.PointerType)
                 and result not in getattr(self, "_cpy_values", ())
                 and self._pcc_pointer_source_is_owned(expr)
             ):
                 self._gc_pin(result)
                 result_pin = True
-            if lhs_pin:
+            if lhs_pin and not defer_pins:
                 self._gc_unpin(lhs)
             if lhs_release_owned:
                 self._gc_release(lhs)
             elif not lhs_pin:
                 self._gc_release_if_owned(lhs, expr.lhs)
-            if rhs_pin:
+            if rhs_pin and not defer_pins:
                 self._gc_unpin(rhs)
             if rhs_release_owned:
                 self._gc_release(rhs)

@@ -94,15 +94,24 @@ def build_pcc_link_command(
     runtime_archive: Optional[str],
     extra_link_inputs: tuple[str, ...],
     internal_input_flag: str = "--asm",
+    internal_input_manifest: Optional[str] = None,
     semantic_layout_policy: Optional[str] = None,
+    profile_json: Optional[str] = None,
 ) -> list[str]:
     """Build the complete owned-link subprocess command in stable input order."""
-    if internal_input_flag not in ("--asm", "--object"):
+    if internal_input_flag not in ("--asm", "--native-object", "--object"):
         raise SelfLinkContractError(
             "invalid owned-link internal input flag "
             + repr(internal_input_flag)
         )
+    if internal_input_manifest and (asm_path or internal_asm_inputs):
+        raise SelfLinkContractError(
+            "ordered internal-input manifest cannot be combined with direct "
+            "internal inputs"
+        )
     command = [str(host_python), str(driver), "--out", str(output)]
+    if profile_json:
+        command.extend(["--profile-json", str(profile_json)])
     temporary_suffix = ".tmp"
     output_text = str(output)
     if output_text.endswith(temporary_suffix) and len(output_text) > len(
@@ -116,6 +125,10 @@ def build_pcc_link_command(
         command.extend([internal_input_flag, str(asm_path)])
     for internal_asm in internal_asm_inputs:
         command.extend([internal_input_flag, str(internal_asm)])
+    if internal_input_manifest:
+        command.extend(
+            ["--internal-input-manifest", str(internal_input_manifest)]
+        )
     if runtime_archive is not None:
         command.extend(["--archive", str(runtime_archive)])
     for extra in extra_link_inputs:

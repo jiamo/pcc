@@ -29,6 +29,9 @@ Exception-table codes and exception-object payload layout remain owned here:
   PY_EXC_BASE = 0 ... PY_EXC_MODULENOTFOUNDERROR = 21 (py_runtime.h enum)
   PyExceptionObject.exc_class lives at offset 16.
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_CLASS,
     PY_TYPE_EXC,
@@ -84,6 +87,8 @@ from pcc.unsafe import (
 py_incref = extern("py_incref", (c_ptr,), c_void)
 py_decref = extern("py_decref", (c_ptr,), c_void)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 py_exc_new_with_value = extern("py_exc_new_with_value", (c_int64, c_ptr), c_ptr)
 py_exc_new_with_class = extern("py_exc_new_with_class", (c_ptr, c_ptr), c_ptr)
@@ -260,7 +265,7 @@ def pcc_capi_exception_class(type):
 def PyErr_SetString(type, message) -> None:
     if ptr_is_null(message):
         message = cstr("")
-    py_raise(py_exc_new(pcc_capi_exception_tag(type), message))
+    py_raise_owned(py_exc_new(pcc_capi_exception_tag(type), message))
 
 
 @c_abi_typed_export("PyErr_SetNone", "void", ("ptr",))

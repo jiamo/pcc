@@ -69,7 +69,10 @@ def pcc_gc_object_is_known_no_lock(obj) -> i64:
     node = pcc_gc_object_index_find(obj)
     if ptr_is_null(node) != 0:
         return 0
-    return 1 if load_i64(node, 32) == 0 else 0
+    if load_i64(node, 32) != 0:
+        return 0
+    flags: i64 = load_i32(obj, 12)
+    return 0 if (flags & 524288) != 0 else 1
 
 
 @c_abi_export("pcc_gc_mark_root_gray_if_known")

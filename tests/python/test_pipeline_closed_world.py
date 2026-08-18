@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from pcc.py_frontend import pipeline
 from pcc.py_frontend import pipeline_closed_world
+from pcc.parse.py_lift import parse_and_lift
 
 
 def test_pipeline_closed_world_helper_facade_is_thin():
@@ -12,6 +13,7 @@ def test_pipeline_closed_world_helper_facade_is_thin():
         "_merge_closed_world_reexport_edges",
         "_repair_closed_world_default_global_owners",
         "_mark_closed_world_function_object_exports",
+        "_closed_world_module_dependencies",
         "_closed_world_function_object_exports",
         "_write_reexport_edges_wire",
         "_read_reexport_edges_wire",
@@ -64,6 +66,37 @@ def test_reexport_edge_wire_roundtrip_preserves_order(tmp_path):
         ("pkg.api", "pkg.extra", "*", "", True),
     )
     path = tmp_path / "reexports.json"
-    pipeline_closed_world._write_reexport_edges_wire(path, edges)
+    dependencies = (("pkg.api", ("pkg.impl", "pkg.extra")),)
+    pipeline_closed_world._write_reexport_edges_wire(
+        path,
+        edges,
+        module_dependencies=dependencies,
+    )
     assert pipeline_closed_world._read_reexport_edges_wire(path) == edges
+    assert pipeline_closed_world._read_reexport_edges_wire(
+        path,
+        include_module_dependencies=True,
+    ) == (edges, dependencies)
 
+
+def test_ast_dependency_rows_cover_relative_nested_and_ir_provider_imports():
+    source = (
+        "from . import dep\n"
+        "from pcc.llvm_capi.compat import ir\n"
+        "def load():\n"
+        "    import pkg.inner\n"
+        "    return dep.VALUE\n"
+    )
+    module = parse_and_lift(source, "/tmp/pkg/entry.py", "pkg.entry")
+    rows = pipeline_closed_world._closed_world_module_dependencies(
+        (module,),
+        ("pkg.entry",),
+        ("/tmp/pkg/entry.py",),
+        ("pkg.entry", "pkg.dep", "pkg.inner", "pcc.llvm_capi.ir"),
+    )
+    assert rows == (
+        (
+            "pkg.entry",
+            ("pkg.inner", "pcc.llvm_capi.ir", "pkg.dep"),
+        ),
+    )

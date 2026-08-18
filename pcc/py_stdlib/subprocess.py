@@ -9,12 +9,12 @@ land.
 
 from __future__ import annotations
 
-from pcc.extern import extern, c_int, c_int64, c_ptr
+from pcc.extern import extern, c_int, c_int64, c_ptr, c_obj
 
 py_subprocess_check_output = extern(
     "py_subprocess_check_output",
     (c_ptr,),
-    c_ptr,
+    c_obj,
 )
 py_subprocess_run = extern(
     "py_subprocess_run",

@@ -33,6 +33,8 @@ same observable semantics:
   * cancelled / superseded entries are dropped without being returned.
 """
 
+__pcc_runtime_port__ = True
+
 
 class MinHeapTimerQueue:
     """Binary min-heap timer queue with lazy cancellation."""

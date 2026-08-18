@@ -22,9 +22,18 @@ from pcc.py_frontend.py_ast import (
 )
 
 
-def _infer(src: str, *, external_exports=None):
+def _infer(
+    src: str,
+    *,
+    external_exports=None,
+    unique_external_class_preload=None,
+):
     mod = parse_and_lift(textwrap.dedent(src).lstrip(), "schema.py", "schema")
-    return type_infer.infer_module(mod, external_exports=external_exports)
+    return type_infer.infer_module(
+        mod,
+        external_exports=external_exports,
+        unique_external_class_preload=unique_external_class_preload,
+    )
 
 
 def _func(mod, name: str) -> FuncDef:
@@ -48,6 +57,51 @@ def _return_type(fn: FuncDef):
         if isinstance(stmt, Return) and stmt.value is not None:
             return stmt.value.ty
     raise AssertionError(f"function {fn.name!r} has no value return")
+
+
+def test_indexed_unique_class_preload_preserves_global_ambiguity_decision():
+    external_exports = {
+        "unique.owner": {
+            "Solo": {
+                "kind": "class",
+                "class_name": "Solo",
+                "base_names": (),
+                "field_names": ("value",),
+                "field_types": (("value", ("int", 64, True)),),
+            }
+        },
+        "duplicate.visible": {
+            "Shared": {
+                "kind": "class",
+                "class_name": "Shared",
+                "base_names": (),
+                "field_names": ("wrong",),
+                "field_types": (("wrong", ("str",)),),
+            }
+        },
+    }
+    mod = _infer(
+        """
+        def read_solo(value: Solo) -> int:
+            return value.value
+
+        def read_shared(value: Shared):
+            return value.wrong
+        """,
+        external_exports=external_exports,
+        unique_external_class_preload=(
+            type_infer.build_unique_external_class_preload(
+                {"unique.owner": external_exports["unique.owner"]}
+            )
+        ),
+    )
+
+    solo = _func(mod, "read_solo")
+    assert isinstance(solo.args[0].annotation, ClassType)
+    assert solo.args[0].annotation.fields[0][0] == "value"
+    shared = _func(mod, "read_shared")
+    assert isinstance(shared.args[0].annotation, ClassType)
+    assert shared.args[0].annotation.fields == ()
 
 
 def test_contextual_l1_codegen_host_param_types_host_methods():

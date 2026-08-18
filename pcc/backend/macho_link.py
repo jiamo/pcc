@@ -48,7 +48,12 @@ from .macho_parallel import (
 from .native_object import (
     NativeObject,
     NativeObjectError,
+    NativeSection,
+    NativeSymbol,
     NativeObjectView,
+    PackedNativeObject,
+    PackedNativeSection,
+    PackedNativeSymbol,
     is_native_object_bytes,
 )
 from .precise_stackmap import (
@@ -67,7 +72,13 @@ class LinkError(Exception):
     """The link job is outside what this linker proves."""
 
 
-LinkInput = bytes | NativeObject | NativeObjectView | spec.MachOObject
+LinkInput = (
+    bytes
+    | NativeObject
+    | NativeObjectView
+    | PackedNativeObject
+    | spec.MachOObject
+)
 
 
 def _coerce_link_object(value: LinkInput, input_index: int):
@@ -82,8 +93,15 @@ def _coerce_link_object(value: LinkInput, input_index: int):
     try:
         if isinstance(value, NativeObjectView):
             return value
+        if isinstance(value, PackedNativeObject):
+            return value
         if isinstance(value, NativeObject):
-            return value.link_view()
+            # Keep pcc's already-validated indexed representation intact.
+            # Expanding it to NativeObjectView eagerly copied every payload
+            # and materialised Mach-O-shaped dicts for every symbol and raw
+            # relocation before the linker converted them back to indexed
+            # NativeObject records at the output boundary.
+            return value
         if isinstance(value, spec.MachOObject):
             return value
         if not isinstance(value, bytes):
@@ -116,12 +134,162 @@ class _MergedSection:
 @dataclass(frozen=True)
 class _InspectedLinkInput:
     obj: object
-    symbols: list[dict]
+    symbols: object
     relocation_target_indices: frozenset[int]
+    section_addrs: tuple[int, ...] = ()
+
+
+def _symbol_name(symbol) -> str:
+    if isinstance(symbol, (NativeSymbol, PackedNativeSymbol)):
+        return symbol.name
+    return symbol["name"]
+
+
+def _symbol_type(symbol) -> int:
+    if isinstance(symbol, (NativeSymbol, PackedNativeSymbol)):
+        if symbol.section_index == 0:
+            return spec.N_UNDF | spec.N_EXT
+        value = spec.N_SECT
+        if symbol.external:
+            value |= spec.N_EXT
+        if symbol.private_external:
+            value |= spec.N_PEXT
+        return value
+    return symbol["n_type"]
+
+
+def _symbol_section_index(symbol) -> int:
+    if isinstance(symbol, (NativeSymbol, PackedNativeSymbol)):
+        return symbol.section_index
+    return symbol["n_sect"]
+
+
+def _section_key(section) -> tuple[str, str]:
+    if isinstance(section, (NativeSection, PackedNativeSection)):
+        return section.segname, section.sectname
+    return section["segname_str"], section["sectname_str"]
+
+
+def _section_flags(section) -> int:
+    if isinstance(section, (NativeSection, PackedNativeSection)):
+        return section.flags
+    return section["flags"]
+
+
+def _section_align(section) -> int:
+    if isinstance(section, (NativeSection, PackedNativeSection)):
+        return section.align_log2
+    return section["align"]
+
+
+def _section_size(section) -> int:
+    if isinstance(section, (NativeSection, PackedNativeSection)):
+        return section.vm_size
+    return section["size"]
+
+
+def _native_section_addrs(
+    native: NativeObject | PackedNativeObject,
+) -> tuple[int, ...]:
+    addrs: list[int] = []
+    cursor = 0
+    for section in native.sections:
+        cursor = _align_up(cursor, section.align_log2)
+        addrs.append(cursor)
+        cursor += section.vm_size
+    return tuple(addrs)
+
+
+def _section_addr(section, section_index: int, addrs: tuple[int, ...]) -> int:
+    if isinstance(section, (NativeSection, PackedNativeSection)):
+        return addrs[section_index - 1]
+    return section["addr"]
+
+
+def _native_section_payload(
+    native: NativeObject | PackedNativeObject,
+    section_index: int,
+    addrs: tuple[int, ...],
+) -> bytes | bytearray:
+    """Return one payload, patching only section-target fields that need it.
+
+    NativeObjectView used to copy *all* input payloads up front.  A section
+    target needs the same object-address normalization, but ordinary sections
+    can be consumed directly from their immutable bytes.
+    """
+
+    section = native.sections[section_index - 1]
+    if isinstance(native, PackedNativeObject):
+        section_targets = tuple(
+            relocation
+            for relocation in native.decoded_relocations(section_index - 1)
+            if relocation[6] is not None
+        )
+        source_payload = native.section_data(section_index - 1)
+    else:
+        section_targets = tuple(
+            relocation
+            for relocation in section.relocations
+            if relocation.target_section_index is not None
+        )
+        source_payload = section.data
+    if not section_targets:
+        return source_payload
+    payload = bytearray(source_payload)
+    for relocation in section_targets:
+        if isinstance(native, PackedNativeObject):
+            (
+                start, _symbol_index, _type, _pcrel, length, _addend,
+                target_section_index, _minuend_index, target_offset,
+            ) = relocation
+        else:
+            start = relocation.offset
+            length = relocation.length
+            target_section_index = relocation.target_section_index
+            target_offset = relocation.target_offset
+        width = 1 << length
+        stored = int.from_bytes(payload[start:start + width], "little")
+        assert target_section_index is not None
+        target_index = target_section_index - 1
+        target_addr = addrs[target_index]
+        target_size = native.sections[target_index].vm_size
+        if target_offset is not None:
+            if stored:
+                raise NativeObjectError(
+                    "section-target relocation with target_offset must have "
+                    "a zero-filled field"
+                )
+            target_value = target_addr + target_offset
+        elif target_addr <= stored < target_addr + target_size:
+            target_value = stored
+        elif 0 <= stored < target_size:
+            target_value = target_addr + stored
+        else:
+            raise NativeObjectError(
+                f"section-target value {stored} is outside section "
+                f"{target_section_index}"
+            )
+        if target_value >= 1 << (width * 8):
+            raise NativeObjectError(
+                "section-target value does not fit relocation width"
+            )
+        payload[start:start + width] = target_value.to_bytes(width, "little")
+    return payload
+
+
+def _section_payload(
+    obj,
+    section,
+    section_index: int,
+    section_addrs: tuple[int, ...],
+):
+    if isinstance(obj, (NativeObject, PackedNativeObject)):
+        return _native_section_payload(obj, section_index, section_addrs)
+    return obj.data[section["offset"]:section["offset"] + section["size"]]
 
 
 def _is_zerofill(section) -> bool:
-    return (section["flags"] & spec.SECTION_TYPE) in (
+    return (_section_flags(section) & spec.SECTION_TYPE) in (
         spec.S_ZEROFILL, _S_THREAD_LOCAL_ZEROFILL
     )
 
@@ -149,10 +317,10 @@ def _relocation_symbol_name(
             f"{len(symbols)} symbols"
         )
     symbol = symbols[symbol_index]
-    name = symbol["name"]
+    name = _symbol_name(symbol)
     if (
-        (symbol["n_type"] & spec.N_TYPE) == spec.N_SECT
-        and not (symbol["n_type"] & spec.N_EXT)
+        (_symbol_type(symbol) & spec.N_TYPE) == spec.N_SECT
+        and not (_symbol_type(symbol) & spec.N_EXT)
     ):
         return local_rename.get(name, name)
     return name
@@ -168,13 +336,13 @@ def _local_symbol_renames(symbol_tables) -> list[dict[str, str]]:
     result is independent of input order.
     """
     external_names = {
-        symbol["name"]
+        _symbol_name(symbol)
         for symbols in symbol_tables
         for symbol in symbols
-        if symbol["n_type"] & spec.N_EXT
+        if _symbol_type(symbol) & spec.N_EXT
     }
     reserved_names = {
-        symbol["name"]
+        _symbol_name(symbol)
         for symbols in symbol_tables
         for symbol in symbols
     }
@@ -185,11 +353,11 @@ def _local_symbol_renames(symbol_tables) -> list[dict[str, str]]:
         mapping: dict[str, str] = {}
         local_names: set[str] = set()
         for symbol in symbols:
-            if (symbol["n_type"] & spec.N_TYPE) != spec.N_SECT:
+            if (_symbol_type(symbol) & spec.N_TYPE) != spec.N_SECT:
                 continue
-            if symbol["n_type"] & spec.N_EXT:
+            if _symbol_type(symbol) & spec.N_EXT:
                 continue
-            name = symbol["name"]
+            name = _symbol_name(symbol)
             if name in local_names:
                 raise LinkError(
                     f"input {input_index} defines local symbol {name!r} twice"
@@ -226,6 +394,98 @@ def _read_relocations(
     (segname, sectname) target so the merge can rewrite that stored address
     once the section's new home is known.
     """
+    if isinstance(obj, PackedNativeObject):
+        out: list[Relocation] = []
+        section_index = obj.sections.index(section)
+        for entry in obj.decoded_relocations(section_index):
+            (
+                offset,
+                symbol_index,
+                relocation_type,
+                pcrel,
+                length,
+                addend,
+                target_section_index,
+                minuend_index,
+                target_offset,
+            ) = entry
+            target_section = None
+            symbol_name = ""
+            if target_section_index is not None:
+                target_section = _section_key(
+                    obj.sections[target_section_index - 1]
+                )
+            else:
+                assert symbol_index is not None
+                symbol_name = _relocation_symbol_name(
+                    symbols,
+                    symbol_index,
+                    local_rename,
+                    context="packed native relocation",
+                )
+            minuend = None
+            if minuend_index is not None:
+                minuend = _relocation_symbol_name(
+                    symbols,
+                    minuend_index,
+                    local_rename,
+                    context="packed native SUBTRACTOR minuend relocation",
+                )
+            out.append(Relocation(
+                offset=offset,
+                symbol=symbol_name,
+                type=relocation_type,
+                pcrel=pcrel,
+                length=length,
+                addend=addend,
+                section=target_section,
+                minuend=minuend,
+                target_offset=target_offset,
+            ))
+        return out
+
+    if isinstance(obj, NativeObject):
+        out: list[Relocation] = []
+        for entry in sorted(
+            section.relocations,
+            key=lambda relocation: relocation.offset,
+            reverse=True,
+        ):
+            target_section = None
+            symbol_name = ""
+            if entry.target_section_index is not None:
+                target_section = _section_key(
+                    obj.sections[entry.target_section_index - 1]
+                )
+            else:
+                assert entry.symbol_index is not None
+                symbol_name = _relocation_symbol_name(
+                    symbols,
+                    entry.symbol_index,
+                    local_rename,
+                    context="native relocation",
+                )
+            minuend = None
+            if entry.minuend_index is not None:
+                minuend = _relocation_symbol_name(
+                    symbols,
+                    entry.minuend_index,
+                    local_rename,
+                    context="native SUBTRACTOR minuend relocation",
+                )
+            out.append(Relocation(
+                offset=entry.offset,
+                symbol=symbol_name,
+                type=entry.type,
+                pcrel=entry.pcrel,
+                length=entry.length,
+                addend=entry.addend,
+                section=target_section,
+                minuend=minuend,
+                target_offset=entry.target_offset,
+            ))
+        return out
+
     raw = obj.relocations(section)
     sections = obj.sections()
     out: list[Relocation] = []
@@ -346,6 +606,44 @@ def _inspect_link_input(
 
     index, data, definitions = item
     obj = _coerce_link_object(data, index)
+    if isinstance(obj, PackedNativeObject):
+        symbols = obj.symbols
+        targeted = obj.relocation_target_indices
+        for symbol_index, symbol in enumerate(symbols):
+            if symbol.section_index and symbol.external:
+                definitions.add(
+                    symbol.name,
+                    SymbolDefinition(index, symbol_index),
+                )
+        return _InspectedLinkInput(
+            obj,
+            symbols,
+            targeted,
+            _native_section_addrs(obj),
+        )
+
+    if isinstance(obj, NativeObject):
+        symbols = obj.symbols
+        targeted: set[int] = set()
+        for section in obj.sections:
+            for entry in section.relocations:
+                if entry.symbol_index is not None:
+                    targeted.add(entry.symbol_index)
+                if entry.minuend_index is not None:
+                    targeted.add(entry.minuend_index)
+        for symbol_index, symbol in enumerate(symbols):
+            if symbol.section_index and symbol.external:
+                definitions.add(
+                    symbol.name,
+                    SymbolDefinition(index, symbol_index),
+                )
+        return _InspectedLinkInput(
+            obj,
+            symbols,
+            frozenset(targeted),
+            _native_section_addrs(obj),
+        )
+
     if obj.header["filetype"] != spec.MH_OBJECT:
         raise LinkError(f"input {index} is not an MH_OBJECT")
     if (
@@ -406,6 +704,8 @@ def _link_input_size_hint(value: LinkInput) -> int:
         return len(value)
     if isinstance(value, NativeObject):
         return sum(len(section.data) for section in value.sections)
+    if isinstance(value, PackedNativeObject):
+        return len(value.encoded)
     if isinstance(value, NativeObjectView):
         return len(value.data)
     if isinstance(value, spec.MachOObject):
@@ -447,7 +747,7 @@ def link_relocatable_native(objects: list[LinkInput]) -> NativeObject:
 
     merged: dict[tuple[str, str], _MergedSection] = {}
     order: list[tuple[str, str]] = []
-    defined: dict[str, tuple[str, str]] = {}  # name -> section key
+    defined: dict[str, tuple[str, str]] = {}
     referenced: set[str] = set()
     # Dedicated stack-map sections are semantic tables, not byte streams:
     # concatenating two versioned headers would produce an apparently valid
@@ -489,35 +789,58 @@ def link_relocatable_native(objects: list[LinkInput]) -> NativeObject:
 
     for index, obj in enumerate(parsed_objects):
 
-        sections = obj.sections()
+        is_native = isinstance(obj, (NativeObject, PackedNativeObject))
+        sections = obj.sections if is_native else obj.sections()
         symbols = symbol_tables[index]
         local_rename = local_renames[index]
+        section_addrs = inspected_inputs[index].section_addrs
 
         # LC_DATA_IN_CODE uses object-address offsets, not file offsets.
         # Assign every range to exactly one input section now so its start can
         # be rebased alongside that section's payload during the merge.
         data_regions_by_section: dict[int, list[DataInCodeRegion]] = {}
-        for entry in obj.data_in_code():
-            start = entry["offset"]
-            end = start + entry["length"]
-            owners = [
-                (sec_index, sec)
-                for sec_index, sec in enumerate(sections, start=1)
-                if sec["addr"] <= start and end <= sec["addr"] + sec["size"]
-            ]
-            if len(owners) != 1:
-                raise LinkError(
-                    "data-in-code range does not belong to exactly one "
-                    f"section: {start}..{end}"
+        if is_native:
+            for sec_index, section in enumerate(sections, start=1):
+                if section.data_in_code:
+                    if isinstance(section, PackedNativeSection):
+                        data_regions_by_section[sec_index] = [
+                            DataInCodeRegion(*region)
+                            for region in section.data_in_code
+                        ]
+                    else:
+                        data_regions_by_section[sec_index] = list(
+                            section.data_in_code
+                        )
+        else:
+            for entry in obj.data_in_code():
+                start = entry["offset"]
+                end = start + entry["length"]
+                owners = [
+                    (sec_index, sec)
+                    for sec_index, sec in enumerate(sections, start=1)
+                    if (
+                        _section_addr(sec, sec_index, section_addrs) <= start
+                        and end <= (
+                            _section_addr(sec, sec_index, section_addrs)
+                            + _section_size(sec)
+                        )
+                    )
+                ]
+                if len(owners) != 1:
+                    raise LinkError(
+                        "data-in-code range does not belong to exactly one "
+                        f"section: {start}..{end}"
+                    )
+                sec_index, sec = owners[0]
+                data_regions_by_section.setdefault(sec_index, []).append(
+                    DataInCodeRegion(
+                        offset=start - _section_addr(
+                            sec, sec_index, section_addrs,
+                        ),
+                        length=entry["length"],
+                        kind=entry["kind"],
+                    )
                 )
-            sec_index, sec = owners[0]
-            data_regions_by_section.setdefault(sec_index, []).append(
-                DataInCodeRegion(
-                    offset=start - sec["addr"],
-                    length=entry["length"],
-                    kind=entry["kind"],
-                )
-            )
 
         # Where each of this input's sections lands in the merged output.
         bases: dict[int, int] = {}
@@ -525,11 +848,17 @@ def link_relocatable_native(objects: list[LinkInput]) -> NativeObject:
         # (segname, sectname): a stored address is rebased through them.
         input_section_addr: dict[tuple[str, str], tuple[int, int]] = {}
         for sec_index, sec in enumerate(sections, start=1):
-            key = (sec["segname_str"], sec["sectname_str"])
+            key = _section_key(sec)
+            sec_flags = _section_flags(sec)
+            sec_align = _section_align(sec)
+            sec_size = _section_size(sec)
+            sec_addr = _section_addr(sec, sec_index, section_addrs)
             if key == ("__DATA", "__pcc_stackmaps"):
-                if sec["flags"] != spec.S_REGULAR or sec["align"] < 3:
+                if sec_flags != spec.S_REGULAR or sec_align < 3:
                     raise LinkError("input stack-map section has invalid flags/alignment")
-                payload = bytes(obj.data[sec["offset"]:sec["offset"] + sec["size"]])
+                payload = bytes(_section_payload(
+                    obj, sec, sec_index, section_addrs,
+                ))
                 try:
                     _function_count, scanned, _tstart, _tcount = (
                         _scan_stack_map_payload(payload)
@@ -561,8 +890,8 @@ def link_relocatable_native(objects: list[LinkInput]) -> NativeObject:
                         "relocatable stack-map function address must be zero"
                     )
                 if any(
-                    (sym["n_type"] & spec.N_TYPE) == spec.N_SECT
-                    and sym["n_sect"] == sec_index
+                    (_symbol_type(sym) & spec.N_TYPE) == spec.N_SECT
+                    and _symbol_section_index(sym) == sec_index
                     for sym in symbols
                 ):
                     raise LinkError("stack-map section must not define symbols")
@@ -595,27 +924,27 @@ def link_relocatable_native(objects: list[LinkInput]) -> NativeObject:
                 stack_map_payloads.append(payload)
                 continue
             if key not in merged:
-                merged[key] = _MergedSection(key[0], key[1], sec["flags"])
+                merged[key] = _MergedSection(key[0], key[1], sec_flags)
                 order.append(key)
             target = merged[key]
-            if (target.flags & spec.SECTION_TYPE) != (sec["flags"] & spec.SECTION_TYPE):
+            if (target.flags & spec.SECTION_TYPE) != (sec_flags & spec.SECTION_TYPE):
                 raise LinkError(
                     f"{key} has conflicting section TYPES across inputs "
-                    f"({target.flags:#x} vs {sec['flags']:#x})"
+                    f"({target.flags:#x} vs {sec_flags:#x})"
                 )
             # Attributes are a union, not an identity: an input whose __text
             # happens to contain no branch targets omits SOME_INSTRUCTIONS,
             # and ld merges the attribute sets rather than refusing. The
             # section TYPE (low byte) must still agree.
-            target.flags |= sec["flags"] & spec.SECTION_ATTRIBUTES
-            target.align_log2 = max(target.align_log2, sec["align"])
+            target.flags |= sec_flags & spec.SECTION_ATTRIBUTES
+            target.align_log2 = max(target.align_log2, sec_align)
             if _is_zerofill(sec):
                 # No file payload: only the size accumulates. Symbols still
                 # need an offset, so the running vm size is the base.
-                base = _align_up(target.zerofill_size, sec["align"])
-                target.zerofill_size = base + sec["size"]
+                base = _align_up(target.zerofill_size, sec_align)
+                target.zerofill_size = base + sec_size
             else:
-                base = _align_up(len(target.data), sec["align"])
+                base = _align_up(len(target.data), sec_align)
                 padding = base - len(target.data)
                 if padding and len(target.data) % 4 != 0 and (
                     target.flags & spec.S_ATTR_PURE_INSTRUCTIONS
@@ -629,10 +958,12 @@ def link_relocatable_native(objects: list[LinkInput]) -> NativeObject:
                         kind=spec.DICE_KIND_DATA,
                     ))
                 target.data.extend(b"\0" * (base - len(target.data)))
-                payload = obj.data[sec["offset"]:sec["offset"] + sec["size"]]
+                payload = _section_payload(
+                    obj, sec, sec_index, section_addrs,
+                )
                 target.data.extend(payload)
             bases[sec_index] = base
-            input_section_addr[key] = (sec["addr"], base)
+            input_section_addr[key] = (sec_addr, base)
             target.data_in_code.extend(
                 DataInCodeRegion(
                     offset=base + region.offset,
@@ -670,11 +1001,12 @@ def link_relocatable_native(objects: list[LinkInput]) -> NativeObject:
                     ))
 
         for symbol_index, sym in enumerate(symbols):
-            name = sym["name"]
-            if (sym["n_type"] & spec.N_TYPE) == spec.N_UNDF:
+            name = _symbol_name(sym)
+            sym_type = _symbol_type(sym)
+            if (sym_type & spec.N_TYPE) == spec.N_UNDF:
                 referenced.add(name)
                 continue
-            if (sym["n_type"] & spec.N_TYPE) != spec.N_SECT:
+            if (sym_type & spec.N_TYPE) != spec.N_SECT:
                 raise LinkError(f"symbol {name!r} has an unsupported type")
             if (
                 name[:1] in ("l", "L")
@@ -688,25 +1020,32 @@ def link_relocatable_native(objects: list[LinkInput]) -> NativeObject:
                 # real targets and are kept.
                 continue
             name = local_rename.get(name, name)
-            if sym["n_type"] & spec.N_EXT:
+            if sym_type & spec.N_EXT:
                 owner = external_definitions.owner(name)
                 if owner != SymbolDefinition(index, symbol_index):
                     raise LinkError(f"duplicate definition of {name!r}")
             if name in defined:
                 raise LinkError(f"duplicate definition of {name!r}")
-            sec_index = sym["n_sect"]
+            sec_index = _symbol_section_index(sym)
             if sec_index not in bases:
                 raise LinkError(f"symbol {name!r} names section {sec_index}")
             sec = sections[sec_index - 1]
-            key = (sec["segname_str"], sec["sectname_str"])
+            key = _section_key(sec)
             # n_value is the section-relative address in an object file;
             # subtract the section's own addr to get the payload offset.
-            offset = sym["n_value"] - sec["addr"] + bases[sec_index]
+            if isinstance(sym, (NativeSymbol, PackedNativeSymbol)):
+                offset = sym.offset + bases[sec_index]
+            else:
+                offset = (
+                    sym["n_value"]
+                    - _section_addr(sec, sec_index, section_addrs)
+                    + bases[sec_index]
+                )
             merged[key].symbols.append(TextSymbol(
                 name,
                 offset,
-                external=bool(sym["n_type"] & spec.N_EXT),
-                private_external=bool(sym["n_type"] & spec.N_PEXT),
+                external=bool(sym_type & spec.N_EXT),
+                private_external=bool(sym_type & spec.N_PEXT),
             ))
             defined[name] = key
 

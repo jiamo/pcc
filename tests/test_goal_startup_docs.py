@@ -107,3 +107,101 @@ def test_checked_truth_manifest_matches_current_gate_registry() -> None:
     for gate, spec in zip(manifest["gates"], specs, strict=True):
         assert gate["command"] == list(spec.command)
         assert gate["timeout_seconds"] == spec.timeout_seconds
+
+
+def test_ordinary_sessions_use_the_runner_neutral_resume_loop() -> None:
+    agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    protocol = (ROOT / "docs/goal/goal-prompt.md").read_text(encoding="utf-8")
+    state = (ROOT / "docs/current-goal-state.md").read_text(encoding="utf-8")
+    agents_words = " ".join(agents.split())
+    protocol_words = " ".join(protocol.split())
+
+    assert "继续任务板" in agents
+    assert "scripts/goal_state.py resume" in agents
+    assert "scripts/goal_state.py finish-check" in agents
+    assert (
+        "Do not voluntarily end the session while `resume` reports `CONTINUE`"
+        in agents_words
+    )
+    assert "does not require a runner-specific Goal mode" in protocol_words
+    assert "scripts/goal_state.py resume" in protocol
+    assert "scripts/goal_state.py finish-check" in protocol
+    assert "scripts/goal_state.py resume" in state
+    assert "scripts/goal_state.py finish-check" in state
+
+
+def test_task_board_mutations_are_direct_validated_operations() -> None:
+    agents = (ROOT / "AGENTS.md").read_text(encoding="utf-8")
+    protocol = (ROOT / "docs/goal/goal-prompt.md").read_text(encoding="utf-8")
+    words = " ".join((agents + "\n" + protocol).split())
+
+    for operation in ("Add", "Update", "Remove"):
+        assert f"{operation} a task" in words
+    assert "dispatch: IMMEDIATE" in words
+    assert "P0`, `P1`, or `P2" in words
+    assert "No CRUD command is required" in words
+    assert "reverse dependencies" in words
+    assert "linked evidence" in words
+
+
+def test_startup_projection_is_bounded_under_hundreds_of_tasks() -> None:
+    """GOAL-P0-STARTUP-STATE-BOUNDED-RENDER: the active-task table is
+    hard-bounded so the render size is independent of the unfinished-task
+    count, while milestone/status counts, the dependency-ready selected task
+    (id + title + open boundary) and the routing links are all retained."""
+    tasks: list[dict[str, object]] = []
+    for index in range(400):
+        tasks.append(
+            {
+                "id": f"M1-SYNTH-{index:04d}-A-DESCRIPTIVE-UNFINISHED-TASK-ID",
+                "priority": "P0",
+                "status": "IN_PROGRESS",
+                "track": "test",
+                "title": f"Synthetic unfinished task number {index}",
+                "milestone": "M1",
+                # index 0 is dependency-ready; the rest depend on it so the
+                # selection is deterministic and the table stays populated.
+                "depends_on": [] if index == 0 else ["M1-SYNTH-0000-A-DESCRIPTIVE-UNFINISHED-TASK-ID"],
+                "rank": index,
+                "exit_criteria": [f"Complete synthetic task {index}"],
+                "latest_evidence": f"docs/goal/evidence/SYNTH/{index:04d}-a-fairly-long-evidence-path.md",
+                "open_boundary": "Not complete; " + "detail " * 20,
+                "required_gates": ["synthetic gate"],
+            }
+        )
+    board = {
+        "version": 2,
+        "source_protocol": goal_state.CANONICAL_GOAL_PROTOCOL,
+        "active_milestone": "M1",
+        "milestone_order": ["M0", "M1", "M2"],
+        "tasks": tasks,
+    }
+    manifest = {"schema": "test", "source": {}, "platform": {}, "gates": []}
+
+    rendered = goal_state.render_startup_markdown(board, manifest)
+    size = len(rendered.encode("utf-8"))
+
+    # Count-independent hard bound: hundreds of unfinished rows still render
+    # under 20 KiB.
+    assert size < 20_000, f"startup projection is {size} bytes, expected < 20000"
+
+    # Exact milestone and status counts are retained (not hidden to shrink).
+    assert "Tasks in milestone: `400`" in rendered
+    assert "`IN_PROGRESS`: `400`" in rendered
+
+    # Deterministic dependency-ready selection is retained with id, title and
+    # open boundary.
+    resume_outcome, next_task = goal_state.resume_state(board)
+    assert next_task is not None and next_task["id"].endswith("SYNTH-0000-A-DESCRIPTIVE-UNFINISHED-TASK-ID")
+    assert f"Next dependency-ready task: `{next_task['id']}`" in rendered
+    assert f"Next title: {next_task['title']}" in rendered
+    assert str(next_task["open_boundary"])[:20] in rendered
+
+    # Authority/routing links survive the bound.
+    assert "docs/investigations/INDEX.md" in rendered
+    assert "docs/goal/task-board.yaml` is the only executable task queue" in rendered
+
+    # The table was bounded (not the whole board hidden): the omitted-count
+    # line points back to the authoritative queue.
+    assert "more unfinished rows are not shown" in rendered
+    assert rendered.count("| `M1-SYNTH-") == 40

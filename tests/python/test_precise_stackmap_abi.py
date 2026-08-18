@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import replace
+import struct
 
 from pathlib import Path
 from pcc.backend import self_backend_precise_stackmaps as precise_stackmaps
+from pcc.backend import precise_stackmap as wire_stackmaps
 
 import pytest
 
@@ -14,6 +16,7 @@ from pcc.backend.arm64_asm_driver import assemble_file
 from pcc.backend.macho_link import LinkError, link_relocatable
 from pcc.backend.precise_stackmap import (
     HEADER_SIZE,
+    FUNCTION_SIZE,
     ARCH_AARCH64,
     ARCH_X86_64,
     FunctionStackMap,
@@ -28,6 +31,7 @@ from pcc.backend.precise_stackmap import (
     PreciseStackMap,
     PreciseStackMapError,
     RECORD_HAS_EXCEPTION_EDGE,
+    RECORD_SIZE,
     RECORD_SUSPENDED,
     SAFEPOINT_CALL,
     SAFEPOINT_CONTINUATION,
@@ -44,14 +48,24 @@ from pcc.backend.precise_stackmap import (
     safepoint_id,
     scoped_stable_id,
     stable_id,
+    validate_stack_map_payload,
 )
 from pcc.backend.self_backend_aarch64_darwin import emit_aarch64_darwin_asm
+from pcc.backend.self_backend_ir import (
+    ParsedBlock,
+    ParsedFunction,
+    ParsedInstr,
+    TypeDesc,
+)
 from pcc.backend.self_backend_precise_stackmaps import (
+    PackedManagedLiveness,
+    PackedRootStatePlane,
     PlannedRootLocation,
     _stack_locations,
     build_stack_map_plans,
 )
 from pcc.backend.self_backend_prepare import prepare_module_for_target
+from pcc.backend.self_backend_value_arena import CompilerIntArena
 from pcc.backend.self_backend_x86_64_linux import emit_x86_64_linux_asm
 
 
@@ -63,6 +77,223 @@ def _location(arch: int, offset: int = -8) -> StackMapLocation:
         base_index=NO_BASE,
         offset=offset,
     )
+
+
+def test_packed_stack_map_record_arena_matches_public_codec() -> None:
+    fields = (
+        0x123456789ABCDEF,
+        44,
+        NO_OFFSET,
+        7,
+        3,
+        0,
+        SAFEPOINT_CALL,
+        RECORD_HAS_EXCEPTION_EDGE,
+        0,
+        9,
+    )
+    records = CompilerIntArena()
+    records.append4(*fields[:4])
+    records.append4(*fields[4:8])
+    records.append2(*fields[8:])
+
+    assert precise_stackmaps._pack_stack_map_record_arena(records) == (
+        precise_stackmaps._STACK_MAP_RECORD_CODEC.pack(*fields)
+    )
+    records.close()
+
+
+def test_packed_managed_liveness_uses_batch_records_and_sparse_overflow():
+    live = PackedManagedLiveness()
+    empty_id = live.append_state(set())
+    pair_id = live.append_state({9, 2})
+    overflow_id = live.append_state({9, 2, 5})
+
+    empty_record = live.record(empty_id)
+    pair = live.record(pair_id)
+    overflow = live.record(overflow_id)
+    assert (
+        empty_record.first,
+        empty_record.second,
+        empty_record.third,
+        empty_record.fourth,
+    ) == (0, -1, -1, 0)
+    assert (pair.first, pair.second, pair.third, pair.fourth) == (2, 2, 9, 0)
+    assert [pair.second, pair.third] == [2, 9]
+    overflow_start = -overflow.third - 2
+    assert [
+        overflow.second,
+        live.overflow_ids.get_unchecked(overflow_start),
+        live.overflow_ids.get_unchecked(overflow_start + 1),
+    ] == [
+        2,
+        5,
+        9,
+    ]
+    live.close()
+
+    words = CompilerIntArena()
+    words.append((1 << 0) | (1 << 29))
+    words.append((1 << 0) | (1 << 4))
+    tracked = CompilerIntArena()
+    for value_id in range(100, 135):
+        tracked.append(value_id)
+    packed = PackedManagedLiveness()
+    state_id = packed.append_state_words(words, tracked, 2)
+    state = packed.record(state_id)
+    overflow_start = -state.third - 2
+    assert (state.first, state.second) == (4, 100)
+    assert [
+        packed.overflow_ids.get_unchecked(overflow_start + index)
+        for index in range(3)
+    ] == [129, 130, 134]
+    packed.close()
+    tracked.close()
+    words.close()
+
+
+def test_packed_root_state_reuses_transitions_and_sorts_locations() -> None:
+    roots = PackedRootStatePlane(block_count=1, protocol_hint=4)
+    near_group = roots.intern_group(
+        base_ref=1,
+        origin_offset=0,
+        count=2,
+        owned=True,
+        alloca_offset=32,
+        frame_size=64,
+    )
+    far_group = roots.intern_group(
+        base_ref=2,
+        origin_offset=0,
+        count=2,
+        owned=False,
+        alloca_offset=64,
+        frame_size=64,
+    )
+
+    near_state = roots.transition(0, near_group, True)
+    both_state = roots.transition(near_state, far_group, True)
+    state_count = len(roots.state_spans) // 4
+    assert roots.transition(near_state, far_group, True) == both_state
+    assert len(roots.state_spans) // 4 == state_count
+
+    locations = roots.ensure_state_locations(both_state)
+    offsets = [
+        roots.state_locations.get_unchecked((locations.first + index) * 2)
+        for index in range(locations.second)
+    ]
+    assert offsets == [-64, -56, -32, -24]
+    assert roots.has_location_offset(both_state, -64)
+    assert roots.has_location_offset(both_state, -24)
+    assert not roots.has_location_offset(both_state, -40)
+    assert roots.transition(both_state, far_group, False) == near_state
+    with pytest.raises(BackendUnavailable, match="registered twice"):
+        roots.transition(both_state, near_group, True)
+    roots.close()
+
+
+def test_aarch64_label_offsets_skip_normalizing_ordinary_instructions():
+    class InstructionText(str):
+        def strip(self, *_args, **_kwargs):
+            raise AssertionError("ordinary instruction was normalized")
+
+    lines = [
+        ".section __TEXT,__text,regular,pure_instructions",
+        ".p2align 2",
+        "_entry:",
+        InstructionText("  add x0, x0, #1"),
+        InstructionText("  ret"),
+        ".p2align 3",
+        "L_next:",
+        "  .long 1, 2",
+        ".space 4",
+        ".section __DATA,__data",
+        "_ignored:",
+    ]
+
+    assert precise_stackmaps._aarch64_text_label_offsets(lines) == {
+        "_entry": 0,
+        "L_next": 8,
+    }
+
+
+def test_stackmap_cfg_recovers_equal_block_labels_with_different_hashes():
+    """Native bootstrap may hash equal parsed/terminator strings differently."""
+
+    class HashSkewText(str):
+        def __new__(cls, value: str):
+            instance = super().__new__(cls, value)
+            instance.hash_calls = 0
+            return instance
+
+        def __hash__(self) -> int:
+            self.hash_calls += 1
+            return super().__hash__() ^ self.hash_calls
+
+    defined_target = HashSkewText("err.frame.791")
+    edge_target = "err.frame.791"
+    assert defined_target == edge_target
+
+    void = TypeDesc("void")
+    entry = ParsedBlock(
+        name="entry",
+        terminator=ParsedInstr("br", (edge_target,)),
+    )
+    target = ParsedBlock(
+        name=defined_target,
+        terminator=ParsedInstr("ret", (void, "null")),
+    )
+    func = ParsedFunction(
+        name="hash_skew_cfg",
+        ret_type=void,
+        args=[],
+        is_global=True,
+        is_vararg=False,
+        blocks=[entry, target],
+    )
+
+    plan = precise_stackmaps.build_function_stack_map_plan(
+        func,
+        [],
+        target="aarch64-darwin",
+    )
+    assert plan.function_name == "hash_skew_cfg"
+
+
+def test_stackmap_pointer_alias_recovers_a_changed_hash_name():
+    class ChangingHashText(str):
+        def __new__(cls, value: str):
+            instance = super().__new__(cls, value)
+            instance.hash_calls = 0
+            return instance
+
+        def __hash__(self) -> int:
+            self.hash_calls += 1
+            return super().__hash__() ^ self.hash_calls
+
+    stored_name = ChangingHashText("gc.frame.slots.ptr.5272.8")
+    func = ParsedFunction(
+        name="hash_skew_alias",
+        ret_type=TypeDesc("void"),
+        args=[],
+        is_global=True,
+        is_vararg=False,
+        blocks=[],
+    )
+    aliases = {}
+    precise_stackmaps._pointer_alias_set(
+        aliases,
+        stored_name,
+        precise_stackmaps._PointerOrigin("root.addr", 8),
+    )
+
+    origin = precise_stackmaps._resolve_pointer(
+        func,
+        aliases,
+        "gc.frame.slots.ptr.5272.8",
+    )
+    assert origin.base == "root.addr"
+    assert origin.offset == 8
 
 
 def test_stackmap_identity_fields_are_domain_separated_and_validated():
@@ -176,10 +407,59 @@ def test_precise_stackmap_rejects_truncation_trailing_and_wrong_target():
     payload = encode_stack_map(_map(ARCH_AARCH64, "probe"))
     with pytest.raises(PreciseStackMapError, match="truncated"):
         decode_stack_map(payload[:-1])
+    with pytest.raises(PreciseStackMapError, match="truncated"):
+        validate_stack_map_payload(payload[:-1])
     with pytest.raises(PreciseStackMapError, match="trailing bytes"):
         decode_stack_map(payload + b"x")
+    with pytest.raises(PreciseStackMapError, match="trailing bytes"):
+        validate_stack_map_payload(payload + b"x")
     with pytest.raises(PreciseStackMapError, match="does not match target"):
         decode_stack_map(payload, expected_arch=ARCH_X86_64)
+    with pytest.raises(PreciseStackMapError, match="does not match target"):
+        validate_stack_map_payload(payload, expected_arch=ARCH_X86_64)
+
+
+def test_wire_stackmap_validator_matches_final_decode_semantics():
+    first_map = _map(ARCH_AARCH64, "first", address=0x1000)
+    second_map = _map(ARCH_AARCH64, "second", address=0x2000)
+    value = PreciseStackMap(
+        arch=ARCH_AARCH64,
+        functions=tuple(sorted(
+            first_map.functions + second_map.functions,
+            key=lambda function: function.function_id,
+        )),
+    )
+    payload = encode_stack_map(value, final_image=True)
+    assert validate_stack_map_payload(
+        payload,
+        expected_arch=ARCH_AARCH64,
+        final_image=True,
+    ) is None
+
+    # The two functions share interned location shapes.  Shrinking only the
+    # second frame must still validate that function's slice: the raw fast
+    # path may reuse a slice only when frame_size is part of the key.
+    first = value.functions[0]
+    second_function_offset = (
+        HEADER_SIZE + FUNCTION_SIZE + len(first.records) * RECORD_SIZE
+    )
+    too_small = bytearray(payload)
+    struct.pack_into("<I", too_small, second_function_offset + 20, 0)
+    for validator in (decode_stack_map, validate_stack_map_payload):
+        with pytest.raises(
+            PreciseStackMapError,
+            match="exceeds frame size 0",
+        ):
+            validator(bytes(too_small), final_image=True)
+
+    raw_pointer = bytearray(payload)
+    _count, _functions, table_start, _table_count = (
+        wire_stackmaps._scan_stack_map_payload(payload)
+    )
+    raw_pointer[table_start + 1] = 0
+    for validator in (decode_stack_map, validate_stack_map_payload):
+        with pytest.raises(PreciseStackMapError, match="raw pointer"):
+            validator(bytes(raw_pointer), final_image=True)
 
 
 def test_precise_stackmap_rejects_duplicate_ids_and_nonfinal_offsets():
@@ -439,7 +719,8 @@ def test_target_final_planner_maps_only_explicit_registered_stack_roots(
     )
     assert len(plans) == 1
     plan = plans[0]
-    assert {record.kind for record in plan.records} == {
+    records = plan.diagnostic_records()
+    assert {record.kind for record in records} == {
         SAFEPOINT_ENTRY,
         SAFEPOINT_LOOP,
         SAFEPOINT_CALL,
@@ -447,16 +728,16 @@ def test_target_final_planner_maps_only_explicit_registered_stack_roots(
         SAFEPOINT_CONTINUATION,
     }
     entry = next(
-        record for record in plan.records if record.kind == SAFEPOINT_ENTRY
+        record for record in records if record.kind == SAFEPOINT_ENTRY
     )
     assert entry.locations == ()
-    rooted = [record for record in plan.records if record.kind != SAFEPOINT_ENTRY]
+    rooted = [record for record in records if record.kind != SAFEPOINT_ENTRY]
     assert rooted
     assert all(len(record.locations) == 1 for record in rooted)
     assert all(record.locations[0].owned for record in rooted)
     assert all(record.locations[0].offset < 0 for record in rooted)
     exception = next(
-        record for record in plan.records if record.kind == SAFEPOINT_EXCEPTION
+        record for record in records if record.kind == SAFEPOINT_EXCEPTION
     )
     assert exception.exceptional_block == "failure"
     assert exception.flags == RECORD_HAS_EXCEPTION_EDGE
@@ -598,7 +879,9 @@ def test_safepoint_reloads_live_root_derived_ssa_from_rewritten_slot(
         prepared.functions, prepared.globals_, target=target,
     )[0]
     safepoint = next(
-        record for record in plan.records if record.kind == SAFEPOINT_LOOP
+        record
+        for record in plan.diagnostic_records()
+        if record.kind == SAFEPOINT_LOOP
     )
     assert len(safepoint.locations) == 1
     assert len(safepoint.reloads) == 1
@@ -607,6 +890,29 @@ def test_safepoint_reloads_live_root_derived_ssa_from_rewritten_slot(
     assert reload.destination_offset < 0
     assert reload.destination_offset != reload.source_offset
     assert reload.derived_offset == 24
+
+
+def test_structured_parsed_aarch64_reloads_keep_final_instruction_order():
+    from pcc.backend.arm64_asm_driver import assemble_file, assemble_lines
+    from pcc.backend.self_backend_aarch64_darwin import (
+        emit_aarch64_darwin_indexed_transport,
+    )
+    from pcc.backend.self_backend_parse import parse_self_backend_module
+
+    source = _stale_managed_ssa_ir("arm64-apple-darwin23.6.0")
+    expected = assemble_file(emit_aarch64_darwin_asm(source, optimize=False))
+    transport = emit_aarch64_darwin_indexed_transport(
+        parse_self_backend_module(source), optimize=False,
+    )
+    try:
+        assert transport.direct_instruction_count > 0
+        assert assemble_lines(
+            transport.line_chunks, transport.structured_sections,
+            transport.encoded_line_records, transport.structured_symbol_names,
+        ) == expected
+    finally:
+        assert transport.native_finalized
+        assert transport.encoded_line_records is None
 
 
 def test_both_target_emitters_refresh_live_managed_ssa_after_safepoint():
@@ -761,15 +1067,16 @@ def test_owned_elf_stackmap_rejects_missing_function_relocation():
 def test_stable_id_prefix_streaming_matches_one_shot():
     """The streaming split must stay bit-identical to the one-shot hash.
 
-    `stable_id_prefix_state` / `stable_id_resume` are not on the hot path (see
-    the comment in `build_function_stack_map_plan`: streaming a packed state
-    crosses pcc1's tagged-int lane and was a large net loss there). They remain
-    available for a future batched caller, so pin the equivalence that makes
-    them usable at all.
+    The string-based `stable_id_resume` is not on the hot path: concatenating
+    and encoding each suffix was a large pcc1 loss.  The compiler instead
+    passes two 32-bit prefix limbs and feeds decimal digits numerically.  Pin
+    both continuations to the public one-shot identity.
     """
     from pcc.backend.precise_stackmap import (
         SAFEPOINT_KINDS,
         safepoint_id,
+        safepoint_id_from_prefix_limbs,
+        stable_id_prefix_limb,
         stable_id_prefix_state,
         stable_id_resume,
     )
@@ -783,11 +1090,18 @@ def test_stable_id_prefix_streaming_matches_one_shot():
     )
     for symbol in symbols:
         state = stable_id_prefix_state("safepoint", symbol)
+        high = state >> 32
+        low = state & 0xFFFFFFFF
+        assert stable_id_prefix_limb("safepoint", symbol, True) == high
+        assert stable_id_prefix_limb("safepoint", symbol, False) == low
         for ordinal in (0, 1, 7, 38539):
             for kind in sorted(SAFEPOINT_KINDS):
                 assert stable_id_resume(state, str(ordinal), str(kind)) == (
                     safepoint_id(symbol, ordinal, kind)
                 )
+                assert safepoint_id_from_prefix_limbs(
+                    high, low, ordinal, kind
+                ) == safepoint_id(symbol, ordinal, kind)
 
 
 def test_location_dedup_uses_identity_before_equality():
@@ -805,13 +1119,13 @@ def test_location_dedup_uses_identity_before_equality():
     source = Path(
         precise_stackmaps.__file__
     ).read_text(encoding="utf-8")
-    marker = "record.locations is previous_locations"
+    marker = "candidate[0] is locations"
     assert marker in source, (
         "the consecutive-record fast path must test identity first; "
         "`==` alone is a no-op under pcc1"
     )
     identity_at = source.index(marker)
-    equality_at = source.index("record.locations == previous_locations")
+    equality_at = source.index("content_key in self.location_content_index")
     assert identity_at < equality_at, (
         "identity must be tested before equality so pcc1 short-circuits "
         "before building the key string"
@@ -829,7 +1143,23 @@ def test_interned_locations_pin_their_key_objects():
     source = Path(
         precise_stackmaps.__file__
     ).read_text(encoding="utf-8")
-    assert "(_locations(active), tuple(active.values()))" in source, (
+    assert "(_locations(active_groups), active_groups)" in source, (
         "each interned-locations entry must store the groups it was keyed on "
         "so their id() cannot be recycled while the entry is alive"
     )
+
+
+def test_main_planner_materializes_mutable_root_state_only_for_protocol_blocks():
+    """Ordinary blocks must consume their shared immutable entry state.
+
+    Item311 has 9,474 reachable blocks and 1,626,262 entry-state group
+    references, but only 1,278 blocks execute frame enter/leave. Rebuilding a
+    string-keyed dict for every block duplicates those references without a
+    mutation consumer.
+    """
+
+    source = Path(precise_stackmaps.__file__).read_text(encoding="utf-8")
+    assert "active_groups = entry_state" in source
+    assert "active = {group.key: group for group in entry_state}" not in source
+    assert "if call_header.third & CALL_FLAG_FRAME_PROTOCOL:" in source
+    assert "active_groups = tuple(active.values())" in source

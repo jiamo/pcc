@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+import json
+import subprocess
+import sys
+
 import pytest
 
 from pcc.backend import macho_spec as spec
+from pcc.backend import native_object as native_object_module
 from pcc.backend.macho_exec import link_executable
 from pcc.backend.macho_link import (
     LinkError,
@@ -29,12 +35,94 @@ from pcc.backend.native_object import (
     NativeSection,
     NativeSymbol,
     decode_native_object,
+    decode_packed_native_object,
     encode_native_object,
+    encode_native_object_from_sections,
+)
+from pcc.backend.self_backend_value_arena import CompilerIntArena
+from pcc.backend.macho_assemble_worker import (
+    assemble_asm_path_to_encoded,
+    assemble_asm_text_to_encoded,
 )
 
 
 _RET = b"\xc0\x03\x5f\xd6"
 _BL_PLACEHOLDER = b"\x00\x00\x00\x94"
+
+
+def test_worker_assembly_text_and_path_publish_identical_native_object(
+    tmp_path: Path,
+) -> None:
+    assembly = (
+        ".section __TEXT,__text,regular,pure_instructions\n"
+        ".globl _main\n.p2align 2\n_main:\n  ret\n"
+    )
+    path = tmp_path / "input.s"
+    path.write_text(assembly, encoding="utf-8")
+
+    from_text = assemble_asm_text_to_encoded(assembly)
+    from_path = assemble_asm_path_to_encoded(str(path))
+
+    assert from_text == from_path
+    packed = decode_packed_native_object(from_text)
+    assert [symbol.name for symbol in packed.symbols] == ["_main"]
+
+
+def test_macho_driver_links_ordered_mixed_asm_and_pco_inputs(
+    tmp_path: Path,
+) -> None:
+    assembly = tmp_path / "main.s"
+    assembly.write_text(
+        ".section __TEXT,__text,regular,pure_instructions\n"
+        ".globl _main\n.p2align 2\n_main:\n  movz x0, #0\n  ret\n",
+        encoding="utf-8",
+    )
+    helper = tmp_path / "helper.pco"
+    helper.write_bytes(
+        encode_native_object(NativeObject.from_sections(_helper_sections()))
+    )
+    manifest = tmp_path / "inputs.txt"
+    manifest.write_text(
+        "pcc.macho-internal-inputs.v1\n"
+        "2\n"
+        "PCO\t"
+        + str(helper)
+        + "\nASM\t"
+        + str(assembly)
+        + "\n",
+        encoding="utf-8",
+    )
+    output = tmp_path / "program"
+    profile = tmp_path / "link-profile.json"
+    driver = Path(__file__).resolve().parents[2] / "scripts" / "pcc_link_macho.py"
+
+    linked = subprocess.run(
+        [
+            sys.executable,
+            str(driver),
+            "--internal-input-manifest",
+            str(manifest),
+            "--out",
+            str(output),
+            "--profile-json",
+            str(profile),
+        ],
+        text=True,
+        capture_output=True,
+        timeout=30,
+    )
+
+    assert linked.returncode == 0, linked.stderr
+    link_profile = json.loads(profile.read_text(encoding="utf-8"))
+    assert link_profile["inputs"]["asm"] == 1
+    assert link_profile["inputs"]["native_object"] == 1
+    executed = subprocess.run(
+        [str(output)],
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+    assert executed.returncode == 0, executed.stderr
 
 
 def _caller_sections() -> list[Section]:
@@ -80,6 +168,235 @@ def test_native_codec_stores_each_symbol_once_and_relocations_by_index() -> None
     assert restored.symbols[relocation.symbol_index].name == "_helper"
 
 
+def test_direct_section_codec_matches_materialized_object_without_records(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sections = _caller_sections()
+    expected = encode_native_object(NativeObject.from_sections(
+        sections,
+        undefined=["_helper"],
+    ))
+
+    def unexpected_materialization(*_args, **_kwargs):
+        raise AssertionError("direct section codec materialized native records")
+
+    monkeypatch.setattr(
+        native_object_module,
+        "NativeSymbol",
+        unexpected_materialization,
+    )
+    monkeypatch.setattr(
+        native_object_module,
+        "NativeSection",
+        unexpected_materialization,
+    )
+    monkeypatch.setattr(
+        native_object_module,
+        "NativeRelocation",
+        unexpected_materialization,
+    )
+
+    actual = encode_native_object_from_sections(
+        sections,
+        undefined=["_helper"],
+    )
+    assert actual == expected
+    assert decode_packed_native_object(actual).relocation_target_indices == (
+        frozenset({1})
+    )
+
+
+def test_packed_relocation_scalar_arena_matches_codec_layout() -> None:
+    records = CompilerIntArena()
+    fields = (
+        24,
+        0xFFFFFFFF,
+        spec.ARM64_RELOC_PAGE21,
+        1,
+        2,
+        -17,
+        3,
+        0xFFFFFFFF,
+        -1,
+    )
+    records.append4(*fields[:4])
+    records.append4(*fields[4:8])
+    records.append(fields[8])
+
+    assert native_object_module._pack_native_relocation_records(records) == (
+        native_object_module._RELOCATION.pack(*fields)
+    )
+    records.close()
+
+
+def test_direct_section_codec_preserves_canonical_symbol_order() -> None:
+    sections = [Section(
+        sectname="__text",
+        segname="__TEXT",
+        data=_RET + _RET,
+        align_log2=2,
+        flags=TEXT_SECTION_FLAGS,
+        symbols=(
+            TextSymbol("_later_local", 4, external=False),
+            TextSymbol("_entry", 0, external=True),
+            TextSymbol("_first_local", 0, external=False),
+        ),
+    )]
+
+    expected = encode_native_object(NativeObject.from_sections(
+        sections,
+        undefined=["_z", "_a"],
+    ))
+    actual = encode_native_object_from_sections(
+        sections,
+        undefined=["_z", "_a"],
+    )
+
+    assert actual == expected
+    packed = decode_packed_native_object(actual)
+    assert [symbol.name for symbol in packed.symbols] == [
+        "_first_local",
+        "_later_local",
+        "_entry",
+        "_a",
+        "_z",
+    ]
+
+
+def test_direct_section_codec_revalidates_the_final_packed_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def reject_final_bytes(_payload):
+        raise NativeObjectError("packed boundary reached")
+
+    monkeypatch.setattr(
+        native_object_module,
+        "decode_packed_native_object",
+        reject_final_bytes,
+    )
+    with pytest.raises(NativeObjectError, match="packed boundary reached"):
+        encode_native_object_from_sections(_helper_sections())
+
+
+def test_native_wire_ascii_names_use_the_owned_utf8_subset() -> None:
+    assert native_object_module._decode_ascii_name(
+        b"_entry",
+        "symbol",
+    ) == "_entry"
+    with pytest.raises(NativeObjectError, match="non-ASCII symbol name"):
+        native_object_module._decode_ascii_name(b"\xc3\xa9", "symbol")
+    source = Path(native_object_module.__file__).read_text(encoding="utf-8")
+    assert '.decode("ascii")' not in source
+    special_start = source.index("def _validate_packed_special_section(")
+    special_end = source.index("\ndef is_native_object_bytes", special_start)
+    assert "tuple(_packed_relocations_in_storage_order" not in source[
+        special_start:special_end
+    ]
+
+
+def test_packed_codec_validates_without_native_relocation_materialization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    payload = encode_native_object(NativeObject.from_sections(
+        _caller_sections(), undefined=["_helper"],
+    ))
+
+    def unexpected_relocation(*_args, **_kwargs):
+        raise AssertionError("packed decode materialized NativeRelocation")
+
+    monkeypatch.setattr(
+        native_object_module, "NativeRelocation", unexpected_relocation,
+    )
+    packed = decode_packed_native_object(payload)
+
+    assert isinstance(packed.section_data(0), memoryview)
+    assert [symbol.name for symbol in packed.symbols] == ["_main", "_helper"]
+    assert packed.relocation_target_indices == frozenset({1})
+    fields = list(packed.relocation_fields(0))
+    assert len(fields) == 1
+    assert fields[0][1] == 1
+    assert bytes(packed.section_data(0)) == _BL_PLACEHOLDER + _RET
+
+
+def test_packed_codec_rejects_bad_framing_and_relocation_flags() -> None:
+    payload = encode_native_object(NativeObject.from_sections(
+        _caller_sections(), undefined=["_helper"],
+    ))
+    packed = decode_packed_native_object(payload)
+    damaged = bytearray(payload)
+    # <Q offset, I symbol, I type, B pcrel, ...>
+    damaged[packed.sections[0].relocation_offset + 16] = 2
+
+    with pytest.raises(NativeObjectError, match="pcrel byte"):
+        decode_packed_native_object(bytes(damaged))
+    with pytest.raises(NativeObjectError, match="trailing bytes"):
+        decode_packed_native_object(payload + b"unexpected")
+    with pytest.raises(NativeObjectError, match="truncated"):
+        decode_packed_native_object(payload[:-1])
+
+
+def test_packed_codec_rejects_symbols_defined_in_stackmap_section() -> None:
+    from pcc.backend.precise_stackmap import (
+        ARCH_AARCH64,
+        FunctionStackMap,
+        PreciseStackMap,
+        SAFEPOINT_ENTRY,
+        SafepointRecord,
+        encode_stack_map,
+        function_address_offsets,
+        function_id,
+        safepoint_id,
+    )
+
+    symbol = "_main"
+    stack_map = PreciseStackMap(
+        arch=ARCH_AARCH64,
+        functions=(FunctionStackMap(
+            function_id=function_id(symbol),
+            function_address=0,
+            code_size=4,
+            frame_size=0,
+            records=(SafepointRecord(
+                safepoint_id=safepoint_id(symbol, 0, SAFEPOINT_ENTRY),
+                instruction_offset=0,
+                kind=SAFEPOINT_ENTRY,
+                locations=(),
+            ),),
+        ),),
+    )
+    stack_payload = encode_stack_map(stack_map)
+    address_offset = function_address_offsets(stack_payload)[0]
+    valid = encode_native_object(NativeObject.from_sections([
+        Section(
+            "__text", "__TEXT", _RET, 2, TEXT_SECTION_FLAGS,
+            (TextSymbol(symbol, 0),),
+        ),
+        Section(
+            "__pcc_stackmaps", "__DATA", stack_payload, 3,
+            spec.S_REGULAR,
+            relocations=(Relocation(
+                address_offset,
+                symbol,
+                spec.ARM64_RELOC_UNSIGNED,
+                False,
+                length=3,
+            ),),
+        ),
+    ]))
+    damaged = bytearray(valid)
+    symbol_record = (
+        native_object_module._HEADER.size
+        + native_object_module._U32.size
+        + len(symbol)
+    )
+    damaged[symbol_record:symbol_record + 4] = (2).to_bytes(4, "little")
+
+    with pytest.raises(NativeObjectError, match="cannot define data symbols"):
+        decode_packed_native_object(bytes(damaged))
+    with pytest.raises(NativeObjectError, match="cannot define data symbols"):
+        decode_native_object(bytes(damaged))
+
+
 def test_native_final_link_never_parses_an_internal_macho_string_table(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -105,6 +422,25 @@ def test_native_final_link_never_parses_an_internal_macho_string_table(
     }
 
 
+def test_native_link_does_not_expand_inputs_to_macho_shaped_views(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    caller = NativeObject.from_sections(
+        _caller_sections(), undefined=["_helper"],
+    )
+    helper = NativeObject.from_sections(_helper_sections())
+
+    def unexpected_view(_self):
+        raise AssertionError("indexed input expanded to NativeObjectView")
+
+    monkeypatch.setattr(NativeObject, "link_view", unexpected_view)
+    merged = link_relocatable_native([caller, helper])
+
+    assert [symbol.name for symbol in merged.symbols] == ["_main", "_helper"]
+    relocation = merged.sections[0].relocations[0]
+    assert merged.symbols[relocation.symbol_index].name == "_helper"
+
+
 def test_internal_and_external_object_boundaries_produce_the_same_image() -> None:
     caller_sections = _caller_sections()
     helper_sections = _helper_sections()
@@ -118,6 +454,20 @@ def test_internal_and_external_object_boundaries_produce_the_same_image() -> Non
     ])
 
     assert internal == external
+
+
+def test_packed_and_materialized_native_inputs_produce_the_same_image() -> None:
+    caller = NativeObject.from_sections(
+        _caller_sections(), undefined=["_helper"],
+    )
+    helper = NativeObject.from_sections(_helper_sections())
+    materialized = link_executable([caller, helper])
+    packed = link_executable([
+        decode_packed_native_object(encode_native_object(caller)),
+        decode_packed_native_object(encode_native_object(helper)),
+    ])
+
+    assert packed == materialized
 
 
 def test_indexed_view_matches_macho_for_sections_symbols_and_relocations() -> None:

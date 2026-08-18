@@ -132,6 +132,8 @@ static void *pcc_gc_index_remove_slot(
     int64_t *used,
     void *key
 ) {
+    /* Mirrors pcc_gc_index_py_remove: an empty index cannot hold the key. */
+    if (*count <= 0) return NULL;
     int found = 0;
     int64_t idx = pcc_gc_index_find_slot(slots, cap, key, &found);
     if (!found) return NULL;
@@ -565,6 +567,134 @@ static PccGcPtrIndex pcc_gc_zpage_page_index = {
     NULL, 0, 0, 0
 };
 
+#define PCC_GC_FORWARDING_PLAN_SOURCE_INDEX 0
+#define PCC_GC_FORWARDING_PLAN_TARGET_INDEX 1
+#define PCC_GC_FORWARDING_PLAN_IDENTITY_INDEX 2
+
+static PccGcPtrIndex *pcc_gc_forwarding_plan_index(int64_t kind) {
+    if (kind == PCC_GC_FORWARDING_PLAN_SOURCE_INDEX) {
+        return &pcc_gc_forwarding_index;
+    }
+    if (kind == PCC_GC_FORWARDING_PLAN_TARGET_INDEX) {
+        return &pcc_gc_forwarding_target_index;
+    }
+    if (kind == PCC_GC_FORWARDING_PLAN_IDENTITY_INDEX) {
+        return &pcc_gc_identity_index;
+    }
+    return NULL;
+}
+
+static int64_t pcc_gc_ptr_index_plan_capacity(
+    PccGcPtrIndex *index,
+    int64_t extra
+) {
+    if (index == NULL || extra <= 0) return -1;
+    if (
+        index->slots != NULL
+        && index->used + extra <= index->cap / 2
+    ) {
+        return 0;
+    }
+    int64_t wanted = index->count + extra;
+    int64_t desired = wanted * 4;
+    if (desired < PCC_GC_INDEX_DEFAULT_INIT_CAP) {
+        desired = PCC_GC_INDEX_DEFAULT_INIT_CAP;
+    }
+    int64_t capacity = py_gc_index_next_pow2(desired);
+    if (index->cap > 0 && wanted > index->cap / 2) {
+        int64_t grown = index->cap * 2;
+        if (grown > capacity) capacity = grown;
+    }
+    return capacity;
+}
+
+static int64_t pcc_gc_ptr_index_plan_commit(
+    PccGcPtrIndex *index,
+    void **prepared_slots_io,
+    int64_t prepared_cap,
+    int64_t extra
+) {
+    if (index == NULL || prepared_slots_io == NULL) return -1;
+    int64_t required = pcc_gc_ptr_index_plan_capacity(index, extra);
+    if (required < 0) return -1;
+    if (required == 0) return 0;
+    PccGcIndexSlot *new_slots = (PccGcIndexSlot *)*prepared_slots_io;
+    if (new_slots == NULL || prepared_cap < required) return -1;
+
+    int64_t new_used = 0;
+    for (int64_t i = 0; i < index->cap; i++) {
+        if (index->slots[i].state != PCC_GC_INDEX_SLOT_FULL) continue;
+        int found = 0;
+        int64_t slot = pcc_gc_index_find_slot(
+            new_slots,
+            prepared_cap,
+            index->slots[i].key,
+            &found
+        );
+        new_slots[slot] = index->slots[i];
+        new_slots[slot].state = PCC_GC_INDEX_SLOT_FULL;
+        new_used++;
+    }
+    PccGcIndexSlot *old_slots = index->slots;
+    index->slots = new_slots;
+    index->cap = prepared_cap;
+    index->used = new_used;
+    *prepared_slots_io = old_slots;
+    return 1;
+}
+
+int64_t pcc_gc_forwarding_plan_index_capacity(
+    int64_t kind,
+    int64_t extra
+) {
+    PccGcPtrIndex *index = pcc_gc_forwarding_plan_index(kind);
+    return pcc_gc_ptr_index_plan_capacity(index, extra);
+}
+
+int64_t pcc_gc_forwarding_plan_index_commit(
+    int64_t kind,
+    void **prepared_slots_io,
+    int64_t prepared_cap,
+    int64_t extra
+) {
+    PccGcPtrIndex *index = pcc_gc_forwarding_plan_index(kind);
+    return pcc_gc_ptr_index_plan_commit(
+        index, prepared_slots_io, prepared_cap, extra
+    );
+}
+
+int64_t pcc_gc_forwarding_plan_index_insert(
+    int64_t kind,
+    PyObject *obj,
+    void *node
+) {
+    PccGcPtrIndex *index = pcc_gc_forwarding_plan_index(kind);
+    if (
+        index == NULL
+        || index->slots == NULL
+        || obj == NULL
+        || PY_IS_TAGGED_INT(obj)
+        || node == NULL
+    ) {
+        return -1;
+    }
+    int found = 0;
+    int64_t slot = pcc_gc_index_find_slot(
+        index->slots,
+        index->cap,
+        obj,
+        &found
+    );
+    if (found) return 0;
+    if (index->used + 1 > index->cap / 2) return -1;
+    index->slots[slot].key = obj;
+    index->slots[slot].node = node;
+    index->slots[slot].state = PCC_GC_INDEX_SLOT_FULL;
+    index->count++;
+    index->used++;
+    return 1;
+}
+
 /* Exact provenance for managed objects that intentionally do not have a
  * PccGcObjectNode: backend-0 objects, backend-3/4 graph leaves, and the small
  * number of runtime-owned objects constructed outside pcc_gc_alloc.  This is
@@ -762,12 +892,53 @@ void *pcc_gc_frame_index_find(void *slots) {
     return pcc_gc_ptr_index_find_raw(&pcc_gc_frame_index, slots);
 }
 
+int64_t pcc_gc_frame_index_plan_capacity(int64_t extra) {
+    return pcc_gc_ptr_index_plan_capacity(&pcc_gc_frame_index, extra);
+}
+
+int64_t pcc_gc_frame_index_plan_commit(
+    void **prepared_slots_io,
+    int64_t prepared_cap,
+    int64_t extra
+) {
+    return pcc_gc_ptr_index_plan_commit(
+        &pcc_gc_frame_index,
+        prepared_slots_io,
+        prepared_cap,
+        extra
+    );
+}
+
 int64_t pcc_gc_frame_index_insert(void *slots, void *node) {
     return pcc_gc_ptr_index_insert_raw(&pcc_gc_frame_index, slots, node);
 }
 
 void *pcc_gc_frame_index_replace(void *slots, void *node) {
     return pcc_gc_ptr_index_replace_raw(&pcc_gc_frame_index, slots, node);
+}
+
+void *pcc_gc_frame_index_replace_preallocated(void *slots, void *node) {
+    PccGcPtrIndex *index = &pcc_gc_frame_index;
+    if (slots == NULL || node == NULL || index->slots == NULL) return node;
+    int found = 0;
+    int64_t slot = pcc_gc_index_find_slot(
+        index->slots,
+        index->cap,
+        slots,
+        &found
+    );
+    if (found) {
+        void *old = index->slots[slot].node;
+        index->slots[slot].node = node;
+        return old;
+    }
+    if (index->used + 1 > index->cap / 2) return node;
+    index->slots[slot].key = slots;
+    index->slots[slot].node = node;
+    index->slots[slot].state = PCC_GC_INDEX_SLOT_FULL;
+    index->used++;
+    index->count++;
+    return NULL;
 }
 
 void *pcc_gc_frame_index_remove(void *slots) {
@@ -788,6 +959,58 @@ int64_t pcc_gc_zpage_owner_index_insert(PyObject *obj, void *node) {
 
 int64_t pcc_gc_zpage_owner_index_upsert(PyObject *obj, void *node) {
     return pcc_gc_ptr_index_upsert(&pcc_gc_zpage_owner_index, obj, node);
+}
+
+int64_t pcc_gc_zpage_owner_index_plan_capacity(int64_t extra) {
+    return pcc_gc_ptr_index_plan_capacity(
+        &pcc_gc_zpage_owner_index, extra
+    );
+}
+
+int64_t pcc_gc_zpage_owner_index_plan_commit(
+    void **prepared_slots_io,
+    int64_t prepared_cap,
+    int64_t extra
+) {
+    return pcc_gc_ptr_index_plan_commit(
+        &pcc_gc_zpage_owner_index,
+        prepared_slots_io,
+        prepared_cap,
+        extra
+    );
+}
+
+int64_t pcc_gc_zpage_owner_index_upsert_preallocated(
+    PyObject *obj,
+    void *node
+) {
+    PccGcPtrIndex *index = &pcc_gc_zpage_owner_index;
+    if (
+        index->slots == NULL
+        || obj == NULL
+        || PY_IS_TAGGED_INT(obj)
+        || node == NULL
+    ) {
+        return -1;
+    }
+    int found = 0;
+    int64_t slot = pcc_gc_index_find_slot(
+        index->slots,
+        index->cap,
+        obj,
+        &found
+    );
+    if (found) {
+        index->slots[slot].node = node;
+        return 0;
+    }
+    if (index->used + 1 > index->cap / 2) return -1;
+    index->slots[slot].key = obj;
+    index->slots[slot].node = node;
+    index->slots[slot].state = PCC_GC_INDEX_SLOT_FULL;
+    index->count++;
+    index->used++;
+    return 1;
 }
 
 void *pcc_gc_zpage_owner_index_remove(PyObject *obj) {
@@ -853,6 +1076,95 @@ void *pcc_gc_object_index_find(PyObject *obj) {
         &found
     );
     return found ? pcc_gc_object_index_slots[idx].node : NULL;
+}
+
+int64_t pcc_gc_object_index_plan_capacity(int64_t extra) {
+    if (extra <= 0) return -1;
+    if (
+        pcc_gc_object_index_slots != NULL
+        && pcc_gc_object_index_used + extra <= pcc_gc_object_index_cap / 2
+    ) {
+        return 0;
+    }
+    int64_t wanted = pcc_gc_object_index_count + extra;
+    int64_t desired = wanted * 4;
+    if (desired < 16384) desired = 16384;
+    int64_t capacity = py_gc_index_next_pow2(desired);
+    if (
+        pcc_gc_object_index_cap > 0
+        && wanted > pcc_gc_object_index_cap / 2
+    ) {
+        int64_t grown = pcc_gc_object_index_cap * 2;
+        if (grown > capacity) capacity = grown;
+    }
+    return capacity;
+}
+
+int64_t pcc_gc_object_index_plan_commit(
+    void **prepared_slots_io,
+    int64_t prepared_cap,
+    int64_t extra
+) {
+    if (prepared_slots_io == NULL) return -1;
+    int64_t required = pcc_gc_object_index_plan_capacity(extra);
+    if (required < 0) return -1;
+    if (required == 0) return 0;
+    PccGcIndexSlot *new_slots = (PccGcIndexSlot *)*prepared_slots_io;
+    if (new_slots == NULL || prepared_cap < required) return -1;
+
+    int64_t new_used = 0;
+    for (int64_t i = 0; i < pcc_gc_object_index_cap; i++) {
+        if (
+            pcc_gc_object_index_slots[i].state
+            != PCC_GC_INDEX_SLOT_FULL
+        ) continue;
+        int found = 0;
+        int64_t slot = pcc_gc_index_find_slot(
+            new_slots,
+            prepared_cap,
+            pcc_gc_object_index_slots[i].key,
+            &found
+        );
+        new_slots[slot] = pcc_gc_object_index_slots[i];
+        new_slots[slot].state = PCC_GC_INDEX_SLOT_FULL;
+        new_used++;
+    }
+    PccGcIndexSlot *old_slots = pcc_gc_object_index_slots;
+    pcc_gc_object_index_slots = new_slots;
+    pcc_gc_object_index_cap = prepared_cap;
+    pcc_gc_object_index_used = new_used;
+    *prepared_slots_io = old_slots;
+    return 1;
+}
+
+int64_t pcc_gc_object_index_insert_preallocated(
+    PyObject *obj,
+    void *node
+) {
+    if (
+        pcc_gc_object_index_slots == NULL
+        || obj == NULL
+        || PY_IS_TAGGED_INT(obj)
+        || node == NULL
+    ) return -1;
+    int found = 0;
+    int64_t slot = pcc_gc_index_find_slot(
+        pcc_gc_object_index_slots,
+        pcc_gc_object_index_cap,
+        obj,
+        &found
+    );
+    if (found) return 0;
+    if (
+        pcc_gc_object_index_used + 1
+        > pcc_gc_object_index_cap / 2
+    ) return -1;
+    pcc_gc_object_index_slots[slot].key = obj;
+    pcc_gc_object_index_slots[slot].node = node;
+    pcc_gc_object_index_slots[slot].state = PCC_GC_INDEX_SLOT_FULL;
+    pcc_gc_object_index_count++;
+    pcc_gc_object_index_used++;
+    return 1;
 }
 
 int64_t pcc_gc_object_index_insert(PyObject *obj, void *node) {
@@ -922,4 +1234,44 @@ void pcc_gc_object_index_clear(void) {
     pcc_gc_object_index_cap = 0;
     pcc_gc_object_index_count = 0;
     pcc_gc_object_index_used = 0;
+}
+
+/* ---- slab-granule provenance ABI (ARCH-P0, v2) ----
+ *
+ * In cc-mode the runtime allocates through libc malloc: there are no pcc
+ * slabs, so no granule is ever registered and every provenance question
+ * falls through to the exact per-object set exactly as before.  The port's
+ * allocator owns the real map (freestanding_allocator.py); these stubs keep
+ * the ABI total so shared callers link in both modes.
+ */
+int64_t pcc_gc_granule_register_slab(void *slab, int64_t kind, int64_t stride) {
+    (void)slab;
+    (void)kind;
+    (void)stride;
+    return -1;
+}
+
+void *pcc_gc_granule_span(void *ptr) {
+    (void)ptr;
+    return 0;
+}
+
+int64_t pcc_gc_granule_kind(void *ptr) {
+    (void)ptr;
+    return 0;
+}
+
+int64_t pcc_gc_granule_is_object_start(void *ptr) {
+    (void)ptr;
+    return -1; /* unknown granule: callers use the exact per-object chain */
+}
+
+int64_t pcc_gc_granule_object_publish(void *ptr) {
+    (void)ptr;
+    return 0; /* cc-mode has no object-family slab lifecycle */
+}
+
+int64_t pcc_gc_granule_object_retire(void *ptr) {
+    (void)ptr;
+    return 0; /* cc-mode has no object-family slab lifecycle */
 }

@@ -1,5 +1,7 @@
 """pcc-Python port of py_file.c."""
 
+__pcc_runtime_port__ = True
+
 from pcc.extern import (
     extern,
     c_abi_export,
@@ -9,7 +11,16 @@ from pcc.extern import (
     c_size_t,
     c_void,
 )
-from pcc.py_runtime.py.py_abi_constants import PY_TYPE_FILE, PY_TYPE_INT
+from pcc.py_runtime.py.py_abi_constants import (
+    PYBYTESOBJECT_BYTE_LEN_OFFSET,
+    PYBYTESOBJECT_DATA_OFFSET,
+    PYMEMORYVIEWOBJECT_BASE_OFFSET,
+    PY_TYPE_BYTEARRAY,
+    PY_TYPE_BYTES,
+    PY_TYPE_FILE,
+    PY_TYPE_INT,
+    PY_TYPE_MEMORYVIEW,
+)
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_LIST,
     PY_TYPE_STR,
@@ -22,6 +33,7 @@ from pcc.unsafe import (
     is_tagged_int,
     load_i8,
     load_i32,
+    load_i64,
     load_ptr,
     malloc,
     memcpy,
@@ -72,6 +84,7 @@ py_str_splitlines_keepends = extern(
 py_bytes_new = extern("py_bytes_new", (c_ptr, c_int64), c_ptr)
 pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
 py_obj_str = extern("py_obj_str", (c_ptr,), c_ptr)
+pcc_gc_load_ptr = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_ptr)
 py_str_byte_len = extern("py_str_byte_len", (c_ptr,), c_int64)
 py_str_new = extern("py_str_new", (c_ptr, c_int64), c_ptr)
 py_str_utf8 = extern("py_str_utf8", (c_ptr,), c_ptr)
@@ -124,6 +137,21 @@ def _file_bytes_or_str(file, data, n: int):
     if _file_binary(file) != 0:
         return py_bytes_new(data, n)
     return py_str_new(data, n)
+
+
+def _file_bytes_like_base(value):
+    current = value
+    while not ptr_is_null(current) and not is_tagged_int(current):
+        tag: int = _type_of(current)
+        if tag == PY_TYPE_BYTES or tag == PY_TYPE_BYTEARRAY:
+            return current
+        if tag != PY_TYPE_MEMORYVIEW:
+            return null()
+        current = pcc_gc_load_ptr(
+            current,
+            ptr_add(current, PYMEMORYVIEWOBJECT_BASE_OFFSET),
+        )
+    return null()
 
 
 @c_abi_export("py_file_open")
@@ -246,6 +274,26 @@ def py_file_write(file, text):
     f = _checked_file(file)
     if ptr_is_null(f):
         return null()
+    if _file_binary(f) != 0:
+        base = _file_bytes_like_base(text)
+        if ptr_is_null(base):
+            py_raise_owned(
+                py_exc_new(
+                    3,
+                    cstr("a bytes-like object is required for binary write"),
+                )
+            )
+            return null()
+        n: int = load_i64(base, PYBYTESOBJECT_BYTE_LEN_OFFSET)
+        wrote: int = 0
+        if n > 0:
+            wrote = fwrite(
+                ptr_add(base, PYBYTESOBJECT_DATA_OFFSET),
+                1,
+                n,
+                load_ptr(f, 16),
+            )
+        return py_int_from_i64(wrote)
     s = _coerce_str(text)
     owned = null()
     if not ptr_is_null(s) and not ptr_eq(s, text):

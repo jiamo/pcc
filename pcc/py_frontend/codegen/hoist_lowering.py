@@ -605,16 +605,16 @@ class _HoistLoweringPass:
                 """Names that are already available inside ``fd`` without
                 capturing them from the enclosing scope."""
                 cache_key = _hoist_cache_key("local", fd)
-                cached = locally_bound_names_cache.get(cache_key)
-                if cached is not None:
-                    return cached
+                cached_entry = locally_bound_names_cache.get(cache_key)
+                if cached_entry is not None and cached_entry[1] is fd:
+                    return cached_entry[0]
                 bound = []
                 for a in fd.args:
                     if a.name != "":
                         append_name_once(bound, a.name)
                 extend_names_once(bound, collect_scope_bindings(fd.body))
                 result = tuple(bound)
-                locally_bound_names_cache[cache_key] = result
+                locally_bound_names_cache[cache_key] = (result, fd)
                 return result
 
             def called_sibling_names(fd, current_sibling_names):
@@ -623,14 +623,14 @@ class _HoistLoweringPass:
                 caller once the call site is rewritten to the hoisted
                 form with synthetic capture kwargs."""
                 cache_key = _hoist_cache_key("called", fd)
-                cached = called_sibling_names_cache.get(cache_key)
-                if cached is not None:
+                cached_entry = called_sibling_names_cache.get(cache_key)
+                if cached_entry is not None and cached_entry[1] is fd:
                     hoist_stat_inc(
                         hoist_profile_enabled,
                         hoist_stats,
                         "called_sibling_names_cache_hits",
                     )
-                    return cached
+                    return cached_entry[0]
                 hoist_stat_inc(
                     hoist_profile_enabled,
                     hoist_stats,
@@ -769,7 +769,7 @@ class _HoistLoweringPass:
                 for s in fd.body:
                     walk(s)
                 result = tuple(out)
-                called_sibling_names_cache[cache_key] = result
+                called_sibling_names_cache[cache_key] = (result, fd)
                 return result
 
             def referenced_sibling_names(fd, current_sibling_names):
@@ -783,14 +783,14 @@ class _HoistLoweringPass:
                 available in the referencing function's environment.
                 """
                 cache_key = _hoist_cache_key("referenced", fd)
-                cached = referenced_sibling_names_cache.get(cache_key)
-                if cached is not None:
+                cached_entry = referenced_sibling_names_cache.get(cache_key)
+                if cached_entry is not None and cached_entry[1] is fd:
                     hoist_stat_inc(
                         hoist_profile_enabled,
                         hoist_stats,
                         "referenced_sibling_names_cache_hits",
                     )
-                    return cached
+                    return cached_entry[0]
                 hoist_stat_inc(
                     hoist_profile_enabled,
                     hoist_stats,
@@ -924,7 +924,7 @@ class _HoistLoweringPass:
                 for s in fd.body:
                     walk(s)
                 result = tuple(out)
-                referenced_sibling_names_cache[cache_key] = result
+                referenced_sibling_names_cache[cache_key] = (result, fd)
                 return result
 
             def forwarded_value_capture_names(
@@ -948,9 +948,9 @@ class _HoistLoweringPass:
                     outer_scope_names,
                     outer_local_bound,
                 )
-                cached = forwarded_value_capture_names_cache.get(cache_key)
-                if cached is not None:
-                    return cached
+                cached_entry = forwarded_value_capture_names_cache.get(cache_key)
+                if cached_entry is not None and cached_entry[1] is fd:
+                    return cached_entry[0]
                 out = []
                 for inner_fd in fd.body:
                     if not isinstance(inner_fd, _FuncDef):
@@ -980,7 +980,7 @@ class _HoistLoweringPass:
                         ):
                             append_name_once(out, fv)
                 result = tuple(out)
-                forwarded_value_capture_names_cache[cache_key] = result
+                forwarded_value_capture_names_cache[cache_key] = (result, fd)
                 return result
 
             excluded_prescan = []
@@ -999,14 +999,14 @@ class _HoistLoweringPass:
 
             def sibling_effective_free_names(fd, seen_names):
                 cache_key = _hoist_cache_key("effective", fd)
-                cached = sibling_effective_free_names_cache.get(cache_key)
-                if cached is not None:
+                cached_entry = sibling_effective_free_names_cache.get(cache_key)
+                if cached_entry is not None and cached_entry[1] is fd:
                     hoist_stat_inc(
                         hoist_profile_enabled,
                         hoist_stats,
                         "sibling_effective_free_names_cache_hits",
                     )
-                    return cached
+                    return cached_entry[0]
                 hoist_stat_inc(
                     hoist_profile_enabled,
                     hoist_stats,
@@ -1032,7 +1032,7 @@ class _HoistLoweringPass:
                     ),
                 )
                 result = tuple(sorted(out))
-                sibling_effective_free_names_cache[cache_key] = result
+                sibling_effective_free_names_cache[cache_key] = (result, fd)
                 return result
 
             effective_free_names: dict[str, tuple] = {}

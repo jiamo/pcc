@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+import pcc.backend.self_backend_ir as backend_ir
 from pcc.backend import BackendUnavailable
 from pcc.backend.self_backend_ir import (
     CompactParsedInstrArena,
@@ -13,6 +14,13 @@ from pcc.backend.self_backend_ir import (
     parsed_module_instruction_arena_profile,
 )
 from pcc.backend.self_backend_parse import parse_self_backend_module
+from pcc.backend.self_backend_kernel import get_indexed_function_kernel
+
+
+def test_stable_opcode_constants_match_the_canonical_vocabulary() -> None:
+    for kind_id, kind_name in enumerate(PARSED_INSTRUCTION_KINDS):
+        constant_name = "PARSED_INSTRUCTION_KIND_" + kind_name.upper()
+        assert getattr(backend_ir, constant_name) == kind_id
 
 
 def test_compact_instruction_arena_uses_dense_kinds_and_preserves_projection():
@@ -50,6 +58,7 @@ def test_compact_instruction_arena_uses_dense_kinds_and_preserves_projection():
         "records": 3,
         "kind_id_bytes": 3,
         "volatile_bytes": 3,
+        "arithmetic_flag_bytes": 3,
         "diagnostic_materializations": 3,
     }
 
@@ -110,7 +119,7 @@ def test_parsed_block_converts_legacy_lists_and_keeps_diagnostic_source_lines():
     assert block.terminator.kind == "ret"
 
 
-def test_parser_retains_compact_arena_at_real_ir_boundary():
+def test_parser_uses_function_kind_plane_at_real_ir_boundary():
     module = parse_self_backend_module(
         "target triple = \"arm64-apple-darwin\"\n"
         "define i64 @add_one(i64 %value) {\n"
@@ -119,16 +128,17 @@ def test_parser_retains_compact_arena_at_real_ir_boundary():
         "  ret i64 %sum\n"
         "}\n"
     )
-    block = module.functions[0].blocks[0]
-    assert isinstance(block.instructions, CompactParsedInstrArena)
-    assert [(value.dense_id, value.kind) for value in block.instructions] == [
-        (0, "binop"),
-    ]
-    assert block.instructions[0].data[1] == "sum"
+    function = module.functions[0]
+    kernel = get_indexed_function_kernel(function)
+    assert function.blocks == []
+    assert kernel.instruction_count(0) == 1
+    assert PARSED_INSTRUCTION_KINDS[kernel.instruction_kind_id(0, 0)] == "binop"
+    assert kernel.value_name(kernel.defined_value_id(0, 0)) == "sum"
     assert parsed_module_instruction_arena_profile(module) == {
         "blocks": 1,
         "records": 1,
         "kind_id_bytes": 1,
-        "volatile_bytes": 1,
+        "volatile_bytes": 0,
+        "arithmetic_flag_bytes": 0,
         "diagnostic_materializations": 0,
     }

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+from types import SimpleNamespace
+
 from pcc.py_frontend import pipeline
 from pcc.py_frontend import pipeline_runtime_archive as runtime_archive
 
@@ -29,3 +32,39 @@ def test_non_production_archive_bundle_policy_is_basename_scoped():
     assert not runtime_archive.requires_provenance("/tmp/foreign.a")
     assert runtime_archive.requires_c_bundle_validation("/tmp/libpy_runtime.a")
     assert not runtime_archive.requires_c_bundle_validation("/tmp/foreign.a")
+
+
+def test_codegen_freshness_checker_uses_the_host_python_boundary(
+    tmp_path: Path,
+    monkeypatch,
+):
+    archive = tmp_path / "libpy_runtime_pcc_py.a"
+    Path(str(archive) + ".provenance.json").write_text("{}\n", encoding="utf-8")
+    calls = []
+
+    def fake_run(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return SimpleNamespace(returncode=0)
+
+    monkeypatch.setattr(runtime_archive.subprocess, "run", fake_run)
+
+    assert not runtime_archive.provenance_codegen_stale(
+        str(archive),
+        pcc_source_root=lambda: "/source/root",
+        host_python_command=lambda: "/host/python",
+    )
+    assert calls[0][0][0] == "/host/python"
+    assert calls[0][0][-2] == "/source/root"
+    assert calls[0][0][-1] == str(archive) + ".provenance.json"
+    assert calls[0][1]["timeout"] == 90
+
+    monkeypatch.setattr(
+        runtime_archive.subprocess,
+        "run",
+        lambda *_args, **_kwargs: SimpleNamespace(returncode=1),
+    )
+    assert runtime_archive.provenance_codegen_stale(
+        str(archive),
+        pcc_source_root=lambda: "/source/root",
+        host_python_command=lambda: "/host/python",
+    )

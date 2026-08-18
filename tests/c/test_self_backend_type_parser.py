@@ -10,6 +10,7 @@ import pytest
 import pcc.backend.self_backend_parse as parser
 from pcc.backend import BackendUnavailable
 from pcc.backend.self_backend_ir import TypeDesc
+from pcc.backend.self_backend_kernel import get_indexed_function_kernel
 from pcc.backend.self_backend_parse import (
     _tokenize_ir_type,
     extract_leading_type_token,
@@ -26,6 +27,10 @@ def _direct_call_names(function) -> set[str]:
         for node in ast.walk(tree)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
     }
+
+
+def _diagnostic_instruction(function, index: int = 0):
+    return get_indexed_function_kernel(function).diagnostic_instruction(0, index)
 
 
 def test_type_surfaces_share_the_token_parser_source_contract() -> None:
@@ -181,10 +186,48 @@ entry:
     )
     assert module.functions[0].ret_type == envelope
     assert module.functions[0].args[0].type == envelope
-    call = module.functions[1].blocks[0].instructions[0]
+    kernel = get_indexed_function_kernel(module.functions[1])
+    call = kernel.diagnostic_instruction(0, 0)
     assert call.kind == "call"
     assert call.data[4] == ((literal, "payload"), (TypeDesc("int", 64), "9"))
     assert call.data[5:] == (2, True, (0, 0))
+
+
+def test_module_parser_interns_repeated_leaf_types_by_identity() -> None:
+    ir_text = '''
+target triple = "arm64-apple-darwin23.6.0"
+
+@first = internal global ptr null
+@second = internal global ptr null
+@typed_first = internal global i64* null
+@typed_second = internal global i64* null
+
+declare i64 @sum(i64, i64)
+
+define i64 @caller(i64 %left, i64 %right) {
+entry:
+  %result = call i64 @sum(i64 %left, i64 %right)
+  ret i64 %result
+}
+'''.strip()
+
+    module = parse_self_backend_module(ir_text)
+    first_ptr = module.globals_[0].type
+    second_ptr = module.globals_[1].type
+    typed_first_ptr = module.globals_[2].type
+    typed_second_ptr = module.globals_[3].type
+    function = module.functions[0]
+    call = _diagnostic_instruction(function)
+
+    assert first_ptr is second_ptr
+    assert first_ptr.pointee is second_ptr.pointee
+    assert typed_first_ptr is typed_second_ptr
+    assert typed_first_ptr.pointee is function.ret_type
+    assert function.ret_type is function.args[0].type
+    assert function.args[0].type is function.args[1].type
+    assert function.args[0].type is call.data[1]
+    assert function.args[0].type is call.data[4][0][0]
+    assert call.data[4][0][0] is call.data[4][1][0]
 
 
 def test_call_parser_preserves_exact_pointer_argument_alignments() -> None:
@@ -200,7 +243,7 @@ entry:
 }
 '''.strip()
 
-    call = parse_self_backend_module(ir_text).functions[0].blocks[0].instructions[0]
+    call = _diagnostic_instruction(parse_self_backend_module(ir_text).functions[0])
 
     assert call.kind == "call"
     assert call.data[4] == (
@@ -225,7 +268,7 @@ entry:
 }
 '''.strip()
 
-    call = parse_self_backend_module(ir_text).functions[0].blocks[0].instructions[0]
+    call = _diagnostic_instruction(parse_self_backend_module(ir_text).functions[0])
 
     assert call.kind == "call"
     assert call.data[4] == (

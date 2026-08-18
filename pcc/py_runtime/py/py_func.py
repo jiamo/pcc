@@ -8,6 +8,9 @@ Function object layout:
     offset 40   bound self object, nullable
     total size: 48 bytes
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_DICT,
     PY_TYPE_FUNC,
@@ -64,6 +67,9 @@ py_runtime_error_if_unset = extern(
 py_incref = extern("py_incref", (c_ptr,), c_void)
 py_decref = extern("py_decref", (c_ptr,), c_void)
 py_gc_track = extern("py_gc_track", (c_ptr,), c_void)
+pcc_gc_publish_initialized = extern(
+    "pcc_gc_publish_initialized", (c_ptr,), c_void
+)
 pcc_gc_load_ptr = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_ptr)
 pcc_gc_store_ptr = extern("pcc_gc_store_ptr", (c_ptr, c_ptr, c_ptr), c_void)
 pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
@@ -1019,6 +1025,7 @@ def py_func_new_bound(entry, captures_tuple, name, self_obj):
     if made_captures != 0:
         py_decref(captures)
     py_gc_track(fn)
+    pcc_gc_publish_initialized(fn)
     return fn
 
 

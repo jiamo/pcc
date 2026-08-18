@@ -1,5 +1,7 @@
 """pcc-Python owner of subprocess timeout and process-group cleanup."""
 
+__pcc_runtime_port__ = True
+
 from pcc.extern import c_abi_export, c_int64, c_ptr, c_void, extern
 from pcc.unsafe import (
     free,

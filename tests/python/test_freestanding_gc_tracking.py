@@ -25,6 +25,9 @@ INTERNAL_SYMBOLS = {
     "pcc_gc_default_table_lock",
     "pcc_gc_default_table_unlock",
     "pcc_gc_default_unlink_tracked_node",
+    "pcc_gc_tracked_node_pool_cached_count",
+    "pcc_gc_tracked_node_pool_drain",
+    "pcc_gc_tracked_node_recycle",
 }
 RAW_FUNCTION_IMPORTS = {
     "free",
@@ -39,6 +42,8 @@ RAW_FUNCTION_IMPORTS = {
 RAW_GLOBAL_IMPORTS = {
     "pcc_gc_deferred_node_free_head",
     "pcc_gc_table_lock_owner_token",
+    "pcc_gc_tracked_node_pool",
+    "pcc_gc_tracked_node_pool_count",
     "py_gc_head",
     "py_gc_tracked_count",
 }
@@ -238,6 +243,8 @@ def test_gc_tracking_has_one_strict_source_owner_and_one_unlink_rule():
     assert "pcc_thread_safepoint()" in tracking
     assert "__atomic_test_and_set" in oracle
     assert "__atomic_clear" in oracle
+    assert "count >= 4096" in tracking
+    assert "PCC_GC_TRACKED_NODE_POOL_LIMIT 4096" in oracle
     for name in ("py_gc_track", "py_gc_untrack"):
         port_body = tracking.split("def " + name, 1)[1].split("\n\n@", 1)[0]
         oracle_body = oracle.split("void " + name, 1)[1].split("\n}", 1)[0]

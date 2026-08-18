@@ -3,6 +3,9 @@
 Minimal native iterator wrapper for list / tuple / str / dict keys plus
 dispatch to native generator objects.
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_BYTEARRAY,
     PY_TYPE_BYTES,
@@ -31,6 +34,7 @@ from pcc.unsafe import (
     null,
     ptr_add,
     ptr_is_null,
+    stack_alloc,
     store_i32,
     store_i64,
     store_ptr,
@@ -66,11 +70,23 @@ py_exc_builtin_class = extern("py_exc_builtin_class", (c_int64,),         c_ptr)
 py_exc_matches   = extern("py_exc_matches",   (c_ptr, c_ptr),           c_int64)
 py_raise_owned   = extern("py_raise_owned",   (c_ptr,),                 c_void)
 py_gc_track      = extern("py_gc_track",      (c_ptr,),                 c_void)
+pcc_gc_publish_initialized = extern(
+    "pcc_gc_publish_initialized", (c_ptr,), c_void
+)
 pcc_gc_alloc     = extern("pcc_gc_alloc",     (c_int64, c_int32, c_int32), c_ptr)
 pcc_gc_free_object_memory = extern(
     "pcc_gc_free_object_memory", (c_ptr,), c_void
 )
 pcc_gc_load_ptr  = extern("pcc_gc_load_ptr",  (c_ptr, c_ptr),           c_ptr)
+pcc_gc_backend = extern("pcc_gc_backend", (), c_int64)
+pcc_gc_scheduler_root_register_handle = extern(
+    "pcc_gc_scheduler_root_register_handle", (c_ptr,), c_ptr
+)
+pcc_gc_scheduler_root_unregister_handle = extern(
+    "pcc_gc_scheduler_root_unregister_handle", (c_ptr,), c_void
+)
+pcc_gc_pin = extern("pcc_gc_pin", (c_ptr,), c_void)
+pcc_gc_unpin = extern("pcc_gc_unpin", (c_ptr,), c_void)
 py_user_iter_dispatch = extern("py_user_iter_dispatch", (c_ptr,),       c_ptr)
 py_user_next_dispatch = extern("py_user_next_dispatch", (c_ptr,),       c_ptr)
 pcc_capi_is_cext_type_tag = extern(
@@ -99,6 +115,41 @@ def _type_of(obj) -> int:
     return load_i32(obj, 8)
 
 
+def _iter_prepare_moving_root(slot, value, backend: int):
+    store_ptr(slot, 0, value)
+    if (
+        (backend == 3 or backend == 4)
+        and ptr_is_null(value) == 0
+        and is_tagged_int(value) == 0
+    ):
+        handle = pcc_gc_scheduler_root_register_handle(slot)
+        if ptr_is_null(handle) == 0:
+            store_ptr(slot, 0, pcc_gc_load_ptr(null(), slot))
+        return handle
+    return null()
+
+
+def _iter_moving_root_failed(value, backend: int, handle) -> int:
+    if backend != 3 and backend != 4:
+        return 0
+    if ptr_is_null(value) != 0 or is_tagged_int(value) != 0:
+        return 0
+    return ptr_is_null(handle)
+
+
+def _iter_reload_moving_root(slot, handle):
+    value = load_ptr(slot, 0)
+    if ptr_is_null(handle) == 0:
+        value = pcc_gc_load_ptr(null(), slot)
+        store_ptr(slot, 0, value)
+    return value
+
+
+def _iter_finish_moving_root(handle) -> None:
+    if ptr_is_null(handle) == 0:
+        pcc_gc_scheduler_root_unregister_handle(handle)
+
+
 def _iter_new(seq):
     if ptr_is_null(seq):
         return null()
@@ -109,6 +160,7 @@ def _iter_new(seq):
     store_ptr(it, 16, seq)
     store_i64(it, 24, 0)
     py_gc_track(it)
+    pcc_gc_publish_initialized(it)
     return it
 
 
@@ -144,6 +196,7 @@ def py_iter_callable_new(callable, sentinel):
     store_ptr(it, 16, pair)  # owned reference; dealloc decrefs it
     store_i64(it, 24, -1)    # PY_ITER_CALLABLE_ACTIVE
     py_gc_track(it)
+    pcc_gc_publish_initialized(it)
     return it
 
 
@@ -284,21 +337,41 @@ def py_obj_next(it_obj):
         py_raise_owned(exc)
         return null()
 
+    moving_backend: int = pcc_gc_backend()
+    it_slot = stack_alloc(8)
+    it_handle = _iter_prepare_moving_root(it_slot, it_obj, moving_backend)
+    if _iter_moving_root_failed(it_obj, moving_backend, it_handle) != 0:
+        return null()
+    it_obj = _iter_reload_moving_root(it_slot, it_handle)
     index: int = load_i64(it_obj, 24)
     if index < 0:
         # Callable-iterator: iter(callable, sentinel).
         if index == -2:                       # PY_ITER_CALLABLE_DONE
+            _iter_finish_moving_root(it_handle)
             exc = py_exc_new(8, null())        # StopIteration
             py_raise_owned(exc)
             return null()
         pair = pcc_gc_load_ptr(it_obj, ptr_add(it_obj, 16))
         callable = py_tuple_get(pair, 0)
         if ptr_is_null(callable):
+            _iter_finish_moving_root(it_handle)
             return _require_result(
                 null(),
                 cstr("py_tuple_get"),
                 cstr("callable iterator lost its callable"),
             )
+        callable_slot = stack_alloc(8)
+        callable_handle = _iter_prepare_moving_root(
+            callable_slot, callable, moving_backend
+        )
+        if _iter_moving_root_failed(
+            callable, moving_backend, callable_handle
+        ) != 0:
+            py_decref(callable)
+            _iter_finish_moving_root(it_handle)
+            return null()
+        it_obj = _iter_reload_moving_root(it_slot, it_handle)
+        pair = pcc_gc_load_ptr(it_obj, ptr_add(it_obj, 16))
         sentinel = py_tuple_get(pair, 1)
         if ptr_is_null(sentinel):
             _require_result(
@@ -306,7 +379,27 @@ def py_obj_next(it_obj):
                 cstr("py_tuple_get"),
                 cstr("callable iterator lost its sentinel"),
             )
+            callable = _iter_reload_moving_root(
+                callable_slot, callable_handle
+            )
+            _iter_finish_moving_root(callable_handle)
             py_decref(callable)
+            _iter_finish_moving_root(it_handle)
+            return null()
+        sentinel_slot = stack_alloc(8)
+        sentinel_handle = _iter_prepare_moving_root(
+            sentinel_slot, sentinel, moving_backend
+        )
+        if _iter_moving_root_failed(
+            sentinel, moving_backend, sentinel_handle
+        ) != 0:
+            py_decref(sentinel)
+            callable = _iter_reload_moving_root(
+                callable_slot, callable_handle
+            )
+            _iter_finish_moving_root(callable_handle)
+            py_decref(callable)
+            _iter_finish_moving_root(it_handle)
             return null()
         args = py_tuple_new(0)
         if ptr_is_null(args):
@@ -315,30 +408,101 @@ def py_obj_next(it_obj):
                 cstr("py_tuple_new"),
                 cstr("callable iterator could not allocate its argument tuple"),
             )
+            callable = _iter_reload_moving_root(
+                callable_slot, callable_handle
+            )
+            sentinel = _iter_reload_moving_root(
+                sentinel_slot, sentinel_handle
+            )
+            _iter_finish_moving_root(callable_handle)
+            _iter_finish_moving_root(sentinel_handle)
             py_decref(callable)
             py_decref(sentinel)
+            _iter_finish_moving_root(it_handle)
+            return null()
+        args_slot = stack_alloc(8)
+        args_handle = _iter_prepare_moving_root(
+            args_slot, args, moving_backend
+        )
+        if _iter_moving_root_failed(args, moving_backend, args_handle) != 0:
+            py_decref(args)
+            callable = _iter_reload_moving_root(
+                callable_slot, callable_handle
+            )
+            sentinel = _iter_reload_moving_root(
+                sentinel_slot, sentinel_handle
+            )
+            _iter_finish_moving_root(callable_handle)
+            _iter_finish_moving_root(sentinel_handle)
+            py_decref(callable)
+            py_decref(sentinel)
+            _iter_finish_moving_root(it_handle)
             return null()
         none_obj = global_load_ptr("py_None")
-        result = py_obj_call(callable, args, none_obj)
+        result = py_obj_call(
+            _iter_reload_moving_root(callable_slot, callable_handle),
+            _iter_reload_moving_root(args_slot, args_handle),
+            none_obj,
+        )
+        result_slot = stack_alloc(8)
+        result_handle = _iter_prepare_moving_root(
+            result_slot, result, moving_backend
+        )
+        if _iter_moving_root_failed(
+            result, moving_backend, result_handle
+        ) != 0:
+            py_decref(result)
+            result = null()
+            _require_result(
+                null(),
+                cstr("pcc_gc_scheduler_root_register_handle"),
+                cstr("callable iterator could not root its result"),
+            )
         if ptr_is_null(result):
             _require_result(
                 null(),
                 cstr("py_obj_call"),
                 cstr("callable iterator returned NULL without setting an exception"),
             )
+        args = _iter_reload_moving_root(args_slot, args_handle)
+        _iter_finish_moving_root(args_handle)
         py_decref(args)
+        callable = _iter_reload_moving_root(callable_slot, callable_handle)
+        _iter_finish_moving_root(callable_handle)
         py_decref(callable)
         if ptr_is_null(result):
+            sentinel = _iter_reload_moving_root(
+                sentinel_slot, sentinel_handle
+            )
+            _iter_finish_moving_root(sentinel_handle)
             py_decref(sentinel)
+            _iter_finish_moving_root(it_handle)
             return null()
-        is_stop: int = py_obj_eq(result, sentinel)
+        is_stop: int = py_obj_eq(
+            _iter_reload_moving_root(result_slot, result_handle),
+            _iter_reload_moving_root(sentinel_slot, sentinel_handle),
+        )
+        had_error: int = py_err_occurred()
+        result = _iter_reload_moving_root(result_slot, result_handle)
+        sentinel = _iter_reload_moving_root(sentinel_slot, sentinel_handle)
+        _iter_finish_moving_root(sentinel_handle)
         py_decref(sentinel)
-        if is_stop != 0:
+        if had_error != 0:
+            _iter_finish_moving_root(result_handle)
             py_decref(result)
+            _iter_finish_moving_root(it_handle)
+            return null()
+        if is_stop != 0:
+            _iter_finish_moving_root(result_handle)
+            py_decref(result)
+            it_obj = _iter_reload_moving_root(it_slot, it_handle)
             store_i64(it_obj, 24, -2)          # PY_ITER_CALLABLE_DONE
+            _iter_finish_moving_root(it_handle)
             exc = py_exc_new(8, null())        # StopIteration
             py_raise_owned(exc)
             return null()
+        _iter_finish_moving_root(result_handle)
+        _iter_finish_moving_root(it_handle)
         return result
 
     seq = pcc_gc_load_ptr(it_obj, ptr_add(it_obj, 16))
@@ -348,6 +512,7 @@ def py_obj_next(it_obj):
     if tag == PY_TYPE_LIST:
         n = py_list_len(seq)
         if index >= n:
+            _iter_finish_moving_root(it_handle)
             exc = py_exc_new(8, null())        # StopIteration
             py_raise_owned(exc)
             return null()
@@ -355,6 +520,7 @@ def py_obj_next(it_obj):
     elif tag == PY_TYPE_TUPLE:
         n = py_tuple_len(seq)
         if index >= n:
+            _iter_finish_moving_root(it_handle)
             exc = py_exc_new(8, null())
             py_raise_owned(exc)
             return null()
@@ -362,11 +528,13 @@ def py_obj_next(it_obj):
     elif tag == PY_TYPE_STR:
         n = py_str_len(seq)
         if index >= n:
+            _iter_finish_moving_root(it_handle)
             exc = py_exc_new(8, null())
             py_raise_owned(exc)
             return null()
         idx = py_int_from_i64(index)
         if ptr_is_null(idx):
+            _iter_finish_moving_root(it_handle)
             return _require_result(
                 null(),
                 cstr("py_int_from_i64"),
@@ -377,11 +545,13 @@ def py_obj_next(it_obj):
     elif tag == PY_TYPE_BYTES or tag == PY_TYPE_BYTEARRAY or tag == PY_TYPE_MEMORYVIEW:
         n = py_bytes_len(seq)
         if index >= n:
+            _iter_finish_moving_root(it_handle)
             exc = py_exc_new(8, null())
             py_raise_owned(exc)
             return null()
         idx = py_int_from_i64(index)
         if ptr_is_null(idx):
+            _iter_finish_moving_root(it_handle)
             return _require_result(
                 null(),
                 cstr("py_int_from_i64"),
@@ -390,16 +560,30 @@ def py_obj_next(it_obj):
         item = py_bytes_getitem(seq, idx)
         py_decref(idx)
     else:
+        _iter_finish_moving_root(it_handle)
         exc = py_exc_new(3, null())
         py_raise_owned(exc)
         return null()
     if ptr_is_null(item):
+        _iter_finish_moving_root(it_handle)
         return _require_result(
             null(),
             cstr("py_obj_next"),
             cstr("iterator element lookup returned NULL without setting an exception"),
         )
+    item_slot = stack_alloc(8)
+    item_handle = _iter_prepare_moving_root(
+        item_slot, item, moving_backend
+    )
+    if _iter_moving_root_failed(item, moving_backend, item_handle) != 0:
+        py_decref(item)
+        _iter_finish_moving_root(it_handle)
+        return null()
+    it_obj = _iter_reload_moving_root(it_slot, it_handle)
     store_i64(it_obj, 24, index + 1)
+    item = _iter_reload_moving_root(item_slot, item_handle)
+    _iter_finish_moving_root(item_handle)
+    _iter_finish_moving_root(it_handle)
     return item
 
 
@@ -408,6 +592,20 @@ def py_enumerate_list(iterable, start: int):
     it = py_obj_iter(iterable)
     if ptr_is_null(it) != 0:
         return null()
+    moving_backend: int = pcc_gc_backend()
+    it_slot = stack_alloc(8)
+    item_slot = stack_alloc(8)
+    index_slot = stack_alloc(8)
+    store_ptr(it_slot, 0, it)
+    store_ptr(item_slot, 0, null())
+    store_ptr(index_slot, 0, null())
+    it_handle = null()
+    if moving_backend == 3 or moving_backend == 4:
+        it_handle = pcc_gc_scheduler_root_register_handle(it_slot)
+        if ptr_is_null(it_handle) != 0:
+            py_decref(it)
+            return null()
+        it = pcc_gc_load_ptr(null(), it_slot)
     out = py_list_new(4)
     if ptr_is_null(out) != 0:
         _require_result(
@@ -415,13 +613,20 @@ def py_enumerate_list(iterable, start: int):
             cstr("py_list_new"),
             cstr("enumerate could not allocate its result list"),
         )
+        if ptr_is_null(it_handle) == 0:
+            pcc_gc_scheduler_root_unregister_handle(it_handle)
         py_decref(it)
         return null()
+    pcc_gc_pin(out)
 
     index: int = start
     done: int = 0
     while done == 0:
+        if ptr_is_null(it_handle) == 0:
+            it = pcc_gc_load_ptr(null(), it_slot)
         item = py_obj_next(it)
+        if ptr_is_null(it_handle) == 0:
+            it = pcc_gc_load_ptr(null(), it_slot)
         if ptr_is_null(item) != 0:
             if py_err_occurred() != 0:
                 current = py_current_exception()
@@ -429,11 +634,26 @@ def py_enumerate_list(iterable, start: int):
                 if py_exc_matches(current, stop) != 0:
                     py_clear_exception()
                 else:
+                    pcc_gc_unpin(out)
+                    if ptr_is_null(it_handle) == 0:
+                        pcc_gc_scheduler_root_unregister_handle(it_handle)
                     py_decref(it)
                     py_decref(out)
                     return null()
             done = 1
         else:
+            store_ptr(item_slot, 0, item)
+            item_handle = null()
+            if moving_backend == 3 or moving_backend == 4:
+                item_handle = pcc_gc_scheduler_root_register_handle(item_slot)
+                if ptr_is_null(item_handle) != 0:
+                    py_decref(item)
+                    pcc_gc_unpin(out)
+                    if ptr_is_null(it_handle) == 0:
+                        pcc_gc_scheduler_root_unregister_handle(it_handle)
+                    py_decref(it)
+                    py_decref(out)
+                    return null()
             pair = py_tuple_new(2)
             if ptr_is_null(pair) != 0:
                 _require_result(
@@ -441,10 +661,17 @@ def py_enumerate_list(iterable, start: int):
                     cstr("py_tuple_new"),
                     cstr("enumerate could not allocate an output pair"),
                 )
+                if ptr_is_null(item_handle) == 0:
+                    item = pcc_gc_load_ptr(null(), item_slot)
+                    pcc_gc_scheduler_root_unregister_handle(item_handle)
                 py_decref(item)
+                pcc_gc_unpin(out)
+                if ptr_is_null(it_handle) == 0:
+                    pcc_gc_scheduler_root_unregister_handle(it_handle)
                 py_decref(it)
                 py_decref(out)
                 return null()
+            pcc_gc_pin(pair)
             index_obj = py_int_from_i64(index)
             if ptr_is_null(index_obj) != 0:
                 _require_result(
@@ -452,23 +679,64 @@ def py_enumerate_list(iterable, start: int):
                     cstr("py_int_from_i64"),
                     cstr("enumerate could not allocate an index object"),
                 )
+                if ptr_is_null(item_handle) == 0:
+                    item = pcc_gc_load_ptr(null(), item_slot)
+                    pcc_gc_scheduler_root_unregister_handle(item_handle)
                 py_decref(item)
+                pcc_gc_unpin(pair)
                 py_decref(pair)
+                pcc_gc_unpin(out)
+                if ptr_is_null(it_handle) == 0:
+                    pcc_gc_scheduler_root_unregister_handle(it_handle)
                 py_decref(it)
                 py_decref(out)
                 return null()
+            store_ptr(index_slot, 0, index_obj)
+            index_handle = null()
+            if moving_backend == 3 or moving_backend == 4:
+                index_handle = pcc_gc_scheduler_root_register_handle(index_slot)
+                if ptr_is_null(index_handle) != 0:
+                    py_decref(index_obj)
+                    if ptr_is_null(item_handle) == 0:
+                        item = pcc_gc_load_ptr(null(), item_slot)
+                        pcc_gc_scheduler_root_unregister_handle(item_handle)
+                    py_decref(item)
+                    pcc_gc_unpin(pair)
+                    py_decref(pair)
+                    pcc_gc_unpin(out)
+                    if ptr_is_null(it_handle) == 0:
+                        pcc_gc_scheduler_root_unregister_handle(it_handle)
+                    py_decref(it)
+                    py_decref(out)
+                    return null()
             py_tuple_set_item(pair, 0, index_obj)
+            if ptr_is_null(index_handle) == 0:
+                index_obj = pcc_gc_load_ptr(null(), index_slot)
+                pcc_gc_scheduler_root_unregister_handle(index_handle)
             py_decref(index_obj)
+            if ptr_is_null(item_handle) == 0:
+                item = pcc_gc_load_ptr(null(), item_slot)
             py_tuple_set_item(pair, 1, item)
+            if ptr_is_null(item_handle) == 0:
+                item = pcc_gc_load_ptr(null(), item_slot)
+                pcc_gc_scheduler_root_unregister_handle(item_handle)
             py_decref(item)
             py_list_append(out, pair)
             if py_err_occurred() != 0:
+                pcc_gc_unpin(pair)
                 py_decref(pair)
+                pcc_gc_unpin(out)
+                if ptr_is_null(it_handle) == 0:
+                    pcc_gc_scheduler_root_unregister_handle(it_handle)
                 py_decref(it)
                 py_decref(out)
                 return null()
+            pcc_gc_unpin(pair)
             py_decref(pair)
             index = index + 1
 
+    if ptr_is_null(it_handle) == 0:
+        pcc_gc_scheduler_root_unregister_handle(it_handle)
     py_decref(it)
+    pcc_gc_unpin(out)
     return out

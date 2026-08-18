@@ -37,6 +37,9 @@ from .py_frontend.pipeline import (
     run_self_backend_emit_worker as _run_self_backend_emit_worker,
 )
 from .py_frontend.pipeline import (
+    run_self_backend_indexed_emit_worker as _run_self_backend_indexed_emit_worker,
+)
+from .py_frontend.pipeline import (
     run_self_backend_split_worker as _run_self_backend_split_worker,
 )
 from .py_frontend.pipeline import (
@@ -136,6 +139,7 @@ Options:
   --backend BACKEND         Native emission backend: llvm or self.
   --python-libpython MODE   off (default), auto, or on for Python fallback linkage.
   --python-library          Emit a Python library module without @main.
+  -g, --debug               Emit DWARF line information.
   --ir-scaffold MODE        on (default), off, or auto. Enables Path A
                             closed-world IR-builder lowering (Issue 1).
   --emit-llvm[=PATH]        Emit LLVM IR instead of linking a native binary.
@@ -155,6 +159,12 @@ PCC-CPY-UNSUPPORTED-L3-TOOLING-INTERACTIVE-REPL; pcc1 never invokes CPython.
 
 
 def _write_text(text: str, *, err: bool = False, nl: bool = True) -> None:
+    # A None here used to reach `sys.stderr.write` unchecked on the nl=False
+    # path, and pcc-compiled code writes it as the literal "None" rather than
+    # raising.  That produced a bare `None` glued to the front of a real error
+    # message, which reads as stray compiler noise and hides who emitted it.
+    if text is None:
+        text = "<_write_text(None) -- caller passed no text>"
     if nl:
         if text.endswith("\n"):
             if err:
@@ -10565,6 +10575,50 @@ def _format_compile_error(exc, *, options, metadata):
             _write_text("debug: compile exception message unavailable")
     message = str(exc)
     if not message:
+        # Under pcc1 a PyPipelineError has been observed with str()=""
+        # AND args=None AND no __cause__ chain (2026-08-27, three stage2
+        # failures) — the args machinery and the from-chain both lost the
+        # text.  PyPipelineError therefore also stores its message in a
+        # plain instance attribute at construction; that storage path is
+        # independent of the args tuple and survives when args does not.
+        fallback_text = ""
+        try:
+            fallback_text = str(getattr(exc, "pcc_message", "") or "")
+        except Exception:
+            fallback_text = ""
+        if fallback_text:
+            message = fallback_text
+    if not message:
+        # Every re-raise in the pipeline uses `raise PyPipelineError(...) from
+        # exc`, so the original failure is on __cause__.  Reporting only the
+        # outer wrapper printed "compile failed" with no text at all, and the
+        # real error then surfaced much later as an unrelated linker complaint.
+        cause = getattr(exc, "__cause__", None)
+        if cause is None:
+            cause = getattr(exc, "__context__", None)
+        depth = 0
+        while cause is not None and depth < 6:
+            cause_text = ""
+            try:
+                cause_text = str(cause)
+            except Exception:
+                cause_text = ""
+            cause_name = ""
+            try:
+                cause_name = str(type(cause).__name__)
+            except Exception:
+                cause_name = "Exception"
+            if cause_text:
+                message = cause_name + ": " + cause_text
+                break
+            if not message:
+                message = cause_name
+            nxt = getattr(cause, "__cause__", None)
+            if nxt is None:
+                nxt = getattr(cause, "__context__", None)
+            cause = nxt
+            depth = depth + 1
+    if not message:
         message = "compile failed"
     # Keep this bootstrap formatter deliberately static. The stage1 binary
     # runs this path inside the pcc-py runtime after arbitrary compiler
@@ -10825,6 +10879,26 @@ def _observed_compile_python(
     The self-host path does not yet have a native ``callable(*args,
     **kwargs)`` ABI, and the bootstrap CLI has a fixed compile shape.
     """
+    if str(os.environ.get("PCC_DEBUG_NO_CATCH", "")).strip():
+        # Let the exception escape.  Under pcc1 a CAUGHT exception carries
+        # neither __cause__ nor __traceback__ (both verified: MISSING and
+        # <unavailable>), so every diagnostic built from a caught exception is
+        # empty by construction -- which is why seven rounds of message fixes
+        # recovered nothing.  An UNCAUGHT exception, by contrast, gets a full
+        # traceback printed by the runtime itself.  So the only way to see the
+        # stack is to not catch it.
+        _compile_python(
+            compile_input,
+            compile_output,
+            verbose=verbose,
+            emit_llvm_only=emit_llvm_only,
+            libpython_mode=libpython_mode,
+            ir_scaffold_mode=ir_scaffold_mode,
+            backend=backend,
+            python_library=python_library,
+            profile=metadata,
+        )
+        return None
     try:
         _compile_python(
             compile_input,
@@ -10874,9 +10948,21 @@ def _observed_compile_python(
                 + ("; ".join(tb_lines) if tb_lines else "<unavailable>")
             )
             _write_text("debug: raw_exception_type=" + str(type(exc).__name__))
-            _write_text(
-                "debug: raw_exception_message=" + str(getattr(exc, "message", ""))
-            )
+            # `.message` has not existed on exceptions since Python 2, so this
+            # printed an empty string for every failure and hid the actual text.
+            # str(exc) inline: `.message` has not existed on exceptions since
+            # Python 2, so the old form printed an empty string for every
+            # failure.  Do not call a helper from another module here -- an
+            # undefined name in the *error reporting* path raises inside the
+            # handler and hides the very failure being reported, which is what
+            # happened when this line called safe_exception_text without an
+            # import.
+            reported_message = ""
+            try:
+                reported_message = str(exc)
+            except Exception:
+                reported_message = "<unprintable>"
+            _write_text("debug: raw_exception_message=" + reported_message)
             try:
                 _write_text(
                     "debug: raw_exception_hint=" + repr(getattr(exc, "hint", None))
@@ -11057,6 +11143,13 @@ def parse_bootstrap_cli_args(argv=None):
             continue
         if arg == "--python-library":
             python_library = True
+            i += 1
+            continue
+        if arg == "-g" or arg == "--debug":
+            # Read by ``debug_info_lowering``; pcc1 is where the
+            # instrument-and-rebuild loop hurts most, so the bootstrap CLI
+            # accepts the flag the host CLI does.
+            os.environ["PCC_PY_DEBUG_INFO"] = "1"
             i += 1
             continue
         if arg.startswith("--pass="):
@@ -11265,6 +11358,19 @@ def _bootstrap_cli_main_impl(
                 raw_argv[1], raw_argv[2], raw_argv[3], raw_argv[4]
             )
         return _run_self_backend_emit_worker(raw_argv[1], raw_argv[2])
+    if (
+        len(raw_argv) > 0
+        and raw_argv[0] == "--pcc-self-backend-indexed-emit-worker"
+    ):
+        if len(raw_argv) != 4:
+            _write_text(
+                "Error: --pcc-self-backend-indexed-emit-worker requires sidecar, output and ASM/PCO kind",
+                err=True,
+            )
+            return 2
+        return _run_self_backend_indexed_emit_worker(
+            raw_argv[1], raw_argv[2], raw_argv[3]
+        )
     if len(raw_argv) > 0 and raw_argv[0] == "--pcc-self-backend-emit-batch-worker":
         if len(raw_argv) != 2:
             _write_text(

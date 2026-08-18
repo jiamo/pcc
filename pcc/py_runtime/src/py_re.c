@@ -166,7 +166,7 @@ static PyObject *py_re_match_impl(PyObject *pattern, PyObject *text, int64_t fla
          * mismatching the way the legacy literal matcher below would. */
         return py_re_engine_truth_flags(pattern, text, flags, search);
     }
-    py_raise(py_exc_new(
+    py_raise_owned(py_exc_new(
         PY_EXC_NOTIMPLEMENTEDERROR,
         "pcc re: flags outside the native regex subset (no-libpython)"
     ));
@@ -214,7 +214,7 @@ PyObject *py_re_fullmatch_flags(PyObject *pattern, PyObject *text, int64_t flags
     if ((flags & ~(int64_t)PCC_RE_OK_FLAGS) == 0) {
         return py_re_engine_fullmatch_flags(pattern, text, flags);
     }
-    py_raise(py_exc_new(
+    py_raise_owned(py_exc_new(
         PY_EXC_NOTIMPLEMENTEDERROR,
         "pcc re: flags outside the native regex subset (no-libpython)"
     ));
@@ -308,7 +308,7 @@ PyObject *py_re_findall_flags(PyObject *pattern, PyObject *text, int64_t flags) 
     if ((flags & ~(int64_t)PCC_RE_OK_FLAGS) == 0) {
         return py_re_engine_findall(pattern, text, flags);
     }
-    py_raise(py_exc_new(
+    py_raise_owned(py_exc_new(
         PY_EXC_NOTIMPLEMENTEDERROR,
         "pcc re: flags outside the native regex subset (no-libpython)"
     ));

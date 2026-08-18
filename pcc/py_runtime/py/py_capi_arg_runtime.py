@@ -15,6 +15,9 @@ Public object type tags come from the generated ``py_abi_constants`` module.
 Private exception codes remain owned by the C-API argument contract:
   PY_EXC_TYPEERROR = 3, PY_EXC_VALUEERROR = 2
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_BYTES,
     PY_TYPE_DICT,
@@ -61,6 +64,8 @@ py_str_utf8 = extern("py_str_utf8", (c_ptr,), c_ptr)
 py_str_byte_len = extern("py_str_byte_len", (c_ptr,), c_int64)
 py_decref = extern("py_decref", (c_ptr,), c_void)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 PyObject_IsTrue = extern("PyObject_IsTrue", (c_ptr,), c_int64)
 PyDict_GetItemString = extern("PyDict_GetItemString", (c_ptr, c_ptr), c_ptr)
@@ -68,11 +73,11 @@ pcc_capi_typecheck = extern("pcc_capi_typecheck", (c_ptr, c_ptr), c_int64)
 
 
 def _type_error(message) -> None:
-    py_raise(py_exc_new(3, message))  # PY_EXC_TYPEERROR
+    py_raise_owned(py_exc_new(3, message))  # PY_EXC_TYPEERROR
 
 
 def _value_error(message) -> None:
-    py_raise(py_exc_new(2, message))  # PY_EXC_VALUEERROR
+    py_raise_owned(py_exc_new(2, message))  # PY_EXC_VALUEERROR
 
 
 # NOTE: never wrap stack_alloc in a helper that returns it -- the allocation

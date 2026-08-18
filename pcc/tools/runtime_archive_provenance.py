@@ -31,7 +31,7 @@ _LLVM_OBJECT_EMITTER = "llvmlite-target-machine"
 _LOGICAL_RUNTIME_ROOT = PurePosixPath("pcc/py_runtime")
 _AR_METADATA_MEMBERS = {"/", "//", "__.SYMDEF", "__.SYMDEF SORTED"}
 _REGULAR_AR_MAGIC = b"!<arch>\n"
-_RECEIPT_FIELDS = frozenset(
+_RECEIPT_REQUIRED_FIELDS = frozenset(
     {
         "schema",
         "member",
@@ -46,6 +46,16 @@ _RECEIPT_FIELDS = frozenset(
         "target_triple",
     }
 )
+_RECEIPT_OPTIONAL_FIELDS = frozenset(
+    {
+        # Identity of the compiler that produced the object.  Optional for
+        # integrity compatibility with receipts written before this field was
+        # introduced; automatic local archive selection separately treats a
+        # missing or unprovable identity as stale.
+        "codegen_checksum",
+    }
+)
+_RECEIPT_FIELDS = _RECEIPT_REQUIRED_FIELDS | _RECEIPT_OPTIONAL_FIELDS
 _MANIFEST_FIELDS = frozenset(
     {
         "schema",
@@ -287,9 +297,96 @@ def write_pcc_python_receipt(
         "object_emitter": _LLVM_OBJECT_EMITTER,
         "uses_host_cc": False,
         "target_triple": target_triple,
+        "codegen_checksum": codegen_checksum(),
     }
     _write_json_atomic(output_path or receipt_path_for_object(object_path), receipt)
     return receipt
+
+
+_CODEGEN_CHECKSUM_CACHE: dict = {}
+
+
+def codegen_checksum() -> str:
+    """Identity of the COMPILER that produced an object, not just its source.
+
+    `build_py/*.o` receipts recorded only `source_sha256`, so a codegen change
+    left every object valid and the archive silently stale.  Measured cost of
+    that during one session: a codegen edit was benchmarked against objects
+    built by the previous compiler, and three separate conclusions had to be
+    retracted after the fact.  Mojo does the same thing with its
+    DialectChecksum, for the same stated reason -- false cache hits are very
+    hard to debug.
+
+    Reuses `bootstrap_source_sha256`, which already hashes the frontend- and
+    backend-relevant source set, so there is one definition of "the compiler
+    changed" rather than two that can drift.
+    """
+    cached = _CODEGEN_CHECKSUM_CACHE.get("value")
+    if cached is not None:
+        return cached
+    try:
+        from pcc.bootstrap_cache_identity import bootstrap_source_sha256
+
+        value = bootstrap_source_sha256()
+    except Exception:
+        # Never fail an object build over provenance metadata; an unknown
+        # identity is recorded verbatim so a reader can tell it apart from a
+        # real mismatch.
+        value = "unknown"
+    _CODEGEN_CHECKSUM_CACHE["value"] = value
+    return value
+
+
+def receipt_is_stale_for_current_codegen(
+    record: object,
+    *,
+    current_checksum: str | None = None,
+) -> bool:
+    """True when *record* was produced by a different compiler than this one.
+
+    Separate from receipt *validation* on purpose: an object whose source is
+    unchanged but whose compiler changed is stale, not corrupt.  Conflating the
+    two makes every pre-existing object fail integrity the moment the field is
+    introduced.
+
+    This check is fail-closed for automatically managed local archives: an old
+    receipt without the field, a malformed value, or an unavailable current
+    identity must rebuild rather than silently reusing an unprovable object.
+    Receipt integrity remains a separate question so explicit archives and
+    verified wheel bundles are not coupled to the current checkout.
+    """
+    if not isinstance(record, dict):
+        return True
+    recorded = record.get("codegen_checksum")
+    current = codegen_checksum() if current_checksum is None else current_checksum
+    if not _is_sha256(recorded) or not _is_sha256(current):
+        return True
+    return recorded != current
+
+
+def manifest_is_stale_for_current_codegen(manifest: object) -> bool:
+    """Return whether any member lacks the current compiler identity.
+
+    The caller is responsible for archive/manifest integrity validation.  This
+    aggregate deliberately computes the current identity once so a manifest is
+    judged against one frozen value.
+    """
+
+    if not isinstance(manifest, dict):
+        return True
+    members = manifest.get("members")
+    if not isinstance(members, list) or not members:
+        return True
+    current = codegen_checksum()
+    if not _is_sha256(current):
+        return True
+    for record in members:
+        if receipt_is_stale_for_current_codegen(
+            record,
+            current_checksum=current,
+        ):
+            return True
+    return False
 
 
 def _run_ar(ar: str, arguments: Sequence[str], *, cwd: Path | None = None) -> str:
@@ -356,8 +453,11 @@ def _validate_member_record(
     member_bytes: bytes,
     runtime_root: Path,
 ) -> str:
-    if set(record) != _RECEIPT_FIELDS:
-        missing = sorted(_RECEIPT_FIELDS - set(record))
+    if (
+        not _RECEIPT_REQUIRED_FIELDS.issubset(record)
+        or not set(record).issubset(_RECEIPT_FIELDS)
+    ):
+        missing = sorted(_RECEIPT_REQUIRED_FIELDS - set(record))
         extra = sorted(set(record) - _RECEIPT_FIELDS)
         raise ProvenanceError(
             f"{member}: invalid receipt fields: missing={missing!r} extra={extra!r}"
@@ -395,6 +495,13 @@ def _validate_member_record(
         value = record.get(field)
         if not _is_sha256(value):
             raise ProvenanceError(f"{member}: {field} must be SHA-256")
+    # NOTE: `codegen_checksum` is deliberately NOT validated here.  This
+    # function checks archive *integrity* -- "is this object what its receipt
+    # says it is".  A compiler-identity mismatch means the object is *stale*,
+    # which is a rebuild trigger, not corruption; raising here stopped the
+    # build outright the moment the field was introduced, because every
+    # existing object predates it.  Staleness is exposed by
+    # `receipt_is_stale_for_current_codegen` for build logic to consult.
     return target_triple
 
 

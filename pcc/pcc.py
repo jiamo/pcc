@@ -286,7 +286,7 @@ def _build_click_main():
         "--llvmdump",
         is_flag=True,
         default=False,
-        help="Dump LLVM IR to temp files",
+        help="Dump LLVM artifacts under the pcc cache; PCC_LLVM_DUMP_DIR overrides",
     )(cmd)
     cmd = click_mod.option(
         "--disable-pass",

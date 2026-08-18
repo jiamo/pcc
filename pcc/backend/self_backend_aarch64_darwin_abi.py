@@ -4,6 +4,15 @@ from __future__ import annotations
 
 from . import BackendUnavailable
 from .self_backend_ir import TypeDesc, _align_to
+from .self_backend_kernel import (
+    IndexedFunctionKernel,
+    TYPE_KIND_ARRAY,
+    TYPE_KIND_FP,
+    TYPE_KIND_INT,
+    TYPE_KIND_PTR,
+    TYPE_KIND_STRUCT,
+    TYPE_KIND_VOID,
+)
 
 
 def _append_hfa_members(
@@ -148,6 +157,157 @@ def aggregate_passed_indirect(value_type: TypeDesc) -> bool:
 
 def aggregate_returned_indirect(value_type: TypeDesc) -> bool:
     return aggregate_passed_indirect(value_type)
+
+
+def _indexed_hfa_code(kernel: IndexedFunctionKernel, type_id: int) -> int:
+    """Encode a valid HFA as ``width * 8 + member_count``; zero is invalid."""
+    kind_id = kernel.type_kind_id(type_id)
+    if kind_id == TYPE_KIND_FP:
+        return kernel.type_width(type_id) * 8 + 1
+    if kind_id == TYPE_KIND_ARRAY:
+        child_id = kernel.type_child_id(type_id)
+        count = kernel.type_scalars.get_unchecked(type_id * 12 + 2)
+        if child_id < 0 or count <= 0:
+            return 0
+        child_code = _indexed_hfa_code(kernel, child_id)
+        if child_code == 0:
+            return 0
+        width = child_code // 8
+        member_count = (child_code % 8) * count
+        return 0 if member_count > 4 else width * 8 + member_count
+    if kind_id != TYPE_KIND_STRUCT:
+        return 0
+    field_start = kernel.type_field_start(type_id)
+    field_count = kernel.type_field_count(type_id)
+    width = 0
+    count = 0
+    index = 0
+    while index < field_count:
+        field_id = kernel.type_field_ids.get_unchecked(field_start + index)
+        child_code = _indexed_hfa_code(kernel, field_id)
+        if child_code == 0:
+            return 0
+        child_width = child_code // 8
+        if width and child_width != width:
+            return 0
+        width = child_width
+        count += child_code % 8
+        if count > 4:
+            return 0
+        index += 1
+    return 0 if count == 0 else width * 8 + count
+
+
+def _indexed_aggregate_is_gpr_only(
+    kernel: IndexedFunctionKernel, type_id: int
+) -> bool:
+    kind_id = kernel.type_kind_id(type_id)
+    if kind_id == TYPE_KIND_INT or kind_id == TYPE_KIND_PTR:
+        return True
+    if kind_id == TYPE_KIND_ARRAY:
+        child_id = kernel.type_child_id(type_id)
+        return child_id >= 0 and _indexed_aggregate_is_gpr_only(
+            kernel, child_id
+        )
+    if kind_id != TYPE_KIND_STRUCT:
+        return False
+    field_start = kernel.type_field_start(type_id)
+    field_count = kernel.type_field_count(type_id)
+    index = 0
+    while index < field_count:
+        if not _indexed_aggregate_is_gpr_only(
+            kernel,
+            kernel.type_field_ids.get_unchecked(field_start + index),
+        ):
+            return False
+        index += 1
+    return True
+
+
+def aggregate_fits_reg_abi_indexed(
+    kernel: IndexedFunctionKernel, type_id: int
+) -> bool:
+    kind_id = kernel.type_kind_id(type_id)
+    if kind_id != TYPE_KIND_ARRAY and kind_id != TYPE_KIND_STRUCT:
+        return True
+    if _indexed_hfa_code(kernel, type_id):
+        return True
+    if not _indexed_aggregate_is_gpr_only(kernel, type_id):
+        return False
+    size = kernel.type_slot_size(type_id)
+    return 1 <= size <= 16
+
+
+def aggregate_returned_indirect_indexed(
+    kernel: IndexedFunctionKernel, type_id: int
+) -> bool:
+    kind_id = kernel.type_kind_id(type_id)
+    return (
+        kind_id == TYPE_KIND_ARRAY or kind_id == TYPE_KIND_STRUCT
+    ) and not aggregate_fits_reg_abi_indexed(kernel, type_id)
+
+
+def aggregate_passed_indirect_indexed(
+    kernel: IndexedFunctionKernel, type_id: int
+) -> bool:
+    return aggregate_returned_indirect_indexed(kernel, type_id)
+
+
+def abi_register_code_indexed(
+    kernel: IndexedFunctionKernel, type_id: int
+) -> int:
+    """Return 8+GPR-count, 16+FPR-count, or zero for void."""
+    kind_id = kernel.type_kind_id(type_id)
+    if kind_id == TYPE_KIND_VOID:
+        return 0
+    if kind_id == TYPE_KIND_FP:
+        return 17
+    if kind_id == TYPE_KIND_ARRAY or kind_id == TYPE_KIND_STRUCT:
+        hfa_code = _indexed_hfa_code(kernel, type_id)
+        if hfa_code:
+            return 16 + (hfa_code % 8)
+        if aggregate_passed_indirect_indexed(kernel, type_id):
+            return 9
+        size = kernel.type_slot_size(type_id)
+        return 9 if size <= 8 else 10
+    return 9
+
+
+def reg_name_indexed(
+    kernel: IndexedFunctionKernel, type_id: int, index: int
+) -> str:
+    kind_id = kernel.type_kind_id(type_id)
+    width = kernel.type_width(type_id)
+    if kind_id == TYPE_KIND_FP:
+        return ("s" if width <= 32 else "d") + str(index)
+    if kind_id == TYPE_KIND_PTR:
+        return "x" + str(index)
+    if kind_id == TYPE_KIND_INT:
+        return ("x" if width > 32 else "w") + str(index)
+    hfa_code = _indexed_hfa_code(kernel, type_id)
+    if hfa_code:
+        return ("s" if hfa_code // 8 <= 32 else "d") + str(index)
+    return ("x" if kernel.type_slot_size(type_id) > 4 else "w") + str(index)
+
+
+def stack_arg_storage_size_indexed(
+    kernel: IndexedFunctionKernel, type_id: int
+) -> int:
+    if aggregate_passed_indirect_indexed(kernel, type_id):
+        return 8
+    kind_id = kernel.type_kind_id(type_id)
+    if kind_id == TYPE_KIND_ARRAY or kind_id == TYPE_KIND_STRUCT:
+        return _align_to(kernel.type_slot_size(type_id), 8)
+    return 8
+
+
+def variadic_stack_arg_storage_size_indexed(
+    kernel: IndexedFunctionKernel, type_id: int
+) -> int:
+    kind_id = kernel.type_kind_id(type_id)
+    if kind_id == TYPE_KIND_ARRAY or kind_id == TYPE_KIND_STRUCT:
+        return _align_to(kernel.type_slot_size(type_id), 8)
+    return 8
 
 
 def stack_arg_storage_size(arg_type: TypeDesc) -> int:

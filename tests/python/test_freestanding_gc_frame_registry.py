@@ -55,10 +55,12 @@ TLS_STORAGE_SYMBOLS = {
 RAW_ONLY_CROSS_OBJECT_SYMBOLS = {
     "pcc_gc_cycle_requested_store_release",
     "pcc_gc_frame_index_find",
-    "pcc_gc_frame_index_insert",
+    "pcc_gc_frame_index_plan_capacity",
+    "pcc_gc_frame_index_plan_commit",
     "pcc_gc_frame_index_remove",
-    "pcc_gc_frame_index_replace",
+    "pcc_gc_frame_index_replace_preallocated",
     "pcc_gc_root_map_is_borrowed",
+    "pcc_gc_root_registry_note_mutation_locked",
     "pcc_gc_root_slot_count_from_map",
 }
 RAW_FUNCTION_IMPORTS = RAW_ONLY_CROSS_OBJECT_SYMBOLS | {
@@ -71,6 +73,8 @@ RAW_FUNCTION_IMPORTS = RAW_ONLY_CROSS_OBJECT_SYMBOLS | {
 }
 RAW_GLOBAL_IMPORTS = {
     "pcc_gc_backend0_frame_roots_enabled",
+    "pcc_gc_backend3_frame_root_scan_cursor",
+    "pcc_gc_backend3_frame_root_scan_slot",
     "pcc_gc_backend_selected",
     "pcc_gc_config_initialized",
     "pcc_gc_frame_head",
@@ -131,6 +135,24 @@ def test_frame_registry_has_one_strict_source_owner():
     assert FREESTANDING_GC_CROSS_OBJECT_SIGNATURES[
         "pcc_gc_frame_node_tls_pool_drain"
     ] == ((), "c_void")
+    assert FREESTANDING_GC_CROSS_OBJECT_SIGNATURES[
+        "pcc_gc_frame_index_plan_capacity"
+    ] == (("c_int64",), "c_int64")
+    assert FREESTANDING_GC_CROSS_OBJECT_SIGNATURES[
+        "pcc_gc_frame_index_plan_commit"
+    ] == (("c_ptr", "c_int64", "c_int64"), "c_int64")
+    assert FREESTANDING_GC_CROSS_OBJECT_SIGNATURES[
+        "pcc_gc_frame_index_replace_preallocated"
+    ] == (("c_ptr", "c_ptr"), "c_ptr")
+    internal_header = (RUNTIME_DIR / "src" / "py_internal.h").read_text(
+        encoding="utf-8"
+    )
+    for symbol in (
+        "pcc_gc_frame_index_plan_capacity",
+        "pcc_gc_frame_index_plan_commit",
+        "pcc_gc_frame_index_replace_preallocated",
+    ):
+        assert symbol in internal_header
     assert FREESTANDING_GC_THREAD_LOCAL_GLOBALS == TLS_STORAGE_SYMBOLS
     assert 'define_thread_local_ptr_null("pcc_gc_frame_node_pool_heads")' in strict
     assert 'define_thread_local_ptr_null("pcc_gc_frame_node_pool_counts")' in strict
@@ -146,12 +168,81 @@ def test_frame_registry_has_one_strict_source_owner():
     )[0]
     assert "pcc_thread_unregister_current()" in trampoline
     unregister_current = threads.split(
-        "static void pcc_thread_unregister_current", 1
+        "void pcc_thread_unregister_current", 1
     )[1].split("\n}", 1)[0]
     assert "pcc_gc_thread_unregister_buffers()" in unregister_current
     assert "freestanding_gc_frame_registry" in makefile
     for symbol in PUBLIC_SYMBOLS:
         assert f'"{symbol}"' in wrappers
+
+
+def test_frame_registry_allocator_and_release_tails_are_outside_graph_lock():
+    strict = FRAME_SOURCE.read_text(encoding="utf-8")
+    oracle = (RUNTIME_DIR / "src" / "py_gc_backend.c").read_text(
+        encoding="utf-8"
+    )
+
+    for name in ("pcc_gc_note_frame_enter", "pcc_gc_note_frame_enter_lifo"):
+        strict_body = strict.split(f"def {name}", 1)[1].split("\n\n@", 1)[0]
+        assert strict_body.index("pcc_gc_frame_node_create(") < strict_body.index(
+            "pcc_py_gc_minor_graph_lock()"
+        )
+
+    for name in ("pcc_gc_note_frame_leave", "pcc_gc_note_frame_leave_lifo"):
+        strict_body = strict.split(f"def {name}", 1)[1].split("\n\n@", 1)[0]
+        assert strict_body.rindex("pcc_py_gc_minor_graph_unlock()") < (
+            strict_body.rindex("pcc_gc_frame_node_release(")
+        )
+
+    for name in ("pcc_gc_note_frame_enter", "pcc_gc_note_frame_enter_lifo"):
+        oracle_body = oracle.split(f"void {name}", 1)[1].split("\n}\n", 1)[0]
+        assert oracle_body.index("pcc_gc_frame_node_create_unlocked(") < (
+            oracle_body.index("pcc_gc_graph_lock();")
+        )
+
+    strict_enter = strict.split("def pcc_gc_note_frame_enter", 1)[1].split(
+        "\n\n@", 1
+    )[0]
+    assert "pcc_gc_frame_index_plan_capacity(1)" in strict_enter
+    assert "pcc_gc_frame_index_plan_commit(" in strict_enter
+    assert "pcc_gc_frame_index_replace_preallocated(" in strict_enter
+    assert "pcc_gc_frame_index_replace(" not in strict_enter
+    for forbidden in ("malloc(", "free("):
+        start = 0
+        while (position := strict_enter.find(forbidden, start)) >= 0:
+            preceding_lock = strict_enter.rfind(
+                "pcc_py_gc_minor_graph_lock()", 0, position
+            )
+            preceding_unlock = strict_enter.rfind(
+                "pcc_py_gc_minor_graph_unlock()", 0, position
+            )
+            assert preceding_lock < preceding_unlock
+            start = position + len(forbidden)
+
+    oracle_enter = oracle.split("void pcc_gc_note_frame_enter", 1)[1].split(
+        "\n}\n", 1
+    )[0]
+    assert "pcc_gc_frame_index_plan_capacity(1)" in oracle_enter
+    assert "pcc_gc_frame_index_plan_commit(" in oracle_enter
+    assert "pcc_gc_frame_index_replace_preallocated(" in oracle_enter
+    assert "pcc_gc_frame_index_replace(" not in oracle_enter
+    for forbidden in ("calloc(", "free("):
+        start = 0
+        while (position := oracle_enter.find(forbidden, start)) >= 0:
+            preceding_lock = oracle_enter.rfind(
+                "pcc_gc_graph_lock();", 0, position
+            )
+            preceding_unlock = oracle_enter.rfind(
+                "pcc_gc_graph_unlock();", 0, position
+            )
+            assert preceding_lock < preceding_unlock
+            start = position + len(forbidden)
+
+    for name in ("pcc_gc_note_frame_leave", "pcc_gc_note_frame_leave_lifo"):
+        oracle_body = oracle.split(f"void {name}", 1)[1].split("\n}\n", 1)[0]
+        assert oracle_body.rindex("pcc_gc_graph_unlock();") < (
+            oracle_body.rindex("pcc_gc_frame_node_release_unlocked(")
+        )
 
 
 @pytest.mark.parametrize("emitter", ["llvm", "self"])

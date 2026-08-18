@@ -23,6 +23,7 @@ OWNED_SYMBOLS = {
     "pcc_gc_memoryview_initialize_owned_buffer",
     "pcc_gc_memoryview_refresh_owned_buffer",
     "pcc_gc_visit_object_slots",
+    "pcc_gc_visit_object_slots_slice",
     "pcc_gc_object_slots_visit_slot",
     "pcc_gc_object_slots_visit_core_container_slots",
     "pcc_gc_object_slots_visit_fixed_owner_slots",
@@ -459,6 +460,7 @@ int main(void) {
     memset(aux, 0, sizeof(aux));
     *(int32_t *)(object + 8) = 11;  /* instance */
     *(void **)(object + 16) = aux;
+    *(int32_t *)(aux + 8) = 10;  /* live class */
     *(int32_t *)(aux + 72) = 2;
     visit("instance", object);
 
@@ -467,7 +469,7 @@ int main(void) {
     visit("int", object);
 
     memset(object, 0, sizeof(object));
-    *(int32_t *)(object + 8) = 31;  /* unsupported */
+    *(int32_t *)(object + 8) = 31;  /* vthread channel, unknown kind */
     visit("unknown", object);
     return 0;
 }
@@ -517,7 +519,7 @@ int main(void) {
         "instance:o40r1\n"
         "instance:h1\n"
         "int:h1\n"
-        "unknown:h0\n"
+        "unknown:h1\n"
     )
 
 

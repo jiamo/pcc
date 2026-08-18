@@ -12,6 +12,8 @@ Owned surface (stable C ABI names):
   PyObject_CallFunction, PyObject_CallMethod
 """
 
+__pcc_runtime_port__ = True
+
 from pcc.extern import c_abi_typed_export, c_abi_variadic_export, c_int64, c_ptr, c_void, extern
 from pcc.unsafe import (
     cstr,
@@ -30,6 +32,8 @@ py_tuple_new = extern("py_tuple_new", (c_int64,), c_ptr)
 py_tuple_set_item = extern("py_tuple_set_item", (c_ptr, c_int64, c_ptr), c_void)
 py_decref = extern("py_decref", (c_ptr,), c_void)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 PyObject_GetAttr = extern("PyObject_GetAttr", (c_ptr, c_ptr), c_ptr)
 PyObject_CallNoArgs = extern("PyObject_CallNoArgs", (c_ptr,), c_ptr)
@@ -38,7 +42,7 @@ PyObject_Call = extern("PyObject_Call", (c_ptr, c_ptr, c_ptr), c_ptr)
 
 
 def _type_error(message) -> None:
-    py_raise(py_exc_new(3, message))  # PY_EXC_TYPEERROR
+    py_raise_owned(py_exc_new(3, message))  # PY_EXC_TYPEERROR
 
 
 def _call_objargs_v(callable, cursor) -> c_ptr:
@@ -71,7 +75,7 @@ def _call_objargs_v(callable, cursor) -> c_ptr:
 
 
 def _runtime_error_oom() -> None:
-    py_raise(py_exc_new(7, cstr("out of memory creating call args")))
+    py_raise_owned(py_exc_new(7, cstr("out of memory creating call args")))
 
 
 @c_abi_typed_export("PyObject_CallMethodNoArgs", "ptr", ("ptr", "ptr"))

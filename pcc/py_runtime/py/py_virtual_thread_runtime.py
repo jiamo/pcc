@@ -14,6 +14,8 @@ bounded scan makes work stealing observable without allowing an unbounded
 search under the scheduler mutex.
 """
 
+__pcc_runtime_port__ = True
+
 from pcc.extern import c_abi_export, c_int32, c_int64, c_ptr, c_void, extern
 from pcc.py_runtime.py.py_abi_constants import (
     PCC_VTHREAD_CHANNEL_KIND_CORE,
@@ -178,6 +180,8 @@ py_incref = extern("py_incref", (c_ptr,), c_void)
 py_decref = extern("py_decref", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 pcc_runtime_monotonic_us = extern("pcc_runtime_monotonic_us", (), c_int64)
 pcc_threads_enabled = extern("pcc_threads_enabled", (), c_int64)
 pcc_thread_start = extern("pcc_thread_start", (c_ptr, c_ptr, c_ptr), c_int64)
@@ -356,13 +360,13 @@ def _scheduler_signal() -> None:
 
 def _checked(vthread):
     if ptr_is_null(vthread) or is_tagged_int(vthread):
-        py_raise(py_exc_new(3, cstr("object is not a virtual thread")))
+        py_raise_owned(py_exc_new(3, cstr("object is not a virtual thread")))
         return null()
     resolved = pcc_gc_note_relocation_read(vthread)
     if ptr_is_null(resolved) == 0:
         vthread = resolved
     if load_i32(vthread, 8) != PY_TYPE_VIRTUAL_THREAD:
-        py_raise(py_exc_new(3, cstr("object is not a virtual thread")))
+        py_raise_owned(py_exc_new(3, cstr("object is not a virtual thread")))
         return null()
     return vthread
 
@@ -2529,7 +2533,7 @@ def py_virtual_thread_io_resource_register(fd: int) -> int:
 @c_abi_export("py_virtual_thread_io_resource_generation")
 def py_virtual_thread_io_resource_generation(fd: int) -> int:
     if fd < 0 or _scheduler_lock() != 0:
-        py_raise(py_exc_new(14, cstr("TCP descriptor is not open")))
+        py_raise_owned(py_exc_new(14, cstr("TCP descriptor is not open")))
         return -1
     node = _io_resource_find(fd)
     generation = -1
@@ -2537,7 +2541,7 @@ def py_virtual_thread_io_resource_generation(fd: int) -> int:
         generation = load_i64(node, 8)
     _scheduler_unlock()
     if generation < 0:
-        py_raise(py_exc_new(14, cstr("TCP descriptor is not open")))
+        py_raise_owned(py_exc_new(14, cstr("TCP descriptor is not open")))
     return generation
 
 
@@ -2546,12 +2550,12 @@ def py_virtual_thread_io_resource_operation_begin(
     fd: int, generation: int
 ) -> int:
     if fd < 0 or generation <= 0 or _scheduler_lock() != 0:
-        py_raise(py_exc_new(14, cstr("TCP descriptor was closed")))
+        py_raise_owned(py_exc_new(14, cstr("TCP descriptor was closed")))
         return -1
     node = _io_resource_find(fd)
     if ptr_is_null(node) or load_i64(node, 8) != generation:
         _scheduler_unlock()
-        py_raise(py_exc_new(14, cstr("TCP descriptor was closed")))
+        py_raise_owned(py_exc_new(14, cstr("TCP descriptor was closed")))
         return -1
     # Success deliberately retains the scheduler mutex through one
     # nonblocking observation syscall.
@@ -2611,7 +2615,7 @@ def py_virtual_thread_block_on_fd_generation(
     resource = _io_resource_find(fd)
     if ptr_is_null(resource) or load_i64(resource, 8) != generation:
         _scheduler_unlock()
-        py_raise(py_exc_new(14, cstr("TCP descriptor was closed")))
+        py_raise_owned(py_exc_new(14, cstr("TCP descriptor was closed")))
         return -1
     if load_i64(vthread, 32) == 4:
         _scheduler_unlock()

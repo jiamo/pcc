@@ -307,11 +307,17 @@ class DictLoweringMixin:
                 if not kname or kname.startswith("*"):
                     return None
             if expr.args:
+                source_expr = expr.args[0]
+                source = _dict_method_box(self, source_expr)
                 self.builder.call(
                     self.runtime["py_dict_update"],
-                    [recv, _dict_method_box(self, expr.args[0])],
+                    [recv, source],
                     name=self._fresh("dict.update"),
                 )
+                # py_dict_update borrows its source.  Consume a fresh mapping
+                # before branching through the error check so both success and
+                # failure paths balance the temporary owner.
+                self._gc_release_if_owned(source, source_expr)
                 self._emit_post_call_err_check(expr.span)
             for kname, kv in (expr.kwargs or ()):
                 self.builder.call(
@@ -497,6 +503,42 @@ class DictLoweringMixin:
                 name=self._fresh("dict.copy.keys"),
             )
             fn = self.current_function
+            if isinstance(arg_ty, DynType):
+                # py_dict_keys on a NON-dict returns NULL without raising
+                # (py_dict.c), so a dyn-held non-mapping silently produced an
+                # empty dict here.  CPython raises TypeError; fail closed.
+                keys_null = self.builder.icmp_unsigned(
+                    "==",
+                    keys_list,
+                    ir.Constant(keys_list.type, None),
+                    name=self._fresh("dict.copy.keys.null"),
+                )
+                bad_bb = fn.append_basic_block(
+                    name=self._fresh("dict.copy.notmapping")
+                )
+                ok_bb = fn.append_basic_block(
+                    name=self._fresh("dict.copy.keys.ok")
+                )
+                self.builder.cbranch(keys_null, bad_bb, ok_bb)
+                self.builder.position_at_end(bad_bb)
+                message = self._ptr_to_cstr(
+                    self._cstr_global(
+                        "dict() argument is not iterable",
+                        ".dict.copy.typeerror",
+                    )
+                )
+                exc = self.builder.call(
+                    self.runtime["py_exc_new"],
+                    [ir.Constant(_I64, 3), message],
+                    name=self._fresh("dict.copy.exc"),
+                )
+                self.builder.call(self.runtime["py_raise"], [exc])
+                err_target = (
+                    self._current_try_err_block()
+                    or self._ensure_fn_err_exit()
+                )
+                self.builder.branch(err_target)
+                self.builder.position_at_end(ok_bb)
             n_val = self.builder.call(
                 self.runtime["py_obj_len"],
                 [keys_list],
@@ -540,12 +582,35 @@ class DictLoweringMixin:
                 [src_obj, k_elem],
                 name=self._fresh("dict.copy.val"),
             )
-            self._emit_post_call_err_check(expr.span)
+            # On this edge v_elem is the raising call's own NULL return
+            # (pcc_gc_release is NULL-safe); k_elem and the keys view are
+            # live owned references that the error exit must drop.
+            self._emit_post_call_err_check(
+                expr.span,
+                release_on_error=(v_elem, k_elem, keys_list),
+            )
             self.builder.call(
                 self.runtime["py_dict_set"],
                 [new_dict, k_elem, v_elem],
             )
-            self._emit_post_call_err_check(expr.span)
+            # py_list_get and py_dict_get both return NEW refs
+            # (py_runtime.h), and py_dict_set retains what it stores rather
+            # than stealing.  Without these two releases every entry of the
+            # copy leaked one key and one value.
+            #
+            # Released BEFORE the error check, not after: pcc_gc_release does
+            # not touch the exception TLS, so doing it first makes the
+            # raising edge out of py_dict_set drop these references too.
+            self._gc_release(
+                v_elem, self._release_context_label("dict.copy.val")
+            )
+            self._gc_release(
+                k_elem, self._release_context_label("dict.copy.key")
+            )
+            self._emit_post_call_err_check(
+                expr.span,
+                release_on_error=(keys_list,),
+            )
             self.builder.branch(step_bb)
             self.builder.position_at_end(step_bb)
             nxt = self.builder.add(
@@ -556,5 +621,10 @@ class DictLoweringMixin:
             self.builder.store(nxt, idx_slot)
             self.builder.branch(cond_bb)
             self.builder.position_at_end(end_bb)
+            # py_dict_keys returns a NEW list ref; end_bb is this loop's only
+            # exit.
+            self._gc_release(
+                keys_list, self._release_context_label("dict.copy.keys")
+            )
             return new_dict
         return None

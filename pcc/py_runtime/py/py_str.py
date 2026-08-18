@@ -3,6 +3,9 @@
 Only py_str_new remains here; the rest of the string runtime lives in
 py_str_accessors.py.
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.extern import extern, c_abi_export, c_int32, c_int64, c_ptr
 from pcc.py_runtime.py.py_abi_constants import (
     PYOBJECTHEADER_REFCOUNT_OFFSET,

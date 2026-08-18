@@ -803,7 +803,21 @@ class AssignmentStatementLoweringMixin:
             self.current_func_def is None or target.ident in self._current_global_names
         ):
             gv, declared_ty = module_globals[target.ident]
-            value = self._coerce(value, stmt.value.ty, declared_ty)
+            boxed_module_int = (
+                isinstance(declared_ty, IntType)
+                and isinstance(gv.value_type, ir.PointerType)
+            )
+            if boxed_module_int:
+                if not isinstance(value.type, ir.PointerType):
+                    value = marshal.marshal_to_object(
+                        self.builder,
+                        self.module,
+                        self.runtime,
+                        value,
+                        stmt.value.ty,
+                    )
+            else:
+                value = self._coerce(value, stmt.value.ty, declared_ty)
             if value in getattr(self, "_cpy_values", ()):
                 self._cpy_module_flags[target.ident] = True
                 is_cpy_value = True
@@ -966,13 +980,16 @@ class AssignmentStatementLoweringMixin:
         exact_int_result_is_owned = exact_int_value is not None and not (
             isinstance(stmt.value, Name) and exact_int_name_source_is_borrowed
         )
+        rhs_emitted_value_is_owned = self._value_is_owned_object(value)
         rhs_is_safe_owned_in_raw = (
             rhs_local_copy_is_owned
+            or rhs_emitted_value_is_owned
             or self._raw_scaffold_object_rhs_is_owned(stmt.value)
             or exact_int_result_is_owned
         )
         rhs_returns_owned_object = (
             rhs_local_copy_is_owned
+            or rhs_emitted_value_is_owned
             or rhs_native_file_is_owned
             or self._expr_returns_owned_object(stmt.value)
             or exact_int_result_is_owned
@@ -1006,13 +1023,10 @@ class AssignmentStatementLoweringMixin:
             and value not in getattr(self, "_cpy_values", ())
             and self._ir_type_matches(ir_ty, _CSTR)
         )
-        exact_replacement_pinned = False
-        if exact_root_store:
-            # Root-store retains the replacement and releases the previous
-            # slot owner as one relocation-aware operation.  Keep the fresh
-            # exact value stable while that operation enters backend 3/4.
-            self._gc_pin(value)
-            exact_replacement_pinned = True
+        # exact_root_store transfers the fresh value's reference into the slot
+        # with one pcc_gc_store_root_take call; the previous pin / store_root /
+        # unpin / release quartet cost four runtime calls per exact-int
+        # assignment (tests/python/test_exact_int_loop_protocol_ratchet.py).
         if manages_owned_local and not exact_root_store:
             self._emit_release_owned_local_if_flagged(target.ident, alloca)
         if manages_owned_local:
@@ -1062,25 +1076,16 @@ class AssignmentStatementLoweringMixin:
                 value = self.builder.trunc(value, ir_ty, name=self._fresh("trunc"))
         if exact_root_store:
             self.builder.call(
-                self.runtime["pcc_gc_store_root"],
+                self.runtime["pcc_gc_store_root_take"],
                 [self._as_gc_ptr(alloca), value],
             )
         else:
             self.builder.store(value, alloca)
-        if exact_replacement_pinned:
-            self._gc_unpin(value)
-            # ``pcc_gc_store_root`` created the local slot's owner.  Consume
-            # the fresh/retained temporary that was transferred into it.
-            self._gc_release(
-                value,
-                self._release_context_label(
-                    "exact-local-incoming:" + target.ident
-                ),
-            )
         if self._is_valueclass_payload_type(declared_ty):
             self._ensure_valueclass_payload_gc_roots(target.ident, alloca, declared_ty)
         if (
             rhs_local_copy_is_owned
+            or rhs_emitted_value_is_owned
             or rhs_native_file_is_owned
             or exact_int_result_is_owned
         ):
@@ -1646,10 +1651,14 @@ class AssignmentStatementLoweringMixin:
                     stmt.target.ident,
                     False,
                 )
-            ):
+            ) or isinstance(stmt.target.ty, (StrType, BytesType)):
                 # Reuse the exact Assign path so lhs pinning, RHS error
                 # cleanup, owned-result replacement, root barriers, and the
                 # local owned flag stay identical to ``x = x <op> rhs``.
+                # str/bytes are immutable, so ``+=`` IS ``x = x + rhs``; the
+                # generic augassign store below never released the previous
+                # owned value (a 20k-char ``cur += ch`` loop retained 299 MB,
+                # tests/python/test_ownership_str_iadd_and_len_call_result.py).
                 combined = BinOp(
                     span=stmt.span,
                     ty=stmt.target.ty,

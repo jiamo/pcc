@@ -1,5 +1,7 @@
 """Runtime event logging authored in pcc-Python."""
 
+__pcc_runtime_port__ = True
+
 from pcc.extern import c_abi_export, c_int32, c_int64, c_ptr, c_void, extern
 from pcc.unsafe import (
     atomic_cas_i32,
@@ -206,11 +208,15 @@ def pcc_runtime_sleep_ns(delay_ns: int) -> int:
 
 @c_abi_export("pcc_runtime_log_enabled")
 def pcc_runtime_log_enabled(category: c_ptr) -> int:
+    # First registration may wait for a stopped-world owner.  It must happen
+    # before initialization or the write lock can be owned by this thread.
+    pcc_current_thread_id()
     _init_once()
     return load_i32(global_addr("pcc_log_mask"), 0) & _category_mask(category)
 
 
 def _code_enabled(category: int) -> int:
+    pcc_current_thread_id()
     _init_once()
     mask: int = load_i32(global_addr("pcc_log_mask"), 0)
     if category == 1:
@@ -431,11 +437,14 @@ def pcc_runtime_log_event(
 ) -> None:
     if pcc_runtime_log_enabled(category) == 0:
         return
+    # pcc_runtime_log_enabled has completed newcomer admission.  Keep the
+    # identity read before the write lock so an active stop can never leave an
+    # unregistered pthread holding that lock while it waits for resume.
+    thread_id: int = pcc_current_thread_id()
     _write_lock_acquire()
     close_slot = stack_alloc(4)
     stream = _open_stream(close_slot)
     timestamp: int = unsigned_div_i64(pcc_runtime_now_us(), 1000000)
-    thread_id: int = pcc_current_thread_id()
     category_text = category
     if ptr_is_null(category_text):
         category_text = cstr("")

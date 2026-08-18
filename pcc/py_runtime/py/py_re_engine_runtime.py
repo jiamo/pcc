@@ -5,6 +5,9 @@ This module owns all construction of Match/Pattern objects and the public
 findall/sub/split/truth adapters, so the production archive no longer needs
 ``py_re_engine_obj.o``.
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_INT,
     PY_TYPE_STR,
@@ -53,6 +56,8 @@ py_instance_new = extern("py_instance_new", (c_ptr,), c_ptr)
 py_obj_setattr = extern("py_obj_setattr", (c_ptr, c_ptr, c_ptr), c_int64)
 py_decref = extern("py_decref", (c_ptr,), c_void)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 
 pcc_re_engine_supported = extern("pcc_re_engine_supported", (c_ptr,), c_int32)
@@ -105,20 +110,20 @@ def _cstr_equal(left, right) -> int:
 
 def _raise_engine_status(status: int) -> None:
     if status == -1:
-        py_raise(
+        py_raise_owned(
             py_exc_new(
                 11,
                 cstr("pcc re: pattern outside the native regex subset (no-libpython)"),
             )
         )
     elif status == -4:
-        py_raise(
+        py_raise_owned(
             py_exc_new(
                 11, cstr("pcc re: non-ASCII text outside the native regex subset")
             )
         )
     else:
-        py_raise(
+        py_raise_owned(
             py_exc_new(7, cstr("pcc re: native regex engine limit reached"))
         )
 
@@ -235,7 +240,7 @@ def _match_method_call(captures, args):
         py_decref(text)
         py_decref(spans)
         py_decref(names)
-        py_raise(
+        py_raise_owned(
             py_exc_new(
                 11, cstr("pcc re: multi-group Match method arguments are not supported")
             )
@@ -271,7 +276,7 @@ def _match_method_call(captures, args):
         py_decref(text)
         py_decref(spans)
         py_decref(names)
-        py_raise(py_exc_new(5, cstr("no such group")))
+        py_raise_owned(py_exc_new(5, cstr("no such group")))
         return null()
 
     lo = _span_at(spans, selected * 2)
@@ -441,7 +446,7 @@ def py_re_engine_fullmatch_flags(pattern, text, flags: int):
     if _type_of(pattern) != PY_TYPE_STR or _type_of(text) != PY_TYPE_STR:
         return none
     if (flags & ~26) != 0:
-        py_raise(
+        py_raise_owned(
             py_exc_new(11, cstr("pcc re: flags outside the native regex subset (no-libpython)"))
         )
         return null()
@@ -545,12 +550,12 @@ def py_re_engine_sub(pattern, replacement, text, count: int, flags: int):
     ):
         return none
     if _type_of(pattern) != PY_TYPE_STR or _type_of(replacement) != PY_TYPE_STR or _type_of(text) != PY_TYPE_STR:
-        py_raise(
+        py_raise_owned(
             py_exc_new(3, cstr("pcc re: sub expects string pattern, replacement, and text"))
         )
         return null()
     if _str_has_backslash(replacement) != 0:
-        py_raise(
+        py_raise_owned(
             py_exc_new(11, cstr("pcc re: backslash replacement templates are not supported"))
         )
         return null()
@@ -613,7 +618,7 @@ def py_re_engine_split(pattern, text, maxsplit: int, flags: int):
     if ptr_is_null(pattern) != 0 or ptr_is_null(text) != 0:
         return none
     if _type_of(pattern) != PY_TYPE_STR or _type_of(text) != PY_TYPE_STR:
-        py_raise(py_exc_new(3, cstr("pcc re: split expects string pattern and text")))
+        py_raise_owned(py_exc_new(3, cstr("pcc re: split expects string pattern and text")))
         return null()
     text_bytes = py_str_utf8(text)
     text_length: int = _cstrlen(text_bytes)
@@ -706,7 +711,7 @@ def _pattern_method_call(captures, args):
     if kind == 3:
         if nargs < 2:
             py_decref(pattern)
-            py_raise(py_exc_new(3, cstr("pcc re: Pattern.sub expects replacement and string")))
+            py_raise_owned(py_exc_new(3, cstr("pcc re: Pattern.sub expects replacement and string")))
             return null()
         replacement = py_tuple_get(args, 0)
         text = py_tuple_get(args, 1)
@@ -722,7 +727,7 @@ def _pattern_method_call(captures, args):
     if kind == 4:
         if nargs < 1:
             py_decref(pattern)
-            py_raise(py_exc_new(3, cstr("pcc re: Pattern.split expects a string")))
+            py_raise_owned(py_exc_new(3, cstr("pcc re: Pattern.split expects a string")))
             return null()
         text = py_tuple_get(args, 0)
         result = null()
@@ -733,7 +738,7 @@ def _pattern_method_call(captures, args):
         return result
     if nargs < 1:
         py_decref(pattern)
-        py_raise(py_exc_new(3, cstr("pcc re: Pattern method expects one string argument")))
+        py_raise_owned(py_exc_new(3, cstr("pcc re: Pattern method expects one string argument")))
         return null()
     text = py_tuple_get(args, 0)
     result = null()
@@ -786,16 +791,16 @@ def _add_pattern_method(instance, name, pattern, kind: int, flags: int) -> None:
 @c_abi_export("py_re_compile_obj")
 def py_re_compile_obj(pattern, flags: int):
     if ptr_is_null(pattern) != 0 or _type_of(pattern) != PY_TYPE_STR:
-        py_raise(py_exc_new(3, cstr("pcc re: re.compile pattern must be a string")))
+        py_raise_owned(py_exc_new(3, cstr("pcc re: re.compile pattern must be a string")))
         return null()
     if (flags & ~26) != 0:
-        py_raise(
+        py_raise_owned(
             py_exc_new(11, cstr("pcc re: re.compile flags are outside the native regex subset"))
         )
         return null()
     pattern_text = py_str_utf8(pattern)
     if ptr_is_null(pattern_text) != 0 or pcc_re_engine_supported_flags(pattern_text, flags) == 0:
-        py_raise(
+        py_raise_owned(
             py_exc_new(
                 11, cstr("pcc re: pattern outside the native regex subset (no-libpython)")
             )

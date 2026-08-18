@@ -30,6 +30,9 @@ from typing import BinaryIO, Callable, Sequence, TypeVar, cast
 PARALLEL_JOBS_ENV = "PCC_MACHO_LINK_JOBS"
 _OUTER_PARALLELISM_ENV = "PCC_OUTER_PARALLELISM"
 
+# The v50 source-frozen Stage2 input set proves eight host assembler workers at
+# 4.84 GiB tree peak under the shared 8 GiB breaker, with byte-identical output;
+# keep the independent linker class wider than multi-GiB pcc1 codegen workers.
 _DEFAULT_MAX_JOBS = 8
 _HARD_MAX_JOBS = 32
 _DEFAULT_PARALLEL_MIN_BYTES = 256 * 1024

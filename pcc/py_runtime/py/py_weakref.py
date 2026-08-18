@@ -1,4 +1,7 @@
 """Minimal pcc-Python port of weakref.ref runtime support."""
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_VALUEBOX,
     PY_TYPE_WEAKREF,
@@ -44,8 +47,13 @@ py_obj_call = extern("py_obj_call", (c_ptr, c_ptr, c_ptr), c_ptr)
 py_clear_exception = extern("py_clear_exception", (), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 pcc_runtime_log_event_code = extern("pcc_runtime_log_event_code", (c_int32, c_int32, c_int64, c_int64, c_ptr), c_void)
 pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
+pcc_gc_publish_initialized = extern(
+    "pcc_gc_publish_initialized", (c_ptr,), c_void
+)
 pcc_gc_pin = extern("pcc_gc_pin", (c_ptr,), c_void)
 pcc_gc_note_relocation_read = extern(
     "pcc_gc_note_relocation_read", (c_ptr,), c_ptr,
@@ -97,7 +105,7 @@ def py_weakref_new(target, callback):
     # 3 == PY_EXC_TYPEERROR. The compile-time diagnostic catches the
     # static form; this covers Dyn-path boxes.
     if load_i32(target, 8) == PY_TYPE_VALUEBOX:
-        py_raise(
+        py_raise_owned(
             py_exc_new(
                 3,
                 cstr("cannot create weak reference to a valueclass payload"),
@@ -126,6 +134,7 @@ def py_weakref_new(target, callback):
         store_ptr(head, 32, wr)
     global_store_ptr("py_weakref_head", wr)
     pcc_runtime_log_event_code(4, 1, load_i32(target, 8), 0 if ptr_is_null(callback) != 0 else 1, target)
+    pcc_gc_publish_initialized(wr)
     return wr
 
 

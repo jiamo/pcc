@@ -4248,8 +4248,31 @@ FIXPOINT_CASES = tuple(
     (name, source) for name, source in CASES if name in FIXPOINT_SMOKE_CASES
 )
 
-_SELF_HOST_BUILD_TIMEOUT_SECONDS = 600
+# Set from RECORDED current-source stage costs, not widened as a reflex
+# (INFRA-P1-SELF-HOST-ORACLE-WARMUP-BUDGET).  The oracle builds stages with
+# 4 frontend jobs; the recorded strict-cold stage2 at that shape was
+# 1290.9 s (2026-08-26 evidence), and the 2026-08-27 admission-wave landing
+# takes ~58 s off the oversized lane
+# (docs/goal/evidence/2026-08-27-oversized-admission-waves-implemented.md:
+# 10-job cold stage2 664.2 s quiet / 867.8 s loaded).  1500 covers the
+# recorded 4-job cold cost with margin while still going red on a real
+# regression; PERF-P0-STAGE2-COLD-CACHE-REGRESSION owns shrinking the cost
+# itself.
+_SELF_HOST_BUILD_TIMEOUT_SECONDS = 1500
 _SELF_HOST_STAGE_FRONTEND_JOBS = "4"
+
+
+def _stage_budget_timeout_message(stage_label: str) -> str:
+    return (
+        f"self-host oracle {stage_label} exceeded its "
+        f"{_SELF_HOST_BUILD_TIMEOUT_SECONDS}s budget. This budget is set "
+        "from the RECORDED cold stage costs (4-job strict-cold stage2 "
+        "1290.9s on 2026-08-26; 10-job cold 664.2s quiet / 867.8s loaded "
+        "on 2026-08-27), so exceeding it means a stage-cost regression "
+        "beyond the recorded envelope or a severely loaded machine — "
+        "re-measure the stage cost before widening the budget "
+        "(INFRA-P1-SELF-HOST-ORACLE-WARMUP-BUDGET)."
+    )
 
 
 def _child_env() -> dict[str, str]:
@@ -4346,27 +4369,32 @@ def pcc1_self_host_binary(tmp_path_factory, worker_id):
                 return pcc1
         temporary = out_dir / f".pcc1.{os.getpid()}.tmp"
         try:
-            result = subprocess.run(
-                [
-                    sys.executable,
-                    "-m",
-                    "pcc",
-                    "--python-libpython",
-                    "off",
-                    "--backend",
-                    "self",
-                    "--ir-scaffold",
-                    "on",
-                    "pcc/__main__.py",
-                    "-o",
-                    str(temporary),
-                ],
-                cwd=str(REPO_ROOT),
-                env=_child_env(),
-                capture_output=True,
-                text=True,
-                timeout=_SELF_HOST_BUILD_TIMEOUT_SECONDS,
-            )
+            try:
+                result = subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "pcc",
+                        "--python-libpython",
+                        "off",
+                        "--backend",
+                        "self",
+                        "--ir-scaffold",
+                        "on",
+                        "pcc/__main__.py",
+                        "-o",
+                        str(temporary),
+                    ],
+                    cwd=str(REPO_ROOT),
+                    env=_child_env(),
+                    capture_output=True,
+                    text=True,
+                    timeout=_SELF_HOST_BUILD_TIMEOUT_SECONDS,
+                )
+            except subprocess.TimeoutExpired as exc:
+                raise AssertionError(
+                    _stage_budget_timeout_message("stage1 (pcc0 -> pcc1)")
+                ) from exc
             assert result.returncode == 0, (
                 "failed to build pcc1 for self-host oracle\n"
                 f"stdout:\n{result.stdout}\n"
@@ -4395,23 +4423,30 @@ def _build_next_stage(
     compiler: Path,
     out: Path,
 ) -> Path:
-    result = subprocess.run(
-        [
-            str(compiler),
-            "--python-libpython",
-            "off",
-            "--backend",
-            "self",
-            "pcc/__main__.py",
-            "-o",
-            str(out),
-        ],
-        cwd=str(REPO_ROOT),
-        env=_child_env(),
-        capture_output=True,
-        text=True,
-        timeout=_SELF_HOST_BUILD_TIMEOUT_SECONDS,
-    )
+    try:
+        result = subprocess.run(
+            [
+                str(compiler),
+                "--python-libpython",
+                "off",
+                "--backend",
+                "self",
+                "pcc/__main__.py",
+                "-o",
+                str(out),
+            ],
+            cwd=str(REPO_ROOT),
+            env=_child_env(),
+            capture_output=True,
+            text=True,
+            timeout=_SELF_HOST_BUILD_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise AssertionError(
+            _stage_budget_timeout_message(
+                f"stage build ({compiler.name} -> {out.name})"
+            )
+        ) from exc
     assert result.returncode == 0, (
         f"failed to build {out.name} for self-host oracle\n"
         f"stdout:\n{result.stdout}\n"

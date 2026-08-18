@@ -25,6 +25,8 @@ OWNED_SYMBOLS = {
     "pcc_gc_forwarding_clear_all",
     "pcc_gc_forwarding_identity_graph_lock",
     "pcc_gc_forwarding_identity_graph_unlock",
+    "pcc_gc_forwarding_install_plan_finish",
+    "pcc_gc_forwarding_install_plan_prepare",
     "pcc_gc_forwarding_list_head",
     "pcc_gc_forwarding_set_head",
     "pcc_gc_forwarding_target_exists",
@@ -36,18 +38,22 @@ OWNED_SYMBOLS = {
     "pcc_gc_forwarding_zpage_node_for_owner",
     "pcc_gc_identity_assign",
     "pcc_gc_identity_clear_all",
+    "pcc_gc_identity_detach",
     "pcc_gc_identity_ensure",
     "pcc_gc_identity_find",
+    "pcc_gc_identity_finish_detached",
     "pcc_gc_identity_list_head",
     "pcc_gc_identity_remove",
     "pcc_gc_identity_set_head",
     "pcc_gc_install_forwarding",
+    "pcc_gc_install_forwarding_preallocated_unlocked",
     "pcc_gc_install_forwarding_unlocked",
     "pcc_gc_note_relocation_read",
     "pcc_gc_note_relocation_read_unlocked",
     "pcc_gc_object_id",
 }
 RAW_FUNCTION_IMPORTS = {
+    "calloc",
     "free",
     "malloc",
     "pcc_gc_config_ensure",
@@ -55,11 +61,15 @@ RAW_FUNCTION_IMPORTS = {
     "pcc_gc_forwarding_index_find",
     "pcc_gc_forwarding_index_insert",
     "pcc_gc_forwarding_index_remove",
+    "pcc_gc_forwarding_plan_index_capacity",
+    "pcc_gc_forwarding_plan_index_commit",
+    "pcc_gc_forwarding_plan_index_insert",
     "pcc_gc_forwarding_target_index_clear",
     "pcc_gc_forwarding_target_index_find",
     "pcc_gc_forwarding_target_index_insert",
     "pcc_gc_forwarding_target_index_remove",
     "pcc_gc_forwarding_target_index_upsert",
+    "pcc_gc_generational_oldify_supported_tag",
     "pcc_gc_identity_index_clear",
     "pcc_gc_identity_index_find",
     "pcc_gc_identity_index_insert",
@@ -73,6 +83,8 @@ RAW_FUNCTION_IMPORTS = {
     "py_incref",
 }
 RAW_GLOBAL_IMPORTS = {
+    "pcc_gc_backend4_relocation_reset_owner",
+    "pcc_gc_backend4_reseed_commit_owner",
     "pcc_gc_backend_selected",
     "pcc_gc_forwarding_head",
     "pcc_gc_forwarding_population",
@@ -222,6 +234,66 @@ def test_forwarding_identity_preserves_locking_and_safe_lookup_order() -> None:
     )
     assert read.index("_note_relocation_read_unlocked(obj)") < read.index(
         "_graph_unlock()"
+    )
+
+    preallocated = _export_body(
+        strict, "pcc_gc_install_forwarding_preallocated_unlocked"
+    )
+    assert 'load_i32(global_addr("pcc_gc_next_object_id"), 0)' in preallocated
+    assert 'store_i32(global_addr("pcc_gc_next_object_id"), 0' in preallocated
+    assert 'load_i64(global_addr("pcc_gc_next_object_id"), 0)' not in preallocated
+    assert 'store_i64(global_addr("pcc_gc_next_object_id"), 0' not in preallocated
+    assert preallocated.index("if (flags & 64) != 0:") < preallocated.index(
+        'load_i32(global_addr("pcc_gc_relocation_pin_rejects"), 0)'
+    )
+    assert preallocated.index(
+        'store_i32(global_addr("pcc_gc_relocation_pin_rejects"), 0'
+    ) < preallocated.index("return -2")
+
+
+def test_relocation_read_barrier_is_gated_on_a_moving_backend() -> None:
+    """The read barrier's non-moving early exit rests on three source facts.
+
+    `pcc_gc_note_relocation_read` returns `obj` immediately when the selected
+    backend is not 3 or 4, skipping a full provenance lookup -- and the graph
+    lock whenever the pointer is not a known object -- on every pointer read
+    under GC0/1/2.  That is exact rather than optimistic only while all three
+    hold, so each is asserted here: the installer refuses outright off 3/4, a
+    backend change out of 3/4 is refused while any forwarding node or
+    population remains, and both mirrors place the gate before the lookup.
+    """
+    strict = STRICT_SOURCE.read_text(encoding="utf-8")
+    managed = MANAGED_SOURCE.read_text(encoding="utf-8")
+
+    # 1. Nothing outside backends 3/4 can install forwarding at all.
+    install = _export_body(strict, "pcc_gc_install_forwarding_unlocked")
+    assert "if backend != 3 and backend != 4:" in install
+    assert install.index("if backend != 3 and backend != 4:") < install.index(
+        "pcc_gc_forwarding_find(from_obj)"
+    )
+
+    # 2. A backend cannot leave 3/4 while a forwarding representation is live,
+    #    so "not 3/4" implies the forwarding list and index are both empty.
+    switch = _export_body(managed, "pcc_gc_set_backend")
+    assert "ptr_is_null(_forwarding_head()) == 0" in switch
+    assert 'load_i32(global_addr("pcc_gc_forwarding_population"), 0) != 0' in switch
+
+    # 3. Both mirrors gate before paying for the provenance lookup.
+    read = _export_body(strict, "pcc_gc_note_relocation_read")
+    assert 'load_i32(global_addr("pcc_gc_backend_selected"), 0)' in read
+    assert "if selected != 3 and selected != 4:" in read
+    assert read.index("if selected != 3 and selected != 4:") < read.index(
+        "pcc_gc_object_is_known_no_lock(obj)"
+    )
+
+    c_source = (RUNTIME_DIR / "src" / "py_gc_backend.c").read_text(encoding="utf-8")
+    c_read = c_source.split("PyObject *pcc_gc_note_relocation_read(PyObject *o) {", 1)[
+        1
+    ].split("\n}", 1)[0]
+    assert "PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR" in c_read
+    assert "PCC_GC_KIND_COLORED_RELOCATING" in c_read
+    assert c_read.index("PCC_GC_KIND_COLORED_RELOCATING") < c_read.index(
+        "pcc_gc_is_known_object(o)"
     )
 
 

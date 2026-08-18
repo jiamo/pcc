@@ -3,6 +3,9 @@
 Narrow os.path runtime helpers: join, basename, and exists. Non-string
 path objects are coerced through py_obj_str before reading UTF-8 bytes.
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_INT,
     PY_TYPE_LIST,

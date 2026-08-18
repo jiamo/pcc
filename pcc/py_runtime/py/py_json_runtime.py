@@ -3,6 +3,9 @@
 The public ABI mirrors ``src/py_json.c``.  That C file remains a host-C oracle;
 the production pcc-Python archive owns these symbols through this module.
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_BOOL,
     PY_TYPE_DICT,

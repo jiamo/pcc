@@ -30,7 +30,7 @@ from pcc.evaluater.c_evaluator import CEvaluator
 def _emit_asm(source: str, optimize, monkeypatch, tmp_path) -> str:
     """Compile ``source`` and return the target assembly text."""
     monkeypatch.chdir(tmp_path)
-    CEvaluator().evaluate(source, optimize=optimize, llvmdump=True)
+    CEvaluator().evaluate(source, optimize=optimize, llvmdump=tmp_path)
     return (tmp_path / "temp.bcode").read_text(encoding="utf-8")
 
 
@@ -40,7 +40,7 @@ def _emit_optimized_ir(source: str, monkeypatch, tmp_path) -> str:
     ``temp.ooptimize.bcode`` is written by CEvaluator when llvmdump is on and
     optimization ran, so we can assert on IR that survived the optimizer."""
     monkeypatch.chdir(tmp_path)
-    CEvaluator().evaluate(source, optimize=True, llvmdump=True)
+    CEvaluator().evaluate(source, optimize=True, llvmdump=tmp_path)
     return (tmp_path / "temp.ooptimize.bcode").read_text(encoding="utf-8")
 
 

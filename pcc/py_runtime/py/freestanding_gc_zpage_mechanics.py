@@ -32,6 +32,9 @@ pcc_gc_backend4_evacuation_page_find = extern(
 pcc_gc_zpage_owner_index_upsert = extern(
     "pcc_gc_zpage_owner_index_upsert", (c_ptr, c_ptr), c_int64
 )
+pcc_gc_zpage_owner_index_upsert_preallocated = extern(
+    "pcc_gc_zpage_owner_index_upsert_preallocated", (c_ptr, c_ptr), c_int64
+)
 
 
 @c_abi_export("pcc_gc_backend4_zpage_active_page")
@@ -199,6 +202,7 @@ def pcc_gc_backend4_zpage_reset(page, owner, size: i64) -> None:
     store_i64(page, 88, 0)
     store_i64(page, 96, 0)
     store_i32(page, 104, 0)
+    store_i32(page, 108, 0)
     store_ptr(page, 112, null())
     span = load_ptr(page, 72)
     span_capacity: i64 = load_i64(page, 80)
@@ -229,7 +233,46 @@ def pcc_gc_backend4_zpage_node_alloc():
                 count - 1,
             )
         return head
-    return malloc(72)
+    return malloc(80)
+
+
+@c_abi_export("pcc_gc_backend4_zpage_node_prepare")
+def pcc_gc_backend4_zpage_node_prepare():
+    return malloc(80)
+
+
+@c_abi_export("pcc_gc_backend4_zpage_node_plan_requires_prepare")
+def pcc_gc_backend4_zpage_node_plan_requires_prepare() -> i64:
+    if ptr_is_null(
+        global_load_ptr("pcc_gc_backend4_zpage_node_free_head")
+    ) != 0:
+        return 1
+    return 0
+
+
+@c_abi_export("pcc_gc_backend4_zpage_node_take_prepared")
+def pcc_gc_backend4_zpage_node_take_prepared(prepared_io):
+    head = global_load_ptr("pcc_gc_backend4_zpage_node_free_head")
+    if ptr_is_null(head) == 0:
+        nxt = load_ptr(head, 16)
+        global_store_ptr("pcc_gc_backend4_zpage_node_free_head", nxt)
+        count: i64 = load_i32(
+            global_addr("pcc_gc_backend4_zpage_node_free_count"), 0
+        )
+        if count > 0:
+            store_i32(
+                global_addr("pcc_gc_backend4_zpage_node_free_count"),
+                0,
+                count - 1,
+            )
+        return head
+    if ptr_is_null(prepared_io) != 0:
+        return null()
+    prepared = load_ptr(prepared_io, 0)
+    if ptr_is_null(prepared) != 0:
+        return null()
+    store_ptr(prepared_io, 0, null())
+    return prepared
 
 
 @c_abi_export("pcc_gc_backend4_zpage_node_release")
@@ -269,6 +312,37 @@ def pcc_gc_backend4_zpage_link_node(node) -> None:
     if ptr_is_null(page) == 0:
         store_ptr(page, 112, node)
         store_ptr(page, 0, load_ptr(node, 0))
+
+
+@c_abi_export("pcc_gc_backend4_zpage_link_node_preallocated")
+def pcc_gc_backend4_zpage_link_node_preallocated(node) -> i64:
+    if ptr_is_null(node) != 0:
+        return -1
+    if (
+        pcc_gc_zpage_owner_index_upsert_preallocated(
+            load_ptr(node, 0), node
+        )
+        < 0
+    ):
+        return -1
+    page = load_ptr(node, 8)
+    store_ptr(node, 40, null())
+    nxt = global_load_ptr("pcc_gc_backend4_zpage_head")
+    store_ptr(node, 16, nxt)
+    if ptr_is_null(nxt) == 0:
+        store_ptr(nxt, 40, node)
+    global_store_ptr("pcc_gc_backend4_zpage_head", node)
+    page_head = null()
+    if ptr_is_null(page) == 0:
+        page_head = load_ptr(page, 112)
+    store_ptr(node, 56, null())
+    store_ptr(node, 48, page_head)
+    if ptr_is_null(page_head) == 0:
+        store_ptr(page_head, 56, node)
+    if ptr_is_null(page) == 0:
+        store_ptr(page, 112, node)
+        store_ptr(page, 0, load_ptr(node, 0))
+    return 1
 
 
 @c_abi_export("pcc_gc_backend4_zpage_find_page_for_addr")

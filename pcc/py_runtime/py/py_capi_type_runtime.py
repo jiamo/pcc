@@ -34,6 +34,9 @@ PyType_Ready / PyType_Modified / PyType_GenericAlloc / PyType_FromSpec /
 PyType_GetSlot / PyType_GetFlags and the cext object helpers stay C-side for
 now; they call the exported pcc-Python helpers below via extern.
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_BOOL,
     PY_TYPE_BYTEARRAY,
@@ -87,6 +90,8 @@ py_tuple_len = extern("py_tuple_len", (c_ptr,), c_int64)
 py_str_len = extern("py_str_len", (c_ptr,), c_int64)
 py_bytes_len = extern("py_bytes_len", (c_ptr,), c_int64)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 
 # --- C-extension dynamic type registry -------------------------------
@@ -603,7 +608,7 @@ def pcc_capi_type_object_issubclass(derived, cls) -> int:
 
 
 def _type_error(message) -> None:
-    py_raise(py_exc_new(3, message))  # PY_EXC_TYPEERROR
+    py_raise_owned(py_exc_new(3, message))  # PY_EXC_TYPEERROR
 
 
 # --- PyComplex_* numeric bridge ---------------------------------------

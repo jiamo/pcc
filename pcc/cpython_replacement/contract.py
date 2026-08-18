@@ -315,7 +315,7 @@ def _validate_baseline(value: object) -> None:
     expected = {
         "language_version": "3.13",
         "oracle_implementation": "CPython",
-        "oracle_version": "3.13.2",
+        "oracle_version": "3.15.0rc1",
         "oracle_build": "standard-gil",
         "version_policy": "exact-oracle-version",
     }

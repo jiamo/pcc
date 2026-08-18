@@ -75,14 +75,38 @@ class BuiltinTypeAttrLoweringMixin:
         default_obj = (
             self._emit_as_object(expr.args[2]) if len(expr.args) == 3 else None
         )
+        # 2-arg getattr must raise on a miss; the 3-arg form swallows the
+        # miss into the default, so it uses the no-raise probe and skips the
+        # AttributeError construction entirely.
+        getattr_runtime = (
+            "py_obj_getattr" if len(expr.args) == 2 else "py_obj_getattr_maybe"
+        )
         got = self.builder.call(
-            self.runtime["py_obj_getattr"],
+            self.runtime[getattr_runtime],
             [obj_val, name_ptr],
             name=self._fresh("getattr"),
         )
         if len(expr.args) == 2:
+            # ``py_obj_getattr`` returns a NEW owned reference on every non-NULL
+            # edge (type-class increfs its interned class, instance/class attr
+            # loads incref the stored value, and the bound-method/cext paths
+            # fabricate a fresh object).  The emitter therefore records the
+            # result as owned so a discarded ``getattr(o, 'x')`` releases it
+            # exactly once, mirroring the dynamic-method-call and dict.get
+            # precedents.  The AST classifier is NOT flipped: the native-module
+            # and cpython getattr branches (which return earlier) have their own
+            # unaudited ownership and must not be over-released.
+            self._note_owned_object_value(got)
             return got
         assert default_obj is not None
+        # 3-arg: make BOTH phi edges own exactly one reference so the merged
+        # result is uniformly owned.
+        #   - present edge: ``got`` is owned; the (already-evaluated) default is
+        #     unused here, so release it when it was an owned temporary.
+        #   - missing edge: the default becomes the result; retain it when it
+        #     was a borrowed value so the result owns a reference, and keep the
+        #     temporary's own reference when it was already owned (transfer).
+        default_is_owned = self._expr_returns_owned_object(expr.args[2])
         is_missing = self.builder.icmp_signed(
             "==",
             got,
@@ -96,15 +120,26 @@ class BuiltinTypeAttrLoweringMixin:
         self.builder.cbranch(is_missing, missing_bb, present_bb)
         self.builder.position_at_end(missing_bb)
         self.builder.call(self.runtime["py_clear_exception"], [])
+        default_result = default_obj
+        if not default_is_owned:
+            default_result = self._gc_retain(
+                default_obj, name=self._fresh("getattr.default.retain")
+            )
         self.builder.branch(end_bb)
         missing_exit = self.builder._block
         self.builder.position_at_end(present_bb)
+        if default_is_owned:
+            self._gc_release(
+                default_obj,
+                self._release_context_label("getattr.default.unused"),
+            )
         self.builder.branch(end_bb)
         present_exit = self.builder._block
         self.builder.position_at_end(end_bb)
         phi = self.builder.phi(_CSTR, name=self._fresh("getattr.default"))
-        phi.add_incoming(default_obj, missing_exit)
+        phi.add_incoming(default_result, missing_exit)
         phi.add_incoming(got, present_exit)
+        self._note_owned_object_value(phi)
         return phi
 
     def _emit_attr_name_ptr_arg(self, expr: Expr, label: str) -> ir.Value:
@@ -257,31 +292,34 @@ class BuiltinTypeAttrLoweringMixin:
                 name=self._fresh("weak.key.dict.len"),
             )
         aty = arg.ty
-        if isinstance(aty, ListType):
-            return self.builder.call(
-                self.runtime["py_list_len"], [obj], name=self._fresh("list.len")
-            )
-        if isinstance(aty, StrType):
-            return self.builder.call(
-                self.runtime["py_str_len"], [obj], name=self._fresh("str.len")
-            )
-        if isinstance(aty, DictType):
-            return self.builder.call(
-                self.runtime["py_dict_len"], [obj], name=self._fresh("dict.len")
-            )
-        if isinstance(aty, TupleType):
-            return self.builder.call(
-                self.runtime["py_tuple_len"], [obj], name=self._fresh("tup.len")
-            )
+        # ``len`` consumes its operand: an owned temporary (a call result, a
+        # literal, a concatenation) must be released here or it leaks once per
+        # evaluation -- ``len(f(i))`` with an exact-list ``f`` retained 116 MB
+        # over 300k calls (tests/python/test_ownership_str_iadd_and_len_call_result.py).
+        typed_len = {
+            ListType: "py_list_len",
+            StrType: "py_str_len",
+            DictType: "py_dict_len",
+            TupleType: "py_tuple_len",
+        }
+        for len_ty, helper in typed_len.items():
+            if isinstance(aty, len_ty):
+                result = self.builder.call(
+                    self.runtime[helper], [obj], name=self._fresh(helper[3:])
+                )
+                self._gc_release_if_owned(obj, arg)
+                return result
         # Fallback through the generic helper. Any object with a
         # __len__ gets the right answer; non-sized types raise via the
         # runtime.
         boxed = marshal.marshal_to_object(
             self.builder, self.module, self.runtime, obj, aty
         )
-        return self.builder.call(
+        result = self.builder.call(
             self.runtime["py_obj_len"], [boxed], name=self._fresh("obj.len")
         )
+        self._gc_release_if_owned(boxed, arg)
+        return result
 
     def _emit_str_builtin(self, expr: Call) -> ir.Value:
         """``str(x)`` -> owned PCC string, matching CPython's new-ref result."""
@@ -338,6 +376,11 @@ class BuiltinTypeAttrLoweringMixin:
         result = self.builder.call(
             self.runtime["py_obj_str"], [boxed], name=self._fresh("obj.str")
         )
+        # py_obj_str borrows its operand, so an owned temporary produced by the
+        # argument expression is consumed here.  Release it exactly once
+        # (symmetric with repr/ascii/hash); the shared helper leaves a borrowed
+        # operand alone, so str(name) gains no release.
+        self._gc_release_if_owned(boxed, arg)
         return self.builder.call(
             self.runtime["pcc_gc_resolve_owned_ptr"],
             [result],

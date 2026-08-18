@@ -134,6 +134,77 @@ def _closed_world_dyn_module_global_export(
     return result
 
 
+def _identity_list_contains(values, target) -> bool:
+    for value in values:
+        if value is target:
+            return True
+    return False
+
+
+def _flatten_closed_world_class_export_fields(native_exports) -> None:
+    """Publish the runtime's inherited-first instance-field order."""
+
+    resolved = []
+    visiting = []
+
+    def resolve(info) -> None:
+        if _identity_list_contains(resolved, info):
+            return
+        if _identity_list_contains(visiting, info):
+            return
+        visiting.append(info)
+
+        names = []
+        type_names = []
+        type_values = []
+
+        def append_fields(source_info) -> None:
+            for field_name in source_info.get("field_names", ()):
+                if field_name not in names:
+                    names.append(field_name)
+            for field_entry in source_info.get("field_types", ()):
+                if not isinstance(field_entry, tuple) or len(field_entry) != 2:
+                    continue
+                field_name = field_entry[0]
+                field_type = field_entry[1]
+                replaced = False
+                index = 0
+                while index < len(type_names):
+                    if type_names[index] == field_name:
+                        type_values[index] = field_type
+                        replaced = True
+                        break
+                    index += 1
+                if not replaced:
+                    type_names.append(field_name)
+                    type_values.append(field_type)
+
+        owning_module = info.get("owning_module", "")
+        visible_exports = native_exports.get(owning_module, {})
+        for base_name in info.get("base_names", ()):
+            base_info = visible_exports.get(base_name)
+            if not isinstance(base_info, dict) or base_info.get("kind") != "class":
+                continue
+            resolve(base_info)
+            append_fields(base_info)
+        append_fields(info)
+
+        flattened_types = []
+        index = 0
+        while index < len(type_names):
+            flattened_types.append((type_names[index], type_values[index]))
+            index += 1
+        info["field_names"] = tuple(names)
+        info["field_types"] = tuple(flattened_types)
+        visiting.pop()
+        resolved.append(info)
+
+    for module_exports in native_exports.values():
+        for info in module_exports.values():
+            if isinstance(info, dict) and info.get("kind") == "class":
+                resolve(info)
+
+
 def _merge_closed_world_reexports(
     parsed_modules, module_names, src_paths, native_exports
 ):
@@ -226,6 +297,86 @@ def _closed_world_reexport_edges(
                     continue
                 edges.append((mod_name, src_mod, attr_name, local_name, False))
     return edges
+
+
+def _closed_world_module_dependencies(
+    parsed_modules,
+    module_names,
+    src_paths,
+    all_module_names,
+):
+    """Publish exact in-bundle import edges from each worker-owned AST."""
+
+    from .py_ast import Import as _Import
+    from .py_ast import ImportFrom as _ImportFrom
+    from .py_ast import Type as _Type
+
+    known_modules = list(all_module_names)
+    rows = []
+    for ast_mod, module_name, src_path in zip(
+        parsed_modules,
+        module_names,
+        src_paths,
+    ):
+        dependencies = []
+
+        def add_dependency(candidate: str) -> None:
+            resolved = candidate
+            if (
+                resolved == "pcc.llvm_capi.compat"
+                and resolved not in known_modules
+                and "pcc.llvm_capi.ir" in known_modules
+            ):
+                resolved = "pcc.llvm_capi.ir"
+            if (
+                resolved in known_modules
+                and resolved != module_name
+                and resolved not in dependencies
+            ):
+                dependencies.append(resolved)
+
+        pending = [ast_mod]
+        seen = set()
+        while pending:
+            node = pending.pop()
+            if node is None or _closed_world_is_node(node, _Type):
+                continue
+            if isinstance(node, (tuple, list)):
+                pending.extend(node)
+                continue
+            marker = id(node)
+            if marker in seen:
+                continue
+            seen.add(marker)
+            if _closed_world_is_node(node, _Import):
+                for imported_name, _as_name in _py_ast_field_value(
+                    node, "names", ()
+                ):
+                    parts = imported_name.split(".")
+                    end = len(parts)
+                    while end > 0:
+                        add_dependency(_join_dotted_parts(parts[:end]))
+                        end -= 1
+            elif _closed_world_is_node(node, _ImportFrom):
+                resolved = _resolve_ast_import_from_module(
+                    src_path,
+                    module_name,
+                    node,
+                )
+                add_dependency(resolved)
+                for imported_name, _as_name in _py_ast_field_value(
+                    node, "names", ()
+                ):
+                    if imported_name != "*":
+                        add_dependency(
+                            _join_dotted_parts([resolved, imported_name])
+                        )
+            for field_name in _py_ast_field_names(node):
+                if field_name in ("annotation", "return_ty", "ty", "span"):
+                    continue
+                pending.append(_py_ast_field_value(node, field_name, None))
+        rows.append((module_name, tuple(dependencies)))
+    return tuple(rows)
 
 
 def _merge_closed_world_reexport_edges(module_names, native_exports, edges):
@@ -471,21 +622,28 @@ def _closed_world_function_object_exports(native_exports, module_name: str):
     return out
 
 
-def _write_reexport_edges_wire(path: str, edges) -> None:
+def _write_reexport_edges_wire(path: str, edges, module_dependencies=()) -> None:
     payload = {
         "schema": "pcc.py_frontend.reexport_edges.v1",
         "edges": _native_export_to_wire(edges),
+        "module_dependencies": _native_export_to_wire(module_dependencies),
     }
     with open(path, "w", encoding="utf-8") as f:
         f.write(json.dumps(payload))
 
 
-def _read_reexport_edges_wire(path: str):
+def _read_reexport_edges_wire(path: str, include_module_dependencies: bool = False):
     with open(path, "r", encoding="utf-8") as f:
         payload = json.loads(f.read())
     if payload.get("schema") != "pcc.py_frontend.reexport_edges.v1":
         raise PyPipelineError("invalid frontend reexport edges file")
-    return _native_export_from_wire(payload.get("edges", ()))
+    edges = _native_export_from_wire(payload.get("edges", ()))
+    if include_module_dependencies:
+        dependencies = _native_export_from_wire(
+            payload.get("module_dependencies", ())
+        )
+        return edges, dependencies
+    return edges
 
 
 def _closed_world_shallow_func_body(lifter, raw_func, include_assigns: bool):

@@ -8,11 +8,80 @@ from . import marshal
 from .runtime_abi import declare_runtime_global
 
 
+_I1 = ir.IntType(1)
 _I8 = ir.IntType(8)
 _CSTR = _I8.as_pointer()
 
 
 class DeleteLoweringMixin:
+    def _unbind_module_global(self, name: str) -> None:
+        """Unbind a module-level name deleted by ``del``.
+
+        Mirrors the module teardown protocol in
+        ``module_lifecycle_lowering`` rather than clearing the slot by hand:
+        a CPython-compatible global is released with ``py_cpy_decref``, and a
+        pcc global is unpinned and then cleared through ``pcc_gc_store_root``,
+        which drops the old reference itself.  Storing null directly would
+        leave ``PY_FLAG_GC_PINNED`` and its telemetry behind and would bypass
+        the GC3/GC4 slot write barrier.
+
+        Deleting a name that is not currently bound raises ``NameError``, as
+        Python requires, instead of silently succeeding.
+        """
+        # Only a name that actually denotes the module global here may be
+        # unbound.  A function-local ``del x`` that merely shares a name with a
+        # module global must not touch it -- this is the same scope test the
+        # assignment paths use.
+        if not (
+            self.current_func_def is None
+            or name in getattr(self, "_current_global_names", set())
+        ):
+            return
+        entry = getattr(self, "_module_globals", {}).get(name)
+        if entry is None:
+            return
+        gv, _declared_ty = entry
+        flag = getattr(self, "_module_global_init_flags", {}).get(name)
+        if flag is not None:
+            # ``del x`` on an unbound or already-deleted global is an error.
+            self._emit_module_global_bound_check(name, None)
+
+        if self._cpy_module_flags.get(name, False):
+            value = self.builder.load(
+                gv, name=self._fresh(f"del.global.cpy.{name}")
+            )
+            self.builder.store(ir.Constant(value.type, None), gv)
+            self.builder.call(self.runtime["py_cpy_decref"], [value])
+        else:
+            value_type = getattr(gv, "value_type", None)
+            if isinstance(value_type, ir.PointerType):
+                value = self.builder.load(
+                    gv, name=self._fresh(f"del.global.value.{name}")
+                )
+                self._gc_unpin(value)
+                self.builder.call(
+                    self.runtime["pcc_gc_store_root"],
+                    [
+                        self._as_gc_ptr(
+                            gv, name=self._fresh(f"del.global.slot.{name}")
+                        ),
+                        ir.Constant(value_type, None),
+                    ],
+                )
+        if flag is not None:
+            self.builder.store(ir.Constant(_I1, 0), flag)
+        ast_module = getattr(self, "ast_module", None)
+        if ast_module is not None:
+            module_name_ptr = self._pooled_cstr_ptr(
+                ast_module.name or "__main__",
+                ".pcc.module.del.name",
+            )
+            self.builder.call(
+                self.runtime["py_module_attr_del"],
+                [module_name_ptr, self._attr_name_ptr(name)],
+                name=self._fresh(f"del.global.{name}"),
+            )
+
     def _emit_delete(self, stmt: Delete) -> None:
         """Lower ``del x`` / ``del d[k]`` / ``del xs[i]``."""
         for target in stmt.targets:
@@ -44,6 +113,7 @@ class DeleteLoweringMixin:
                 self._clear_native_module_object_alias(target.ident)
                 self._weak_dict_env_flags.pop(target.ident, None)
                 self._weakref_env_flags.pop(target.ident, None)
+                self._unbind_module_global(target.ident)
                 continue
             if isinstance(target, Subscript):
                 if self._emit_native_os_environ_delitem(target):

@@ -12,6 +12,9 @@ Layout offsets (mirroring PyObjectHeader in py_internal.h):
 
 Tagged ints use the generated ``PY_TYPE_INT`` semantic tag.
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_BOOL,
     PY_TYPE_BYTEARRAY,
@@ -27,6 +30,10 @@ from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_SET,
     PY_TYPE_STR,
     PY_TYPE_TUPLE,
+    PYLISTOBJECT_ITEMS_OFFSET,
+    PYLISTOBJECT_LENGTH_OFFSET,
+    PYTUPLEOBJECT_ITEMS_OFFSET,
+    PYTUPLEOBJECT_LEN_OFFSET,
 )
 
 from pcc.extern import extern, c_abi_export, c_ptr, c_double, c_int32, c_int64, c_void
@@ -62,6 +69,8 @@ define_global_i64_array("pcc_guarded_loop_counters", 0, 0, 0, 0, 0, 0)
 py_incref = extern("py_incref", (c_ptr,), c_void)
 py_decref = extern("py_decref", (c_ptr,), c_void)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 py_list_new = extern("py_list_new", (c_int64,), c_ptr)
 py_list_append = extern("py_list_append", (c_ptr, c_ptr), c_void)
@@ -104,6 +113,9 @@ pcc_gc_alloc = extern("pcc_gc_alloc", (c_int64, c_int32, c_int32), c_ptr)
 pcc_gc_free_object_memory = extern("pcc_gc_free_object_memory", (c_ptr,), c_void)
 pcc_gc_load_ptr = extern("pcc_gc_load_ptr", (c_ptr, c_ptr), c_ptr)
 pcc_gc_store_ptr = extern("pcc_gc_store_ptr", (c_ptr, c_ptr, c_ptr), c_void)
+pcc_gc_publish_initialized = extern(
+    "pcc_gc_publish_initialized", (c_ptr,), c_void
+)
 pcc_gc_note_relocation_read = extern("pcc_gc_note_relocation_read", (c_ptr,), c_ptr)
 py_str_concat = extern("py_str_concat", (c_ptr, c_ptr), c_ptr)
 hypot_c = extern("hypot", (c_double, c_double), c_double)
@@ -1347,7 +1359,7 @@ def py_bytes_split(src, sep):
         return null()
     sep_n: int = py_bytes_len(sep)
     if sep_n == 0:
-        py_raise(py_exc_new(2, cstr("empty separator")))  # PY_EXC_VALUEERROR
+        py_raise_owned(py_exc_new(2, cstr("empty separator")))  # PY_EXC_VALUEERROR
         return null()
     out = py_list_new(4)
     if ptr_is_null(out):
@@ -1460,10 +1472,10 @@ def py_bytes_from_obj(o):
 @c_abi_export("py_bytearray_extend")
 def py_bytearray_extend(o, iterable):
     if ptr_is_null(o) != 0 or _type_of(o) != PY_TYPE_BYTEARRAY:
-        py_raise(py_exc_new(3, cstr("bytearray.extend target must be bytearray")))
+        py_raise_owned(py_exc_new(3, cstr("bytearray.extend target must be bytearray")))
         return null()
     if ptr_is_null(iterable) != 0:
-        py_raise(py_exc_new(3, cstr("bytearray.extend argument must be iterable")))
+        py_raise_owned(py_exc_new(3, cstr("bytearray.extend argument must be iterable")))
         return null()
 
     an: int = py_bytes_len(o)
@@ -1481,7 +1493,7 @@ def py_bytearray_extend(o, iterable):
         if ptr_is_null(bd) != 0:
             if ptr_is_null(tmp) == 0:
                 py_decref(tmp)
-            py_raise(
+            py_raise_owned(
                 py_exc_new(
                     3,
                     cstr(
@@ -1496,7 +1508,7 @@ def py_bytearray_extend(o, iterable):
     if ptr_is_null(ad) != 0 or an < 0 or bn < 0:
         if ptr_is_null(tmp) == 0:
             py_decref(tmp)
-        py_raise(
+        py_raise_owned(
             py_exc_new(
                 3,
                 cstr("bytearray.extend argument must be bytes-like or an int sequence"),
@@ -1506,7 +1518,7 @@ def py_bytearray_extend(o, iterable):
     if an > 9223372036854775807 - bn:
         if ptr_is_null(tmp) == 0:
             py_decref(tmp)
-        py_raise(py_exc_new(15, cstr("bytearray too large")))
+        py_raise_owned(py_exc_new(15, cstr("bytearray too large")))
         return null()
 
     total: int = an + bn
@@ -1537,25 +1549,25 @@ def py_bytearray_extend(o, iterable):
 @c_abi_export("py_bytearray_append")
 def py_bytearray_append(o, item):
     if ptr_is_null(o) != 0 or _type_of(o) != PY_TYPE_BYTEARRAY:
-        py_raise(py_exc_new(3, cstr("bytearray.append target must be bytearray")))
+        py_raise_owned(py_exc_new(3, cstr("bytearray.append target must be bytearray")))
         return null()
     if ptr_is_null(item) != 0 or _type_of(item) != PY_TYPE_INT:
-        py_raise(
+        py_raise_owned(
             py_exc_new(3, cstr("'object' object cannot be interpreted as an integer"))
         )
         return null()
     byte: int = py_int_value_i64(item)
     if byte < 0 or byte > 255:
-        py_raise(py_exc_new(2, cstr("byte must be in range(0, 256)")))
+        py_raise_owned(py_exc_new(2, cstr("byte must be in range(0, 256)")))
         return null()
 
     an: int = py_bytes_len(o)
     ad = _bytes_data(o)
     if ptr_is_null(ad) != 0 or an < 0:
-        py_raise(py_exc_new(3, cstr("bytearray.append target must be bytearray")))
+        py_raise_owned(py_exc_new(3, cstr("bytearray.append target must be bytearray")))
         return null()
     if an > 9223372036854775806:
-        py_raise(py_exc_new(15, cstr("bytearray too large")))
+        py_raise_owned(py_exc_new(15, cstr("bytearray too large")))
         return null()
 
     total: int = an + 1
@@ -1581,30 +1593,30 @@ def py_bytearray_insert(o, index, item):
     # clamp into [0, len]). Inline data[] has no spare room, so growth rebuilds
     # a fresh object; the frontend re-binds the target (same as append).
     if ptr_is_null(o) != 0 or _type_of(o) != PY_TYPE_BYTEARRAY:
-        py_raise(py_exc_new(3, cstr("bytearray.insert target must be bytearray")))
+        py_raise_owned(py_exc_new(3, cstr("bytearray.insert target must be bytearray")))
         return null()
     if ptr_is_null(index) != 0 or _type_of(index) != PY_TYPE_INT:
-        py_raise(
+        py_raise_owned(
             py_exc_new(3, cstr("'object' object cannot be interpreted as an integer"))
         )
         return null()
     if ptr_is_null(item) != 0 or _type_of(item) != PY_TYPE_INT:
-        py_raise(
+        py_raise_owned(
             py_exc_new(3, cstr("'object' object cannot be interpreted as an integer"))
         )
         return null()
     byte: int = py_int_value_i64(item)
     if byte < 0 or byte > 255:
-        py_raise(py_exc_new(2, cstr("byte must be in range(0, 256)")))
+        py_raise_owned(py_exc_new(2, cstr("byte must be in range(0, 256)")))
         return null()
 
     an: int = py_bytes_len(o)
     ad = _bytes_data(o)
     if ptr_is_null(ad) != 0 or an < 0:
-        py_raise(py_exc_new(3, cstr("bytearray.insert target must be bytearray")))
+        py_raise_owned(py_exc_new(3, cstr("bytearray.insert target must be bytearray")))
         return null()
     if an > 9223372036854775806:
-        py_raise(py_exc_new(15, cstr("bytearray too large")))
+        py_raise_owned(py_exc_new(15, cstr("bytearray too large")))
         return null()
 
     at: int = py_int_value_i64(index)
@@ -1642,11 +1654,11 @@ def py_bytearray_pop(o, index):
     # (shift the tail down + decrement byte_len at offset 16). None/non-int
     # index means "last element" (pop() == pop(-1)).
     if ptr_is_null(o) != 0 or _type_of(o) != PY_TYPE_BYTEARRAY:
-        py_raise(py_exc_new(3, cstr("pop() requires a bytearray")))
+        py_raise_owned(py_exc_new(3, cstr("pop() requires a bytearray")))
         return null()
     length: int = py_bytes_len(o)
     if length <= 0:
-        py_raise(py_exc_new(5, cstr("pop from empty bytearray")))
+        py_raise_owned(py_exc_new(5, cstr("pop from empty bytearray")))
         return null()
 
     at: int = length - 1
@@ -1655,12 +1667,12 @@ def py_bytearray_pop(o, index):
         if at < 0:
             at = at + length
     if at < 0 or at >= length:
-        py_raise(py_exc_new(5, cstr("pop index out of range")))
+        py_raise_owned(py_exc_new(5, cstr("pop index out of range")))
         return null()
 
     data = _bytes_data(o)
     if ptr_is_null(data) != 0:
-        py_raise(py_exc_new(3, cstr("pop() requires a bytearray")))
+        py_raise_owned(py_exc_new(3, cstr("pop() requires a bytearray")))
         return null()
     byte: int = load_i8(data, at) & 255
     k: int = at
@@ -1687,6 +1699,7 @@ def py_memoryview_new(o):
     store_ptr(p, 16, null())
     store_ptr(p, 24, null())
     pcc_gc_store_ptr(p, ptr_add(p, 16), o)
+    pcc_gc_publish_initialized(p)
     return p
 
 
@@ -1892,10 +1905,10 @@ def py_bytes_decode_with_encoding(o, encoding, errors):
         or is_tagged_int(o)
         or (_type_of(o) != PY_TYPE_BYTES and _type_of(o) != PY_TYPE_BYTEARRAY and _type_of(o) != PY_TYPE_MEMORYVIEW)
     ):
-        py_raise(py_exc_new(3, cstr("decoding to str: need bytes-like object")))
+        py_raise_owned(py_exc_new(3, cstr("decoding to str: need bytes-like object")))
         return null()
     if _str_is_utf8_name(encoding) == 0:
-        py_raise(py_exc_new(13, cstr("pcc-native bytes decode supports utf-8 only")))
+        py_raise_owned(py_exc_new(13, cstr("pcc-native bytes decode supports utf-8 only")))
         return null()
     if (
         ptr_is_null(errors)
@@ -1905,7 +1918,7 @@ def py_bytes_decode_with_encoding(o, encoding, errors):
         return py_bytes_decode(o)
     if _str_is_errors_name(errors, 1) != 0:
         return py_bytes_decode_utf8_ignore(o)
-    py_raise(py_exc_new(13, cstr("unsupported pcc-native bytes decode errors mode")))
+    py_raise_owned(py_exc_new(13, cstr("unsupported pcc-native bytes decode errors mode")))
     return null()
 
 
@@ -1917,7 +1930,7 @@ def py_bytes_getitem(o, k):
     if i < 0:
         i = i + n
     if i < 0 or i >= n or ptr_is_null(data):
-        py_raise(py_exc_new(5, cstr("bytes index out of range")))  # PY_EXC_INDEXERROR
+        py_raise_owned(py_exc_new(5, cstr("bytes index out of range")))  # PY_EXC_INDEXERROR
         return null()
     return py_int_from_i64(load_i8(data, i) & 255)
 
@@ -2005,6 +2018,92 @@ def py_bytes_concat(a, b):
     return out
 
 
+@c_abi_export("py_bytes_join")
+def py_bytes_join(sep, lst):
+    # bytes.join / bytearray.join over a list or tuple of bytes-like items.
+    # Mirrors py_bytes_join in py_bytes.c.  Result takes the separator's
+    # family.  Items that are not bytes/bytearray raise TypeError.  This is
+    # the O(n) bulk-building primitive (chunks + one join) that replaces
+    # quadratic bytearray += under pcc1.
+    if ptr_is_null(sep) or ptr_is_null(lst):
+        return null()
+    sep = pcc_gc_note_relocation_read(sep)
+    lst = pcc_gc_note_relocation_read(lst)
+    st: int = _type_of(sep)
+    if not (st == PY_TYPE_BYTES or st == PY_TYPE_BYTEARRAY):
+        py_raise_owned(py_exc_new(3, cstr("bytes.join receiver must be bytes-like")))
+        return null()
+    sequence_tag: int = _type_of(lst)
+    if sequence_tag != PY_TYPE_LIST and sequence_tag != PY_TYPE_TUPLE:
+        py_raise_owned(py_exc_new(3, cstr("bytes.join argument must be a list or tuple")))
+        return null()
+    length: int = 0
+    if sequence_tag == PY_TYPE_LIST:
+        length = load_i64(lst, PYLISTOBJECT_LENGTH_OFFSET)
+    else:
+        length = load_i64(lst, PYTUPLEOBJECT_LEN_OFFSET)
+    if length == 0:
+        return _bytes_new_same_family(sep, null(), 0)
+    sep_len: int = py_bytes_len(sep)
+    items = null()
+    if sequence_tag == PY_TYPE_LIST:
+        items = load_ptr(lst, PYLISTOBJECT_ITEMS_OFFSET)
+    else:
+        items = ptr_add(lst, PYTUPLEOBJECT_ITEMS_OFFSET)
+    total: int = 0
+    i: int = 0
+    while i < length:
+        e = pcc_gc_load_ptr(lst, ptr_add(items, i * 8))
+        if ptr_is_null(e) != 0:
+            return null()
+        tag: int = _type_of(e)
+        if tag != PY_TYPE_BYTES and tag != PY_TYPE_BYTEARRAY:
+            py_raise_owned(py_exc_new(3, cstr("sequence item: expected a bytes-like object")))
+            return null()
+        if i > 0:
+            if total > 9223372036854775807 - sep_len:
+                return null()
+            total = total + sep_len
+        elem_len: int = py_bytes_len(e)
+        if total > 9223372036854775807 - elem_len:
+            return null()
+        total = total + elem_len
+        i = i + 1
+    out = _bytes_new_same_family(sep, null(), total)
+    if ptr_is_null(out):
+        return null()
+    # Result allocation may run a relocating collector: refresh the rooted
+    # inputs and the list items pointer before copying payloads.
+    sep = pcc_gc_note_relocation_read(sep)
+    lst = pcc_gc_note_relocation_read(lst)
+    if sequence_tag == PY_TYPE_LIST:
+        items = load_ptr(lst, PYLISTOBJECT_ITEMS_OFFSET)
+    else:
+        items = ptr_add(lst, PYTUPLEOBJECT_ITEMS_OFFSET)
+    dst = _bytes_data(out)
+    sd = _bytes_data(sep)
+    off: int = 0
+    i = 0
+    while i < length:
+        e = pcc_gc_load_ptr(lst, ptr_add(items, i * 8))
+        if i > 0 and sep_len > 0:
+            k: int = 0
+            while k < sep_len:
+                store_i8(dst, off + k, load_i8(sd, k))
+                k = k + 1
+            off = off + sep_len
+        elem_len2: int = py_bytes_len(e)
+        ed = _bytes_data(e)
+        j: int = 0
+        while j < elem_len2:
+            store_i8(dst, off + j, load_i8(ed, j))
+            j = j + 1
+        off = off + elem_len2
+        i = i + 1
+    store_i8(dst, total, 0)
+    return out
+
+
 @c_abi_export("py_bytes_repeat")
 def py_bytes_repeat(src, count: int):
     if ptr_is_null(src):
@@ -2043,12 +2142,12 @@ def py_bytes_maketrans(x, y):
     xd = _bytes_data(x)
     yd = _bytes_data(y)
     if ptr_is_null(xd) or ptr_is_null(yd):
-        py_raise(py_exc_new(3, cstr("maketrans arguments must be bytes-like")))
+        py_raise_owned(py_exc_new(3, cstr("maketrans arguments must be bytes-like")))
         return null()
     xn: int = py_bytes_len(x)
     yn: int = py_bytes_len(y)
     if xn != yn:
-        py_raise(py_exc_new(2, cstr("maketrans arguments must have the same length")))
+        py_raise_owned(py_exc_new(2, cstr("maketrans arguments must have the same length")))
         return null()
     table = py_mem_alloc(256)
     if ptr_is_null(table):
@@ -2073,12 +2172,12 @@ def py_bytes_translate(src, table):
     data = _bytes_data(src)
     mapping = _bytes_data(table)
     if ptr_is_null(data) or ptr_is_null(mapping):
-        py_raise(py_exc_new(3, cstr("translate arguments must be bytes-like")))
+        py_raise_owned(py_exc_new(3, cstr("translate arguments must be bytes-like")))
         return null()
     n: int = py_bytes_len(src)
     table_n: int = py_bytes_len(table)
     if table_n != 256:
-        py_raise(py_exc_new(2, cstr("translation table must be 256 characters long")))
+        py_raise_owned(py_exc_new(2, cstr("translation table must be 256 characters long")))
         return null()
     out = _bytes_new_same_family(src, null(), n)
     if ptr_is_null(out):
@@ -2123,7 +2222,7 @@ def py_bytes_fromhex(text):
         data = _bytes_data(text)
         n = py_bytes_len(text)
     else:
-        py_raise(py_exc_new(3, cstr("fromhex() argument must be str or bytes-like")))
+        py_raise_owned(py_exc_new(3, cstr("fromhex() argument must be str or bytes-like")))
         return null()
     if ptr_is_null(data):
         return null()
@@ -2142,7 +2241,7 @@ def py_bytes_fromhex(text):
         v: int = _hex_value(c)
         if v < 0:
             py_mem_free(tmp)
-            py_raise(
+            py_raise_owned(
                 py_exc_new(2, cstr("non-hexadecimal number found in fromhex() arg"))
             )
             return null()
@@ -2156,7 +2255,7 @@ def py_bytes_fromhex(text):
         i = i + 1
     if have_hi != 0:
         py_mem_free(tmp)
-        py_raise(py_exc_new(2, cstr("non-hexadecimal number found in fromhex() arg")))
+        py_raise_owned(py_exc_new(2, cstr("non-hexadecimal number found in fromhex() arg")))
         return null()
     out = py_bytes_new(tmp, out_n)
     py_mem_free(tmp)
@@ -2169,7 +2268,7 @@ def py_bytes_replace(src, old, new_value):
     old_data = _bytes_data(old)
     new_data = _bytes_data(new_value)
     if ptr_is_null(data) or ptr_is_null(old_data) or ptr_is_null(new_data):
-        py_raise(py_exc_new(3, cstr("replace arguments must be bytes-like")))
+        py_raise_owned(py_exc_new(3, cstr("replace arguments must be bytes-like")))
         return null()
     n: int = py_bytes_len(src)
     old_n: int = py_bytes_len(old)

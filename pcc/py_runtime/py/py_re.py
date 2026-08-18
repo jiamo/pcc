@@ -5,6 +5,9 @@ This intentionally remains the same bootstrap regex subset as the C helper:
 '?', the ASCII classes \d, \w, \s plus uppercase negations, and the re.I /
 re.S flags.
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PY_TYPE_INT,
     PY_TYPE_STR,
@@ -49,6 +52,8 @@ py_re_engine_fullmatch_flags = extern(
 py_re_engine_findall = extern("py_re_engine_findall", (c_ptr, c_ptr, c_int64), c_ptr)
 py_decref = extern("py_decref", (c_ptr,), c_void)
 py_raise = extern("py_raise", (c_ptr,), c_void)
+# py_raise increfs; a caller that created the exception must release it.
+py_raise_owned = extern("py_raise_owned", (c_ptr,), c_void)
 py_exc_new = extern("py_exc_new", (c_int64, c_ptr), c_ptr)
 
 
@@ -302,7 +307,7 @@ def _re_match_impl(pattern, text, flags: int, search: int):
         # engine; outside-subset patterns raise NotImplementedError (NULL)
         # instead of silently mismatching like the legacy matcher would.
         return py_re_engine_truth_flags(pattern, text, flags, search)
-    py_raise(
+    py_raise_owned(
         py_exc_new(
             11, cstr("pcc re: flags outside the native regex subset (no-libpython)")
         )
@@ -362,7 +367,7 @@ def py_re_fullmatch_flags(pattern, text, flags: int):
         return none
     if (flags & ~26) == 0:  # 26 == re.I|re.M|re.S — the engine flag mask
         return py_re_engine_fullmatch_flags(pattern, text, flags)
-    py_raise(
+    py_raise_owned(
         py_exc_new(
             11, cstr("pcc re: flags outside the native regex subset (no-libpython)")
         )
@@ -508,7 +513,7 @@ def py_re_findall_flags(pattern, text, flags: int):
     if (flags & ~26) == 0:
         # E3/E4 faithful-engine findall (owned by py_re_engine_runtime.py).
         return py_re_engine_findall(pattern, text, flags)
-    py_raise(
+    py_raise_owned(
         py_exc_new(
             11, cstr("pcc re: flags outside the native regex subset (no-libpython)")
         )

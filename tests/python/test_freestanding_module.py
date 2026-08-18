@@ -596,17 +596,32 @@ def test_freestanding_allows_exact_readonly_gc_runtime_abi_import(tmp_path):
 def test_freestanding_allows_only_registered_gc_cross_object_abi_imports(tmp_path):
     ir_text = _compile_freestanding(
         tmp_path,
-        "from pcc.extern import c_abi_export, c_int64, c_ptr, c_void, extern\n"
+        "from pcc.extern import (\n"
+        "    c_abi_export, c_int32, c_int64, c_ptr, c_void, extern,\n"
+        ")\n"
         "__pcc_freestanding__ = True\n"
         "safepoint = extern('pcc_thread_safepoint', (), c_void)\n"
         "threads_enabled = extern('pcc_threads_enabled', (), c_int64)\n"
         "index_insert = extern('py_gc_index_insert', (c_ptr, c_ptr), c_int64)\n"
         "index_remove = extern('py_gc_index_remove', (c_ptr,), c_ptr)\n"
+        "granule_live = extern(\n"
+        "    'pcc_gc_granule_is_object_start', (c_ptr,), c_int64\n"
+        ")\n"
+        "granule_retire = extern(\n"
+        "    'pcc_gc_granule_object_retire', (c_ptr,), c_int64\n"
+        ")\n"
+        "tripwire = extern(\n"
+        "    'pcc_runtime_tripwire_fail',\n"
+        "    (c_ptr, c_ptr, c_int32), c_void\n"
+        ")\n"
         "@c_abi_export('tracking_probe')\n"
         "def tracking_probe(obj, node) -> i64:\n"
         "    if threads_enabled() != 0:\n"
         "        safepoint()\n"
+        "        tripwire(obj, node, 0)\n"
         "        return -1\n"
+        "    if granule_live(obj) == 1:\n"
+        "        return granule_retire(obj)\n"
         "    result: i64 = index_insert(obj, node)\n"
         "    index_remove(obj)\n"
         "    return result\n",
@@ -614,6 +629,9 @@ def test_freestanding_allows_only_registered_gc_cross_object_abi_imports(tmp_pat
     body = ir_text.split("define i64 @tracking_probe", 1)[1].split("}\n", 1)[0]
     assert "call void @pcc_thread_safepoint()" in body
     assert "call i64 @pcc_threads_enabled()" in body
+    assert "@pcc_runtime_tripwire_fail(ptr %obj" in body
+    assert "call i64 @pcc_gc_granule_is_object_start(ptr %obj)" in body
+    assert "call i64 @pcc_gc_granule_object_retire(ptr %obj)" in body
     assert "call i64 @py_gc_index_insert(ptr %obj, ptr %node)" in body
     assert "call ptr @py_gc_index_remove(ptr %obj)" in body
 

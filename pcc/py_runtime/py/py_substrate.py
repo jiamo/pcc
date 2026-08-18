@@ -8,6 +8,8 @@ create storage symbols in the object file and do not depend on the
 stripped synthetic main().
 """
 
+__pcc_runtime_port__ = True
+
 from pcc.extern import c_abi_export, c_int32, c_int64, c_ptr, c_void, extern
 from pcc.py_runtime.py.py_abi_constants import (
     C_POINTER_SIZE,

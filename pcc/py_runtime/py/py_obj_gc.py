@@ -10,6 +10,9 @@ PyGcNode layout (40 bytes):
     offset 24  prev      PyGcNode*
     offset 32  next      PyGcNode*
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.extern import extern, c_abi_export, c_ptr, c_int64, c_void
 from pcc.unsafe import (
     global_addr,

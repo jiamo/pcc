@@ -70,6 +70,75 @@ def test_native_struct_object_matches_precise_stackmap_layouts(
     assert shape.unpack_from(padded, 2) == values
 
 
+_UNPACK_PARITY_CASES = [
+    ("<QQIIII", (1, 2, 3, 4, 5, 6)),
+    ("<QIIIHHBBHI", (2**64 - 1, 2**32 - 1, 0, 7, 65535, 1, 255, 0, 9, 10)),
+    ("<qihb?", (-(2**63), -(2**31), -32768, -128, True)),
+    ("<qihb?", (2**63 - 1, 2**31 - 1, 32767, 127, False)),
+    ("<qQ", (-1, 2**63)),
+    ("<8sHBBI", (b"PCCSMAP1", 1, 2, 8, 7)),
+    ("<3xIc2s", (5, b"z", b"ab")),
+    ("<4H2q", (1, 2, 3, 4, -5, 6)),
+    ("<lL", (-1, 2**32 - 1)),
+    (">QIHBqihb", (2**64 - 1, 2**32 - 1, 65535, 255, -1, -2, -3, -4)),
+    ("=IH", (0x01020304, 0x0506)),
+    ("", ()),
+]
+
+
+@pytest.mark.parametrize("fmt,values", _UNPACK_PARITY_CASES)
+def test_native_struct_unpack_from_matches_cpython(native_struct, fmt, values):
+    """The compiled ``struct`` provider must decode exactly like CPython.
+
+    The self-backend native-object and stack-map validators call
+    ``Struct.unpack_from`` on immutable ``bytes`` payloads tens of thousands
+    of times per module, so that path is the one exercised at several
+    offsets, through both the module-level and ``Struct`` spellings, and on a
+    ``bytearray`` copy.  Value identity includes ``bool`` for ``?`` fields.
+    """
+    payload = _cpy_struct.pack(fmt, *values)
+    expected = _cpy_struct.unpack_from(fmt, payload, 0)
+    padded = b"\xfe\xff" + payload + b"\x00\x01\x02"
+    layout = native_struct.Struct(fmt)
+    assert layout.size == _cpy_struct.calcsize(fmt)
+    assert native_struct.unpack_from(fmt, payload, 0) == expected
+    assert native_struct.unpack(fmt, payload) == expected
+    assert layout.unpack_from(padded, 2) == expected
+    assert layout.unpack_from(padded, -(len(payload) + 3)) == expected
+    assert layout.unpack_from(bytearray(padded), 2) == expected
+    assert layout.unpack_from(memoryview(padded), 2) == expected
+    assert [type(item) for item in layout.unpack_from(padded, 2)] == [
+        type(item) for item in expected
+    ]
+    if payload:
+        with pytest.raises(native_struct.error):
+            layout.unpack_from(payload[:-1], 0)
+        with pytest.raises(native_struct.error):
+            layout.unpack_from(padded, len(padded) - len(payload) + 1)
+    with pytest.raises(native_struct.error):
+        layout.unpack_from(padded, len(padded) + 1)
+
+
+def test_native_struct_unpack_from_reads_every_offset_of_a_large_payload(
+    native_struct,
+):
+    """Sweep a multi-record payload the way the stack-map validator does."""
+    record = _cpy_struct.Struct("<QIIIHHBBHI")
+    rows = [
+        (index * 7919, index & 0xFFFFFFFF, 2**32 - 1 - index, 3, index & 0xFFFF,
+         0xFFFF - (index & 0xFFFF), index & 0xFF, 0xFF - (index & 0xFF),
+         (index * 3) & 0xFFFF, index * 5)
+        for index in range(257)
+    ]
+    payload = b"".join(record.pack(*row) for row in rows)
+    layout = native_struct.Struct("<QIIIHHBBHI")
+    offset = 0
+    for row in rows:
+        assert layout.unpack_from(payload, offset) == row
+        offset += layout.size
+    assert offset == len(payload)
+
+
 def test_native_struct_pack_into_matches_cpython(native_struct):
     fmt = "<IIQ"
     expected = bytearray(b"_" * 24)
@@ -268,6 +337,120 @@ def test_ir_py_float32_round_pattern(pcc_struct, value):
     expected = _cpy_struct.unpack(">f", _cpy_struct.pack(">f", value))[0]
     actual = pcc_struct.unpack(">f", pcc_struct.pack(">f", value))[0]
     assert actual == expected
+
+
+_UNPACK_PARITY_PROGRAM = '''
+import struct
+
+
+def show(fmt: str, payload: bytes, offset: int) -> None:
+    values = struct.unpack_from(fmt, payload, offset)
+    print(fmt, len(values))
+    for item in values:
+        if isinstance(item, bytes):
+            print("bytes", item.hex())
+        else:
+            print(item)
+
+
+def main() -> None:
+    show("<QQIIII", struct.pack("<QQIIII", 1, 2, 3, 4, 5, 6), 0)
+    show("<QQIIII", b"\\x01\\x02" + struct.pack("<QQIIII", 1, 2, 3, 4, 5, 6), 2)
+    show("<QIIIHHBBHI", struct.pack("<QIIIHHBBHI", 18446744073709551615, 4294967295, 0, 7, 65535, 1, 255, 0, 9, 10), 0)
+    show("<qihb?", struct.pack("<qihb?", -9223372036854775808, -2147483648, -32768, -128, True), 0)
+    show("<qihb?", struct.pack("<qihb?", 9223372036854775807, 2147483647, 32767, 127, False), 0)
+    show("<qQ", struct.pack("<qQ", -1, 9223372036854775808), 0)
+    show("<8sHBBI", struct.pack("<8sHBBI", b"PCCSMAP1", 1, 2, 8, 7), 0)
+    show("<3xIc2s", struct.pack("<3xIc2s", 5, b"z", b"ab"), 0)
+    show("<4H2q", struct.pack("<4H2q", 1, 2, 3, 4, -5, 6), 0)
+    show("<lL", struct.pack("<lL", -1, 4294967295), 0)
+    show(">QIHBqihb", struct.pack(">QIHBqihb", 18446744073709551615, 4294967295, 65535, 255, -1, -2, -3, -4), 0)
+    show("=IH", struct.pack("=IH", 16909060, 1286), 0)
+    layout = struct.Struct("<QIIIHHBBHI")
+    payload = b"".join(layout.pack(i * 7919, i, 4294967295 - i, 3, i, 65535 - i, i & 255, 255 - (i & 255), (i * 3) & 65535, i * 5) for i in range(64))
+    total = 0
+    offset = 0
+    while offset < len(payload):
+        row = layout.unpack_from(payload, offset)
+        total = total + row[0] + row[1] + row[2] + row[4] + row[6] + row[9]
+        offset = offset + layout.size
+    print("sweep", total)
+    try:
+        layout.unpack_from(payload, len(payload) - 3)
+    except struct.error:
+        print("truncated-rejected")
+
+
+main()
+'''.lstrip()
+
+
+@pytest.mark.integration
+def test_host_pcc_and_current_pcc1_unpack_from_matches_cpython_without_libpython(
+    tmp_path: Path,
+    pcc_py_runtime_archive: Path,
+):
+    """The compiled provider's in-place payload reads must equal CPython.
+
+    Covers every owned integer width in both signednesses, the unsigned
+    64-bit high-bit lift, pad/bytes/char fields, offsets, the big-endian
+    generic path, a multi-record sweep like the stack-map validator and the
+    truncation error, under host pcc and the current pcc1 with no libpython.
+    """
+    pcc1 = find_current_pcc1(REPO_ROOT)
+    if pcc1 is None:
+        skip_or_fail_no_current_pcc1(
+            "no current pcc1 for struct unpack_from parity"
+        )
+        return
+
+    source = tmp_path / "struct_unpack_parity.py"
+    source.write_text(_UNPACK_PARITY_PROGRAM, encoding="utf-8")
+    expected = subprocess.run(
+        [sys.executable, str(source)],
+        cwd=REPO_ROOT,
+        text=True,
+        capture_output=True,
+        timeout=30,
+        check=True,
+    ).stdout
+    assert expected.count("\n") == 74
+    env = os.environ.copy()
+    env.pop("LC_ALL", None)
+    env["PCC_RUNTIME_ARCHIVE"] = str(pcc_py_runtime_archive)
+    for label, compiler in (
+        ("host-pcc", ["uv", "run", "pcc"]),
+        ("current-pcc1", [str(pcc1)]),
+    ):
+        executable = tmp_path / ("struct_unpack_parity_" + label)
+        compiled = subprocess.run(
+            compiler
+            + [
+                "--backend=self",
+                "--python-libpython=off",
+                "--ir-scaffold=on",
+                str(source),
+                "-o",
+                str(executable),
+            ],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            timeout=420,
+            env=env,
+        )
+        assert compiled.returncode == 0, (
+            label + " compile failed: " + compiled.stdout + compiled.stderr
+        )
+        actual = subprocess.run(
+            [str(executable)],
+            cwd=REPO_ROOT,
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        assert actual.returncode == 0, label + ": " + actual.stderr
+        assert actual.stdout == expected, label
 
 
 @pytest.mark.integration

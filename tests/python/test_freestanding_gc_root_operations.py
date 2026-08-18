@@ -81,6 +81,20 @@ def test_root_operations_have_one_strict_source_owner():
         assert f'"{symbol}"' in managed
 
 
+def test_strict_gc3_known_object_gate_rejects_deallocating_header_state():
+    strict = ROOT_OPS_SOURCE.read_text(encoding="utf-8")
+    body = strict.split("def pcc_gc_object_is_known_no_lock(", 1)[1].split(
+        '@c_abi_export("pcc_gc_mark_root_gray_if_known")', 1
+    )[0]
+    assert "524288" in body
+    assert (
+        body.index("pcc_gc_object_index_find(obj)")
+        < body.index("load_i64(node, 32)")
+        < body.index("flags: i64 = load_i32(obj, 12)")
+        < body.index("524288")
+    )
+
+
 @pytest.mark.parametrize("emitter", ["llvm", "self"])
 def test_root_operations_object_has_exact_raw_closure(tmp_path: Path, emitter: str):
     obj = _compile_object(tmp_path, emitter)
@@ -115,6 +129,7 @@ def _root_operations_harness_source() -> str:
 #include "py_runtime.h"
 #include "py_internal.h"
 #include <stdint.h>
+#include <sys/mman.h>
 #include <stdio.h>
 
 extern int64_t pcc_gc_gray_count_load_acquire(void);
@@ -207,6 +222,50 @@ int main(void) {
 '''
 
 
+def _gc3_deallocating_known_harness_source() -> str:
+    return r'''
+#define _GNU_SOURCE
+#include "py_runtime.h"
+#include "py_internal.h"
+#include <stdint.h>
+#include <sys/mman.h>
+
+extern int64_t pcc_gc_object_is_known_no_lock(PyObject *obj);
+
+typedef struct {
+    PyObjectHeader h;
+    int64_t length;
+    int64_t capacity;
+    PyObject **items;
+} ProbeListObject;
+
+int main(void) {
+    if (pcc_gc_set_backend(PCC_GC_KIND_GENERATIONAL_MINOR_MAJOR) != 0) {
+        return 2;
+    }
+    void *guard = mmap(
+        0, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0
+    );
+    if (guard == MAP_FAILED) return 3;
+    if (pcc_gc_object_is_known_no_lock((PyObject *)guard) != 0) return 4;
+    if (munmap(guard, 4096) != 0) return 5;
+    ProbeListObject *obj = (ProbeListObject *)pcc_gc_alloc(
+        64, PY_TYPE_LIST, 0
+    );
+    if (obj == 0) return 6;
+    obj->length = 0;
+    obj->capacity = 0;
+    obj->items = 0;
+    if (pcc_gc_object_is_known_no_lock((PyObject *)obj) != 1) return 7;
+    py_header_flags_or(&obj->h, PY_FLAG_GC_DEALLOCATING);
+    if (pcc_gc_object_is_known_no_lock((PyObject *)obj) != 0) return 8;
+    py_header_flags_and(&obj->h, ~PY_FLAG_GC_DEALLOCATING);
+    pcc_gc_release((PyObject *)obj);
+    return 0;
+}
+'''
+
+
 def _link_harness(tmp_path: Path, name: str, source_text: str, archive: Path) -> Path:
     source = tmp_path / (name + ".c")
     executable = tmp_path / name
@@ -279,3 +338,19 @@ def test_gray_counter_survives_threaded_increment_decrement(
     )
     assert result.returncode == 0, result.stdout + result.stderr
     assert result.stdout == "final:0\n"
+
+
+def test_strict_gc3_known_object_gate_executes_deallocating_rejection(
+    tmp_path: Path,
+    pcc_py_runtime_archive: Path,
+):
+    executable = _link_harness(
+        tmp_path,
+        "root_operations_gc3_deallocating",
+        _gc3_deallocating_known_harness_source(),
+        pcc_py_runtime_archive,
+    )
+    result = subprocess.run(
+        [str(executable)], capture_output=True, text=True, timeout=30
+    )
+    assert result.returncode == 0, result.stdout + result.stderr

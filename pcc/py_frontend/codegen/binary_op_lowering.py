@@ -46,6 +46,45 @@ def _raw_int_name(ty: Type) -> str:
 
 
 class BinaryOpLoweringMixin:
+    _INLINE_TAGGED_BINOPS = ("+", "-", "*", "&", "|", "^")
+
+    def _binop_route_defers_pins(
+        self,
+        op: str,
+        lhs_ty: Type,
+        rhs_ty: Type,
+        result_ty: Type,
+    ) -> bool:
+        """True when ``_emit_binop_value`` reaches an inline tagged-int route.
+
+        Those two routes (``_emit_runtime_int_binop_value`` for boxed
+        int/bool operands, ``_emit_dyn_tagged_int_object_binop`` for a
+        DynType operand) pin operands only inside their slow block, so the
+        caller must not pin them up front.  Mirrors the routing order of
+        ``_emit_binop_value``: every earlier branch is keyed on a container,
+        text, set, float or complex operand type, none of which may appear.
+        """
+        if op not in self._INLINE_TAGGED_BINOPS:
+            return False
+        numeric = (IntType, BoolType)
+        if (
+            self._int_exprs_are_boxed()
+            and isinstance(result_ty, IntType)
+            and isinstance(lhs_ty, numeric)
+            and isinstance(rhs_ty, numeric)
+        ):
+            return True
+        if not (
+            isinstance(result_ty, DynType)
+            or isinstance(lhs_ty, DynType)
+            or isinstance(rhs_ty, DynType)
+        ):
+            return False
+        for ty in (lhs_ty, rhs_ty, result_ty):
+            if not isinstance(ty, (DynType, IntType, BoolType)):
+                return False
+        return True
+
     def _emit_binop_value(
         self,
         op: str,
@@ -55,6 +94,37 @@ class BinaryOpLoweringMixin:
         rhs_ty: Type,
         result_ty: Type,
         pinned_pcc_on_error: tuple[tuple[ir.Value, bool], ...] = (),
+        slow_pins: tuple[ir.Value, ...] = (),
+    ) -> ir.Value:
+        """Lower ``lhs <op> rhs``; ``slow_pins`` are operands the caller left
+        unpinned so that an inline tagged route pins them only around its
+        slow call.  Any other route pins them around its whole lowering."""
+        if not slow_pins or self._binop_route_defers_pins(op, lhs_ty, rhs_ty, result_ty):
+            return self._emit_binop_value_routed(
+                op, lhs, lhs_ty, rhs, rhs_ty, result_ty,
+                pinned_pcc_on_error=pinned_pcc_on_error,
+                slow_pins=slow_pins,
+            )
+        for pinned in slow_pins:
+            self._gc_pin(pinned)
+        result = self._emit_binop_value_routed(
+            op, lhs, lhs_ty, rhs, rhs_ty, result_ty,
+            pinned_pcc_on_error=pinned_pcc_on_error,
+        )
+        for pinned in reversed(slow_pins):
+            self._gc_unpin(pinned)
+        return result
+
+    def _emit_binop_value_routed(
+        self,
+        op: str,
+        lhs: ir.Value,
+        lhs_ty: Type,
+        rhs: ir.Value,
+        rhs_ty: Type,
+        result_ty: Type,
+        pinned_pcc_on_error: tuple[tuple[ir.Value, bool], ...] = (),
+        slow_pins: tuple[ir.Value, ...] = (),
     ) -> ir.Value:
         # CPython values (libpython mode): a binary operator where either
         # operand is a CPython object (e.g. numpy arrays, ``a + b``) must
@@ -424,7 +494,9 @@ class BinaryOpLoweringMixin:
             or isinstance(rhs_ty, DynType)
         ):
             return self._emit_dyn_tagged_int_object_binop(
-                op, lhs, lhs_ty, rhs, rhs_ty
+                op, lhs, lhs_ty, rhs, rhs_ty,
+                pinned_pcc_on_error=pinned_pcc_on_error,
+                slow_pins=slow_pins,
             )
 
         if op == "/" and (
@@ -494,7 +566,9 @@ class BinaryOpLoweringMixin:
             or isinstance(rhs_ty, DynType)
         ):
             return self._emit_dyn_tagged_int_object_binop(
-                op, lhs, lhs_ty, rhs, rhs_ty
+                op, lhs, lhs_ty, rhs, rhs_ty,
+                pinned_pcc_on_error=pinned_pcc_on_error,
+                slow_pins=slow_pins,
             )
 
         if op == "//" and (
@@ -528,7 +602,9 @@ class BinaryOpLoweringMixin:
             or isinstance(rhs_ty, DynType)
         ):
             return self._emit_dyn_tagged_int_object_binop(
-                op, lhs, lhs_ty, rhs, rhs_ty
+                op, lhs, lhs_ty, rhs, rhs_ty,
+                pinned_pcc_on_error=pinned_pcc_on_error,
+                slow_pins=slow_pins,
             )
 
         if (
@@ -603,6 +679,17 @@ class BinaryOpLoweringMixin:
             )
             return out
 
+        if op in ("&", "|", "^", "<<", ">>") and (
+            isinstance(result_ty, DynType)
+            or isinstance(lhs_ty, DynType)
+            or isinstance(rhs_ty, DynType)
+        ):
+            return self._emit_dyn_tagged_int_object_binop(
+                op, lhs, lhs_ty, rhs, rhs_ty,
+                pinned_pcc_on_error=pinned_pcc_on_error,
+                slow_pins=slow_pins,
+            )
+
         _complex_binop = {
             "+": "py_complex_add",
             "-": "py_complex_sub",
@@ -658,6 +745,7 @@ class BinaryOpLoweringMixin:
                 rhs,
                 rhs_ty,
                 pinned_pcc_on_error=pinned_pcc_on_error,
+                slow_pins=slow_pins,
             )
 
         if (
@@ -933,6 +1021,7 @@ class BinaryOpLoweringMixin:
         rhs_ty: Type,
         *,
         pinned_pcc_on_error: tuple[tuple[ir.Value, bool], ...] = (),
+        slow_pins: tuple[ir.Value, ...] = (),
     ) -> ir.Value:
         fn_name = {
             "+": "py_int_add",
@@ -973,17 +1062,14 @@ class BinaryOpLoweringMixin:
             lhs_obj,
             rhs_obj,
             fn_name,
+            slow_pins=slow_pins,
+            slow_err_check=True,
+            slow_err_cleanup=pinned_pcc_on_error,
         )
         if inline is not None:
-            self._emit_post_call_err_check(
-                None,
-                pinned_release_on_error=pinned_pcc_on_error,
-            )
-            self._guard_cpy_value_not_null(
-                inline,
-                pinned_pcc_on_error=pinned_pcc_on_error,
-            )
             return inline
+        for pinned in slow_pins:
+            self._gc_pin(pinned)
         result = self.builder.call(
             self.runtime[fn_name],
             [lhs_obj, rhs_obj],
@@ -1006,6 +1092,8 @@ class BinaryOpLoweringMixin:
                 result,
                 pinned_pcc_on_error=pinned_pcc_on_error,
             )
+        for pinned in reversed(slow_pins):
+            self._gc_unpin(pinned)
         return result
     def _emit_negative_shift_count_check(
         self,
@@ -1118,12 +1206,24 @@ class BinaryOpLoweringMixin:
         lhs_ty: Type,
         rhs: ir.Value,
         rhs_ty: Type,
+        *,
+        pinned_pcc_on_error: tuple[tuple[ir.Value, bool], ...] = (),
+        slow_pins: tuple[ir.Value, ...] = (),
     ) -> ir.Value:
-        """Lower a DynType ``+``/``-``/``*`` with one fast/slow contract."""
+        """Lower a DynType integer/object binop with one fast/slow contract.
+
+        ``slow_pins`` are pinned only around the ``py_obj_*`` slow call (the
+        inline tagged fast path cannot move or raise); ``pinned_pcc_on_error``
+        is released on the slow call's error edge."""
         runtime_fn = {
             "+": "py_obj_add",
             "-": "py_obj_sub",
             "*": "py_obj_mul",
+            "&": "py_obj_and",
+            "|": "py_obj_or",
+            "^": "py_obj_xor",
+            "<<": "py_obj_lshift",
+            ">>": "py_obj_rshift",
         }.get(op)
         if runtime_fn is None:
             raise L1CodegenError(f"unsupported DynType tagged binop: {op}")
@@ -1134,18 +1234,32 @@ class BinaryOpLoweringMixin:
         rhs_obj = marshal.marshal_to_object(
             self.builder, self.module, self.runtime, rhs, rhs_ty
         )
+        # The py_obj_* slow paths can raise through user dunders or unsupported
+        # operands; the inline tagged fast path cannot, so the check lives in
+        # the slow block (an enclosing try/except still observes it).
         result = self._emit_inline_tagged_int_binop_or_call(
             op,
             lhs_obj,
             rhs_obj,
             runtime_fn,
+            slow_pins=slow_pins,
+            slow_err_check=True,
+            slow_err_cleanup=pinned_pcc_on_error,
         )
         if result is None:
-            raise L1CodegenError("DynType tagged binop requires an active function")
-        # The py_obj_* slow paths can raise through user dunders or unsupported
-        # operands. Keep the check after the joined fast/slow value so an
-        # enclosing try/except observes the runtime exception.
-        self._emit_post_call_err_check(None)
+            for pinned in slow_pins:
+                self._gc_pin(pinned)
+            result = self.builder.call(
+                self.runtime[runtime_fn],
+                [lhs_obj, rhs_obj],
+                name=self._fresh("obj.binop"),
+            )
+            self._emit_post_call_err_check(
+                None,
+                pinned_release_on_error=pinned_pcc_on_error,
+            )
+            for pinned in reversed(slow_pins):
+                self._gc_unpin(pinned)
         return result
 
     def _emit_inline_tagged_int_binop_or_call(
@@ -1154,7 +1268,21 @@ class BinaryOpLoweringMixin:
         lhs_obj: ir.Value,
         rhs_obj: ir.Value,
         fn_name: str,
+        *,
+        slow_pins: tuple[ir.Value, ...] = (),
+        slow_err_check: bool = False,
+        slow_err_cleanup: tuple[tuple[ir.Value, bool], ...] = (),
     ) -> ir.Value | None:
+        """Inline tagged fast path with the runtime call as the slow path.
+
+        ``slow_pins`` are pinned only around the slow call (the fast path
+        never leaves this function, so nothing can relocate its operands),
+        and with ``slow_err_check`` the ``py_err_occurred`` probe and the
+        NULL guard are emitted inside the slow block instead of after the
+        join: the fast path cannot raise.  Measured on ``total += i``: the
+        join-side check and the unconditional pins were part of a 1288
+        instruction loop iteration (CPython: 718).
+        """
         if op not in ("+", "-", "*", "&", "|", "^"):
             return None
 
@@ -1332,11 +1460,24 @@ class BinaryOpLoweringMixin:
         self.builder.branch(join_bb)
 
         self.builder.position_at_end(slow_bb)
+        for pinned in slow_pins:
+            self._gc_pin(pinned)
         slow_result = self.builder.call(
             self.runtime[fn_name],
             [lhs_obj, rhs_obj],
             name=self._fresh("int.obj"),
         )
+        if slow_err_check:
+            self._emit_post_call_err_check(
+                None,
+                pinned_release_on_error=slow_err_cleanup,
+            )
+            self._guard_cpy_value_not_null(
+                slow_result,
+                pinned_pcc_on_error=slow_err_cleanup,
+            )
+        for pinned in reversed(slow_pins):
+            self._gc_unpin(pinned)
         slow_exit = self.builder._block
         self.builder.branch(join_bb)
 

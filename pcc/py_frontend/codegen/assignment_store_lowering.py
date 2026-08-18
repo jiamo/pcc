@@ -6,7 +6,7 @@ from typing import Optional
 
 from pcc.llvm_capi.compat import ir
 
-from ..py_ast import Attr, DynType, Expr, Name, Subscript, TupleExpr, Type
+from ..py_ast import Attr, DynType, Expr, IntType, Name, Subscript, TupleExpr, Type
 from . import marshal
 
 _I8 = ir.IntType(8)
@@ -258,7 +258,21 @@ class AssignmentStoreLoweringMixin:
             self.current_func_def is None or target.ident in self._current_global_names
         ):
             gv, declared_ty = module_globals[target.ident]
-            value = self._coerce(value, value_ty, declared_ty)
+            boxed_module_int = (
+                isinstance(declared_ty, IntType)
+                and isinstance(gv.value_type, ir.PointerType)
+            )
+            if boxed_module_int:
+                if not isinstance(value.type, ir.PointerType):
+                    value = marshal.marshal_to_object(
+                        self.builder,
+                        self.module,
+                        self.runtime,
+                        value,
+                        value_ty,
+                    )
+            else:
+                value = self._coerce(value, value_ty, declared_ty)
             if value in getattr(self, "_cpy_values", ()):
                 self._cpy_module_flags[target.ident] = True
                 is_cpy_value = True

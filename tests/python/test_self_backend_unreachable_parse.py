@@ -1,6 +1,10 @@
 from __future__ import annotations
 
+import pytest
+
+from pcc.backend import BackendUnavailable
 from pcc.backend.self_backend_ir import ParsedBlock, ParsedInstr
+from pcc.backend.self_backend_kernel import get_indexed_function_kernel
 from pcc.backend.self_backend_parse import (
     _filter_reachable_blocks,
     _filter_reachable_blocks_linear,
@@ -30,13 +34,49 @@ def test_self_backend_parser_truncates_dead_text_after_unreachable():
     )
 
     func = module.functions[0]
-    blocks = {block.name: block for block in func.blocks}
-    assert blocks["raise.cont"].instructions == []
-    assert blocks["raise.cont"].terminator is not None
-    assert blocks["raise.cont"].terminator.kind == "unreachable"
-    assert blocks["next"].terminator is not None
-    assert blocks["next"].terminator.kind == "ret"
-    assert "dead.next" not in blocks
+    kernel = get_indexed_function_kernel(func)
+    assert func.blocks == []
+    assert kernel.block_names == ["entry", "raise.cont", "next"]
+    raise_id = kernel.block_id("raise.cont")
+    next_id = kernel.block_id("next")
+    assert kernel.instruction_count(raise_id) == 0
+    assert kernel.diagnostic_terminator(raise_id).kind == "unreachable"
+    assert kernel.diagnostic_terminator(next_id).kind == "ret"
+    assert kernel.block_id("dead.next") < 0
+
+
+def test_unreachable_cfg_call_is_validated_but_not_published() -> None:
+    module = parse_self_backend_module(
+        'target triple = "aarch64-apple-darwin"\n'
+        "define i64 @f() {\n"
+        "entry:\n"
+        "  ret i64 0\n"
+        "dead:\n"
+        "  %unused = call i64 @callee(i64 7)\n"
+        "  ret i64 %unused\n"
+        "}\n"
+    )
+
+    func = module.functions[0]
+    kernel = get_indexed_function_kernel(func)
+    assert kernel.block_names == ["entry"]
+    assert len(kernel.call_scalars) == 0
+    assert len(kernel.call_arg_scalars) == 0
+    assert len(kernel.instruction_metadata) == 0
+
+
+def test_unreachable_cfg_instruction_still_fails_closed() -> None:
+    with pytest.raises(BackendUnavailable, match="does not support instruction"):
+        parse_self_backend_module(
+            'target triple = "aarch64-apple-darwin"\n'
+            "define i64 @f() {\n"
+            "entry:\n"
+            "  ret i64 0\n"
+            "dead:\n"
+            "  %unused = unsupported_opcode i64 7\n"
+            "  ret i64 %unused\n"
+            "}\n"
+        )
 
 
 def test_reachability_filter_detects_dropped_existing_branch_target():

@@ -12,19 +12,36 @@ import re
 
 from . import BackendUnavailable
 from .self_backend_float_bits import float32_to_bits, float64_to_bits
+from .self_backend_kernel import IndexedFunctionSeed, get_indexed_function_kernel
+from .self_backend_literals import (
+    _is_float_token,
+    _is_hex_token,
+    _is_int_token,
+    const_int_from_value,
+    is_aggregate_literal_value,
+    is_float_literal,
+    is_hex_literal,
+)
 from .self_backend_ir import (
     ArgInfo,
+    CompactParsedInstrArena,
     GlobalDef,
+    I1,
+    IndexedCallPlane,
     ParsedBlock,
     ParsedFunction,
     ParsedInstr,
     ParsedModule,
+    PARSED_INSTRUCTION_KINDS,
     PhiIncoming,
     PhiInstr,
     TypeDesc,
+    _PARSED_INSTRUCTION_KIND_IDS,
     _align_to,
     aggregate_member_info,
+    reset_operand_intern,
 )
+from .self_backend_value_arena import CompilerInt2, CompilerInt4, CompilerIntArena
 
 _SCALAR_TYPE_TOKEN = (
     r'(?:void|ptr|float|double|i\d+|%(?:"[^"]+"|(?:[A-Za-z_.$][\w.$-]*|\d+)))'
@@ -79,10 +96,6 @@ _LABEL_REF_RE = re.compile(
 _PLAIN_LABEL_RE = re.compile(
     r'^(?:"(?P<quoted>[^"]+)"|(?P<plain>[A-Za-z_.$][\w.$-]*|\.[0-9A-Za-z_.$-]+|\d+)):(?:\s*;.*)?$'
 )
-_SYMBOL_NAME_RE = re.compile(r"^[A-Za-z_.$][A-Za-z0-9_.$]*$")
-_HEX_DIGITS = "0123456789abcdefABCDEF"
-
-
 # Token classifiers, not regexes: these three ran 7.8M of the 11.0M regex
 # calls needed to parse one 27 MB module.  Under pcc1 every call enters the
 # pcc-Python regex engine (pattern-cache walk + matcher), which is orders of
@@ -100,54 +113,6 @@ _HEX_DIGITS = "0123456789abcdefABCDEF"
 
 
 _U64_MASK = (1 << 64) - 1  # computed, NOT a literal: see M5-SELFHOST-BIG-INT-LITERAL
-
-
-def _without_trailing_newline(text: str) -> str:
-    if text.endswith("\n"):
-        return text[:-1]
-    return text
-
-
-def _is_int_token(text: str) -> bool:
-    body = _without_trailing_newline(text)
-    if body.startswith("-"):
-        body = body[1:]
-    return body.isdecimal()
-
-
-def _is_hex_token(text: str) -> bool:
-    body = _without_trailing_newline(text)
-    if not body.startswith("0x") or len(body) < 3:
-        return False
-    # strip() removes maximal runs of the allowed set from both ends, so the
-    # result is empty exactly when every character is a hex digit.
-    return body[2:].strip(_HEX_DIGITS) == ""
-
-
-def _is_float_token(text: str) -> bool:
-    body = _without_trailing_newline(text)
-    if body.startswith("-"):
-        body = body[1:]
-    exponent_at = body.find("e")
-    if exponent_at < 0:
-        exponent_at = body.find("E")
-    if exponent_at >= 0:
-        exponent = body[exponent_at + 1:]
-        body = body[:exponent_at]
-        if exponent.startswith("-") or exponent.startswith("+"):
-            exponent = exponent[1:]
-        if not exponent.isdecimal():
-            return False
-    dot_at = body.find(".")
-    if dot_at < 0:
-        return body.isdecimal()
-    whole = body[:dot_at]
-    fraction = body[dot_at + 1:]
-    if whole and not whole.isdecimal():
-        return False
-    if fraction and not fraction.isdecimal():
-        return False
-    return bool(whole) or bool(fraction)
 _ARG_RE = re.compile(
     rf"^(?P<type>{_TYPE_TOKEN})(?:\s+[A-Za-z_][A-Za-z0-9_.$-]*)*\s+"
     r'(?P<name>%(?:"[^"]+"|[A-Za-z_.$][\w.$-]*))$'
@@ -278,10 +243,52 @@ _UNREACHABLE_RE = re.compile(r"^unreachable$")
 _INDEX_RE = re.compile(r"^(?P<type>i\d+)\s+(?P<value>.+)$")
 _NAMED_TYPES: dict[str, TypeDesc] = {}
 _TYPE_CACHE: dict[str, TypeDesc] = {}
+_POINTER_TYPE_CACHE: dict[int, tuple[TypeDesc, TypeDesc]] = {}
 _CALL_SIGNATURE_CACHE: dict[str, tuple[int, bool]] = {}
 _NUMERIC_SSA_NAME_CACHE: dict[int, str] = {}
 _DOT_NUMERIC_SSA_NAME_CACHE: dict[int, str] = {}
 _SPLIT_NESTING_MARKERS = '"{}[]()<>'
+
+
+def _canonical_pointer_type(pointee: TypeDesc) -> TypeDesc:
+    key = id(pointee)
+    entry = _POINTER_TYPE_CACHE.get(key)
+    if entry is not None and entry[0] is pointee:
+        return entry[1]
+    result = TypeDesc("ptr", pointee=pointee)
+    # Pin the identity key with the result. A bare id()-keyed cache can return
+    # the wrong type after address reuse; this entry keeps the pointee alive.
+    _POINTER_TYPE_CACHE[key] = (pointee, result)
+    return result
+
+
+def _canonical_leaf_type(token: str) -> TypeDesc:
+    """Return the per-module identity for one non-recursive LLVM type.
+
+    `_extract_leading_type_token` must parse a prefix before it knows the text
+    boundary. Without interning here, every repeated `ptr`, `void`, `iN`, or
+    floating token allocates a fresh frozen dataclass and overwrites the text
+    cache; item311 retained 137,468 TypeDesc objects for 74 structural values.
+    """
+    cached = _TYPE_CACHE.get(token)
+    if cached is not None:
+        return cached
+    if token == "void":
+        result = TypeDesc("void")
+    elif token == "ptr":
+        result = _canonical_pointer_type(_canonical_leaf_type("void"))
+    elif token == "float":
+        result = TypeDesc("fp", 32)
+    elif token == "double":
+        result = TypeDesc("fp", 64)
+    elif token.startswith("i") and token[1:].isdigit():
+        result = TypeDesc("int", int(token[1:]))
+    else:
+        raise BackendUnavailable(
+            f"self backend cannot intern non-leaf LLVM type token {token!r}"
+        )
+    _TYPE_CACHE[token] = result
+    return result
 
 
 def parse_self_backend_target_triple(ir_text: str) -> str:
@@ -295,9 +302,16 @@ def parse_self_backend_target_triple(ir_text: str) -> str:
 
 def parse_self_backend_module(ir_text: str) -> ParsedModule:
     _TYPE_CACHE.clear()
+    _POINTER_TYPE_CACHE.clear()
     _CALL_SIGNATURE_CACHE.clear()
     _NUMERIC_SSA_NAME_CACHE.clear()
     _DOT_NUMERIC_SSA_NAME_CACHE.clear()
+    # Compact instruction operand canonicalization is module-scoped.  Keeping
+    # a prior module's string alive makes a later instruction definition use
+    # that old object while its terminator/phi use keeps the new module's
+    # spelling, breaking the parser's within-module identity invariant and
+    # retaining every compiler input forever.
+    reset_operand_intern()
     _parse_named_types(ir_text)
     return ParsedModule(
         triple=parse_self_backend_target_triple(ir_text),
@@ -307,10 +321,24 @@ def parse_self_backend_module(ir_text: str) -> ParsedModule:
 
 
 def check_simple_symbol_name(name: str) -> None:
-    if not _SYMBOL_NAME_RE.match(name):
-        raise BackendUnavailable(
-            f"self backend MVP only supports simple C identifier symbols, got {name!r}"
+    valid = bool(name)
+    index = 0
+    while valid and index < len(name):
+        code = ord(name[index])
+        valid = (
+            65 <= code <= 90
+            or 97 <= code <= 122
+            or code == 95
+            or code == 46
+            or code == 36
+            or (index > 0 and 48 <= code <= 57)
         )
+        index += 1
+    if valid:
+        return
+    raise BackendUnavailable(
+        f"self backend MVP only supports simple C identifier symbols, got {name!r}"
+    )
 
 
 def split_top_level(text: str) -> list[str]:
@@ -690,16 +718,10 @@ def _parse_ir_type_tokens(
                 if field_info[0] == "eof" or field_info[1] == "}":
                     raise _ir_type_parse_error(text, "expected type after ','")
         base = TypeDesc("struct", fields=tuple(fields))
-    elif token == "void":
-        base = TypeDesc("void")
-    elif token == "ptr":
-        base = TypeDesc("ptr", pointee=TypeDesc("void"))
-    elif token == "float":
-        base = TypeDesc("fp", 32)
-    elif token == "double":
-        base = TypeDesc("fp", 64)
-    elif token.startswith("i") and token[1:].isdigit():
-        base = TypeDesc("int", int(token[1:]))
+    elif token in ("void", "ptr", "float", "double") or (
+        token.startswith("i") and token[1:].isdigit()
+    ):
+        base = _canonical_leaf_type(token)
     elif token.startswith("%"):
         if token not in _NAMED_TYPES and resolve_named is not None:
             resolve_named(token)
@@ -717,7 +739,7 @@ def _parse_ir_type_tokens(
             star_index += 1
         if star_index >= len(text) or text[star_index] != "*":
             break
-        base = TypeDesc("ptr", pointee=base)
+        base = _canonical_pointer_type(base)
         index = star_index + 1
     return base, index
 
@@ -969,8 +991,339 @@ def _decode_parenthesized_constant_expr(token: str) -> str | None:
     return f"cexpr:{token.strip()}"
 
 
+def _ascii_decimal_name(text: str, start: int = 0) -> bool:
+    if start >= len(text):
+        return False
+    index = start
+    while index < len(text):
+        code = ord(text[index])
+        if code < 48 or code > 57:
+            return False
+        index += 1
+    return True
+
+
+def _ascii_plain_ir_name(text: str) -> bool:
+    if not text:
+        return False
+    first = ord(text[0])
+    if not (
+        65 <= first <= 90
+        or 97 <= first <= 122
+        or first == 95
+        or first == 46
+        or first == 36
+    ):
+        return False
+    index = 1
+    while index < len(text):
+        code = ord(text[index])
+        if not (
+            65 <= code <= 90
+            or 97 <= code <= 122
+            or 48 <= code <= 57
+            or code == 95
+            or code == 46
+            or code == 36
+            or code == 45
+        ):
+            return False
+        index += 1
+    return True
+
+
+def _ascii_decimal_span(text: str, start: int, end: int) -> bool:
+    """Return whether ``text[start:end]`` is a non-empty ASCII decimal."""
+
+    if start >= end:
+        return False
+    index = start
+    while index < end:
+        code = ord(text[index])
+        if code < 48 or code > 57:
+            return False
+        index += 1
+    return True
+
+
+def _ascii_literal_at(text: str, start: int, literal: str) -> bool:
+    """Compare an ASCII literal at one span without the startswith bridge."""
+
+    if start < 0 or start + len(literal) > len(text):
+        return False
+    index = 0
+    while index < len(literal):
+        if ord(text[start + index]) != ord(literal[index]):
+            return False
+        index += 1
+    return True
+
+
+def _ascii_plain_ir_name_span(text: str, start: int, end: int) -> bool:
+    """Span form of ``_ascii_plain_ir_name`` without a substring object."""
+
+    if start >= end:
+        return False
+    first = ord(text[start])
+    if not (
+        65 <= first <= 90
+        or 97 <= first <= 122
+        or first == 95
+        or first == 46
+        or first == 36
+    ):
+        return False
+    index = start + 1
+    while index < end:
+        code = ord(text[index])
+        if not (
+            65 <= code <= 90
+            or 97 <= code <= 122
+            or 48 <= code <= 57
+            or code == 95
+            or code == 46
+            or code == 36
+            or code == 45
+        ):
+            return False
+        index += 1
+    return True
+
+
+def _simple_ir_type_span(
+    text: str,
+    start: int,
+    end: int,
+    *,
+    allow_void: bool,
+) -> bool:
+    """Recognize scalar type spellings emitted by pcc's hot call path."""
+
+    length = end - start
+    if length <= 0:
+        return False
+    first = ord(text[start])
+    if first == 105:  # iNN
+        return _ascii_decimal_span(text, start + 1, end)
+    if length == 3:
+        return (
+            ord(text[start]) == 112
+            and ord(text[start + 1]) == 116
+            and ord(text[start + 2]) == 114
+        )
+    if length == 4:
+        return allow_void and (
+            ord(text[start]) == 118
+            and ord(text[start + 1]) == 111
+            and ord(text[start + 2]) == 105
+            and ord(text[start + 3]) == 100
+        )
+    if length == 5:
+        return (
+            ord(text[start]) == 102
+            and ord(text[start + 1]) == 108
+            and ord(text[start + 2]) == 111
+            and ord(text[start + 3]) == 97
+            and ord(text[start + 4]) == 116
+        )
+    if length == 6:
+        return (
+            ord(text[start]) == 100
+            and ord(text[start + 1]) == 111
+            and ord(text[start + 2]) == 117
+            and ord(text[start + 3]) == 98
+            and ord(text[start + 4]) == 108
+            and ord(text[start + 5]) == 101
+        )
+    return False
+
+
+def _simple_call_signature_span_info(text: str, start: int, end: int) -> int:
+    """Return ``fixed_count * 2 + is_vararg`` or -1 for a cold signature."""
+
+    if start == end:
+        return 0
+    position = start
+    fixed_count = 0
+    is_vararg = 0
+    while position < end:
+        while position < end:
+            code = ord(text[position])
+            if code != 32 and code != 9:
+                break
+            position += 1
+        if position >= end:
+            return -1
+        comma = text.find(",", position, end)
+        token_end = end if comma < 0 else comma
+        while token_end > position:
+            code = ord(text[token_end - 1])
+            if code != 32 and code != 9:
+                break
+            token_end -= 1
+        if (
+            token_end - position == 3
+            and ord(text[position]) == 46
+            and ord(text[position + 1]) == 46
+            and ord(text[position + 2]) == 46
+        ):
+            if comma >= 0:
+                return -1
+            is_vararg = 1
+        elif not _simple_ir_type_span(
+            text,
+            position,
+            token_end,
+            allow_void=False,
+        ):
+            return -1
+        else:
+            fixed_count += 1
+        if comma < 0:
+            break
+        position = comma + 1
+    return fixed_count * 2 + is_vararg
+
+
+def _simple_call_arg_span_count(text: str, start: int, end: int) -> int:
+    """Validate allocation-free scalar call-arg spans and return their count."""
+
+    if start == end:
+        return 0
+    position = start
+    count = 0
+    while position < end:
+        while position < end:
+            code = ord(text[position])
+            if code != 32 and code != 9:
+                break
+            position += 1
+        if position >= end:
+            return -1
+        comma = text.find(",", position, end)
+        chunk_end = end if comma < 0 else comma
+        while chunk_end > position:
+            code = ord(text[chunk_end - 1])
+            if code != 32 and code != 9:
+                break
+            chunk_end -= 1
+        type_end = position
+        while type_end < chunk_end:
+            code = ord(text[type_end])
+            if code == 32 or code == 9:
+                break
+            type_end += 1
+        if not _simple_ir_type_span(
+            text,
+            position,
+            type_end,
+            allow_void=False,
+        ):
+            return -1
+        value_start = type_end
+        while value_start < chunk_end:
+            code = ord(text[value_start])
+            if code != 32 and code != 9:
+                break
+            value_start += 1
+        if value_start >= chunk_end:
+            return -1
+        index = value_start
+        while index < chunk_end:
+            code = ord(text[index])
+            if (
+                code == 32
+                or code == 9
+                or code == 34
+                or code == 40
+                or code == 41
+                or code == 60
+                or code == 62
+                or code == 91
+                or code == 93
+                or code == 123
+                or code == 125
+            ):
+                return -1
+            index += 1
+        count += 1
+        if comma < 0:
+            break
+        position = comma + 1
+    return count
+
+
+def _append_simple_call_arg_spans(
+    text: str,
+    start: int,
+    end: int,
+    call_plane: IndexedCallPlane,
+) -> int:
+    """Append a prevalidated scalar argument range without a split list."""
+
+    position = start
+    count = 0
+    while position < end:
+        while position < end:
+            code = ord(text[position])
+            if code != 32 and code != 9:
+                break
+            position += 1
+        comma = text.find(",", position, end)
+        chunk_end = end if comma < 0 else comma
+        while chunk_end > position:
+            code = ord(text[chunk_end - 1])
+            if code != 32 and code != 9:
+                break
+            chunk_end -= 1
+        type_end = position
+        while type_end < chunk_end:
+            code = ord(text[type_end])
+            if code == 32 or code == 9:
+                break
+            type_end += 1
+        value_start = type_end
+        while value_start < chunk_end:
+            code = ord(text[value_start])
+            if code != 32 and code != 9:
+                break
+            value_start += 1
+        arg_type = _parse_type(text[position:type_end])
+        arg_value = decode_value_token(text[value_start:chunk_end])
+        if arg_type.is_int and arg_type.width == 1:
+            if arg_value == "false":
+                arg_value = "0"
+            elif arg_value == "true":
+                arg_value = "1"
+        call_plane.append_arg(arg_type, arg_value, 0)
+        count += 1
+        if comma < 0:
+            break
+        position = comma + 1
+    return count
+
+
 def decode_ssa_name(token: str) -> str:
-    match = _SSA_NAME_RE.match(token.strip())
+    text = token.strip()
+    if len(text) > 1 and text[0] == "%":
+        name = text[1:]
+        if _ascii_decimal_name(name):
+            numeric_name = int(name)
+            cached_name = _NUMERIC_SSA_NAME_CACHE.get(numeric_name)
+            if cached_name is None:
+                cached_name = f"%{numeric_name}"
+                _NUMERIC_SSA_NAME_CACHE[numeric_name] = cached_name
+            return cached_name
+        if name.startswith(".") and _ascii_decimal_name(name, 1):
+            numeric_name = int(name[1:])
+            cached_name = _DOT_NUMERIC_SSA_NAME_CACHE.get(numeric_name)
+            if cached_name is None:
+                cached_name = f"%.{numeric_name}"
+                _DOT_NUMERIC_SSA_NAME_CACHE[numeric_name] = cached_name
+            return cached_name
+        if _ascii_plain_ir_name(name):
+            return name
+    match = _SSA_NAME_RE.match(text)
     if match is None:
         raise BackendUnavailable(
             f"unsupported SSA value syntax for self backend: {token!r}"
@@ -994,7 +1347,12 @@ def decode_ssa_name(token: str) -> str:
 
 
 def decode_global_name(token: str) -> str:
-    match = _GLOBAL_NAME_RE.match(token.strip())
+    text = token.strip()
+    if len(text) > 1 and text[0] == "@":
+        name = text[1:]
+        if _ascii_plain_ir_name(name):
+            return name
+    match = _GLOBAL_NAME_RE.match(text)
     if match is None:
         raise BackendUnavailable(
             f"unsupported global symbol syntax for self backend: {token!r}"
@@ -1016,28 +1374,6 @@ def decode_label_ref(token: str) -> str:
             f"unsupported label syntax for self backend: {token!r}"
         )
     return match.group(1) or match.group(2)
-
-
-def const_int_from_value(value: str) -> int | None:
-    if value == "false":
-        return 0
-    if value == "true":
-        return 1
-    if _is_int_token(value):
-        return int(value)
-    return None
-
-
-def is_hex_literal(value: str) -> bool:
-    return _is_hex_token(value)
-
-
-def is_float_literal(value: str) -> bool:
-    return _is_float_token(value) and not value.startswith(".")
-
-
-def is_aggregate_literal_value(value: str) -> bool:
-    return value.startswith("{") or value.startswith("[") or value.startswith("<")
 
 
 def _write_bytes(dst: bytearray, offset: int, src: bytes) -> None:
@@ -1248,6 +1584,7 @@ def _strip_volatile_memory_op_prefix(text: str) -> str:
 def _parse_named_types(ir_text: str) -> None:
     _NAMED_TYPES.clear()
     _TYPE_CACHE.clear()
+    _POINTER_TYPE_CACHE.clear()
     pending: dict[str, str] = {}
     search_pos = 0
     while search_pos < len(ir_text):
@@ -1301,9 +1638,8 @@ def _parse_functions(ir_text: str) -> list[ParsedFunction]:
         check_simple_symbol_name(name)
         ret_type = _parse_type(ret_type_text)
         args = _parse_arg_infos(name, args_text)
-        blocks = _parse_blocks(name, body_text)
-        functions.append(
-            ParsedFunction(
+        blocks, indexed_seed = _parse_blocks(name, body_text, args)
+        function = ParsedFunction(
                 name=name,
                 ret_type=ret_type,
                 args=args,
@@ -1312,7 +1648,9 @@ def _parse_functions(ir_text: str) -> list[ParsedFunction]:
                 blocks=blocks,
                 value_types={},
                 value_slots={},
+                value_slot_buckets={},
                 alloca_slots={},
+                alloca_slot_buckets={},
                 block_map={},
                 used_values=[],
                 # Keep every target-owned mutable field explicit here.  Host
@@ -1327,8 +1665,15 @@ def _parse_functions(ir_text: str) -> list[ParsedFunction]:
                 aarch64_cold_fallthrough_edges=[],
                 hidden_sret_slot=None,
                 frame_size=0,
+                indexed_kernel=None,
+                indexed_seed=indexed_seed,
+                indexed_slot_projection=False,
             )
-        )
+        # Freeze/adopt the complete function plane at the parser boundary.
+        # Downstream consumers never need the construction seed or a block
+        # object graph; explicit legacy/diagnostic callers project lazily.
+        get_indexed_function_kernel(function)
+        functions.append(function)
     return functions
 
 
@@ -1902,9 +2247,625 @@ def _parse_arg_infos(function_name: str, args_text: str) -> list[ArgInfo]:
     return args
 
 
-def _parse_blocks(function_name: str, body: str) -> list[ParsedBlock]:
-    blocks: list[ParsedBlock] = []
-    current: ParsedBlock | None = None
+class _FunctionBlockPlane:
+    """One function's construction-time block/PHI/terminator plane.
+
+    Targets are old block IDs until reachability has selected the final dense
+    block order.  Operand spellings and canonical types live in two function-
+    level side tables; no ``ParsedBlock``/``ParsedInstr``/PHI object or
+    per-block instruction arena is built.
+    The final publication pass remaps targets and interns operands/types into
+    ``IndexedFunctionSeed`` without reparsing the source line.
+    """
+
+    __slots__ = (
+        "block_names",
+        "block_indices_by_key",
+        "headers",
+        "cases",
+        "block_phi_facts",
+        "phi_records",
+        "phi_incoming",
+        "instruction_lines",
+        "instruction_line_spans",
+        "value_texts",
+        "types",
+        "missing_target_names",
+    )
+
+    def __init__(self, block_names: list[str]) -> None:
+        self.block_names = block_names
+        self.block_indices_by_key: dict[int, list[int]] = {}
+        for block_id, name in enumerate(self.block_names):
+            key = _stable_block_name_key(name)
+            bucket = self.block_indices_by_key.get(key)
+            if bucket is None:
+                bucket = []
+                self.block_indices_by_key[key] = bucket
+            bucket.append(block_id)
+        self.headers = CompilerIntArena(max(1, len(block_names) * 8))
+        self.cases = CompilerIntArena()
+        self.block_phi_facts = CompilerIntArena(max(1, len(block_names) * 2))
+        self.phi_records = CompilerIntArena()
+        self.phi_incoming = CompilerIntArena()
+        self.instruction_lines: list[str] = []
+        self.instruction_line_spans = CompilerIntArena(
+            max(1, len(block_names) * 2)
+        )
+        self.value_texts: list[str] = []
+        self.types: list[TypeDesc] = []
+        self.missing_target_names: list[str] = []
+
+    def block_id(self, name: str) -> int:
+        key = _stable_block_name_key(name)
+        for block_id in self.block_indices_by_key.get(key, []):
+            if self.block_names[block_id] == name:
+                return block_id
+        return -1
+
+    def _target_ref(self, name: str) -> int:
+        block_id = self.block_id(name)
+        if block_id >= 0:
+            return block_id
+        result = -len(self.missing_target_names) - 1
+        self.missing_target_names.append(name)
+        return result
+
+    def _value_ref(self, value: str) -> int:
+        result = len(self.value_texts)
+        self.value_texts.append(value)
+        return result
+
+    def _type_ref(self, value_type: TypeDesc) -> int:
+        result = len(self.types)
+        self.types.append(value_type)
+        return result
+
+    def _append_phi_line(
+        self,
+        function_name: str,
+        block_name: str,
+        line: str,
+    ) -> None:
+        phi_match = _PHI_RE.match(line)
+        if phi_match is None:
+            raise BackendUnavailable(
+                f"self backend could not decode phi in {function_name!r}/{block_name!r}: {line}"
+            )
+        type_text, incoming_text = _extract_leading_type_token(
+            phi_match.group("body")
+        )
+        incoming_start = len(self.phi_incoming) // 2
+        incoming_count = 0
+        for item in _parse_phi_incoming_entries(incoming_text):
+            value_text, label_text = _split_top_level_once(item, ",")
+            self.phi_incoming.append2(
+                self._value_ref(decode_value_token(value_text.strip())),
+                self._target_ref(decode_label_ref(label_text.strip())),
+            )
+            incoming_count += 1
+        self.phi_records.append4(
+            self._value_ref(decode_ssa_name(phi_match.group("dest"))),
+            self._type_ref(_parse_type(type_text)),
+            incoming_start,
+            incoming_count,
+        )
+
+    def parse_block(
+        self,
+        function_name: str,
+        block_id: int,
+        raw_lines: list[str],
+        raw_start: int,
+        raw_count: int,
+    ) -> None:
+        block_name = self.block_names[block_id]
+        raw_end = raw_start + raw_count
+        phi_start = len(self.phi_records) // 4
+        phi_count = 0
+        line_index = raw_start
+        while line_index < raw_end and _PHI_RE.match(raw_lines[line_index]):
+            self._append_phi_line(
+                function_name,
+                block_name,
+                raw_lines[line_index],
+            )
+            phi_count += 1
+            line_index += 1
+        self.block_phi_facts.append2(phi_start, phi_count)
+        if line_index >= raw_end:
+            raise BackendUnavailable(
+                f"self backend block {block_name!r} in {function_name!r} has no terminator"
+            )
+        last_line = raw_lines[raw_end - 1]
+        if last_line == "]" or last_line.startswith("],"):
+            switch_start = raw_end - 2
+            while (
+                switch_start >= line_index
+                and not raw_lines[switch_start].startswith("switch ")
+            ):
+                switch_start -= 1
+            if switch_start < line_index:
+                raise BackendUnavailable(
+                    f"self backend could not recover multi-line switch terminator in {function_name!r}/{block_name!r}"
+                )
+            instruction_end = switch_start
+            terminator_line = " ".join(raw_lines[switch_start:raw_end])
+        else:
+            instruction_end = raw_end - 1
+            terminator_line = last_line
+
+        scan_index = line_index
+        while scan_index < instruction_end:
+            line = raw_lines[scan_index]
+            if _UNREACHABLE_RE.match(line):
+                instruction_end = scan_index
+                terminator_line = line
+                break
+            scan_index += 1
+        instruction_start = len(self.instruction_lines)
+        while line_index < instruction_end:
+            self.instruction_lines.append(raw_lines[line_index])
+            line_index += 1
+        self.instruction_line_spans.append2(
+            instruction_start,
+            len(self.instruction_lines) - instruction_start,
+        )
+        self.append(function_name, block_name, terminator_line)
+
+    def append(
+        self,
+        function_name: str,
+        block_name: str,
+        line: str,
+    ) -> None:
+        kind = ""
+        type_ref = -1
+        value_ref = -1
+        target0 = -1
+        target1 = -1
+        case_start = len(self.cases) // 2
+        case_count = 0
+        switch_line = _normalize_switch_terminator_line(line)
+
+        if match := _BR_COND_RE.match(line):
+            cond_text = match.group("cond").strip()
+            true_label = decode_label_ref(match.group("true").strip())
+            false_label = decode_label_ref(match.group("false").strip())
+            if cond_text in {"1", "true"}:
+                kind = "br"
+                target0 = self._target_ref(true_label)
+            elif cond_text in {"0", "false", "undef", "poison"}:
+                kind = "br"
+                target0 = self._target_ref(false_label)
+            else:
+                kind = "br_cond"
+                value_ref = self._value_ref(decode_ssa_name(cond_text))
+                target0 = self._target_ref(true_label)
+                target1 = self._target_ref(false_label)
+        elif match := _BR_RE.match(line):
+            kind = "br"
+            target0 = self._target_ref(
+                decode_label_ref(match.group("target").strip())
+            )
+        elif _RET_VOID_RE.match(line):
+            kind = "ret_void"
+        elif line.startswith("ret "):
+            ret_type_text, value_text = _extract_leading_type_token(
+                line[len("ret ") :].strip()
+            )
+            if not value_text:
+                raise BackendUnavailable(
+                    f"self backend does not support terminator in {function_name!r}/{block_name!r}: {line}"
+                )
+            kind = "ret"
+            type_ref = self._type_ref(_parse_type(ret_type_text))
+            value_ref = self._value_ref(decode_value_token(value_text))
+        elif _UNREACHABLE_RE.match(line):
+            kind = "unreachable"
+        elif match := _SWITCH_RE.match(switch_line):
+            kind = "switch"
+            value_type = _parse_type(match.group("type"))
+            if not value_type.is_int:
+                raise BackendUnavailable(
+                    f"self backend only supports integer switch values, got {value_type.describe()}"
+                )
+            type_ref = self._type_ref(value_type)
+            value_ref = self._value_ref(
+                decode_value_token(match.group("value"))
+            )
+            target0 = self._target_ref(
+                decode_label_ref(match.group("default"))
+            )
+            cases_text = match.group("cases").strip()
+            case_pos = 0
+            while case_pos < len(cases_text):
+                case_match = _SWITCH_CASE_RE.search(cases_text, case_pos)
+                if (
+                    case_match is None
+                    or cases_text[case_pos : case_match.start()].strip()
+                ):
+                    raise BackendUnavailable(
+                        f"self backend could not decode switch table in {function_name!r}/{block_name!r}: {line}"
+                    )
+                case_type = _parse_type(case_match.group("type"))
+                if case_type.describe() != value_type.describe():
+                    raise BackendUnavailable(
+                        "self backend requires switch case values to use the switch operand type"
+                    )
+                self.cases.append2(
+                    int(case_match.group("value")),
+                    self._target_ref(
+                        decode_label_ref(case_match.group("label"))
+                    ),
+                )
+                case_count += 1
+                case_pos = case_match.end()
+        else:
+            raise BackendUnavailable(
+                f"self backend does not support terminator in {function_name!r}/{block_name!r}: {line}"
+            )
+
+        kind_id = _PARSED_INSTRUCTION_KIND_IDS.get(kind)
+        if kind_id is None:
+            raise BackendUnavailable(f"unknown parsed terminator kind {kind!r}")
+        self.headers.append4(kind_id, type_ref, value_ref, target0)
+        self.headers.append4(target1, case_start, case_count, 0)
+
+    def header(self, block_id: int) -> CompilerInt4:
+        return self.headers.get4_unchecked(block_id * 2)
+
+    def span(self, block_id: int) -> CompilerInt4:
+        return self.headers.get4_unchecked(block_id * 2 + 1)
+
+    def case(self, case_id: int) -> CompilerInt2:
+        return self.cases.get2_unchecked(case_id)
+
+    def phi_fact(self, block_id: int) -> CompilerInt2:
+        return self.block_phi_facts.get2_unchecked(block_id)
+
+    def phi_record(self, phi_id: int) -> CompilerInt4:
+        return self.phi_records.get4_unchecked(phi_id)
+
+    def phi_incoming_record(self, incoming_id: int) -> CompilerInt2:
+        return self.phi_incoming.get2_unchecked(incoming_id)
+
+    def phi_count(self, block_id: int) -> int:
+        return self.block_phi_facts.get_unchecked(block_id * 2 + 1)
+
+    def instruction_start(self, block_id: int) -> int:
+        return self.instruction_line_spans.get_unchecked(block_id * 2)
+
+    def instruction_count(self, block_id: int) -> int:
+        return self.instruction_line_spans.get_unchecked(block_id * 2 + 1)
+
+    def successor_count(self, block_id: int) -> int:
+        header: CompilerInt4 = self.headers.get4_unchecked(block_id * 2)
+        kind = PARSED_INSTRUCTION_KINDS[header.first]
+        if kind == "br":
+            return 1
+        if kind == "br_cond":
+            return 2
+        if kind == "switch":
+            return 1 + self.headers.get_unchecked(block_id * 8 + 6)
+        return 0
+
+    def successor_ref(self, block_id: int, successor_index: int) -> int:
+        header: CompilerInt4 = self.headers.get4_unchecked(block_id * 2)
+        span: CompilerInt4 = self.headers.get4_unchecked(block_id * 2 + 1)
+        kind = PARSED_INSTRUCTION_KINDS[header.first]
+        if successor_index == 0 and kind in ("br", "br_cond", "switch"):
+            return header.fourth
+        if successor_index == 1 and kind == "br_cond":
+            return span.first
+        if kind == "switch" and 1 <= successor_index <= span.third:
+            return self.cases.get_unchecked(
+                (span.second + successor_index - 1) * 2 + 1
+            )
+        raise IndexError(successor_index)
+
+    def branches_to(self, block_id: int, target_id: int) -> bool:
+        successor_index = 0
+        successor_count = self.successor_count(block_id)
+        while successor_index < successor_count:
+            if self.successor_ref(block_id, successor_index) == target_id:
+                return True
+            successor_index += 1
+        return False
+
+    def publish_reachable(
+        self,
+        indexed_seed: IndexedFunctionSeed,
+        reachable_old_ids: list[int],
+    ) -> None:
+        old_to_new = [-1] * len(self.block_names)
+        for new_id, old_id in enumerate(reachable_old_ids):
+            old_to_new[old_id] = new_id
+
+        def target_ref(raw: int) -> int:
+            if raw >= 0:
+                mapped = old_to_new[raw]
+                if mapped < 0:
+                    raise BackendUnavailable(
+                        "reachable terminator targets a filtered block"
+                    )
+                return mapped
+            name = self.missing_target_names[-raw - 1]
+            return -indexed_seed.intern_text(name) - 1
+
+        for old_id in reachable_old_ids:
+            header: CompilerInt4 = self.headers.get4_unchecked(old_id * 2)
+            span: CompilerInt4 = self.headers.get4_unchecked(old_id * 2 + 1)
+            type_id = (
+                -1
+                if header.second < 0
+                else indexed_seed.intern_type(self.types[header.second])
+            )
+            operand = (
+                -1
+                if header.third < 0
+                else indexed_seed.operand_ref(self.value_texts[header.third])
+            )
+            kind = PARSED_INSTRUCTION_KINDS[header.first]
+            final_target0 = (
+                target_ref(header.fourth)
+                if kind in ("br", "br_cond", "switch")
+                else -1
+            )
+            final_target1 = (
+                target_ref(span.first) if kind == "br_cond" else -1
+            )
+            final_case_start = len(indexed_seed.terminator_case_scalars) // 2
+            case_index = 0
+            while case_index < span.third:
+                case: CompilerInt2 = self.cases.get2_unchecked(
+                    span.second + case_index
+                )
+                indexed_seed.terminator_case_scalars.append2(
+                    case.first,
+                    target_ref(case.second),
+                )
+                case_index += 1
+            indexed_seed.terminator_scalars.append4(
+                header.first,
+                type_id,
+                operand,
+                final_target0,
+            )
+            indexed_seed.terminator_scalars.append4(
+                final_target1,
+                final_case_start,
+                span.third,
+                0,
+            )
+        indexed_seed.terminator_records_complete = True
+
+    def define_block_phis(
+        self,
+        indexed_seed: IndexedFunctionSeed,
+        old_block_id: int,
+        new_block_id: int,
+    ) -> None:
+        fact: CompilerInt2 = self.block_phi_facts.get2_unchecked(old_block_id)
+        phi_index = 0
+        while phi_index < fact.second:
+            raw: CompilerInt4 = self.phi_records.get4_unchecked(
+                fact.first + phi_index
+            )
+            indexed_seed.define_value(
+                self.value_texts[raw.first],
+                new_block_id,
+                self.types[raw.second],
+                -1,
+            )
+            phi_index += 1
+
+    def publish_reachable_phis(
+        self,
+        indexed_seed: IndexedFunctionSeed,
+        reachable_old_ids: list[int],
+    ) -> None:
+        old_to_new = [-1] * len(self.block_names)
+        for new_id, old_id in enumerate(reachable_old_ids):
+            old_to_new[old_id] = new_id
+
+        for old_block_id in reachable_old_ids:
+            fact: CompilerInt2 = self.block_phi_facts.get2_unchecked(
+                old_block_id
+            )
+            final_phi_start = len(indexed_seed.phi_scalars) // 4
+            final_phi_count = 0
+            phi_index = 0
+            while phi_index < fact.second:
+                raw: CompilerInt4 = self.phi_records.get4_unchecked(
+                    fact.first + phi_index
+                )
+                final_incoming_start = len(indexed_seed.phi_incoming_scalars) // 2
+                final_incoming_count = 0
+                incoming_index = 0
+                while incoming_index < raw.fourth:
+                    incoming: CompilerInt2 = self.phi_incoming.get2_unchecked(
+                        raw.third + incoming_index
+                    )
+                    predecessor_old_id = incoming.second
+                    predecessor_new_id = (
+                        -1
+                        if predecessor_old_id < 0
+                        else old_to_new[predecessor_old_id]
+                    )
+                    if (
+                        predecessor_new_id >= 0
+                        and self.branches_to(
+                            predecessor_old_id,
+                            old_block_id,
+                        )
+                    ):
+                        indexed_seed.phi_incoming_scalars.append2(
+                            indexed_seed.operand_ref(
+                                self.value_texts[incoming.first]
+                            ),
+                            predecessor_new_id,
+                        )
+                        final_incoming_count += 1
+                    incoming_index += 1
+                dest_value_id = indexed_seed.value_id(
+                    self.value_texts[raw.first]
+                )
+                if dest_value_id < 0:
+                    raise BackendUnavailable(
+                        "indexed function seed omitted a phi destination"
+                    )
+                indexed_seed.phi_scalars.append4(
+                    dest_value_id,
+                    indexed_seed.intern_type(self.types[raw.second]),
+                    final_incoming_start,
+                    final_incoming_count,
+                )
+                final_phi_count += 1
+                phi_index += 1
+            indexed_seed.block_phi_facts.append2(
+                final_phi_start,
+                final_phi_count,
+            )
+        indexed_seed.phi_records_complete = True
+
+    def close(self) -> None:
+        self.headers.close()
+        self.cases.close()
+        self.block_phi_facts.close()
+        self.phi_records.close()
+        self.phi_incoming.close()
+        self.instruction_line_spans.close()
+        self.block_names = []
+        self.block_indices_by_key = {}
+        self.value_texts = []
+        self.types = []
+        self.missing_target_names = []
+        self.instruction_lines = []
+
+
+def _finish_indexed_block_plane(
+    function_name: str,
+    args: list[ArgInfo],
+    block_names: list[str],
+    block_plane: _FunctionBlockPlane,
+) -> IndexedFunctionSeed:
+    """Freeze one already-tokenized function into the final kernel seed."""
+    reachable_old_ids = _filter_reachable_blocks_indexed(block_plane)
+    reachable_set = set(reachable_old_ids)
+    old_block_id = 0
+    while old_block_id < len(block_names):
+        if old_block_id not in reachable_set:
+            line_start = block_plane.instruction_start(old_block_id)
+            line_count = block_plane.instruction_count(old_block_id)
+            line_index = 0
+            while line_index < line_count:
+                _parse_instruction(
+                    function_name,
+                    block_names[old_block_id],
+                    block_plane.instruction_lines[line_start + line_index],
+                )
+                line_index += 1
+        old_block_id += 1
+
+    value_capacity_hint = len(args)
+    instruction_capacity_hint = 0
+    for old_block_id in reachable_old_ids:
+        # Most self-host IR blocks mix value-producing calls/loads with
+        # stores and frame protocol.  Half-density avoids carrying a 2x
+        # oversized name index through every later emit lookup; the seed's
+        # exact grow/rebuild path handles denser functions without changing
+        # semantics.
+        value_capacity_hint += block_plane.phi_count(old_block_id)
+        instruction_capacity_hint += block_plane.instruction_count(old_block_id)
+    value_capacity_hint += (instruction_capacity_hint + 1) // 2
+    indexed_seed = IndexedFunctionSeed(
+        len(reachable_old_ids),
+        value_capacity_hint,
+    )
+    for old_block_id in reachable_old_ids:
+        indexed_seed.register_block(block_names[old_block_id])
+
+    for arg in args:
+        indexed_seed.define_value(arg.name, -2, arg.type, -1)
+    for block_id, old_block_id in enumerate(reachable_old_ids):
+        block_plane.define_block_phis(
+            indexed_seed,
+            old_block_id,
+            block_id,
+        )
+        line_start = block_plane.instruction_start(old_block_id)
+        line_count = block_plane.instruction_count(old_block_id)
+        position = 0
+        while position < line_count:
+            line = block_plane.instruction_lines[line_start + position]
+            dest = _instruction_destination_from_line(line)
+            if dest is not None:
+                indexed_seed.define_value(dest, block_id, None, position)
+            position += 1
+
+    for block_id, old_block_id in enumerate(reachable_old_ids):
+        _parse_block_instructions(
+            function_name,
+            block_names[old_block_id],
+            block_plane.instruction_lines,
+            block_plane.instruction_start(old_block_id),
+            block_plane.instruction_count(old_block_id),
+            indexed_seed,
+        )
+    block_plane.publish_reachable(indexed_seed, reachable_old_ids)
+    block_plane.publish_reachable_phis(indexed_seed, reachable_old_ids)
+    block_plane.close()
+    indexed_seed.finish()
+    return indexed_seed
+
+
+def build_indexed_function_seed_from_block_lines(
+    function_name: str,
+    args: list[ArgInfo],
+    block_names: list[str],
+    block_lines: list[list[str]],
+) -> IndexedFunctionSeed:
+    """Build the canonical seed without serializing function/block topology.
+
+    Instruction text is still the transitional payload in this first direct
+    builder slice.  The caller supplies stable block order and already-split
+    lines; later builder publishers replace each line parser with the same
+    final record append API rather than introducing a second IR schema.
+    """
+    if not block_names or len(block_names) != len(block_lines):
+        raise BackendUnavailable(
+            "direct indexed function requires matching non-empty block inputs"
+        )
+    block_plane = _FunctionBlockPlane(list(block_names))
+    block_id = 0
+    while block_id < len(block_names):
+        lines = block_lines[block_id]
+        block_plane.parse_block(
+            function_name,
+            block_id,
+            lines,
+            0,
+            len(lines),
+        )
+        block_id += 1
+    return _finish_indexed_block_plane(
+        function_name,
+        args,
+        block_names,
+        block_plane,
+    )
+
+
+def _parse_blocks(
+    function_name: str,
+    body: str,
+    args: list[ArgInfo],
+) -> tuple[list[ParsedBlock], object]:
+    block_names: list[str] = []
+    raw_lines: list[str] = []
+    raw_line_spans = CompilerIntArena()
+    current_start = 0
 
     for raw_line in body.splitlines():
         line = raw_line.strip()
@@ -1912,29 +2873,47 @@ def _parse_blocks(function_name: str, body: str) -> list[ParsedBlock]:
             continue
         label_match = _PLAIN_LABEL_RE.match(line)
         if label_match is not None:
-            current = ParsedBlock(
-                name=label_match.group("quoted") or label_match.group("plain"),
-                raw_lines=[],
-                phis=[],
-                instructions=[],
-                terminator=None,
+            if block_names:
+                raw_line_spans.append2(
+                    current_start,
+                    len(raw_lines) - current_start,
+                )
+            block_names.append(
+                label_match.group("quoted") or label_match.group("plain")
             )
-            blocks.append(current)
+            current_start = len(raw_lines)
             continue
-        if current is None:
+        if not block_names:
             raise BackendUnavailable(
                 f"self backend expected a labeled basic block in {function_name!r}: {line}"
             )
-        current.raw_lines.append(line)
+        raw_lines.append(line)
 
-    if not blocks:
+    if not block_names:
         raise BackendUnavailable(
             f"self backend found no basic blocks in {function_name!r}"
         )
+    raw_line_spans.append2(current_start, len(raw_lines) - current_start)
 
-    for block in blocks:
-        _parse_block(function_name, block)
-    return _filter_reachable_blocks(blocks)
+    block_plane = _FunctionBlockPlane(block_names)
+    old_block_id = 0
+    while old_block_id < len(block_names):
+        block_plane.parse_block(
+            function_name,
+            old_block_id,
+            raw_lines,
+            raw_line_spans.get_unchecked(old_block_id * 2),
+            raw_line_spans.get_unchecked(old_block_id * 2 + 1),
+        )
+        old_block_id += 1
+    raw_line_spans.close()
+    raw_lines = []
+    return [], _finish_indexed_block_plane(
+        function_name,
+        args,
+        block_names,
+        block_plane,
+    )
 
 
 def _terminator_successors(term: ParsedInstr | None) -> tuple[str, ...]:
@@ -1996,6 +2975,51 @@ def _indexed_phi_edge_survives(
     return _block_branches_to(blocks[predecessor_index], target_name)
 
 
+def _packed_phi_edge_survives(
+    terminators: _FunctionBlockPlane,
+    reachable_indices: set[int],
+    predecessor_name: str,
+    target_id: int,
+) -> bool:
+    predecessor_id = terminators.block_id(predecessor_name)
+    if predecessor_id not in reachable_indices:
+        return False
+    return terminators.branches_to(predecessor_id, target_id)
+
+
+def _filter_reachable_blocks_indexed(
+    terminators: _FunctionBlockPlane,
+) -> list[int]:
+    """Return reachable old block IDs through the packed construction plane."""
+
+    if not terminators.block_names:
+        return []
+    reachable_indices: set[int] = set()
+    worklist = [0]
+    while worklist:
+        block_id = worklist.pop()
+        if block_id in reachable_indices:
+            continue
+        reachable_indices.add(block_id)
+        successor_index = 0
+        successor_count = terminators.successor_count(block_id)
+        while successor_index < successor_count:
+            successor_id = terminators.successor_ref(
+                block_id,
+                successor_index,
+            )
+            if successor_id >= 0 and successor_id not in reachable_indices:
+                worklist.append(successor_id)
+            successor_index += 1
+
+    reachable_old_ids = [
+        block_id
+        for block_id in range(len(terminators.block_names))
+        if block_id in reachable_indices
+    ]
+    return reachable_old_ids
+
+
 def _filter_reachable_blocks(blocks: list[ParsedBlock]) -> list[ParsedBlock]:
     if not blocks:
         return blocks
@@ -2032,7 +3056,7 @@ def _filter_reachable_blocks(blocks: list[ParsedBlock]) -> list[ParsedBlock]:
     for block in filtered:
         if not block.phis:
             continue
-        block.phis = [
+        block.phis = tuple(
             PhiInstr(
                 dest=phi.dest,
                 type=phi.type,
@@ -2049,7 +3073,7 @@ def _filter_reachable_blocks(blocks: list[ParsedBlock]) -> list[ParsedBlock]:
                 ),
             )
             for phi in block.phis
-        ]
+        )
     return filtered
 
 
@@ -2115,7 +3139,7 @@ def _filter_reachable_blocks_linear(blocks: list[ParsedBlock]) -> list[ParsedBlo
     for block in filtered:
         if not block.phis:
             continue
-        block.phis = [
+        block.phis = tuple(
             PhiInstr(
                 dest=phi.dest,
                 type=phi.type,
@@ -2131,7 +3155,7 @@ def _filter_reachable_blocks_linear(blocks: list[ParsedBlock]) -> list[ParsedBlo
                 ),
             )
             for phi in block.phis
-        ]
+        )
     return filtered
 
 
@@ -2151,8 +3175,24 @@ def _filtered_blocks_drop_referenced_target(
 _EMPTY_BLOCK_LINES: tuple = ()
 
 
-def _parse_block(function_name: str, block: ParsedBlock) -> None:
+def _instruction_destination_from_line(line: str) -> str | None:
+    """Read the SSA definition spelling without decoding the payload.
+
+    LLVM instructions define a value only through a leading ``%name =``.
+    This deliberately stays lenient: the full parser still owns malformed
+    instruction diagnostics after the definitions-first seed is populated.
+    """
+    if "=" not in line:
+        return None
+    dest_text = line.split("=", 1)[0].strip()
+    if not dest_text.startswith("%"):
+        return None
+    return decode_ssa_name(dest_text)
+
+
+def _parse_block_structure(function_name: str, block: ParsedBlock) -> str:
     lines = list(block.raw_lines)
+    parsed_phis = None
     while lines and _PHI_RE.match(lines[0]):
         phi_match = _PHI_RE.match(lines.pop(0))
         assert phi_match is not None
@@ -2166,13 +3206,16 @@ def _parse_block(function_name: str, block: ParsedBlock) -> None:
                     label=decode_label_ref(label_text.strip()),
                 )
             )
-        block.phis.append(
+        if parsed_phis is None:
+            parsed_phis = []
+        parsed_phis.append(
             PhiInstr(
                 dest=decode_ssa_name(phi_match.group("dest")),
                 type=_parse_type(type_text),
                 incoming=tuple(incoming_entries),
             )
         )
+    block.phis = () if parsed_phis is None else tuple(parsed_phis)
 
     if not lines:
         raise BackendUnavailable(
@@ -2199,15 +3242,66 @@ def _parse_block(function_name: str, block: ParsedBlock) -> None:
             terminator_line = line
             break
 
-    for line in instruction_lines:
-        block.instructions.append(_parse_instruction(function_name, block.name, line))
-    block.terminator = _parse_terminator(function_name, block.name, terminator_line)
-    # Release the source lines: this is their only consumer, and every later
-    # phase reads the parsed instruction arena instead.  Holding them kept one
-    # Python str per IR line alive for the whole emit -- 423698 of them for a
-    # single 43 MB module -- which is pure duplication of text the emitter has
-    # already finished with.
-    block.raw_lines = _EMPTY_BLOCK_LINES
+    block.raw_lines = instruction_lines
+    block.terminator = None
+    return terminator_line
+
+
+def _parse_block_instructions(
+    function_name: str,
+    block_name: str,
+    instruction_lines: list[str],
+    line_start: int,
+    line_count: int,
+    indexed_seed: IndexedFunctionSeed,
+) -> None:
+    instruction_start = len(indexed_seed.instruction_metadata) // 4
+    line_index = 0
+    while line_index < line_count:
+        line = instruction_lines[line_start + line_index]
+        if (
+            " asm " not in line
+            and _is_call_instruction_shape(line)
+        ):
+            parsed_call = _parse_call_instruction(
+                function_name,
+                block_name,
+                line,
+                indexed_seed,
+            )
+            if parsed_call is not None:
+                raise BackendUnavailable(
+                    "indexed call parser returned an object projection"
+                )
+            line_index += 1
+            continue
+        if _parse_indexed_hot_instruction(
+            function_name,
+            block_name,
+            line,
+            indexed_seed,
+        ):
+            line_index += 1
+            continue
+        parsed = _parse_instruction(function_name, block_name, line)
+        dest = _instruction_destination_from_line(line)
+        dest_value_id = -1 if dest is None else indexed_seed.value_id(dest)
+        payload_id = indexed_seed.append_cold_instruction_data(parsed.data)
+        indexed_seed.append_instruction(
+            parsed.kind,
+            payload_id,
+            dest_value_id,
+            parsed.is_volatile,
+            parsed.arithmetic_flags,
+        )
+        line_index += 1
+
+    indexed_seed.append_block_fact(
+        instruction_start,
+        line_count,
+        0,
+        -1,
+    )
 
 
 def _parse_binop_instruction(line: str) -> ParsedInstr | None:
@@ -2416,10 +3510,10 @@ def _call_instr_from_parts(
     sig_text: str | None,
     callee_token: str,
     args_text: str,
-) -> ParsedInstr:
+    call_plane: IndexedFunctionSeed | None = None,
+) -> ParsedInstr | None:
     ret_type = _parse_type(ret_text)
     fixed_arg_count, is_vararg_call = _parse_call_signature(sig_text)
-    args, arg_alignments = _parse_call_args(function_name, args_text)
     if ret_type.is_void and dest is not None:
         raise BackendUnavailable(
             f"self backend saw void call with SSA destination in {function_name!r}/{block_name!r}: {line}"
@@ -2428,16 +3522,39 @@ def _call_instr_from_parts(
         raise BackendUnavailable(
             f"self backend saw non-void call without destination in {function_name!r}/{block_name!r}: {line}"
         )
+    decoded_dest = None if dest is None else decode_ssa_name(dest)
+    decoded_callee = (
+        decode_global_name(callee_token)
+        if callee_token.startswith("@")
+        else decode_ssa_name(callee_token)
+    )
+    if not callee_token.startswith("%"):
+        check_simple_symbol_name(decoded_callee)
+    if call_plane is not None:
+        arg_start = len(call_plane.args) // 4
+        arg_count = _parse_call_args_into_plane(
+            function_name,
+            args_text,
+            call_plane,
+        )
+        call_plane.append_parsed_call(
+            decoded_dest,
+            ret_type,
+            decoded_callee,
+            callee_token.startswith("%"),
+            arg_start,
+            arg_count,
+            fixed_arg_count,
+            is_vararg_call,
+        )
+        return None
+    args, arg_alignments = _parse_call_args(function_name, args_text)
     return ParsedInstr(
         "call",
         (
-            None if dest is None else decode_ssa_name(dest),
+            decoded_dest,
             ret_type,
-            (
-                decode_global_name(callee_token)
-                if callee_token.startswith("@")
-                else decode_ssa_name(callee_token)
-            ),
+            decoded_callee,
             callee_token.startswith("%"),
             tuple(args),
             fixed_arg_count,
@@ -2447,16 +3564,200 @@ def _call_instr_from_parts(
     )
 
 
-def _parse_call_instruction(
-    function_name: str, block_name: str, line: str
-) -> ParsedInstr | None:
-    is_call_shape = (
-        line.startswith("call ")
-        or line.startswith("tail call ")
-        or " = call " in line
-        or " = tail call " in line
+def _parse_indexed_scalar_call_span(
+    function_name: str,
+    block_name: str,
+    line: str,
+    call_plane: IndexedFunctionSeed,
+) -> bool:
+    """Publish one canonical scalar call from integer spans, or decline."""
+
+    line_length = len(line)
+    if line_length == 0:
+        return False
+    first_code = ord(line[0])
+    last_code = ord(line[line_length - 1])
+    if (
+        first_code == 9
+        or first_code == 10
+        or first_code == 13
+        or first_code == 32
+        or last_code == 9
+        or last_code == 10
+        or last_code == 13
+        or last_code == 32
+    ):
+        return False
+
+    dest_start = -1
+    dest_end = -1
+    position = 0
+    assign_at = line.find(" = ")
+    if assign_at >= 0:
+        if assign_at <= 1 or ord(line[0]) != 37:
+            return False
+        if not (
+            _ascii_decimal_span(line, 1, assign_at)
+            or _ascii_plain_ir_name_span(line, 1, assign_at)
+        ):
+            return False
+        dest_start = 0
+        dest_end = assign_at
+        position = assign_at + 3
+
+    if _ascii_literal_at(line, position, "tail call "):
+        position += 10
+    elif _ascii_literal_at(line, position, "call "):
+        position += 5
+    else:
+        return False
+
+    ret_start = position
+    ret_end = line.find(" ", ret_start)
+    if ret_end <= ret_start or not _simple_ir_type_span(
+        line,
+        ret_start,
+        ret_end,
+        allow_void=True,
+    ):
+        return False
+    position = ret_end + 1
+    while position < line_length:
+        code = ord(line[position])
+        if code != 32 and code != 9:
+            break
+        position += 1
+    if position >= line_length or ord(line[position]) != 40:
+        return False
+
+    signature_start = position
+    signature_close = line.find(")", signature_start + 1)
+    if signature_close < 0:
+        return False
+    if line.find("(", signature_start + 1, signature_close) >= 0:
+        return False
+    signature_info = _simple_call_signature_span_info(
+        line,
+        signature_start + 1,
+        signature_close,
     )
+    if signature_info < 0:
+        return False
+    position = signature_close + 1
+    while position < line_length:
+        code = ord(line[position])
+        if code != 32 and code != 9:
+            break
+        position += 1
+
+    callee_start = position
+    args_open = line.find("(", callee_start)
+    args_close = line.rfind(")")
+    if args_open <= callee_start + 1 or args_close <= args_open:
+        return False
+    callee_first = ord(line[callee_start])
+    if callee_first == 37:
+        if not (
+            _ascii_decimal_span(line, callee_start + 1, args_open)
+            or _ascii_plain_ir_name_span(line, callee_start + 1, args_open)
+        ):
+            return False
+    elif callee_first == 64:
+        if not _ascii_plain_ir_name_span(line, callee_start + 1, args_open):
+            return False
+    else:
+        return False
+
+    args_start = args_open + 1
+    arg_count = _simple_call_arg_span_count(line, args_start, args_close)
+    if arg_count < 0:
+        return False
+
+    position = args_close + 1
+    while position < line_length:
+        code = ord(line[position])
+        if code != 32 and code != 9:
+            break
+        position += 1
+    if position < line_length and ord(line[position]) == 35:
+        position += 1
+        digit_start = position
+        while position < line_length:
+            code = ord(line[position])
+            if code < 48 or code > 57:
+                break
+            position += 1
+        if position == digit_start:
+            return False
+        while position < line_length:
+            code = ord(line[position])
+            if code != 32 and code != 9:
+                break
+            position += 1
+    if position < line_length:
+        if ord(line[position]) != 44:
+            return False
+        position += 1
+        while position < line_length:
+            code = ord(line[position])
+            if code != 32 and code != 9:
+                break
+            position += 1
+        if position >= line_length or ord(line[position]) != 33:
+            return False
+
+    dest = None if dest_start < 0 else line[dest_start:dest_end]
+    ret_type = _parse_type(line[ret_start:ret_end])
+    if ret_type.is_void and dest is not None:
+        return False
+    if (not ret_type.is_void) and dest is None:
+        return False
+    decoded_dest = None if dest is None else decode_ssa_name(dest)
+    callee_token = line[callee_start:args_open]
+    decoded_callee = (
+        decode_global_name(callee_token)
+        if callee_first == 64
+        else decode_ssa_name(callee_token)
+    )
+    if callee_first == 64:
+        check_simple_symbol_name(decoded_callee)
+
+    arg_start = len(call_plane.args) // 4
+    _append_simple_call_arg_spans(
+        line,
+        args_start,
+        args_close,
+        call_plane,
+    )
+    call_plane.append_parsed_call(
+        decoded_dest,
+        ret_type,
+        decoded_callee,
+        callee_first == 37,
+        arg_start,
+        arg_count,
+        signature_info // 2,
+        (signature_info & 1) != 0,
+    )
+    return True
+
+
+def _parse_call_instruction(
+    function_name: str,
+    block_name: str,
+    line: str,
+    call_plane: IndexedFunctionSeed | None = None,
+) -> ParsedInstr | None:
+    is_call_shape = _is_call_instruction_shape(line)
     if not is_call_shape:
+        return None
+
+    if call_plane is not None and _parse_indexed_scalar_call_span(
+        function_name,
+        block_name,
+        line,
+        call_plane,
+    ):
         return None
 
     if match := _CALL_RE.match(line):
@@ -2469,6 +3770,7 @@ def _parse_call_instruction(
             match.group("sig"),
             match.group("callee"),
             match.group("args"),
+            call_plane,
         )
 
     dest: str | None = None
@@ -2521,7 +3823,361 @@ def _parse_call_instruction(
         sig_text,
         callee_match.group("callee"),
         rest[args_open + 1 : args_close],
+        call_plane,
     )
+
+
+def _is_call_instruction_shape(line: str) -> bool:
+    return (
+        line.startswith("call ")
+        or line.startswith("tail call ")
+        or " = call " in line
+        or " = tail call " in line
+    )
+
+
+def _parse_indexed_hot_instruction(
+    function_name: str,
+    block_name: str,
+    line: str,
+    indexed_seed: IndexedFunctionSeed,
+) -> bool:
+    """Publish the supported hot subset directly into final kernel records."""
+    dest = _instruction_destination_from_line(line)
+    dest_value_id = -1 if dest is None else indexed_seed.value_id(dest)
+
+    alloca_type = None
+    if match := _ALLOCA_RE.match(line):
+        alloca_type = _parse_type(match.group("type"))
+    elif "= alloca " in line:
+        _dest_text, rest = line.split("= alloca ", 1)
+        type_text, _tail = _extract_leading_type_token(rest)
+        alloca_type = _parse_type(type_text)
+    if alloca_type is not None:
+        if dest_value_id < 0:
+            raise BackendUnavailable(
+                "indexed function seed omitted an alloca destination"
+            )
+        allocated_type_id = indexed_seed.intern_type(alloca_type)
+        indexed_seed.publish_alloca_type_id(dest_value_id, allocated_type_id)
+        indexed_seed.publish_value_type_id(
+            dest_value_id,
+            indexed_seed.intern_type(alloca_type.ptr()),
+        )
+        indexed_seed.append_instruction(
+            "alloca",
+            dest_value_id,
+            dest_value_id,
+        )
+        return True
+
+    if line.startswith("store ") and not line.startswith("store atomic "):
+        raw_rest = line[len("store ") :]
+        is_volatile = raw_rest.strip().startswith("volatile ")
+        rest = _strip_volatile_memory_op_prefix(raw_rest)
+        value_type_text, rest = _extract_leading_type_token(rest)
+        value_text, rest = _split_top_level_once(rest, ",")
+        ptr_type_text, rest = _extract_leading_type_token(rest)
+        ptr_text = _first_top_level_piece(rest)
+        record_id = len(indexed_seed.instruction_record_scalars) // 4
+        indexed_seed.instruction_record_scalars.append4(
+            indexed_seed.intern_type(_parse_type(value_type_text)),
+            indexed_seed.operand_ref(decode_value_token(value_text)),
+            indexed_seed.intern_type(_parse_type(ptr_type_text)),
+            indexed_seed.operand_ref(decode_value_token(ptr_text)),
+        )
+        indexed_seed.instruction_record_dest_ids.append(-1)
+        indexed_seed.append_instruction(
+            "store",
+            record_id,
+            -1,
+            is_volatile,
+        )
+        return True
+
+    if "= load " in line and "= load atomic " not in line:
+        dest_text, rest = line.split("= load ", 1)
+        is_volatile = rest.strip().startswith("volatile ")
+        rest = _strip_volatile_memory_op_prefix(rest)
+        value_type_text, rest = _split_top_level_once(rest.strip(), ",")
+        ptr_type_text, rest = _extract_leading_type_token(rest)
+        ptr_text = _first_top_level_piece(rest)
+        value_type_id = indexed_seed.intern_type(_parse_type(value_type_text))
+        record_id = len(indexed_seed.instruction_record_scalars) // 4
+        indexed_seed.instruction_record_scalars.append4(
+            value_type_id,
+            indexed_seed.intern_type(_parse_type(ptr_type_text)),
+            indexed_seed.operand_ref(decode_value_token(ptr_text)),
+            0,
+        )
+        indexed_seed.instruction_record_dest_ids.append(dest_value_id)
+        indexed_seed.publish_value_type_id(dest_value_id, value_type_id)
+        indexed_seed.append_instruction(
+            "load",
+            record_id,
+            dest_value_id,
+            is_volatile,
+        )
+        return True
+
+    if "= getelementptr" in line:
+        _dest_text, rest = line.split("= getelementptr", 1)
+        parts = split_top_level(rest.strip())
+        if len(parts) < 3:
+            raise BackendUnavailable(
+                f"self backend malformed getelementptr in {function_name!r}/{block_name!r}: {line}"
+            )
+        base_type_text = parts[0].strip()
+        while True:
+            try:
+                base_type = _parse_type(base_type_text)
+                break
+            except BackendUnavailable:
+                pieces = base_type_text.split(None, 1)
+                if len(pieces) != 2 or not re.fullmatch(
+                    r"[A-Za-z_][A-Za-z0-9_]*", pieces[0]
+                ):
+                    raise
+                base_type_text = pieces[1].strip()
+        ptr_type_text, ptr_value_text = _extract_leading_type_token(parts[1])
+        ptr_type = _parse_type(ptr_type_text)
+        ptr_ref = indexed_seed.operand_ref(decode_value_token(ptr_value_text))
+        index_start = len(indexed_seed.gep_index_scalars) // 2
+        index_count = 0
+        current_type = base_type
+        for raw_index in parts[2:]:
+            index_type_text, index_value_text = _extract_leading_type_token(
+                raw_index.strip()
+            )
+            index_type = _parse_type(index_type_text)
+            index_value = decode_value_token(index_value_text)
+            indexed_seed.gep_index_scalars.append2(
+                indexed_seed.intern_type(index_type),
+                indexed_seed.operand_ref(index_value),
+            )
+            if index_count > 0:
+                if current_type.is_array:
+                    assert current_type.elem is not None
+                    current_type = current_type.elem
+                elif current_type.is_struct:
+                    field_index = const_int_from_value(index_value)
+                    if field_index is None:
+                        raise BackendUnavailable(
+                            "self backend struct getelementptr currently requires constant field indices"
+                        )
+                    current_type = current_type.field_type(field_index)
+                else:
+                    raise BackendUnavailable(
+                        "self backend cannot index into scalar pointee "
+                        f"{current_type.describe()} with more getelementptr indices"
+                    )
+            index_count += 1
+        if index_count == 0:
+            raise BackendUnavailable(
+                "self backend getelementptr requires at least one index"
+            )
+        result_type_id = indexed_seed.intern_type(current_type.ptr())
+        record_id = len(indexed_seed.gep_scalars) // 8
+        indexed_seed.gep_scalars.append4(
+            indexed_seed.intern_type(base_type),
+            indexed_seed.intern_type(ptr_type),
+            ptr_ref,
+            index_start,
+        )
+        indexed_seed.gep_scalars.append4(
+            index_count,
+            result_type_id,
+            dest_value_id,
+            0,
+        )
+        indexed_seed.publish_value_type_id(dest_value_id, result_type_id)
+        indexed_seed.append_instruction(
+            "gep",
+            record_id,
+            dest_value_id,
+        )
+        return True
+
+    if "=" not in line:
+        return False
+    _dest_text, rest = line.split("=", 1)
+    rest = rest.strip()
+    pieces = rest.split(None, 1)
+    if len(pieces) != 2:
+        return False
+    op = pieces[0]
+
+    if op in {
+        "add",
+        "sub",
+        "mul",
+        "sdiv",
+        "udiv",
+        "srem",
+        "urem",
+        "and",
+        "or",
+        "xor",
+        "shl",
+        "lshr",
+        "ashr",
+    }:
+        typed_rest = pieces[1].strip()
+        arithmetic_flags: list[str] = []
+        while True:
+            try:
+                type_text, remainder = _extract_leading_type_token(typed_rest)
+                value_type = _parse_type(type_text)
+                break
+            except BackendUnavailable:
+                attr_pieces = typed_rest.split(None, 1)
+                if len(attr_pieces) != 2:
+                    return False
+                arithmetic_flags.append(attr_pieces[0])
+                typed_rest = attr_pieces[1].strip()
+        lhs_text, rhs_text = _split_top_level_once(remainder, ",")
+        value_type_id = indexed_seed.intern_type(value_type)
+        record_id = len(indexed_seed.instruction_record_scalars) // 4
+        indexed_seed.instruction_record_scalars.append4(
+            indexed_seed.intern_text(op),
+            value_type_id,
+            indexed_seed.operand_ref(decode_value_token(lhs_text)),
+            indexed_seed.operand_ref(decode_value_token(rhs_text)),
+        )
+        indexed_seed.instruction_record_dest_ids.append(dest_value_id)
+        indexed_seed.publish_value_type_id(dest_value_id, value_type_id)
+        flags = tuple(arithmetic_flags)
+        indexed_seed.append_instruction(
+            "binop",
+            record_id,
+            dest_value_id,
+            arithmetic_flags=flags,
+        )
+        return True
+
+    if op == "icmp":
+        typed_rest = pieces[1].strip()
+        if typed_rest.startswith("samesign "):
+            typed_rest = typed_rest[len("samesign ") :].strip()
+        cond_parts = typed_rest.split(None, 1)
+        if len(cond_parts) != 2:
+            return False
+        cond, typed_rest = cond_parts
+        if cond not in {
+            "eq",
+            "ne",
+            "slt",
+            "sle",
+            "sgt",
+            "sge",
+            "ult",
+            "ule",
+            "ugt",
+            "uge",
+        }:
+            return False
+        type_text, typed_rest = _extract_leading_type_token(typed_rest)
+        lhs_text, rhs_text = _split_top_level_once(typed_rest, ",")
+        value_type = _parse_type(type_text)
+        value_type_id = indexed_seed.intern_type(value_type)
+        result_type = (
+            TypeDesc("array", count=value_type.count, elem=I1)
+            if value_type.is_array and value_type.elem is not None
+            else I1
+        )
+        result_type_id = indexed_seed.intern_type(result_type)
+        record_id = len(indexed_seed.instruction_record_scalars) // 4
+        indexed_seed.instruction_record_scalars.append4(
+            indexed_seed.intern_text(cond),
+            value_type_id,
+            indexed_seed.operand_ref(decode_value_token(lhs_text)),
+            indexed_seed.operand_ref(decode_value_token(rhs_text)),
+        )
+        indexed_seed.instruction_record_dest_ids.append(dest_value_id)
+        indexed_seed.publish_value_type_id(dest_value_id, result_type_id)
+        indexed_seed.append_instruction(
+            "icmp",
+            record_id,
+            dest_value_id,
+        )
+        return True
+
+    if match := _CAST_RE.match(line):
+        src_type_id = indexed_seed.intern_type(
+            _parse_type(match.group("src_type"))
+        )
+        dst_type_id = indexed_seed.intern_type(
+            _parse_type(match.group("dst_type"))
+        )
+        record_id = len(indexed_seed.instruction_record_scalars) // 4
+        indexed_seed.instruction_record_scalars.append4(
+            indexed_seed.intern_text(match.group("op")),
+            src_type_id,
+            indexed_seed.operand_ref(
+                decode_value_token(match.group("value"))
+            ),
+            dst_type_id,
+        )
+        indexed_seed.instruction_record_dest_ids.append(dest_value_id)
+        indexed_seed.publish_value_type_id(dest_value_id, dst_type_id)
+        indexed_seed.append_instruction(
+            "cast",
+            record_id,
+            dest_value_id,
+        )
+        return True
+
+    if op != "select" and "= select " not in line:
+        return False
+    select_rest = pieces[1].strip()
+    while not select_rest.startswith("i1 "):
+        select_parts = select_rest.split(None, 1)
+        if len(select_parts) != 2 or not re.fullmatch(
+            r"[A-Za-z_][A-Za-z0-9_]*", select_parts[0]
+        ):
+            break
+        select_rest = select_parts[1].strip()
+    cond_type_text, select_rest = _extract_leading_type_token(select_rest)
+    cond_value_text, select_rest = _split_top_level_once(select_rest, ",")
+    true_type_text, select_rest = _extract_leading_type_token(select_rest)
+    true_value_text, select_rest = _split_top_level_once(select_rest, ",")
+    false_type_text, false_value_text = _extract_leading_type_token(select_rest)
+    cond_type = _parse_type(cond_type_text)
+    true_type = _parse_type(true_type_text)
+    false_type = _parse_type(false_type_text)
+    if not (
+        (cond_type.is_int and cond_type.width == 1)
+        or (
+            cond_type.is_array
+            and cond_type.elem is not None
+            and cond_type.elem.is_int
+            and cond_type.elem.width == 1
+        )
+    ):
+        raise BackendUnavailable(
+            f"self backend select parser expected i1 or vector-i1 condition in {function_name!r}/{block_name!r}: {line}"
+        )
+    if true_type.describe() != false_type.describe():
+        raise BackendUnavailable(
+            "self backend select parser expected matching arm types in "
+            f"{function_name!r}/{block_name!r}: {line}"
+        )
+    result_type_id = indexed_seed.intern_type(true_type)
+    record_id = len(indexed_seed.instruction_record_scalars) // 4
+    indexed_seed.instruction_record_scalars.append4(
+        result_type_id,
+        indexed_seed.operand_ref(decode_value_token(cond_value_text)),
+        indexed_seed.operand_ref(decode_value_token(true_value_text)),
+        indexed_seed.operand_ref(decode_value_token(false_value_text)),
+    )
+    indexed_seed.instruction_record_dest_ids.append(dest_value_id)
+    indexed_seed.publish_value_type_id(dest_value_id, result_type_id)
+    indexed_seed.append_instruction(
+        "select",
+        record_id,
+        dest_value_id,
+    )
+    return True
 
 
 def _parse_instruction(function_name: str, block_name: str, line: str) -> ParsedInstr:
@@ -2987,6 +4643,42 @@ def _parse_call_args(
                 arg_value = "1"
         args.append((arg_type, arg_value))
     return args, tuple(alignments)
+
+
+def _parse_call_args_into_plane(
+    function_name: str,
+    args_text: str,
+    call_plane: IndexedCallPlane,
+) -> int:
+    text = (args_text or "").strip()
+    if not text:
+        return 0
+    arg_count = 0
+    for raw_chunk in split_top_level(text):
+        chunk = raw_chunk.strip()
+        if not chunk:
+            continue
+        try:
+            type_text, value_text = _extract_leading_type_token(chunk)
+        except BackendUnavailable as exc:
+            raise BackendUnavailable(
+                f"self backend could not decode call arg in {function_name!r}: {chunk}"
+            ) from exc
+        if not value_text:
+            raise BackendUnavailable(
+                f"self backend call arg missing value in {function_name!r}: {chunk}"
+            )
+        alignment = _parse_call_arg_alignment(value_text)
+        arg_type = _parse_type(type_text)
+        arg_value = decode_value_token(value_text)
+        if arg_type.is_int and arg_type.width == 1:
+            if arg_value == "false":
+                arg_value = "0"
+            elif arg_value == "true":
+                arg_value = "1"
+        call_plane.append_arg(arg_type, arg_value, alignment)
+        arg_count += 1
+    return arg_count
 
 
 def _parse_extractvalue_indices(indices_text: str) -> list[int]:

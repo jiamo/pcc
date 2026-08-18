@@ -38,7 +38,7 @@ Options:
                             closed-world IR-builder lowering (Issue 1).
   --pass NAME               Repeat to enable only the named pass(es).
   --disable-pass NAME       Repeat to disable named pass(es).
-  --llvmdump                Dump LLVM IR to temp files.
+  --llvmdump                Dump LLVM artifacts under the pcc cache.
   -g, --debug               Generate DWARF debug information.
   --separate-tus            Compile directory inputs as separate translation units.
   --jobs N                  Parallel jobs for multi-input or system-link modes.
@@ -1552,6 +1552,12 @@ def _cli_main_impl(argv=None) -> int:
     while i < len(prog_args_raw):
         prog_args.append((prog_args_raw[i] or "") + "")
         i += 1
+    if _normalize_cli_flag(emit_debug_raw):
+        # Set before the Python branch below returns: that branch never reaches
+        # the C path's normalization block further down.  The Python frontend
+        # reads this in ``debug_info_lowering``; the C frontend takes
+        # ``emit_debug`` through its own evaluator argument.
+        os.environ["PCC_PY_DEBUG_INFO"] = "1"
     if path.endswith(".py"):
         if freestanding_libc_raw:
             _write_text(

@@ -245,7 +245,7 @@ PyObject *py_obj_as_int_object(PyObject *o, int base) {
 
 PyObject *py_int_from_cstr_or_raise(const char *s, int base) {
     if (base != 0 && (base < 2 || base > 36)) {
-        py_raise(py_exc_new(PY_EXC_VALUEERROR,
+        py_raise_owned(py_exc_new(PY_EXC_VALUEERROR,
                             "int() base must be >= 2 and <= 36, or 0"));
         return NULL;
     }
@@ -254,10 +254,10 @@ PyObject *py_int_from_cstr_or_raise(const char *s, int base) {
         const char *src = (s != NULL) ? s : "";
         char *msg = build_bad_literal_message(src, base);
         if (msg != NULL) {
-            py_raise(py_exc_new(PY_EXC_VALUEERROR, msg));
+            py_raise_owned(py_exc_new(PY_EXC_VALUEERROR, msg));
             free(msg);
         } else {
-            py_raise(py_exc_new(PY_EXC_VALUEERROR,
+            py_raise_owned(py_exc_new(PY_EXC_VALUEERROR,
                                 "invalid literal for int()"));
         }
     }

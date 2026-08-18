@@ -10,6 +10,8 @@ specific register set or calling convention.
 from dataclasses import dataclass, field
 
 from . import BackendUnavailable
+from .self_backend_call_flags import classify_call_flags
+from .self_backend_value_arena import CompilerInt4, CompilerIntArena
 
 
 def _dot_numeric_text_key_id(text: str) -> int:
@@ -21,6 +23,11 @@ def _dot_numeric_text_key_id(text: str) -> int:
     if suffix and suffix.isdigit():
         return int(suffix)
     return -1
+
+
+def dot_numeric_text_key_id(text: str) -> int:
+    """Public name for the dot-numeric id; callers key sets/dicts on it."""
+    return _dot_numeric_text_key_id(text)
 
 
 def text_key_names_equal(left: str, right: str) -> bool:
@@ -44,14 +51,14 @@ def text_collection_contains(values, key: str) -> bool:
     return False
 
 
-_TEXT_KEY_BUCKET_MOD = 1000000007
-
-
 def _text_key_bucket_id(text: str) -> int:
     """Deterministic char-based hash; native str hashing may false-miss."""
+    mask = 1099511627775
     value = 0
-    for ch in text:
-        value = (value * 33 + ord(ch)) % _TEXT_KEY_BUCKET_MOD
+    index = 0
+    while index < len(text):
+        value = (value * 131 + ord(text[index])) & mask
+        index += 1
     return value
 
 
@@ -117,6 +124,23 @@ def _text_key_index(mapping) -> tuple[dict[int, str], dict[int, list[str]]]:
     return by_id, by_bucket
 
 
+def _text_key_mapping_value_without_hash(mapping, existing_key):
+    """Read an indexed key's current value without hashing that key again.
+
+    Native bootstrap can corrupt/change a string's cached hash after the key
+    entered a dict.  The stable text index still finds the original key by
+    contents, but ``mapping[existing_key]`` would hash it again and false-miss.
+    This linear scan runs only after the stable bucket has found a real text
+    match; absent-key lookups keep the indexed O(1) path.
+    """
+    for candidate_key, candidate_value in mapping.items():
+        if candidate_key is existing_key or text_key_names_equal(
+            candidate_key, existing_key
+        ):
+            return candidate_value
+    return None
+
+
 def text_key_mapping_get(mapping, key: str):
     """Return a text-keyed mapping value despite a false hash miss."""
     result = mapping.get(key)
@@ -139,17 +163,194 @@ def text_key_mapping_get(mapping, key: str):
     bucket = _text_key_bucket_id(key)
     if bucket in by_bucket:
         for existing_key in by_bucket[bucket]:
-            if existing_key == key and existing_key in mapping:
-                return mapping[existing_key]
+            if existing_key == key:
+                return _text_key_mapping_value_without_hash(
+                    mapping, existing_key
+                )
     if key_id >= 0 and key_id in by_id:
         existing_key = by_id[key_id]
-        if existing_key in mapping:
-            return mapping[existing_key]
+        return _text_key_mapping_value_without_hash(mapping, existing_key)
     return None
 
 
-def parsed_function_value_slot(func, key: str):
+def _parsed_function_slot_bucket_get(buckets, key: str):
+    bucket = buckets.get(_text_key_bucket_id(key))
+    if bucket is None:
+        return None
+    for existing_name, slot in bucket:
+        if text_key_names_equal(existing_name, key):
+            return slot
+    return None
+
+
+def _parsed_function_slot_bucket_set(buckets, key: str, slot) -> None:
+    bucket_id = _text_key_bucket_id(key)
+    bucket = buckets.get(bucket_id)
+    if bucket is None:
+        bucket = []
+        buckets[bucket_id] = bucket
+    for index, entry in enumerate(bucket):
+        if text_key_names_equal(entry[0], key):
+            bucket[index] = (entry[0], slot)
+            return
+    bucket.append((key, slot))
+
+
+def parsed_function_publish_value_slot(func, key: str, slot) -> None:
+    func.value_slots[key] = slot
+    _parsed_function_slot_bucket_set(func.value_slot_buckets, key, slot)
+
+
+def parsed_function_publish_alloca_slot(func, key: str, slot) -> None:
+    func.alloca_slots[key] = slot
+    _parsed_function_slot_bucket_set(func.alloca_slot_buckets, key, slot)
+
+
+def _parsed_function_value_slot_raw(func, key: str):
+    direct = func.value_slots.get(key)
+    if direct is not None:
+        return direct
+    slot = _parsed_function_slot_bucket_get(func.value_slot_buckets, key)
+    if slot is not None:
+        return slot
     return text_key_mapping_get(func.value_slots, key)
+
+
+def _parsed_function_alloca_slot_raw(func, key: str):
+    direct = func.alloca_slots.get(key)
+    if direct is not None:
+        return direct
+    slot = _parsed_function_slot_bucket_get(func.alloca_slot_buckets, key)
+    if slot is not None:
+        return slot
+    return text_key_mapping_get(func.alloca_slots, key)
+
+
+def parsed_function_value_slot_id(func, key: str) -> int:
+    if func.indexed_slot_projection:
+        kernel = func.indexed_kernel
+        value_id = kernel.value_id(key)
+        return -1 if value_id < 0 else kernel.value_slot_id(value_id)
+    raw = _parsed_function_value_slot_raw(func, key)
+    if raw is None:
+        return -1
+    if func.indexed_slot_projection:
+        return raw
+    kernel = func.indexed_kernel
+    value_id = kernel.value_id(key)
+    return -1 if value_id < 0 else kernel.value_slot_id(value_id)
+
+
+def parsed_function_value_slot_offset(func, key: str) -> int:
+    if func.indexed_slot_projection:
+        slot_id = parsed_function_value_slot_id(func, key)
+        return -1 if slot_id < 0 else func.indexed_kernel.slot_offset(slot_id)
+    raw = _parsed_function_value_slot_raw(func, key)
+    if raw is None:
+        return -1
+    if func.indexed_slot_projection:
+        return func.indexed_kernel.slot_offset(raw)
+    return raw.offset
+
+
+def parsed_function_value_slot_type(func, key: str):
+    if func.indexed_slot_projection:
+        slot_id = parsed_function_value_slot_id(func, key)
+        if slot_id < 0:
+            return None
+        kernel = func.indexed_kernel
+        return kernel.type_desc(kernel.slot_type_id(slot_id))
+    raw = _parsed_function_value_slot_raw(func, key)
+    if raw is None:
+        return None
+    if func.indexed_slot_projection:
+        kernel = func.indexed_kernel
+        return kernel.type_desc(kernel.slot_type_id(raw))
+    return raw.type
+
+
+def parsed_function_alloca_value_id(func, key: str) -> int:
+    if func.indexed_slot_projection:
+        value_id = func.indexed_kernel.value_id(key)
+        if value_id < 0 or func.indexed_kernel.alloca_offset(value_id) < 0:
+            return -1
+        return value_id
+    raw = _parsed_function_alloca_slot_raw(func, key)
+    if raw is None:
+        return -1
+    if func.indexed_slot_projection:
+        return raw
+    return func.indexed_kernel.value_id(key)
+
+
+def parsed_function_alloca_slot_offset(func, key: str) -> int:
+    if func.indexed_slot_projection:
+        value_id = parsed_function_alloca_value_id(func, key)
+        return -1 if value_id < 0 else func.indexed_kernel.alloca_offset(value_id)
+    raw = _parsed_function_alloca_slot_raw(func, key)
+    if raw is None:
+        return -1
+    if func.indexed_slot_projection:
+        return func.indexed_kernel.alloca_offset(raw)
+    return raw.offset
+
+
+def parsed_function_alloca_slot_type(func, key: str):
+    if func.indexed_slot_projection:
+        value_id = parsed_function_alloca_value_id(func, key)
+        if value_id < 0:
+            return None
+        kernel = func.indexed_kernel
+        return kernel.type_desc(kernel.alloca_type_id(value_id))
+    raw = _parsed_function_alloca_slot_raw(func, key)
+    if raw is None:
+        return None
+    if func.indexed_slot_projection:
+        kernel = func.indexed_kernel
+        return kernel.type_desc(kernel.alloca_type_id(raw))
+    return raw.allocated_type
+
+
+def parsed_function_value_slot(func, key: str):
+    if func.indexed_slot_projection:
+        slot_id = parsed_function_value_slot_id(func, key)
+        if slot_id < 0:
+            return None
+        kernel = func.indexed_kernel
+        kernel.legacy_slot_projections += 1
+        return SlotInfo(
+            kernel.slot_offset(slot_id),
+            kernel.type_desc(kernel.slot_type_id(slot_id)),
+        )
+    raw = _parsed_function_value_slot_raw(func, key)
+    return raw
+
+
+def parsed_function_alloca_slot(func, key: str):
+    if func.indexed_slot_projection:
+        value_id = parsed_function_alloca_value_id(func, key)
+        if value_id < 0:
+            return None
+        kernel = func.indexed_kernel
+        kernel.legacy_slot_projections += 1
+        return AllocaInfo(
+            kernel.alloca_offset(value_id),
+            kernel.type_desc(kernel.alloca_type_id(value_id)),
+        )
+    raw = _parsed_function_alloca_slot_raw(func, key)
+    return raw
+
+
+def parsed_function_has_value_slot(func, key: str) -> bool:
+    if func.indexed_slot_projection:
+        return parsed_function_value_slot_id(func, key) >= 0
+    return _parsed_function_value_slot_raw(func, key) is not None
+
+
+def parsed_function_has_alloca_slot(func, key: str) -> bool:
+    if func.indexed_slot_projection:
+        return parsed_function_alloca_value_id(func, key) >= 0
+    return _parsed_function_alloca_slot_raw(func, key) is not None
 
 
 def _align_to(value: int, alignment: int) -> int:
@@ -384,9 +585,10 @@ class ParsedInstr:
 
 
 # One stable ID table for the complete parse-boundary instruction vocabulary.
-# IDs are persisted only inside the in-memory block arena; the public/debug
-# projection remains ``ParsedInstr.kind`` so diagnostics and target emitters do
-# not inherit a representation-specific integer protocol.
+# IDs are persisted inside the indexed kernel and are the supported direct
+# backend protocol.  ``ParsedInstr.kind`` remains the public/debug/legacy
+# projection; hot indexed consumers must keep the integer instead of restoring
+# the string merely to dispatch on it again.
 PARSED_INSTRUCTION_KINDS = (
     "alloca",
     "atomicrmw",
@@ -420,6 +622,37 @@ PARSED_INSTRUCTION_KINDS = (
     "unreachable",
     "va_arg",
 )
+PARSED_INSTRUCTION_KIND_ALLOCA = 0
+PARSED_INSTRUCTION_KIND_ATOMICRMW = 1
+PARSED_INSTRUCTION_KIND_BINOP = 2
+PARSED_INSTRUCTION_KIND_BR = 3
+PARSED_INSTRUCTION_KIND_BR_COND = 4
+PARSED_INSTRUCTION_KIND_CALL = 5
+PARSED_INSTRUCTION_KIND_CAST = 6
+PARSED_INSTRUCTION_KIND_CMPXCHG = 7
+PARSED_INSTRUCTION_KIND_EXTRACTELEMENT = 8
+PARSED_INSTRUCTION_KIND_EXTRACTVALUE = 9
+PARSED_INSTRUCTION_KIND_FBINOP = 10
+PARSED_INSTRUCTION_KIND_FCMP = 11
+PARSED_INSTRUCTION_KIND_FENCE = 12
+PARSED_INSTRUCTION_KIND_FNEG = 13
+PARSED_INSTRUCTION_KIND_FREEZE = 14
+PARSED_INSTRUCTION_KIND_GEP = 15
+PARSED_INSTRUCTION_KIND_ICMP = 16
+PARSED_INSTRUCTION_KIND_INSERTELEMENT = 17
+PARSED_INSTRUCTION_KIND_INSERTVALUE = 18
+PARSED_INSTRUCTION_KIND_LOAD = 19
+PARSED_INSTRUCTION_KIND_LOAD_ATOMIC = 20
+PARSED_INSTRUCTION_KIND_RET = 21
+PARSED_INSTRUCTION_KIND_RET_VOID = 22
+PARSED_INSTRUCTION_KIND_SELECT = 23
+PARSED_INSTRUCTION_KIND_SHUFFLEVECTOR = 24
+PARSED_INSTRUCTION_KIND_STORE = 25
+PARSED_INSTRUCTION_KIND_STORE_ATOMIC = 26
+PARSED_INSTRUCTION_KIND_SWITCH = 27
+PARSED_INSTRUCTION_KIND_SYSCALL6 = 28
+PARSED_INSTRUCTION_KIND_UNREACHABLE = 29
+PARSED_INSTRUCTION_KIND_VA_ARG = 30
 _PARSED_INSTRUCTION_KIND_IDS = {
     name: index for index, name in enumerate(PARSED_INSTRUCTION_KINDS)
 }
@@ -453,9 +686,9 @@ class CompactParsedInstrView:
                 f"corrupt parsed-instruction kind id {kind_id}"
             )
         self.kind = PARSED_INSTRUCTION_KINDS[kind_id]
-        self.data = arena._data[dense_id]
-        self.is_volatile = bool(arena._volatile[dense_id])
-        self.arithmetic_flags = arena._arithmetic_flags[dense_id]
+        self.data = arena.instruction_data(dense_id)
+        self.is_volatile = arena.is_volatile(dense_id)
+        self.arithmetic_flags = arena.arithmetic_flags(dense_id)
         self._arena = arena
         self._dense_id = dense_id
 
@@ -600,6 +833,190 @@ def reset_operand_intern() -> None:
     _OPERAND_INTERN.clear()
 
 
+class IndexedCallPlane:
+    """Parser-owned construction view of the kernel's final call arenas.
+
+    The scalar layouts are already the layouts consumed by verification,
+    stack maps and emit.  During parsing, text IDs temporarily occupy the
+    destination/value slots whose dense value IDs do not exist yet.  Kernel
+    construction resolves those fields in place and takes ownership of the
+    same arenas; it never decodes or copies an intermediate call record.
+    """
+
+    records: CompilerIntArena
+    args: CompilerIntArena
+    texts: list[str]
+    types: list[TypeDesc]
+    text_identity_ids: dict[int, int]
+    type_identity_ids: dict[int, tuple[int, TypeDesc]]
+    diagnostic_projections: int
+
+    __slots__ = (
+        "records",
+        "args",
+        "texts",
+        "types",
+        "text_identity_ids",
+        "type_identity_ids",
+        "diagnostic_projections",
+    )
+
+    def __init__(self) -> None:
+        self.records = CompilerIntArena()
+        self.args = CompilerIntArena()
+        self.texts: list[str] = []
+        self.types: list[TypeDesc] = []
+        self.text_identity_ids: dict[int, int] = {}
+        self.type_identity_ids: dict[int, tuple[int, TypeDesc]] = {}
+        self.diagnostic_projections = 0
+
+    def intern_text(self, text: str) -> int:
+        if text in _OPERAND_INTERN:
+            canonical = _OPERAND_INTERN[text]
+        else:
+            _OPERAND_INTERN[text] = text
+            canonical = text
+        identity = id(canonical)
+        if identity in self.text_identity_ids:
+            return self.text_identity_ids[identity]
+        text_id = len(self.texts)
+        self.texts.append(canonical)
+        self.text_identity_ids[identity] = text_id
+        return text_id
+
+    def intern_type(self, value_type: TypeDesc) -> int:
+        identity = id(value_type)
+        if identity in self.type_identity_ids:
+            identity_entry = self.type_identity_ids[identity]
+            if identity_entry[1] is value_type:
+                return identity_entry[0]
+        type_id = 0
+        while type_id < len(self.types):
+            if self.types[type_id] == value_type:
+                # Do not cache a short-lived equal wrapper by id.  With no
+                # entry there is nothing stale for a recycled address to hit;
+                # only the canonical object receives an identity entry.
+                return type_id
+            type_id += 1
+        type_id = len(self.types)
+        self.types.append(value_type)
+        self.type_identity_ids[identity] = (type_id, value_type)
+        if value_type.is_ptr and value_type.pointee is not None:
+            self.intern_type(value_type.pointee)
+        elif value_type.is_array and value_type.elem is not None:
+            self.intern_type(value_type.elem)
+        elif value_type.is_struct:
+            for field_type in value_type.fields:
+                self.intern_type(field_type)
+        return type_id
+
+    def append_arg(
+        self,
+        value_type: TypeDesc,
+        value: str,
+        alignment: int,
+    ) -> None:
+        # Final layout: type ID, local value ID, cold text ID, alignment.  The
+        # value is unresolved while parsing, so its text ID temporarily lives
+        # in the cold slot and the kernel patches the local-ID slot in place.
+        self.args.append4(
+            self.intern_type(value_type),
+            -1,
+            self.intern_text(value),
+            alignment,
+        )
+
+    def append_call(
+        self,
+        dest: str | None,
+        ret_type: TypeDesc,
+        callee: str,
+        is_indirect: bool,
+        arg_start: int,
+        arg_count: int,
+        fixed_arg_count: int,
+        is_vararg: bool,
+    ) -> int:
+        call_id = len(self.records) // 8
+        flags = classify_call_flags(callee, is_indirect, is_vararg)
+        self.records.append4(
+            self.intern_type(ret_type),
+            self.intern_text(callee),
+            flags,
+            arg_start,
+        )
+        # Final layout: arg count, fixed count, destination value ID, liveness
+        # state ID.  Before the definition pass, the destination field holds
+        # its text ID and is resolved in place.
+        self.records.append4(
+            arg_count,
+            fixed_arg_count,
+            -1 if dest is None else self.intern_text(dest),
+            0,
+        )
+        return call_id
+
+    def append_parsed_call(
+        self,
+        arena: CompactParsedInstrArena,
+        dest: str | None,
+        ret_type: TypeDesc,
+        callee: str,
+        is_indirect: bool,
+        arg_start: int,
+        arg_count: int,
+        fixed_arg_count: int,
+        is_vararg: bool,
+    ) -> None:
+        call_id = self.append_call(
+            dest,
+            ret_type,
+            callee,
+            is_indirect,
+            arg_start,
+            arg_count,
+            fixed_arg_count,
+            is_vararg,
+        )
+        arena.append_indexed_call(call_id)
+
+    def header(self, call_id: int) -> CompilerInt4:
+        return self.records.get4_unchecked(call_id * 2)
+
+    def span(self, call_id: int) -> CompilerInt4:
+        return self.records.get4_unchecked(call_id * 2 + 1)
+
+    def arg(self, arg_id: int) -> CompilerInt4:
+        return self.args.get4_unchecked(arg_id)
+
+    def diagnostic_call_data(self, call_id: int) -> tuple:
+        self.diagnostic_projections += 1
+        header: CompilerInt4 = self.header(call_id)
+        span: CompilerInt4 = self.span(call_id)
+        args = []
+        alignments = []
+        arg_index = 0
+        while arg_index < span.first:
+            raw: CompilerInt4 = self.arg(header.fourth + arg_index)
+            args.append((self.types[raw.first], self.texts[raw.third]))
+            alignments.append(raw.fourth)
+            arg_index += 1
+        return (
+            None if span.third < 0 else self.texts[span.third],
+            self.types[header.first],
+            self.texts[header.second],
+            bool(header.third & 1),
+            tuple(args),
+            span.second,
+            bool(header.third & 2),
+            tuple(alignments),
+        )
+
+    def release_construction_indexes(self) -> None:
+        self.text_identity_ids.clear()
+        self.type_identity_ids.clear()
+
+
 class CompactParsedInstrArena:
     """Block-local structure-of-arrays store keyed by dense instruction ID."""
 
@@ -608,27 +1025,33 @@ class CompactParsedInstrArena:
         "_data",
         "_volatile",
         "_arithmetic_flags",
+        "_arithmetic_flag_values",
+        "_call_projector",
+        "_indexed_call_plane",
+        "_payload_start",
         "_materializations",
     )
 
     def __init__(self, values=()):
-        self._kind_ids = bytearray()
+        self._kind_ids: bytearray = bytearray()
         self._data: list[tuple] = []
         self._volatile = bytearray()
-        self._arithmetic_flags: list[tuple[str, ...]] = []
+        self._arithmetic_flags = bytearray()
+        self._arithmetic_flag_values = None
+        self._call_projector = None
+        self._indexed_call_plane = None
+        self._payload_start = -1
         self._materializations = 0
         for value in values:
             self.append(value)
 
     def append(self, value) -> None:
+        if self._payload_start >= 0:
+            raise BackendUnavailable(
+                "cannot append to a frozen parsed-instruction arena"
+            )
         if isinstance(value, CompactParsedInstrView):
             value = value.materialize()
-        value = ParsedInstr(
-            value.kind,
-            _interned_operands(value.data),
-            value.is_volatile,
-            value.arithmetic_flags,
-        )
         if not isinstance(value, ParsedInstr):
             raise BackendUnavailable(
                 "parsed-instruction arena accepts ParsedInstr records only"
@@ -639,9 +1062,118 @@ class CompactParsedInstrArena:
                 f"unknown parsed-instruction kind {value.kind!r}"
             )
         self._kind_ids.append(kind_id)
-        self._data.append(value.data)
+        self._data.append(_interned_operands(value.data))
         self._volatile.append(1 if value.is_volatile else 0)
-        self._arithmetic_flags.append(value.arithmetic_flags)
+        self._arithmetic_flags.append(1 if value.arithmetic_flags else 0)
+        if value.arithmetic_flags:
+            if self._arithmetic_flag_values is None:
+                self._arithmetic_flag_values = {}
+            self._arithmetic_flag_values[len(self._kind_ids) - 1] = (
+                value.arithmetic_flags
+            )
+
+    def has_arithmetic_flags(self, index: int) -> bool:
+        if self._payload_start >= 0 and not self._arithmetic_flags:
+            metadata = self._call_projector.instruction_metadata_by_id(
+                self._payload_start + index
+            )
+            return bool(metadata.fourth)
+        return bool(self._arithmetic_flags[index])
+
+    def is_volatile(self, index: int) -> bool:
+        if self._payload_start >= 0 and not self._volatile:
+            metadata = self._call_projector.instruction_metadata_by_id(
+                self._payload_start + index
+            )
+            return bool(metadata.third)
+        return bool(self._volatile[index])
+
+    def instruction_data(self, index: int):
+        if self._payload_start >= 0:
+            payload_id = self._call_projector.instruction_payload_id_by_id(
+                self._payload_start + index
+            )
+            if payload_id < 0 and self._data is _EMPTY_SEQUENCE:
+                return self._call_projector.diagnostic_cold_instruction_data(
+                    -payload_id - 1
+                )
+            raw = payload_id
+        else:
+            raw = self._data[index]
+        kind_id = self._kind_ids[index]
+        if kind_id == PARSED_INSTRUCTION_KIND_CALL:
+            if not isinstance(raw, int) or self._call_projector is None:
+                return raw
+            return self._call_projector.diagnostic_call_data(raw)
+        if kind_id == PARSED_INSTRUCTION_KIND_ALLOCA:
+            if not isinstance(raw, int) or self._call_projector is None:
+                return raw
+            return self._call_projector.diagnostic_alloca_data(raw)
+        if kind_id in (
+            PARSED_INSTRUCTION_KIND_LOAD,
+            PARSED_INSTRUCTION_KIND_STORE,
+            PARSED_INSTRUCTION_KIND_CAST,
+            PARSED_INSTRUCTION_KIND_ICMP,
+            PARSED_INSTRUCTION_KIND_BINOP,
+            PARSED_INSTRUCTION_KIND_SELECT,
+        ):
+            if not isinstance(raw, int) or self._call_projector is None:
+                return raw
+            return self._call_projector.diagnostic_fixed_instruction_data(
+                kind_id,
+                raw,
+            )
+        if kind_id == PARSED_INSTRUCTION_KIND_GEP:
+            if not isinstance(raw, int) or self._call_projector is None:
+                return raw
+            return self._call_projector.diagnostic_gep_data(raw)
+        return raw
+
+    def attach_indexed_call_plane(self, plane: IndexedCallPlane) -> None:
+        if self._kind_ids:
+            raise BackendUnavailable(
+                "indexed call plane must attach before instructions"
+            )
+        self._indexed_call_plane = plane
+        self._call_projector = plane
+
+    def attach_indexed_function_seed(self, seed, payload_start: int) -> None:
+        """Attach parser-owned final metadata before publishing instructions."""
+        if self._kind_ids:
+            raise BackendUnavailable(
+                "indexed function seed must attach before instructions"
+            )
+        self._indexed_call_plane = seed
+        self._call_projector = seed
+        self._payload_start = payload_start
+        self._data = _EMPTY_SEQUENCE
+
+    def append_indexed_call(self, call_id: int) -> None:
+        if self._payload_start >= 0:
+            raise BackendUnavailable(
+                "cannot append to a frozen parsed-instruction arena"
+            )
+        self._kind_ids.append(_PARSED_INSTRUCTION_KIND_IDS["call"])
+        self._data.append(call_id)
+        self._volatile.append(0)
+        self._arithmetic_flags.append(0)
+
+    def freeze_payload_ids(self, projector, payload_start: int) -> None:
+        self._call_projector = projector
+        self._payload_start = payload_start
+        self._data = _EMPTY_SEQUENCE
+
+    def arithmetic_flags(self, index: int) -> tuple[str, ...]:
+        if not self.has_arithmetic_flags(index):
+            return ()
+        if self._payload_start >= 0 and not self._arithmetic_flags:
+            return self._call_projector.instruction_arithmetic_flag_values[
+                self._payload_start + index
+            ]
+        values = self._arithmetic_flag_values
+        if values is None or index not in values:
+            raise BackendUnavailable("instruction arithmetic flags are corrupt")
+        return values[index]
 
     def __len__(self) -> int:
         return len(self._kind_ids)
@@ -665,11 +1197,15 @@ class CompactParsedInstrArena:
 
     def __eq__(self, other) -> bool:
         if isinstance(other, CompactParsedInstrArena):
+            if self._payload_start >= 0 or other._payload_start >= 0:
+                return list(self) == list(other)
             return (
                 self._kind_ids == other._kind_ids
                 and self._data == other._data
                 and self._volatile == other._volatile
                 and self._arithmetic_flags == other._arithmetic_flags
+                and self._arithmetic_flag_values
+                == other._arithmetic_flag_values
             )
         if isinstance(other, (list, tuple)):
             return list(self) == list(other)
@@ -683,6 +1219,7 @@ class CompactParsedInstrArena:
             "records": len(self),
             "kind_id_bytes": len(self._kind_ids),
             "volatile_bytes": len(self._volatile),
+            "arithmetic_flag_bytes": len(self._arithmetic_flags),
             "diagnostic_materializations": self._materializations,
         }
 
@@ -695,7 +1232,7 @@ class CompactParsedInstrArena:
 class ParsedBlock:
     name: str
     raw_lines: list[str] = field(default_factory=list)
-    phis: list[PhiInstr] = field(default_factory=list)
+    phis: tuple[PhiInstr, ...] = ()
     instructions: CompactParsedInstrArena = field(
         default_factory=CompactParsedInstrArena,
     )
@@ -751,12 +1288,23 @@ class ParsedFunction:
     is_vararg: bool
     blocks: list[ParsedBlock]
     value_types: dict[str, TypeDesc] = field(default_factory=dict)
-    value_slots: dict[str, SlotInfo] = field(default_factory=dict)
-    alloca_slots: dict[str, AllocaInfo] = field(default_factory=dict)
+    value_slots: dict[str, object] = field(default_factory=dict)
+    value_slot_buckets: dict[int, list[tuple[str, object]]] = field(
+        default_factory=dict
+    )
+    alloca_slots: dict[str, object] = field(default_factory=dict)
+    alloca_slot_buckets: dict[int, list[tuple[str, object]]] = field(
+        default_factory=dict
+    )
     block_map: dict[str, ParsedBlock] = field(default_factory=dict)
     # Membership must be equality-based during native bootstrap.  A set lookup
     # can falsely miss an equal text key produced through another runtime path.
     used_values: list[str] = field(default_factory=list)
+    # Target-neutral stack preparation and AArch64 register allocation consume
+    # the same pure block-local last-use analysis.  Stackprep publishes its
+    # result so the immediately following target pass does not rescan every
+    # instruction; direct target-pass callers retain a compute-on-miss path.
+    block_local_last_uses: dict[str, dict[str, int]] | None = None
     # Optional target-owned scalar register assignments.  Stack slots remain
     # authoritative storage unless a target emitter explicitly recognizes an
     # entry here; this keeps unsupported targets and instruction shapes on the
@@ -777,6 +1325,16 @@ class ParsedFunction:
     )
     hidden_sret_slot: SlotInfo | None = None
     frame_size: int = 0
+    # Built lazily by the first indexed analysis consumer.  Kept at the end to
+    # preserve the established positional construction interface, and typed as
+    # object to avoid a module cycle: self_backend_kernel imports this IR
+    # vocabulary plus the analysis schema used to construct the kernel.
+    indexed_kernel: object | None = None
+    # Parser-owned construction state for the final indexed kernel.  The
+    # kernel adopts its arenas by identity and clears this field; unsupported
+    # diagnostic shapes remain in the seed's explicit cold side table.
+    indexed_seed: object | None = None
+    indexed_slot_projection: bool = False
 
 
 def parsed_module_instruction_arena_profile(module: ParsedModule) -> dict[str, int]:
@@ -786,9 +1344,22 @@ def parsed_module_instruction_arena_profile(module: ParsedModule) -> dict[str, i
         "records": 0,
         "kind_id_bytes": 0,
         "volatile_bytes": 0,
+        "arithmetic_flag_bytes": 0,
         "diagnostic_materializations": 0,
     }
     for function in module.functions:
+        if not function.blocks and function.indexed_kernel is not None:
+            kernel = function.indexed_kernel
+            counters["blocks"] += len(kernel.block_names)
+            counters["records"] += len(kernel.instruction_metadata) // 4
+            counters["kind_id_bytes"] += len(kernel.instruction_kind_ids)
+            continue
+        if not function.blocks and function.indexed_seed is not None:
+            seed = function.indexed_seed
+            counters["blocks"] += len(seed.block_names)
+            counters["records"] += len(seed.instruction_metadata) // 4
+            counters["kind_id_bytes"] += len(seed.instruction_kind_ids)
+            continue
         for block in function.blocks:
             counters["blocks"] += 1
             block_counters = block.instructions.profile_counters()
@@ -796,6 +1367,7 @@ def parsed_module_instruction_arena_profile(module: ParsedModule) -> dict[str, i
                 "records",
                 "kind_id_bytes",
                 "volatile_bytes",
+                "arithmetic_flag_bytes",
                 "diagnostic_materializations",
             ):
                 counters[name] += block_counters[name]
@@ -814,6 +1386,37 @@ __all__ = [
     "ParsedBlock",
     "CompactParsedInstrArena",
     "CompactParsedInstrView",
+    "PARSED_INSTRUCTION_KIND_ALLOCA",
+    "PARSED_INSTRUCTION_KIND_ATOMICRMW",
+    "PARSED_INSTRUCTION_KIND_BINOP",
+    "PARSED_INSTRUCTION_KIND_BR",
+    "PARSED_INSTRUCTION_KIND_BR_COND",
+    "PARSED_INSTRUCTION_KIND_CALL",
+    "PARSED_INSTRUCTION_KIND_CAST",
+    "PARSED_INSTRUCTION_KIND_CMPXCHG",
+    "PARSED_INSTRUCTION_KIND_EXTRACTELEMENT",
+    "PARSED_INSTRUCTION_KIND_EXTRACTVALUE",
+    "PARSED_INSTRUCTION_KIND_FBINOP",
+    "PARSED_INSTRUCTION_KIND_FCMP",
+    "PARSED_INSTRUCTION_KIND_FENCE",
+    "PARSED_INSTRUCTION_KIND_FNEG",
+    "PARSED_INSTRUCTION_KIND_FREEZE",
+    "PARSED_INSTRUCTION_KIND_GEP",
+    "PARSED_INSTRUCTION_KIND_ICMP",
+    "PARSED_INSTRUCTION_KIND_INSERTELEMENT",
+    "PARSED_INSTRUCTION_KIND_INSERTVALUE",
+    "PARSED_INSTRUCTION_KIND_LOAD",
+    "PARSED_INSTRUCTION_KIND_LOAD_ATOMIC",
+    "PARSED_INSTRUCTION_KIND_RET",
+    "PARSED_INSTRUCTION_KIND_RET_VOID",
+    "PARSED_INSTRUCTION_KIND_SELECT",
+    "PARSED_INSTRUCTION_KIND_SHUFFLEVECTOR",
+    "PARSED_INSTRUCTION_KIND_STORE",
+    "PARSED_INSTRUCTION_KIND_STORE_ATOMIC",
+    "PARSED_INSTRUCTION_KIND_SWITCH",
+    "PARSED_INSTRUCTION_KIND_SYSCALL6",
+    "PARSED_INSTRUCTION_KIND_UNREACHABLE",
+    "PARSED_INSTRUCTION_KIND_VA_ARG",
     "PARSED_INSTRUCTION_KINDS",
     "ParsedFunction",
     "ParsedInstr",
@@ -822,9 +1425,21 @@ __all__ = [
     "SlotInfo",
     "TypeDesc",
     "_align_to",
+    "parsed_function_alloca_slot_offset",
+    "parsed_function_alloca_slot_type",
+    "parsed_function_alloca_value_id",
+    "parsed_function_alloca_slot",
+    "parsed_function_has_alloca_slot",
+    "parsed_function_has_value_slot",
+    "parsed_function_publish_alloca_slot",
+    "parsed_function_publish_value_slot",
+    "parsed_function_value_slot_id",
+    "parsed_function_value_slot_offset",
+    "parsed_function_value_slot_type",
     "parsed_function_value_slot",
     "parsed_module_instruction_arena_profile",
     "text_collection_contains",
+    "dot_numeric_text_key_id",
     "text_key_mapping_get",
     "text_key_names_equal",
 ]

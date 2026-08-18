@@ -4,6 +4,9 @@ Traceback frame growth, fail-closed runtime-contract errors, and cold
 unhandled-exception formatting. Output matches the C runtime's stderr text,
 but uses pcc.unsafe.write instead of variadic fprintf.
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.py_runtime.py.py_abi_constants import (
     PYCLASSOBJECT_NAME_OFFSET,
     PY_TYPE_EXC,
@@ -218,6 +221,22 @@ def py_exc_append_frame_source(
     store_i32(fr, 24, line)
     store_i32(fr, 28, 0)
     store_i32(exc, 56, n_frames + 1)
+
+
+@c_abi_export("py_exc_append_frame_indexed")
+def py_exc_append_frame_indexed(
+    exc, func_name, filename, lines, sources, index: int
+) -> None:
+    # Mirror of py_exc_append_frame_indexed in py_exc_traceback.c: one shared
+    # landing per function/target reads the raise site's (line, source) pair
+    # from the module tables by index.
+    py_exc_append_frame_source(
+        exc,
+        func_name,
+        filename,
+        load_ptr(sources, index * 8),
+        load_i32(lines, index * 4),
+    )
 
 
 @c_abi_export("py_runtime_error_if_unset")

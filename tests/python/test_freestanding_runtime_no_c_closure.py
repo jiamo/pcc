@@ -102,6 +102,13 @@ def test_thread_runtime_is_owned_by_pcc_python(
     owners = _defined_symbol_owners(pcc_py_runtime_archive)
     expected = {
         "pcc_threads_enabled": "freestanding_thread_kernel.o",
+        "pcc_thread_stop_requested_acquire": "freestanding_thread_kernel.o",
+        "pcc_thread_no_park_enter": "freestanding_thread_kernel.o",
+        "pcc_thread_no_park_exit": "freestanding_thread_kernel.o",
+        "pcc_thread_no_park_depth": "freestanding_thread_kernel.o",
+        "pcc_thread_owns_stopped_world": "freestanding_thread_kernel.o",
+        "pcc_thread_registration_waiter_count": "freestanding_thread_kernel.o",
+        "pcc_thread_unregister_current": "freestanding_thread_kernel.o",
         "pcc_refcount_incref": "freestanding_thread_kernel.o",
         "pcc_mutex_new": "freestanding_thread_kernel.o",
         "py_virtual_thread_new": "py_virtual_thread_runtime.o",
@@ -112,6 +119,24 @@ def test_thread_runtime_is_owned_by_pcc_python(
     }
     for symbol, owner in expected.items():
         assert owners[symbol] == {owner}
+
+
+def test_c_oracle_thread_quiescence_symbols_have_exact_owner() -> None:
+    from tests.runtime_build_cache import cached_c_runtime, cached_threaded_c_runtime
+
+    symbols = {
+        "pcc_thread_stop_requested_acquire",
+        "pcc_thread_no_park_enter",
+        "pcc_thread_no_park_exit",
+        "pcc_thread_no_park_depth",
+        "pcc_thread_owns_stopped_world",
+        "pcc_thread_registration_waiter_count",
+        "pcc_thread_unregister_current",
+    }
+    for runtime in (cached_c_runtime(), cached_threaded_c_runtime()):
+        owners = _defined_symbol_owners(runtime / "libpy_runtime.a")
+        for symbol in symbols:
+            assert owners[symbol] == {"pcc_threads.o"}
 
 
 def test_production_archive_has_no_handwritten_c_runtime_helpers(
@@ -901,6 +926,16 @@ def test_explicit_thread_runtime_is_owned_by_pcc_python() -> None:
     assert owners["pcc_thread_start"] == {
         "freestanding_thread_kernel_pthread.o"
     }
+    for symbol in [
+        "pcc_thread_no_park_enter",
+        "pcc_thread_stop_requested_acquire",
+        "pcc_thread_no_park_exit",
+        "pcc_thread_no_park_depth",
+        "pcc_thread_owns_stopped_world",
+        "pcc_thread_registration_waiter_count",
+        "pcc_thread_unregister_current",
+    ]:
+        assert owners[symbol] == {"freestanding_thread_kernel_pthread.o"}
     assert owners["py_virtual_thread_new"] == {"py_virtual_thread_runtime.o"}
     assert owners["pcc_debug_check_release"] == {
         "freestanding_runtime_debug.o"
@@ -1648,6 +1683,7 @@ def test_cpy_handle_is_owned_by_pcc_python_object_deallocation(
     assert owners["py_cpy_handle_set_release_fn"] == expected_owner
     assert owners["py_cpy_handle_new"] == expected_owner
     assert owners["py_cpy_handle_get"] == expected_owner
+    assert owners["pcc_cpy_handle_move_owned_ref"] == expected_owner
     assert owners["py_dealloc_cpy_handle"] == expected_owner
 
 
@@ -3953,6 +3989,7 @@ def test_c_api_visit_surface_is_owned_by_pcc_python(
         "pcc_capi_visit_slot",
         "pcc_capi_visit_cext_object_slots",
         "pcc_capi_visit_cext_object_slots_i64",
+        "pcc_capi_visit_cext_object_slot_i64_adapter",
         "pcc_capi_visit_cext_object_slot_ref",
     ):
         assert owners[symbol] == expected_owner, symbol

@@ -131,7 +131,7 @@ def run_pcc1_dlpack_capsule_gate(tmp_path: Path) -> None:
     source.write_text(
         textwrap.dedent(
             f"""
-            from pcc.extern import extern, c_int32, c_int64, c_ptr, c_uint64, c_void
+            from pcc.extern import extern, c_int32, c_int64, c_ptr, c_uint64, c_void, c_obj
             from pcc.unsafe import (
                 cstr,
                 free,
@@ -197,7 +197,7 @@ def run_pcc1_dlpack_capsule_gate(tmp_path: Path) -> None:
             capsule_new = extern(
                 "pcc_dlpack_metal_capsule_new",
                 (c_uint64, c_uint64, c_int32, c_int32, c_int32, c_int64, c_ptr),
-                c_ptr,
+                c_obj,
             )
             capsule_name_code = extern(
                 "pcc_dlpack_capsule_name_code", (c_ptr,), c_int64

@@ -5,6 +5,9 @@ small heap bignum allocation, canonical PyObject conversion, and the
 double conversion used by true division. The heavier arithmetic still
 lives in py_int.c for now.
 """
+
+__pcc_runtime_port__ = True
+
 from pcc.extern import c_abi_export, c_int64, c_ptr, extern
 from pcc.py_runtime.py.py_abi_constants import (
     PYINTOBJECT_DIGITS_OFFSET,

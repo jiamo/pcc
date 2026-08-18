@@ -46,6 +46,7 @@ PyObject *py_gen_new(void *resume, PyObject *frame) {
     pcc_gc_store_ptr((PyObject *)g, &g->frame, frame);
     pcc_gc_store_ptr((PyObject *)g, &g->send_value, py_None);
     py_gc_track((PyObject *)g);
+    pcc_gc_publish_initialized((PyObject *)g);
     return (PyObject *)g;
 }
 
@@ -62,12 +63,12 @@ void py_dealloc_gen(PyObject *o) {
 
 static PyGenObject *checked_gen(PyObject *gen) {
     if (gen == NULL || PY_IS_TAGGED_INT(gen)) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "object is not a generator"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "object is not a generator"));
         return NULL;
     }
     PyObjectHeader *h = py_header(gen);
     if (h->type_tag != PY_TYPE_GEN) {
-        py_raise(py_exc_new(PY_EXC_TYPEERROR, "object is not a generator"));
+        py_raise_owned(py_exc_new(PY_EXC_TYPEERROR, "object is not a generator"));
         return NULL;
     }
     return (PyGenObject *)gen;
@@ -147,7 +148,7 @@ PyObject *py_gen_next(PyObject *gen) {
     PyGenObject *g = checked_gen(gen);
     if (g == NULL) return NULL;
     if (g->done != 0 || g->resume == NULL) {
-        py_raise(py_exc_new(PY_EXC_STOPITERATION, ""));
+        py_raise_owned(py_exc_new(PY_EXC_STOPITERATION, ""));
         return NULL;
     }
     py_gen_set_send_value(g, py_None);
@@ -164,7 +165,7 @@ PyObject *py_gen_send(PyObject *gen, PyObject *value) {
     if (gen != NULL && !PY_IS_TAGGED_INT(gen)
         && py_type_of(gen) == PY_TYPE_COROUTINE) {
         if (value != NULL && value != py_None) {
-            py_raise(py_exc_new(
+            py_raise_owned(py_exc_new(
                 PY_EXC_TYPEERROR,
                 "can't send non-None value to a just-started coroutine"
             ));
@@ -179,11 +180,11 @@ PyObject *py_gen_send(PyObject *gen, PyObject *value) {
     PyGenObject *g = checked_gen(gen);
     if (g == NULL) return NULL;
     if (g->done != 0 || g->resume == NULL) {
-        py_raise(py_exc_new(PY_EXC_STOPITERATION, ""));
+        py_raise_owned(py_exc_new(PY_EXC_STOPITERATION, ""));
         return NULL;
     }
     if (g->state == 0 && value != NULL && value != py_None) {
-        py_raise(py_exc_new(
+        py_raise_owned(py_exc_new(
             PY_EXC_TYPEERROR,
             "can't send non-None value to a just-started generator"
         ));
@@ -203,7 +204,7 @@ PyObject *py_gen_throw(PyObject *gen, PyObject *exc) {
     PyGenObject *g = checked_gen(gen);
     if (g == NULL) return NULL;
     if (g->done != 0 || g->resume == NULL) {
-        py_raise(py_exc_new(PY_EXC_STOPITERATION, ""));
+        py_raise_owned(py_exc_new(PY_EXC_STOPITERATION, ""));
         return NULL;
     }
     py_gen_set_send_value(g, py_None);

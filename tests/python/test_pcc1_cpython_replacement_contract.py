@@ -44,7 +44,7 @@ def test_frozen_contract_has_one_exact_oracle_and_two_honest_platform_boundaries
     assert contract["baseline"] == {
         "language_version": "3.13",
         "oracle_implementation": "CPython",
-        "oracle_version": "3.13.2",
+        "oracle_version": "3.15.0rc1",
         "oracle_build": "standard-gil",
         "version_policy": "exact-oracle-version",
     }
@@ -143,7 +143,7 @@ def test_workload_catalog_is_unverified_cumulative_and_bound_to_the_same_matrix(
     assert validate_workload_catalog(catalog) is catalog
     assert catalog["python_baseline"] == {
         "language": "3.13",
-        "oracle": "CPython 3.13.2",
+        "oracle": "CPython 3.15.0rc1",
     }
     assert [row["level"] for row in catalog["levels"]] == [1, 2, 3]
     assert [row["final_product_goal"] for row in catalog["levels"]] == [
@@ -327,7 +327,7 @@ def _valid_evidence_bundle(level: int = 1):
         ],
         "oracle": {
             "implementation": "CPython",
-            "version": "3.13.2",
+            "version": "3.15.0rc1",
             "build": "standard-gil",
             "execution_is_separate": True,
             "result_sha256": _sha("9"),

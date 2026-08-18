@@ -230,3 +230,58 @@ dispatch runtime/IR gates pass (`3 passed`). The full fallback gate then moved
 from six assignment-related failures to one distinct legacy scaffold-off
 marshal raw-count failure, tracked separately in
 `fallback-baseline-marshal-raw-ratchet-2026-07-10.md`.
+
+## Update 2026-08-27: Indexed Function Kernel raw-probe false regression
+
+The accepted compiler native-data-plane slice added cross-module calls from
+the self-backend verifier, stack preparation, precise stack maps, target
+passes, register allocation and emission into `IndexedFunctionKernel`,
+`CompilerIntArena`, and packed safepoint records. The strict multi-file closure
+remains zero-fallback, but the raw standalone action ratchet reports growth in
+nine self-backend modules because it intentionally omits sibling export
+schemas.
+
+Direct substitution confirms the semantic-model mismatch. Compiling the same
+modules through `compile_contextual_per_module_fallback_counts`, which supplies
+the real closed-world export table, gives ON-mode count zero for every affected
+module. OFF mode is also zero except for one existing legacy scaffold action
+in `self_backend_precise_stackmaps`. Representative results:
+
+```text
+self_backend_kernel:             raw actions 77; closed-world OFF 0 / ON 0
+self_backend_precise_stackmaps:  raw actions 465; closed-world OFF 1 / ON 0
+aarch64 flow/materialize/regalloc:                         OFF 0 / ON 0
+emit/stackprep/target_passes/verify:                       OFF 0 / ON 0
+```
+
+The raw kernel actions name sibling imports and methods such as
+`_stable_text_bucket_key`, `_instruction_defined_value_from_parts`,
+`text_key_names_equal`, and `TypeDesc.__eq__`; they are not present in the
+closed-world compiler IR.
+
+## No.5 Add a closed-world, non-mixin per-module probe policy
+
+### Code Change
+
+Add an explicit `closed-world` probe policy for self-backend compiler Modules.
+It uses the same sibling export context as the real multi-file compile but does
+not bind `self` or `host` to `L1CodeGen`. Keep the existing `contextual-mixin`
+policy distinct, keep raw standalone counts visible but non-authoritative for
+these Modules, and require the contextual ON-mode result to remain hard zero.
+
+### CONFIRMED
+
+`PROBE_POLICY_CLOSED_WORLD` now selects the real sibling export context for
+self-backend Modules while leaving `contextual-mixin` host binding distinct.
+The focused nine-Module ON-mode regression passes with a zero count for every
+Module, the policy/host-contract tests pass, and the original failing OFF raw
+ratchet node passes without changing `tests/fallback_baseline.json`:
+
+```text
+6 policy/host-contract tests: 6 passed in 0.43s
+9-Module closed-world ON gate: 1 passed in 15.12s
+test_per_module_fallbacks_under_ratchet: 1 passed in 271.51s
+```
+
+The full two-file fallback transfer gate remains a caller-owned next step; it
+does not change this proposal's verdict.

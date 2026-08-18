@@ -163,3 +163,69 @@ iterator fallback; the bootstrap passed because pcc's own code has no
   `__getitem__`, return a small sequence-iterator object whose `__next__` calls
   `obj[i++]` and converts `IndexError` to `StopIteration`. Niche (modern code
   defines `__iter__`); lower priority than the generator-consumption sites.
+
+## Update (2026-08-27): the same pattern from the MAPPING side, and what it cost
+
+This investigation approached the pattern from iterator-only objects, where
+`py_obj_len(gen)` is 0 so the loop runs zero times. A dict fails the *same*
+lowering differently and more quietly: it **has** a length and it **has** a
+`__getitem__`, so `py_obj_len(d)` returns the right count and the loop runs the
+right number of times — but `py_obj_getitem(d, i)` is a **key lookup for the
+integer key `i`**, so every probe misses. `set(d)` returned an empty set with
+no error at all.
+
+Sibling investigation with the full write-up:
+[`set-and-frozenset-of-dict-lower-to-empty.md`](set-and-frozenset-of-dict-lower-to-empty.md).
+
+### What it cost, so the priority of proposal No.2 can be judged
+
+`pcc/backend/self_backend_precise_stackmaps.py` computes
+`managed_names = frozenset(managed_origins) | ambiguous_managed`, and
+`managed_origins` is a dict. **Inside pcc1 — which is pcc-compiled code — that
+frozenset was empty.** So `_managed_live_after` tracked nothing and
+`_planned_managed_reloads` returned `()` at every safepoint: pcc1 emitted
+**zero managed-value reloads** into pcc2, pcc3 and every program it compiled,
+for however long the bug existed. Managed reloads are what refresh a spill slot
+from its root after a safepoint the collector may have moved objects across —
+the mechanism GC backend #3 (generational forwarding) and #4 (relocating)
+depend on. Emitting one real module: pcc1 0 reload triples, host pcc 1200.
+
+This is the concrete answer to "is a silent wrong answer in a shared builtin
+lowering worth the bootstrap gate": it hid a GC-soundness hole in the
+self-hosted compiler for months, and no host-side test could see it because
+CPython answers `frozenset(some_dict)` natively.
+
+### Static `DictType` sites are now fixed; the `DynType` residue is not
+
+Fixed by routing the statically known mapping to its keys (`py_dict_keys`), or
+by delegating to a correct sibling implementation that already existed:
+
+```text
+set(d) / frozenset(d)   set_lowering.py                -> _materialize_dict_keys_view_set
+dict(d)                 literal_lowering.py            -> dict_lowering._maybe_emit_dict_builtin
+any(d) / all(d)         numeric_builtin_lowering.py    -> py_dict_keys normalisation
+zip(d, ...)             tuple_zip_lowering.py          -> py_dict_keys normalisation
+for a,b in zip(d, ...)  for_normalization_lowering.py  -> decline the index rewrite
+```
+
+Regression: `tests/python/test_native_set_from_dict_keys.py`, confirmed red
+first. Focused gate: 48 passed across the zip/enumerate/dict/comprehension/set
+families. Strict no-libpython closure rc=0 on every changed file.
+
+Still open, and measured under pcc-native today:
+
+```text
+                pcc-native   CPython
+set(dyn)        0            2
+dict(dyn)       0            2
+any(dyn)        False        True
+list(dyn)       2            2   <- correct, via py_obj_iter
+```
+
+`list()` is right because its `DynType` arm already uses the iterator protocol.
+**Proposal No.2 of this file is therefore the correct fix for the rest**, and it
+now has a second, independent motivation: `py_obj_iter` on a mapping yields its
+keys, so one dispatch change closes the generator case and the mapping case
+together. It remains gated on the full bootstrap for the reason recorded above,
+and that gate has not been run — so it is deliberately NOT applied yet.
+Task-board row: `PY-P1-SET-FROM-DYN-MAPPING`.

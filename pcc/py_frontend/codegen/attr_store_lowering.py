@@ -8,7 +8,41 @@ from ..py_ast import Attr, DynType, Expr, IntType, Name, Type
 from . import marshal
 
 
+_I32 = ir.IntType(32)
+
+
 class AttrStoreLoweringMixin:
+    def _typed_instance_field_slot(self, target: Attr):
+        """Slot index for ``<Name>.<field>`` when the receiver's class is
+        statically known, the field is a declared instance field, and neither
+        the class nor any base overrides ``__setattr__``; else ``None``."""
+        if not isinstance(target.obj, Name) or not hasattr(self, "class_lowering"):
+            return None
+        if getattr(self, "_cpy_env_flags", {}).get(target.obj.ident, False):
+            return None
+        hint = self._class_hint_for_expr(target.obj)
+        if hint is None:
+            return None
+        classes = self.class_lowering.classes
+        info = classes.get(hint)
+        if info is None:
+            return None
+        seen: set[str] = set()
+        pending = [info]
+        while pending:
+            current = pending.pop()
+            if current.name in seen:
+                continue
+            seen.add(current.name)
+            if "__setattr__" in getattr(current, "methods", {}):
+                return None
+            for base in getattr(current, "bases_ast", ()) or ():
+                base_name = getattr(base, "ident", None)
+                base_info = classes.get(base_name) if base_name else None
+                if base_info is not None:
+                    pending.append(base_info)
+        return self.class_lowering.lookup_field_index(info, target.name)
+
     def _emit_attr_store_value(
         self,
         target: Attr,
@@ -285,6 +319,18 @@ class AttrStoreLoweringMixin:
             value,
             value_ty,
         )
+        slot_index = self._typed_instance_field_slot(target)
+        if slot_index is not None:
+            # Same primitive ``self.x = v`` has always used: the receiver's
+            # class and the field's slot are statically known and no class in
+            # the MRO overrides __setattr__, so the string-keyed
+            # ``py_obj_setattr`` lookup (3661 instructions per store against
+            # CPython's 385) is replaced by a balanced slot store.
+            self.builder.call(
+                self.runtime["py_instance_set_field"],
+                [obj, ir.Constant(_I32, slot_index), value],
+            )
+            return
         status = self.builder.call(
             self.runtime["py_obj_setattr"],
             [obj, name_ptr, value],

@@ -4,30 +4,30 @@ This is intentionally conservative.  Native primitives are available, while
 Thread.start remains disabled when the runtime is not built with
 PCC_WITH_THREADS=1; the default runtime runs Thread targets synchronously.
 """
-from pcc.extern import extern, c_int64, c_ptr
+from pcc.extern import extern, c_int64, c_ptr, c_obj
 
 _get_ident = extern("py_threading_get_ident", (), c_int64)
-_lock_new = extern("py_threading_lock_new", (), c_ptr)
+_lock_new = extern("py_threading_lock_new", (), c_obj)
 _lock_acquire = extern("py_threading_lock_acquire", (c_ptr,), c_int64)
 _lock_release = extern("py_threading_lock_release", (c_ptr,), c_int64)
-_rlock_new = extern("py_threading_rlock_new", (), c_ptr)
+_rlock_new = extern("py_threading_rlock_new", (), c_obj)
 _rlock_acquire = extern("py_threading_rlock_acquire", (c_ptr,), c_int64)
 _rlock_release = extern("py_threading_rlock_release", (c_ptr,), c_int64)
-_event_new = extern("py_threading_event_new", (), c_ptr)
+_event_new = extern("py_threading_event_new", (), c_obj)
 _event_set = extern("py_threading_event_set", (c_ptr,), c_int64)
 _event_clear = extern("py_threading_event_clear", (c_ptr,), c_int64)
 _event_is_set = extern("py_threading_event_is_set", (c_ptr,), c_int64)
 _event_wait = extern("py_threading_event_wait", (c_ptr,), c_int64)
-_thread_new = extern("py_threading_thread_new", (c_ptr, c_ptr), c_ptr)
+_thread_new = extern("py_threading_thread_new", (c_ptr, c_ptr), c_obj)
 _thread_start = extern("py_threading_thread_start", (c_ptr,), c_int64)
 _thread_join = extern("py_threading_thread_join", (c_ptr,), c_int64)
 _thread_is_alive = extern("py_threading_thread_is_alive", (c_ptr,), c_int64)
-_condition_new = extern("py_threading_condition_new", (c_ptr,), c_ptr)
+_condition_new = extern("py_threading_condition_new", (c_ptr,), c_obj)
 _condition_acquire = extern("py_threading_condition_acquire", (c_ptr,), c_int64)
 _condition_release = extern("py_threading_condition_release", (c_ptr,), c_int64)
 _condition_wait = extern("py_threading_condition_wait", (c_ptr,), c_int64)
 _condition_notify = extern("py_threading_condition_notify", (c_ptr,), c_int64)
-_sem_new = extern("py_threading_semaphore_new", (c_int64,), c_ptr)
+_sem_new = extern("py_threading_semaphore_new", (c_int64,), c_obj)
 _sem_acquire = extern("py_threading_semaphore_acquire", (c_ptr,), c_int64)
 _sem_release = extern("py_threading_semaphore_release", (c_ptr,), c_int64)
 

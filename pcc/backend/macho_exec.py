@@ -46,11 +46,11 @@ from .macho_parallel import (
     ParallelLinkError,
     materialize_output,
 )
-from .native_object import NativeObject, NativeObjectView
+from .native_object import NativeObject, NativeObjectView, PackedNativeObject
 from .precise_stackmap import (
     ARCH_AARCH64,
     PreciseStackMapError,
-    decode_stack_map,
+    validate_stack_map_payload,
 )
 
 PAGE = 0x4000
@@ -177,7 +177,7 @@ def _validate_minos(minos) -> tuple[int, int]:
 def _validate_input_load_commands(objects: list[LinkInput]) -> None:
     for index, data in enumerate(objects):
         obj = _coerce_link_object(data, index)
-        if isinstance(obj, NativeObjectView):
+        if isinstance(obj, (NativeObject, NativeObjectView, PackedNativeObject)):
             # NativeObject validation is the internal equivalent of the
             # finite input-command allowlist. It has no Mach-O commands.
             continue
@@ -223,7 +223,22 @@ def _external_symbol_state(
 ) -> tuple[set[str], set[str]]:
     defined, undefined = set(), set()
     for index, data in enumerate(objects):
-        for sym in _coerce_link_object(data, index).symbols():
+        obj = _coerce_link_object(data, index)
+        if isinstance(obj, PackedNativeObject):
+            for symbol in obj.symbols:
+                if symbol.section_index and symbol.external:
+                    defined.add(symbol.name)
+                elif not symbol.section_index and symbol.external:
+                    undefined.add(symbol.name)
+            continue
+        if isinstance(obj, NativeObject):
+            for symbol in obj.symbols:
+                if symbol.section_index and symbol.external:
+                    defined.add(symbol.name)
+                elif not symbol.section_index and symbol.external:
+                    undefined.add(symbol.name)
+            continue
+        for sym in obj.symbols():
             kind = sym["n_type"] & spec.N_TYPE
             if kind == spec.N_SECT and (sym["n_type"] & spec.N_EXT):
                 defined.add(sym["name"])
@@ -326,6 +341,7 @@ def link_prepared_executable(
     entry: str = "_main",
     minos: tuple[int, int] = (12, 0),
     identifier: bytes = b"pcc-linked",
+    phase_callback=None,
 ) -> bytes:
     """Finalize one validated, already-merged object as an executable.
 
@@ -773,7 +789,7 @@ def link_prepared_executable(
         if (out.segname, out.sectname) != ("__DATA", "__pcc_stackmaps"):
             continue
         try:
-            decode_stack_map(
+            validate_stack_map_payload(
                 bytes(out.data),
                 expected_arch=ARCH_AARCH64,
                 final_image=True,
@@ -1123,10 +1139,16 @@ def link_prepared_executable(
     except ParallelLinkError as exc:
         raise LinkError(f"parallel Mach-O output failed: {exc}") from exc
 
-    blob = build_signature(
-        image, identifier=identifier,
-        exec_seg_base=0, exec_seg_limit=text_filesize, exec_seg_flags=1,
-    )
+    if phase_callback is not None:
+        phase_callback("sign_begin")
+    try:
+        blob = build_signature(
+            image, identifier=identifier,
+            exec_seg_base=0, exec_seg_limit=text_filesize, exec_seg_flags=1,
+        )
+    finally:
+        if phase_callback is not None:
+            phase_callback("sign_end")
     if len(blob) != sig_size:
         raise LinkError(
             f"signature size mismatch: predicted {sig_size}, built {len(blob)}"

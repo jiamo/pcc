@@ -16,6 +16,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 RUNTIME_DIR = REPO_ROOT / "pcc" / "py_runtime"
 STRICT_SOURCE = RUNTIME_DIR / "py" / "freestanding_gc_zpage_mechanics.py"
 MANAGED_SOURCE = RUNTIME_DIR / "py" / "py_gc_backend.py"
+ALLOCATION_SOURCE = RUNTIME_DIR / "py" / "freestanding_gc_zpage_allocation.py"
 MAKEFILE = RUNTIME_DIR / "Makefile"
 
 OWNED_SYMBOLS = {
@@ -25,8 +26,12 @@ OWNED_SYMBOLS = {
     "pcc_gc_backend4_zpage_find_reusable_page",
     "pcc_gc_backend4_zpage_find_reusable_page_for_gen",
     "pcc_gc_backend4_zpage_link_node",
+    "pcc_gc_backend4_zpage_link_node_preallocated",
     "pcc_gc_backend4_zpage_node_alloc",
+    "pcc_gc_backend4_zpage_node_plan_requires_prepare",
+    "pcc_gc_backend4_zpage_node_prepare",
     "pcc_gc_backend4_zpage_node_release",
+    "pcc_gc_backend4_zpage_node_take_prepared",
     "pcc_gc_backend4_zpage_pop_free_page",
     "pcc_gc_backend4_zpage_reset",
     "pcc_gc_backend4_zpage_set_active_page",
@@ -37,6 +42,7 @@ RAW_FUNCTION_IMPORTS = {
     "memset",
     "pcc_gc_backend4_evacuation_page_find",
     "pcc_gc_zpage_owner_index_upsert",
+    "pcc_gc_zpage_owner_index_upsert_preallocated",
 }
 RAW_GLOBAL_IMPORTS = {
     "pcc_gc_backend4_active_medium_old_page",
@@ -75,6 +81,7 @@ def _literal_global_imports() -> set[str]:
 def test_zpage_mechanics_has_one_strict_source_owner() -> None:
     strict = STRICT_SOURCE.read_text(encoding="utf-8")
     managed = MANAGED_SOURCE.read_text(encoding="utf-8")
+    consumers = managed + ALLOCATION_SOURCE.read_text(encoding="utf-8")
     makefile = MAKEFILE.read_text(encoding="utf-8")
 
     assert "__pcc_freestanding__ = True" in strict
@@ -82,7 +89,7 @@ def test_zpage_mechanics_has_one_strict_source_owner() -> None:
     assert _exported_symbols(managed).isdisjoint(OWNED_SYMBOLS)
     assert "freestanding_gc_zpage_mechanics" in makefile
     for symbol in OWNED_SYMBOLS:
-        assert f'"{symbol}"' in managed
+        assert f'"{symbol}"' in consumers
         assert f'@c_abi_export("{symbol}")' not in managed
 
 
@@ -152,6 +159,7 @@ def test_zpage_mechanics_preserves_layout_and_bounded_reuse_contract() -> None:
     assert "load_i64(page, 80)" in strict
     assert "delta + alloc_size <= span_capacity" in strict
     assert "if count >= 8192:" in strict
+    assert "return malloc(80)" in strict
     assert 'global_store_ptr("pcc_gc_backend4_zpage_node_free_head", node)' in strict
     assert "pcc_gc_zpage_owner_index_upsert(load_ptr(node, 0), node)" in strict
     assert "store_ptr(page, 112, node)" in strict

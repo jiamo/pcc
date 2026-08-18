@@ -27,7 +27,7 @@
 PyObject *py_os_uname(void) {
     struct utsname raw;
     if (uname(&raw) != 0) {
-        py_raise(py_exc_new(PY_EXC_OSERROR, "os.uname() failed"));
+        py_raise_owned(py_exc_new(PY_EXC_OSERROR, "os.uname() failed"));
         return NULL;
     }
 
