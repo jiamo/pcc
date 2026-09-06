@@ -4490,7 +4490,10 @@ class ClassLowering:
             parent.runtime["pcc_gc_store_root"],
             [parent._as_gc_ptr(alloca), cls_ptr],
         )
-        parent.builder.call(parent.runtime["pcc_gc_unpin"], [cls_ptr])
+        parent.builder.call(
+            parent.runtime["pcc_gc_unpin"],
+            [parent._value_available_at_insertion_point(cls_ptr)],
+        )
         # The root store retained the replacement and released any previous
         # binding.  Consume the fresh class-construction result.
         parent._gc_release(
@@ -4799,7 +4802,10 @@ class ClassLowering:
                 root_result=True,
                 pinned_arg_temps=((previous_cls_ptr, True),),
             )
-            builder.call(runtime["pcc_gc_unpin"], [previous_cls_ptr])
+            builder.call(
+                runtime["pcc_gc_unpin"],
+                [parent._value_available_at_insertion_point(previous_cls_ptr)],
+            )
             self.parent._gc_release(
                 previous_cls_ptr,
                 self.parent._release_context_label(
@@ -4842,10 +4848,15 @@ class ClassLowering:
                         alloca,
                         name=self._fresh(name_hint),
                     )
-        return parent.builder.load(
+        loaded = parent.builder.load(
             info.global_var,
             name=self._fresh(name_hint),
         )
+        # A class object loaded from its module-level global can be pinned in
+        # one block and unpinned in a cleanup block a park boundary made
+        # unreachable from it; record the source so the cleanup can re-derive.
+        parent._note_global_backed_value(loaded, info.global_var)
+        return loaded
 
     def _maybe_emit_class_metaclass_slot(
         self,
@@ -6593,11 +6604,20 @@ class ClassLowering:
                         )
                     if recovered_v is not None:
                         v = recovered_v
+                # The callee's ABI slot type is authoritative when it is
+                # known: a sibling module that keeps ints raw exports
+                # ``fd: int`` as ``i64`` even though THIS module boxes ints,
+                # and the caller-side annotation heuristic below would
+                # otherwise pass it a PyObject*.
                 expected_is_object = (
                     expected_ir_ty is not None
                     and _classgen_ir_type_is_pointer(expected_ir_ty)
                 )
-                if not expected_is_object and i < len(declared):
+                if (
+                    not expected_is_object
+                    and expected_ir_ty is None
+                    and i < len(declared)
+                ):
                     expected_is_object = _classgen_annotation_is_object_param(
                         parent,
                         declared[i].annotation,
@@ -6617,20 +6637,31 @@ class ClassLowering:
                         and not _classgen_ir_type_is_pointer(expected_ir_ty)
                         and _classgen_ir_type_is_pointer(v_ir_ty)
                     ):
-                        v = marshal.marshal_from_object(
-                            builder,
-                            parent.module,
-                            runtime,
-                            v,
-                            declared_annotation,
+                        v = _classgen_unbox_into_scalar_slot(
+                            parent, v, expected_ir_ty, declared_annotation
                         )
                     elif not _classgen_ir_types_match(v_ir_ty, expected_ir_ty):
                         v = parent._coerce(v, arg_expr.ty, declared_annotation)
                 else:
-                    # Untyped init param -> marshal to PyObject*.
-                    v = marshal.marshal_to_object(
-                        builder, parent.module, runtime, v, arg_expr.ty
-                    )
+                    v_ir_ty = _classgen_value_type_or_none(v)
+                    if (
+                        expected_ir_ty is not None
+                        and not _classgen_ir_type_is_pointer(expected_ir_ty)
+                    ):
+                        # A sibling module's synthesized ``__init__`` carries the
+                        # scalar ABI slot type but no source annotation; a boxed
+                        # int/float/bool from this module must be unboxed into it
+                        # (a negative literal is emitted as a boxed object in
+                        # modules that keep ints as objects).
+                        if _classgen_ir_type_is_pointer(v_ir_ty):
+                            v = _classgen_unbox_into_scalar_slot(
+                                parent, v, expected_ir_ty, arg_expr.ty
+                            )
+                    else:
+                        # Untyped init param -> marshal to PyObject*.
+                        v = marshal.marshal_to_object(
+                            builder, parent.module, runtime, v, arg_expr.ty
+                        )
                 init_args.append(v)
                 if expected_ir_ty is None:
                     expected_ir_ty = _PTR
@@ -6740,11 +6771,16 @@ class ClassLowering:
                         )
                     if recovered_v is not None:
                         v = recovered_v
+                # The callee's ABI slot type is authoritative when it is
+                # known: a sibling module that keeps ints raw exports
+                # ``fd: int`` as ``i64`` even though THIS module boxes ints,
+                # and the caller-side annotation heuristic below would
+                # otherwise pass it a PyObject*.
                 expected_is_object = (
                     expected_ir_ty is not None
                     and _classgen_ir_type_is_pointer(expected_ir_ty)
                 )
-                if not expected_is_object:
+                if not expected_is_object and expected_ir_ty is None:
                     expected_is_object = _classgen_annotation_is_object_param(
                         parent,
                         arg.annotation,
@@ -6852,7 +6888,10 @@ class ClassLowering:
                     init_info.init_returns_void,
                 )
                 init_called = True
-        builder.call(runtime["pcc_gc_unpin"], [inst])
+        builder.call(
+            runtime["pcc_gc_unpin"],
+            [parent._value_available_at_insertion_point(inst)],
+        )
         if init_called:
             # A user ``__init__`` reports Python exceptions through TLS even
             # when its native return value is discarded.  Check only after
@@ -6908,6 +6947,26 @@ class ClassLowering:
                     if getattr(s, "name", None) == method_name:
                         return s
         return None
+
+
+def _classgen_unbox_into_scalar_slot(parent, value, expected_ir_ty, ty):
+    """Unbox an object-shaped value into a sibling method's scalar ABI slot.
+
+    ``marshal_from_object`` respects the *calling* module's int policy, so in a
+    module that keeps ints as objects it returns the object unchanged; the
+    callee's slot type is authoritative here (a raw-int module exports
+    ``fd: int`` as ``i64``), so integer slots are unboxed explicitly.
+    """
+    if isinstance(expected_ir_ty, ir.IntType):
+        as_i64 = parent._to_int64(value, ty)
+        if expected_ir_ty.width == 64:
+            return as_i64
+        if expected_ir_ty.width < 64:
+            return parent.builder.trunc(as_i64, expected_ir_ty, name=parent._fresh("init.arg.trunc"))
+        return parent.builder.sext(as_i64, expected_ir_ty, name=parent._fresh("init.arg.sext"))
+    return marshal.marshal_from_object(
+        parent.builder, parent.module, parent.runtime, value, ty
+    )
 
 
 def _class_has_dataclass_decorator(cd: ClassDef) -> bool:

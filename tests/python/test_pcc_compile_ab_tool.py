@@ -1069,6 +1069,55 @@ def test_build_receipt_cross_binds_exact_stage_result(
         )
 
 
+@pytest.mark.parametrize(
+    "shape",
+    ["producer", "legacy", "missing-contract", "wrong-scope", "wrong-verdict-type"],
+)
+def test_build_receipt_validates_current_producer_metric_contract(tmp_path, shape):
+    from scripts import run_pcc_stage1_build as producer
+
+    tool = _load_tool()
+    compilers = [tmp_path / "candidate", tmp_path / "baseline"]
+    for compiler in compilers:
+        compiler.write_bytes(compiler.name.encode())
+    runtime = tmp_path / "runtime.a"
+    runtime.write_bytes(b"runtime")
+    receipts, _ = _write_build_evidence(
+        tool, tmp_path / "metric-contract", compilers, runtime
+    )
+
+    def mutate(result):
+        if shape == "legacy":
+            return
+        result["metric_scopes"] = dict(producer.STAGE1_METRIC_SCOPES)
+        result["comparison_contract"] = dict(producer.STAGE1_COMPARISON_CONTRACT)
+        if shape == "missing-contract":
+            result.pop("comparison_contract")
+        elif shape == "wrong-scope":
+            result["metric_scopes"]["instructions"] = "whole_process_tree"
+        elif shape == "wrong-verdict-type":
+            result["comparison_contract"]["single_wall_verdict_allowed"] = 0
+
+    _rewrite_stage_result(tool, receipts[0], mutate)
+
+    def load():
+        return tool._load_build_receipt(
+            receipts[0],
+            arm="candidate",
+            compiler_sha256=tool.sha256_path(compilers[0]),
+            compiler_size_bytes=compilers[0].stat().st_size,
+            runtime_sha256=tool.sha256_path(runtime),
+        )
+
+    if shape in {"producer", "legacy"}:
+        assert load()["receipt"]["status"] == "SUCCEEDED"
+    else:
+        with pytest.raises(
+            tool.CompileABError, match="stage result (fields|metric contract)"
+        ):
+            load()
+
+
 def test_build_receipt_rejects_protocol_artifact_and_incomplete_source(tmp_path):
     tool = _load_tool()
     compilers = []

@@ -5,6 +5,12 @@ from __future__ import annotations
 from typing import Optional
 
 from pcc.llvm_capi.compat import ir
+from pcc.python_target import (
+    PYTHON_TARGET_MAJOR,
+    PYTHON_TARGET_MINOR,
+    PYTHON_TARGET_MICRO,
+    PYTHON_TARGET_VERSION_INFO,
+)
 
 from ..py_ast import Attr, BoolLit, Call, Expr, Name, StrLit, StrType
 from . import marshal
@@ -17,7 +23,7 @@ _CSTR = _I8.as_pointer()
 
 class NativeSystemLoweringMixin:
     def _emit_sys_version_info_tuple(self) -> ir.Value:
-        values = (3, 13, 0)
+        values = PYTHON_TARGET_VERSION_INFO
         version_info = self.builder.call(
             self.runtime["py_tuple_new"],
             [ir.Constant(_I64, len(values))],
@@ -40,7 +46,11 @@ class NativeSystemLoweringMixin:
         return version_info
 
     def _emit_sys_version_info_attr(self, name: str) -> Optional[ir.Value]:
-        values = {"major": 3, "minor": 13, "micro": 0}
+        values = {
+            "major": PYTHON_TARGET_MAJOR,
+            "minor": PYTHON_TARGET_MINOR,
+            "micro": PYTHON_TARGET_MICRO,
+        }
         value = values.get(name)
         if value is None:
             return None

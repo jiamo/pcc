@@ -13,7 +13,8 @@ from pcc.py_stdlib import tempfile
 
 def test_sys_version_streams_and_implementation():
     assert sys.version_info.major == 3
-    assert tuple(sys.version_info)[:3] == (3, 13, 0)
+    assert tuple(sys.version_info)[:3] == (3, 15, 0)
+    assert sys.version == "3.15.0 (pcc self-host)"
     assert sys.stdout.write("x") == 1
     assert sys.stderr.write("err") == 3
     assert sys.getdefaultencoding() == "utf-8"
@@ -26,7 +27,8 @@ def test_platform_subset():
     assert platform.system() in ("Darwin", "Linux", "Windows", "darwin")
     assert isinstance(platform.machine(), str)
     assert platform.python_implementation() == host_sys.implementation.name
-    assert platform.python_version_tuple() == ("3", "13", "0")
+    assert platform.python_version_tuple() == ("3", "15", "0")
+    assert platform.python_version() == "3.15.0"
     assert len(platform.uname()) == 6
 
 

@@ -1,0 +1,115 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 856" role="img" aria-labelledby="title desc">
+  <rect width="1200" height="856" rx="16" fill="#f8f9fa"/>
+  <title id="title">pcc architecture overview</title>
+  <desc id="desc">C and typed Python frontends share an IR and backend layer. Host pcc defaults to LLVM; native pcc1 defaults to the self backend. Python executables link a native runtime with five GC backends. The separate, bounded Kernel IR path targets Metal. Gateway and GUI are external packages. The optional libpython bridge is explicitly enabled; LLVM, TVM, TIRx and TileLang oracle relationships are not self-backend runtime dependencies.</desc>
+  <defs>
+    <marker id="arrow" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse">
+      <path d="M 1 1 L 9 5 L 1 9" fill="none" stroke="#64748b" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+    </marker>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; fill: #243449; }
+      .heading { font-size: 25px; font-weight: 700; }
+      .title { font-size: 20px; font-weight: 650; }
+      .body { font-size: 16px; }
+      .note { font-size: 14px; fill: #475569; }
+      .label { font-size: 13px; font-weight: 700; letter-spacing: 1.2px; fill: #52657b; }
+      .card { fill: #edf3f9; stroke: #afc3d7; stroke-width: 1.4; }
+      .gpu { fill: #f1edf8; stroke: #c5b7da; stroke-width: 1.4; }
+      .runtime { fill: #eaf3ef; stroke: #b0ccc0; stroke-width: 1.4; }
+      .output { fill: #f0f3f6; stroke: #bdc8d4; stroke-width: 1.4; }
+      .edge { fill: none; stroke: #64748b; stroke-width: 1.8; marker-end: url(#arrow); }
+      .optional { stroke-dasharray: 5 4; }
+    </style>
+  </defs>
+
+  <text x="32" y="43" class="heading">pcc · native execution architecture</text>
+  <text x="32" y="68" class="body">Two CPU frontends, one runtime laboratory, and a bounded accelerator path.</text>
+
+  <rect x="32" y="90" width="1136" height="54" rx="10" fill="#dfE8f2" stroke="#afc3d7"/>
+  <text x="600" y="114" text-anchor="middle" class="title">Command entry and build orchestration</text>
+  <text x="600" y="134" text-anchor="middle" class="note">host pcc / C Python API · native pcc1 · source and package discovery</text>
+  <path class="edge" d="M 212 144 V 174"/>
+  <path class="edge" d="M 600 144 V 174"/>
+  <path class="edge" d="M 1000 144 V 174"/>
+
+  <rect x="32" y="176" width="360" height="116" rx="10" class="card"/>
+  <text x="50" y="204" class="title">C frontend</text>
+  <text x="50" y="228" class="body">C sources / projects · mature</text>
+  <text x="50" y="250" class="body">Preprocess → parse → semantic lowering</text>
+  <text x="50" y="276" class="note">pcc1 delegates C inputs to host pcc</text>
+
+  <rect x="420" y="176" width="360" height="116" rx="10" class="card"/>
+  <text x="438" y="204" class="title">Typed-Python frontend</text>
+  <text x="438" y="228" class="body">Python apps + packages · experimental</text>
+  <text x="438" y="250" class="body">Parse → infer → native lowering</text>
+  <text x="438" y="276" class="note">pcc-gateway / pcc-gui are external packages</text>
+
+  <rect x="832" y="176" width="336" height="116" rx="10" class="gpu"/>
+  <text x="850" y="204" class="title">Kernel IR</text>
+  <text x="850" y="228" class="body">@gpu.kernel · host/device split</text>
+  <text x="850" y="250" class="body">Fixed-shape subset · experimental</text>
+  <text x="850" y="276" class="note">TVM / TIRx / TileLang: oracles only</text>
+
+  <path class="edge" d="M 212 292 V 324"/>
+  <path class="edge" d="M 600 292 V 324"/>
+  <path class="edge" d="M 1000 292 V 324"/>
+  <rect x="32" y="326" width="748" height="56" rx="10" class="card"/>
+  <text x="406" y="351" text-anchor="middle" class="title">IR, analysis and lowering passes</text>
+  <text x="406" y="371" text-anchor="middle" class="note">LLVM-compatible IR · native structured/indexed representations</text>
+  <rect x="832" y="326" width="336" height="56" rx="10" class="gpu"/>
+  <text x="1000" y="350" text-anchor="middle" class="title">Metal finalization</text>
+  <text x="1000" y="371" text-anchor="middle" class="note">Validate → TIRx-shaped freeze → compile</text>
+
+  <path class="edge" d="M 212 382 V 414"/>
+  <path class="edge" d="M 600 382 V 414"/>
+  <path class="edge" d="M 1000 382 V 414"/>
+  <rect x="32" y="416" width="360" height="90" rx="10" class="card"/>
+  <text x="50" y="444" class="title">LLVM / LLVM-CAPI</text>
+  <text x="50" y="469" class="body">Default backend for host pcc</text>
+  <text x="50" y="491" class="note">Also a validation oracle for the self backend</text>
+  <rect x="420" y="416" width="360" height="90" rx="10" class="card"/>
+  <text x="438" y="444" class="title">Self backend · LLVM-free</text>
+  <text x="438" y="469" class="body">Default backend for native pcc1</text>
+  <text x="438" y="491" class="note">AArch64 Darwin / x86_64 Linux subsets</text>
+  <rect x="832" y="416" width="336" height="90" rx="10" class="gpu"/>
+  <text x="850" y="444" class="title">GPU artifact and launch</text>
+  <text x="850" y="469" class="body">Host executable + .metallib</text>
+  <text x="850" y="491" class="note">macOS / Metal · hardware-gated</text>
+
+  <path class="edge" d="M 212 506 V 538"/>
+  <path class="edge" d="M 600 506 V 538"/>
+  <rect x="32" y="540" width="748" height="48" rx="10" class="card"/>
+  <text x="406" y="570" text-anchor="middle" class="title">Native emission and linking</text>
+  <path class="edge" d="M 212 588 V 620"/>
+  <path class="edge" d="M 600 588 V 620"/>
+
+  <rect x="32" y="622" width="360" height="88" rx="10" class="output"/>
+  <text x="50" y="651" class="title">C output / execution</text>
+  <text x="50" y="676" class="body">IR · object · assembly · executable</text>
+  <text x="50" y="697" class="note">MCJIT on the LLVM-backed path</text>
+  <rect x="420" y="622" width="360" height="88" rx="10" class="output"/>
+  <text x="438" y="651" class="title">Python native executable</text>
+  <text x="438" y="676" class="body">Linked with the pcc runtime</text>
+  <text x="438" y="697" class="note">Strict mode: no libpython</text>
+
+  <rect x="832" y="540" width="336" height="170" rx="10" class="runtime"/>
+  <text x="850" y="568" class="title">Native Python runtime</text>
+  <text x="850" y="593" class="body">Freestanding pcc-Python migration</text>
+  <text x="850" y="615" class="note">C transition implementations remain</text>
+  <text x="850" y="642" class="body">5 GC: refcount · incremental · concurrent</text>
+  <text x="850" y="663" class="body">generational · relocating</text>
+  <text x="850" y="693" class="note">Memory / atomics / syscall / host-ABI intrinsics</text>
+  <path class="edge" d="M 832 666 H 782"/>
+
+  <path class="edge" d="M 600 710 V 742"/>
+  <rect x="32" y="744" width="748" height="62" rx="10" class="output"/>
+  <text x="50" y="770" class="title">Self-host contract</text>
+  <text x="50" y="794" class="body">pcc0 / host → pcc1 → pcc2 → pcc3 · fixed-point gates</text>
+  <rect x="832" y="744" width="336" height="62" rx="10" fill="#f8f0e7" stroke="#c8b49a" stroke-dasharray="5 4"/>
+  <text x="850" y="770" class="title">Optional libpython bridge</text>
+  <text x="850" y="794" class="note">Explicit --python-libpython=auto/on only</text>
+  <path class="edge optional" d="M 832 776 H 804 V 689 H 782"/>
+
+  <text x="32" y="837" class="note">Overview of current paths. Experimental and hardware-gated surfaces retain their own validation boundaries.</text>
+</svg>

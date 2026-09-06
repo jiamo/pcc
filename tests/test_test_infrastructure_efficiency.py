@@ -372,14 +372,10 @@ def test_full_runtime_c_source_emit_gate_is_integration_only():
     assert "pytest.mark.integration" in source
     assert "pcc_runtime_emit" in source
 
-    board = (ROOT / "docs/goal/task-board.yaml").read_text(encoding="utf-8")
-    commands = [
-        line
-        for line in board.splitlines()
-        if "test_py_runtime_pcc_emit.py" in line and "pytest" in line
-    ]
-    assert commands
-    assert all("-m integration" in line for line in commands)
+    # The task board this used to cross-check retired on 2026-09-06 (its
+    # unfinished rows became GitHub issues).  The property that matters is the
+    # marker in the test itself, asserted above: the gate cannot run outside
+    # an explicit ``-m integration`` selection.
 
 
 def test_gc_root_graph_fixture_is_not_rebuilt_by_every_xdist_worker():

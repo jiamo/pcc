@@ -761,6 +761,13 @@ class AssignmentStatementLoweringMixin:
         elif self._is_object(target_ty) and isinstance(stmt.value, BoolExpr):
             value = self._emit_expr_as_pcc_object(stmt.value)
             local_target_ty = target_ty
+        elif self._is_object(target_ty) and isinstance(stmt.value.ty, IntType):
+            # Select the Python integer object before scalar lowering can
+            # discard an out-of-lane value (notably int(object) / int(str)).
+            # Keep the ordinary object-local ownership path: the producer's
+            # ledger distinguishes new results from borrowed integer objects.
+            value = self._emit_expr_as_pcc_object(stmt.value)
+            local_target_ty = target_ty
         else:
             value = self._emit_expr(stmt.value)
             local_target_ty = target_ty

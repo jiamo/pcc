@@ -99,13 +99,43 @@ def package_parts_for_module(src_path: str, module_name: str) -> list[str]:
     return parts[:-1]
 
 
+def path_component_matches_case(path: str, expected_name: str) -> bool:
+    """Return whether *path*'s last component really is ``expected_name``.
+
+    macOS and Windows filesystems are case-insensitive by default, so
+    ``os.path.isfile`` answers yes for ``pkg/App.py`` when only ``pkg/app.py``
+    exists.  ``from pkg import App`` then resolved the class name ``App`` as a
+    submodule and compiled ``app.py`` twice under two module names, which the
+    linker rejected with undefined ``__pcc_py_module_top_pkg_App``.  Compare
+    against the directory listing so module identity stays case-sensitive on
+    every platform.
+    """
+    directory = str(os.path.dirname(path))
+    if not directory:
+        directory = "."
+    try:
+        names = os.listdir(directory)
+    except OSError:
+        return True
+    for name in names:
+        if name == expected_name:
+            return True
+    return False
+
+
 def resolve_module_src(root_dir: str, dotted_name: str) -> Optional[str]:
     parts = dotted_name.split(".")
+    leaf = parts[len(parts) - 1]
     py_path = str(os.path.join(root_dir, *parts)) + ".py"
-    if os.path.isfile(py_path):
+    if os.path.isfile(py_path) and path_component_matches_case(
+        py_path, leaf + ".py"
+    ):
         return py_path
-    init_path = str(os.path.join(root_dir, *parts, "__init__.py"))
-    if os.path.isfile(init_path):
+    package_dir = str(os.path.join(root_dir, *parts))
+    init_path = str(os.path.join(package_dir, "__init__.py"))
+    if os.path.isfile(init_path) and path_component_matches_case(
+        package_dir, leaf
+    ):
         return init_path
     return None
 

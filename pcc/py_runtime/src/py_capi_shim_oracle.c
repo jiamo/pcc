@@ -5072,6 +5072,11 @@ int PyObject_RichCompareBool(PyObject *left, PyObject *right, int opid) {
 }
 
 PyObject *PyObject_RichCompare(PyObject *left, PyObject *right, int opid) {
+    if (opid == Py_EQ || opid == Py_NE) {
+        int64_t equal = py_obj_eq_value(left, right);
+        if (py_err_occurred() != NULL) return NULL;
+        return PyBool_FromLong(opid == Py_EQ ? equal : !equal);
+    }
     int result = PyObject_RichCompareBool(left, right, opid);
     if (result < 0) return NULL;
     return PyBool_FromLong(result);

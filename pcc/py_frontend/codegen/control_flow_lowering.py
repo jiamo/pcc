@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 from pcc.llvm_capi.compat import ir
+from pcc.python_target import PYTHON_TARGET_VERSION_INFO
 
 from ..py_ast import Assign, Attr, BoolLit, BoolType, Break, Compare, If, IfExpr, IntLit, Name, NoneLit, NoneType, Try, TupleExpr, While
 from . import marshal
 
 
 _CSTR = ir.IntType(8).as_pointer()
-_TARGET_SYS_VERSION_INFO = (3, 13, 0)
+_TARGET_SYS_VERSION_INFO = PYTHON_TARGET_VERSION_INFO
 
 
 class ControlFlowLoweringMixin:

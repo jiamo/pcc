@@ -122,6 +122,7 @@ def _runtime_signatures_part_1():
     "py_obj_truthy": (_I64, [_PYOBJ], False),
     "py_obj_type_tag": (_I64, [_PYOBJ], False),
     "py_obj_eq": (_I64, [_PYOBJ, _PYOBJ], False),
+    "py_obj_eq_value": (_I64, [_PYOBJ, _PYOBJ], False),
     "py_obj_lt": (_I64, [_PYOBJ, _PYOBJ], False),
     "py_obj_le": (_I64, [_PYOBJ, _PYOBJ], False),
     "py_obj_gt": (_I64, [_PYOBJ, _PYOBJ], False),
@@ -735,6 +736,7 @@ def _runtime_signatures_part_12():
     "py_functools_partial_kw": (_PYOBJ, [_PYOBJ, _PYOBJ, _PYOBJ], False),
     "py_functools_update_wrapper": (_PYOBJ, [_PYOBJ, _PYOBJ], False),
     # ---- Native generator objects ----------------------------------
+    "py_gen_frame_new": (_PYOBJ, [_I64], False),
     "py_gen_new": (_PYOBJ, [_PTR, _PYOBJ], False),
     "py_gen_set_may_park": (_VOID, [_PYOBJ], False),
     "py_gen_is_may_park": (_I64, [_PYOBJ], False),

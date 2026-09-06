@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import sys as _sys
 
+from pcc.python_target import PYTHON_TARGET_FULL_VERSION, PYTHON_TARGET_VERSION_PARTS
+
 
 def system() -> str:
     p = _sys.platform
@@ -26,7 +28,7 @@ def machine() -> str:
 
 
 def python_version() -> str:
-    return _sys.version
+    return PYTHON_TARGET_FULL_VERSION
 
 
 def platform() -> str:
@@ -42,7 +44,7 @@ def python_implementation() -> str:
 
 
 def python_version_tuple():
-    return ("3", "13", "0")
+    return PYTHON_TARGET_VERSION_PARTS
 
 
 def uname():

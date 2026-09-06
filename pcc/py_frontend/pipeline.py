@@ -592,6 +592,9 @@ _closed_world_is_node = _pipeline_exports._closed_world_is_node
 _export_default_is_native_typed_int_shape = _pipeline_exports._export_default_is_native_typed_int_shape
 _export_func_uses_unboxed_typed_int_abi = _pipeline_exports._export_func_uses_unboxed_typed_int_abi
 _export_static_literal_type = _pipeline_exports._export_static_literal_type
+_export_signed_int_literal_or_none = (
+    _pipeline_exports._export_signed_int_literal_or_none
+)
 _export_static_all_names = _pipeline_exports._export_static_all_names
 _export_common_static_type = _pipeline_exports._export_common_static_type
 _decorator_name = _pipeline_exports._decorator_name

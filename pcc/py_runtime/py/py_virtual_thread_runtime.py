@@ -2705,6 +2705,13 @@ def _result_bits(result, fd: int) -> int:
 def py_virtual_thread_poll_io(timeout_ms: int) -> int:
     if _scheduler_lock() != 0:
         return -1
+    # Ready-only work has no fd state to observe. Check under the same lock
+    # used by registration; a later registration is seen by the next step or
+    # the idle driver's blocking poll. Avoid allocating/polling an empty OS
+    # waitset on every virtual-thread resume.
+    if timeout_ms == 0 and ptr_is_null(global_load_ptr("pcc_vthread_io_head_py")):
+        _scheduler_unlock()
+        return 0
     if _waitset_init() != 0:
         _scheduler_unlock()
         return -1

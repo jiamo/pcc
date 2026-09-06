@@ -1816,6 +1816,16 @@ PyObject *py_obj_call_method1(PyObject *o, const char *name, PyObject *arg) {
 int64_t py_obj_isinstance(PyObject *o, PyObject *cls) {
     if (!o || !cls) return 0;
     if (PY_IS_TAGGED_INT(cls)) return 0;
+    if (py_header(cls)->type_tag == PY_TYPE_TUPLE) {
+        int64_t count = py_tuple_len(cls);
+        for (int64_t index = 0; index < count; index++) {
+            PyObject *candidate = py_tuple_get(cls, index);
+            int64_t matched = py_obj_isinstance(o, candidate);
+            py_decref(candidate);
+            if (matched != 0) return matched;
+        }
+        return 0;
+    }
     if (py_header(cls)->type_tag != PY_TYPE_CLASS) return 0;
     if (cls == (PyObject *)pcc_type_cls_bool) return py_type_of(o) == PY_TYPE_BOOL;
     if (cls == (PyObject *)pcc_type_cls_int) {

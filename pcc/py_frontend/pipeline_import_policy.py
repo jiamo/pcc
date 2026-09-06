@@ -18,11 +18,11 @@ COMPILE_TIME_ONLY_IMPORT_MODULES = frozenset(
 
 TEST_FACADE_IMPORT_MODULES = ("pytest", "pcc.test_runner")
 
-# pcc-owned product components resolved from the pcc source/install root even
-# when the application lives outside that tree.  Empty since the gateway and
-# web framework moved to https://github.com/allstoalls/pcc-gateway; external
-# packages are resolved through the package site (PCC_PACKAGE_SITE) instead.
-PCC_OWNED_COMPONENT_IMPORT_PREFIXES: tuple[str, ...] = ()
+# Deliberate runtime components resolved from the pcc source/install root even
+# when the application lives outside that tree. The literal semantic target is
+# shared with stdlib providers; compiler implementation modules stay excluded.
+# Gateway/web packages resolve through the package site after their repo split.
+PCC_OWNED_COMPONENT_IMPORT_PREFIXES: tuple[str, ...] = ("pcc.python_target",)
 
 ANNOTATION_ONLY_IMPORT_MODULES = frozenset(
     {"llvmlite.binding", "llvmlite.ir"}
@@ -62,15 +62,15 @@ NATIVE_BUILTIN_IMPORTS = frozenset(
 )
 
 # Most builtin-native modules need no compiled provider because dedicated
-# lowering owns their values. subprocess also exports semantic exception
-# classes and therefore needs its pcc-Python provider in the closed world.
-NATIVE_BUILTIN_IMPORTS_WITH_COMPILED_PROVIDER = frozenset({"subprocess"})
+# lowering owns their values. platform's version functions and subprocess's
+# exception classes belong to their pcc-Python providers in the closed world.
+NATIVE_BUILTIN_IMPORTS_WITH_COMPILED_PROVIDER = frozenset({"platform", "subprocess"})
 
 # A shallow explicit multi-file compile normally admits every directly
 # imported pcc-owned provider.  Entries are needed here only when the module is
 # also classified as compiler-owned builtin dispatch but still exposes
 # semantic objects that require its compiled provider.
-REQUIRED_COMPILED_STDLIB_PROVIDERS = frozenset({"subprocess"})
+REQUIRED_COMPILED_STDLIB_PROVIDERS = frozenset({"platform", "subprocess"})
 
 NATIVE_IMPORT_FROMS = {
     "builtins": frozenset(

@@ -3,8 +3,14 @@
 __pcc_runtime_port__ = True
 
 from pcc.py_runtime.py.py_abi_constants import (
+    C_POINTER_SIZE,
+    PYLISTOBJECT_CAPACITY_OFFSET,
+    PYLISTOBJECT_ITEMS_OFFSET,
+    PYLISTOBJECT_LENGTH_OFFSET,
+    PYLISTOBJECT_SIZE,
     PY_TYPE_COROUTINE,
     PY_TYPE_GEN,
+    PY_TYPE_LIST,
 )
 
 from pcc.extern import extern, c_abi_export, c_int32, c_ptr, c_int64, c_void
@@ -16,6 +22,7 @@ from pcc.unsafe import (
     load_i32,
     load_i64,
     load_ptr,
+    malloc,
     null,
     ptr_add,
     ptr_eq,
@@ -58,12 +65,49 @@ pcc_gc_free_object_memory = extern("pcc_gc_free_object_memory", (c_ptr,), c_void
 py_runtime_error_if_unset = extern(
     "py_runtime_error_if_unset", (c_ptr, c_ptr), c_ptr
 )
+pcc_gc_backend4_zpage_register_owner_payload_span = extern(
+    "pcc_gc_backend4_zpage_register_owner_payload_span",
+    (c_ptr, c_ptr, c_int64), c_int64,
+)
 
 
 def _require_result(result, helper_name, message):
     if ptr_is_null(result):
         py_runtime_error_if_unset(helper_name, message)
     return result
+
+
+@c_abi_export("py_gen_frame_new")
+def py_gen_frame_new(slot_count: int):
+    """Construct the compiler's fixed-size list frame before publishing it."""
+    if slot_count < 0 or slot_count > 134217728:
+        return _require_result(null(), cstr("py_gen_frame_new"), cstr("invalid generator frame size"))
+    frame = pcc_gc_alloc(PYLISTOBJECT_SIZE, PY_TYPE_LIST, 0)
+    if ptr_is_null(frame):
+        return _require_result(null(), cstr("pcc_gc_alloc"), cstr("generator frame allocation failed"))
+    capacity: int = slot_count
+    if capacity < 4:
+        capacity = 4
+    store_i64(frame, PYLISTOBJECT_LENGTH_OFFSET, 0)
+    store_i64(frame, PYLISTOBJECT_CAPACITY_OFFSET, capacity)
+    store_ptr(frame, PYLISTOBJECT_ITEMS_OFFSET, null())
+    items = malloc(capacity * C_POINTER_SIZE)
+    if ptr_is_null(items):
+        py_decref(frame)
+        return _require_result(null(), cstr("malloc"), cstr("generator frame slots allocation failed"))
+    store_ptr(frame, PYLISTOBJECT_ITEMS_OFFSET, items)
+    none = global_load_ptr("py_None")
+    index: int = 0
+    # None is immortal. Fill the unpublished frame without retain/release or
+    # growth; subsequent argument/local stores use the ordinary list barriers.
+    while index < slot_count:
+        store_ptr(items, index * C_POINTER_SIZE, none)
+        index += 1
+    store_i64(frame, PYLISTOBJECT_LENGTH_OFFSET, slot_count)
+    pcc_gc_backend4_zpage_register_owner_payload_span(frame, items, capacity * C_POINTER_SIZE)
+    py_gc_track(frame)
+    pcc_gc_publish_initialized(frame)
+    return frame
 
 
 @c_abi_export("py_gen_new")

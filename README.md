@@ -20,7 +20,7 @@ proves and what it does not.
 - **Runs real C code.** The production-quality C frontend compiles and runs
   Lua, SQLite, PostgreSQL `libpq`, zlib, lz4, zstd, PCRE, OpenSSL, readline, and
   nginx, and is validated against GCC/Clang-derived test suites.
-- **Self-hosts with no libpython.** pcc compiles its own source through a
+- **Self-hosts with no libpython.** Recorded bootstrap gates compile pcc's source through a
   three-stage bootstrap `pcc1 → pcc2 → pcc3`; in the strict path
   (`--backend self --python-libpython=off`) `pcc2` and `pcc3` are byte-identical,
   the emitted IR has zero CPython-bridge calls, and the binaries link no
@@ -28,7 +28,8 @@ proves and what it does not.
 - **Five comparative GC backends.** One runtime, five collectors selectable at
   startup — refcount+cycle, incremental, concurrent, generational, and colored
   relocating — each mirroring a real reference implementation (CPython, Lua, Go,
-  OCaml, ZGC) and each passing the full self-host bootstrap.
+  OCaml, ZGC), with recorded per-backend self-host gates. Current-source
+  qualification is tracked separately from those historical results.
 - **LLVM-free self backend.** An in-tree native emitter (AArch64 Darwin and
   x86_64 Linux subsets) validated against the LLVM-backed path. LLVM is an
   oracle, not a hard dependency.
@@ -54,9 +55,10 @@ proves and what it does not.
   an opt-in identity-free value model, a virtual-thread / effect track, and a
   long-running GC measurement harness (pause / RSS / throughput over time).
 - **Generic ecosystem support.** Package / C-API-shim / extension-ABI work is
-  reusable, never per-package special cases. Locally, NumPy 2.4.4 imports and
-  runs a narrow array runtime under strict pcc-native no-libpython across all
-  five GC backends (import, version, `np.array(...) + scalar`).
+  reusable, never per-package special cases. Recorded NumPy 2.4.4 gates cover
+  a narrow array runtime under strict pcc-native no-libpython across all five
+  GC backends (import, version, `np.array(...) + scalar`); current-source
+  package qualification is separate.
 
 New here? Jump to [Install](#install) and [Quick Start](#quick-start).
 Everything from [Status](#status) onward is reference and maturity detail for
@@ -76,10 +78,135 @@ cd pcc
 uv sync
 ```
 
-Requires Python 3.13+. Source builds may build the Python runtime archive at
-wheel time via `hatch_build.py` (prefers the self backend, falls back to LLVM);
-a missing archive is rebuilt lazily on first use. There is no separate
+### First native installation after cloning (macOS arm64)
+
+With Git, uv, make and the Xcode command line tools installed:
+
+```bash
+git clone https://github.com/allstoalls/pcc
+cd pcc
+env -u LC_ALL uv sync --locked
+gtimeout 2100s env -u LC_ALL uv run python scripts/install_pcc1_toolchain.py --from-source .
+export PATH="$HOME/.local/bin:$PATH"
+pcc1 --help
+```
+
+`gtimeout` is provided by GNU coreutils on macOS. The installer also bounds
+each build stage internally. It copies the source, builds a private runtime,
+checks Stage1 and Stage2 in order, installs matching helper dependencies, and
+runs a native function-bearing canary before creating `~/.local/bin/pcc1`.
+Build logs and stage receipts remain under `~/.cache/pcc/installations/`.
+The first source-install workflow is undergoing the current 0.1.8 qualification;
+failure leaves the shared command unchanged and reports the failed stage.
+
+If `pcc1` already exists, this initial installer refuses to overwrite it.
+Keep using the installed version while a separate candidate is qualified.
+Add `~/.local/bin` to your shell startup PATH once to use the command from
+every project. This staged source installer currently requires macOS arm64;
+it is not a Linux Python self-host claim.
+
+Requires Python 3.13+. PyPI publishes a source distribution. Its wheel-build
+hook builds and bundles both the runtime archive and native `pcc1`; either
+build failing is fatal. The hook currently tries the self backend first and
+can explicitly report a retry through LLVM/clang. Installing a source package
+therefore does not itself prove a build without host compiler tools.
+There is no separate
 `python-cc[no-libpython]` extra — no-libpython is already the default.
+
+### One installed compiler for multiple projects
+
+`pcc-gateway` and `pcc-gui` use **`~/.local/bin/pcc1` through PATH**. This is the
+stable installation entry; a core checkout's `build/bootstrap/pcc1` is a
+development artifact and must not be used as the shared installation.
+
+Versioned toolchains live under `~/.local/share/pcc/toolchains/`. Each candidate
+contains its native compiler, matching runtime and helper sources, and
+validation receipts. Build and test a candidate in its own directory; only
+after qualification may the stable entry switch atomically. Keep the previous
+toolchain for rollback. Rebuilding the core or another application must not
+overwrite the installed toolchain in place.
+
+Ensure `~/.local/bin` is in PATH, then use the same command in either checkout:
+
+```bash
+command -v pcc1                     # ~/.local/bin/pcc1
+pcc1 app.py -o app
+./app
+```
+
+The current local installation is the **v84 historical baseline**, with
+matching successful Stage1/Stage2 receipts and a freshly executed installed
+canary; see the [installation receipt](docs/knowledge/2026-09-06-release-0.1.8-handoff.md).
+It is not the 0.1.8 release candidate. Initial installation is reproducible with
+`scripts/install_pcc1_toolchain.py`; initial installation refuses to replace an
+existing entry. Use `--stage-only` to prepare a later candidate. The same tool's
+`--qualify`, `--promote` and `--rollback` commands bind validation receipts to a
+versioned installation and preserve the previous version during atomic
+switching; `--help` documents the receipt protocol. Qualification requires the
+default and integration suites, fresh pcc1/bootstrap checks and clean package
+installation. New application features may need that newer compiler.
+
+Use `pcc1 --help` to inspect the command. Invoking `pcc1` without arguments
+requests an interactive REPL, which currently fails with an explicit
+unsupported-capability diagnostic.
+
+### Install application packages into one environment
+
+The compiler installation and third-party packages have different lifetimes.
+Use the same package command for local framework checkouts and registry
+packages; manually copying folders into site-packages is not the normal
+installation workflow:
+
+```bash
+pcc1 env info --json
+pcc1 -m pip install /path/to/pcc-gateway
+pcc1 -m pip install /path/to/pcc-gui
+pcc1 -m pip install numpy
+```
+
+All three commands select packages with the same rules:
+
+| Environment | Package installation and import location |
+|---|---|
+| Ordinary shell, no virtual environment | `~/.local/share/pcc/environments/<compatibility-tag>/site-packages` |
+| Active `VIRTUAL_ENV` | That virtual environment's pcc overlay; inspect `selected_site_packages` with `pcc1 env info --json`. |
+| Explicit `PCC_ENVIRONMENT` / data-root override | The explicitly selected pcc environment, reported by `env info`. |
+
+Run installation and compilation in the same environment. `uv run` or an
+activated Python virtual environment can change `VIRTUAL_ENV`, so it can
+select a different pcc package site. Local-directory installation and registry
+installation must obey this equally. `PCC_PACKAGE_SITE` is an explicit extra
+source-search override for development, not a separate package manager.
+
+The default native environment is identified by pcc's ABI and target platform,
+without a Python version in the directory name. For example,
+`pcc_native_v1-arm64_apple_darwin-pcc_native` means:
+
+| Component | Meaning |
+|---|---|
+| `pcc_native_v1` | Version 1 of pcc's native runtime ABI |
+| `arm64_apple_darwin` | macOS on arm64 |
+| `pcc_native` | Native package ABI mode |
+
+The 0.1.8 candidate targets **Python 3.15**; that target is reported separately
+as compatibility metadata and its qualification is still in progress. A later
+Python target such as 3.16 can retain the native package path when pcc's ABI
+and platform remain compatible. Python-dependent lock selections are refreshed
+when the target changes. Explicit CPython compatibility modes keep versioned
+environment identities because their extension ABI is version-sensitive.
+
+The build host's Python version is separate. Users normally use pcc's default;
+`PCC_PACKAGE_TARGET_PYTHON` is an explicit package-selection override, not a
+switch that implements another Python runtime. Existing `py311` environments
+remain untouched and can be selected explicitly with `PCC_ENVIRONMENT`; use
+the same `pcc1 -m pip install` commands for the new default environment.
+A target version does not claim that
+every Python feature or CPython extension ABI is implemented.
+
+`pcc1 env info` is authoritative for the actual path. Current GUI/gateway
+source-install and NumPy native integration are being checked together for
+0.1.8. Installation success alone does not prove application execution or full
+NumPy compatibility; see their separate validation boundaries below.
 
 ## Quick Start
 
@@ -98,6 +225,16 @@ pcc --emit-obj out.o --target x86_64-unknown-linux-gnu hello.c
 ```
 
 ### Compile Python
+
+Use the installed native compiler for ordinary application builds:
+
+```bash
+pcc1 hello.py -o hello
+./hello
+```
+
+`pcc1` defaults to `--backend self --python-libpython off --ir-scaffold on`.
+`pcc` is the host-Python command and keeps LLVM as its default backend:
 
 ```bash
 pcc hello.py                    # compile (strict no-libpython) and run
@@ -118,7 +255,25 @@ Python inputs default to the strict no-libpython path
 | `--python-libpython=on` | Always allow/link the CPython fallback surface. |
 | `--ir-scaffold=on` | Default. Closed-world lowering used by the strict self-host work. |
 | `--ir-scaffold=off` | Compatibility escape hatch for the older Python lowering path. |
-| `--backend {llvm,llvm_capi,self}` | Select the backend. `llvm` is the public default; `self` is experimental. |
+| `--backend {llvm,llvm_capi,self}` | Host `pcc` defaults to `llvm`; native `pcc1` defaults to `self`. |
+
+`ir-scaffold` names a lowering path, not a level of Python completeness, and
+for an ordinary application it changes nothing at all: its three effects are
+about compiling pcc's *own* IR-builder code (treating
+`from pcc.llvm_capi.compat import ir` as a compile-time scaffold so
+`compat.py`/`binding.py` stay out of the link, the matching libpython
+decision, and native lowering of `ir.*` builder calls). `auto` resolves to
+`on`, `off` is an older diagnostic path, and no application ever needs to pass
+it. Unsupported native capabilities must produce a diagnostic. These options
+do not establish full CPython compatibility.
+
+An application also finds its own project's packages with no configuration:
+import resolution starts at the entry file's directory and walks up to the
+first directory holding a project-root marker (`pcc-package.json`,
+`pyproject.toml`, `setup.py`, `.git`), so `examples/probe/app.py` importing
+`mypkg` from the repository root just works. The walk stops at that root, so a
+package above it never enters the program's closure. `PCC_PACKAGE_SITE` and
+the installed package site remain for packages outside the project.
 
 ### Use pcc from Python
 
@@ -143,14 +298,16 @@ print(m.add(3, 4))
 
 ### NumPy on pcc1 (repository example)
 
-From a repository checkout (macOS arm64), `pcc1 -m pip install numpy` now
-performs a real network acquisition and pcc-native source install. The default
-`auto` acquisition mode uses pcc's owned Simple Repository/HTTPS path, verifies
-the repository SHA-256, and downloads a NumPy 2.4.x source artifact for pcc's
-supported Python 3.11 target. Explicit `--acquire=host` remains available as a
-labeled compatibility mode; it is not the normal path. pcc then owns the
-extension build/install, and the emitted application runs without libpython or
-host Python.
+The default `auto` acquisition mode uses pcc's owned Simple Repository/HTTPS
+path, verifies the repository SHA-256, and evaluates `Requires-Python` against
+the configured target. Explicit `--acquire=host` selects the labeled host
+acquisition mode. Acquisition, extension building and native import are
+separate validation boundaries.
+
+Historical Python 3.11 target checks selected NumPy 2.4.x. They do not qualify
+the newer artifacts eligible for the Python 3.15 target. Current 0.1.8
+acquisition/build/import qualification remains in progress; unsupported syntax
+or ABI surfaces must produce an explicit diagnostic.
 
 Install and import use one first-class package environment. An active
 `VIRTUAL_ENV` owns a private compatibility-tagged overlay below
@@ -170,23 +327,23 @@ print([int(x) for x in a + 1])
 ```
 
 ```bash
-# 1. Build the compiler (~3 minutes on the current macOS arm64 gate, once)
-scripts/bootstrap.sh --stage 1
+# Use the verified compiler from the stable installation.
+command -v pcc1
 
 # 2. Acquire and install NumPy from the network (cached afterwards)
-build/bootstrap/pcc1 -m pip install numpy
+pcc1 -m pip install numpy
 
 # 3. Compile and run
-build/bootstrap/pcc1 np_demo.py -o np_demo
+pcc1 np_demo.py -o np_demo
 
 ./np_demo
 # 2.4.x
 # [2, 3, 4]
 ```
 
-`-o` is optional: `build/bootstrap/pcc1 np_demo.py` compiles into the per-user
-run cache and executes immediately (script-style). Use `-o` when you want a
-persistent standalone binary.
+The CLI also has a compile-and-run form, `pcc1 np_demo.py`. That path is under
+renewed qualification for 0.1.8 after a reported hang; use explicit `-o` and
+execute the result while that boundary remains open.
 
 `otool -L np_demo` shows no libpython, and `PCC_GC_BACKEND=0..4` all print the
 same result. Scope today is import/version, array construction, scalar add, and
@@ -201,17 +358,22 @@ For a pinned offline/reproducibility gate, the repository also retains
 
 ## Status
 
+**2026-09-06:** `0.1.8` is undergoing current-source qualification. Historical
+bootstrap/GC/package receipts below do not establish that today's worktree or
+an arbitrary local `pcc1` passes. Publication and shared-toolchain promotion
+remain gated on the new results.
+
 | Area | Current state |
 |---|---|
 | C frontend | Mature relative to the rest of the repo; validated through C tests, GCC/Clang-derived suites, and real projects (Lua, SQLite, PostgreSQL `libpq`, zlib, lz4, zstd, PCRE, OpenSSL, readline, nginx). |
 | Python frontend | Experimental. Typed code can lower to native IR; unsupported idioms fail by default and only route through the CPython bridge when `--python-libpython=auto/on` is explicit. |
 | Runtime | Active migration from C runtime sources to pcc-Python modules under `pcc/py_runtime/py/`, using `pcc.unsafe` and `pcc.extern` for low-level operations. |
 | Libc ownership | In progress. A host-pcc0, self-backend, no-libpython x86_64 Linux tracer is proven statically linked with no `PT_INTERP`, `DT_NEEDED`, undefined symbols, hand-written C startup, or libc object. This is not yet the full runtime/five-GC closure. Darwin intentionally retains an enumerated libSystem ABI boundary and is not a zero-libc target. |
-| Self backend | Experimental LLVM-free emission for AArch64 Darwin and x86_64 Linux subsets; used by bootstrap/build gates. The public default backend is LLVM unless `self` is selected. |
+| Self backend | Experimental LLVM-free emission for AArch64 Darwin and x86_64 Linux subsets; used by bootstrap/build gates. Host `pcc` defaults to LLVM; native `pcc1` defaults to self. |
 | Bootstrap | macOS arm64 three-stage `pcc1 → pcc2 → pcc3` completes in both the default and strict self-backend paths; strict-path `pcc2`/`pcc3` IR is byte-identical with 0 `py_cpy_*` calls and no `libpython`. Issue 1 closed 2026-05-01. |
-| GC | Five backends (0..4); all pass the full three-stage self-host bootstrap matrix. Backend #0 is the default/rollback reference. |
-| NumPy | `pcc1 -m pip install numpy` uses owned, hash-verified network acquisition of NumPy 2.4.x and installs into the active first-class pcc environment; a bare follow-up `pcc1 app.py` runs `import numpy` + `np.array(...) + scalar` under strict self/no-libpython across GC0..4. Narrow (import/version/array construct/scalar add/element access/iteration/`==`/`repr`); general resolver/build isolation, ufuncs, reductions, dtypes, and broadcasting are not covered; CPython-ABI artifacts stay intentionally rejected (`PCC-PKG-004`). |
-| GUI | Experimental pcc-Python runtime modules provide layout, elements/controls, binding, image/text, declarative components, keyed commit, state lanes, events/effects, style compilation, commands, and app lifecycle. The current product canary is a macOS AppKit/Metal dual-pane diff app; deterministic headless behavior and bounded native bridge reachability exist, while continuous interaction, pixel correctness, full text metrics, and platform portability remain open. |
+| GC | Five backends (0..4), with historical three-stage bootstrap evidence. Fresh matrix qualification is required for the release candidate. Backend #0 is the default/rollback reference. |
+| NumPy | Historical Python 3.11-target / NumPy 2.4.x gates cover owned acquisition/install and strict self/no-libpython import, construction and scalar addition across GC0..4. These are narrow gates; they do not qualify the newer artifacts selected for the 3.15 target, general resolver/build isolation, all ufuncs, reductions, dtypes or broadcasting. CPython-ABI artifacts remain rejected in pcc-native mode (`PCC-PKG-004`). |
+| GUI | External [pcc-gui](https://github.com/allstoalls/pcc-gui) package, compiled into applications. The core retains the generic Metal render surface. Native interaction, pixel correctness, full text metrics and portability have separate acceptance boundaries. |
 | Gateway / web framework | Moved to https://github.com/allstoalls/pcc-gateway (experimental; imported as an ordinary pcc package and compiled by pcc1 with the application). The runtime keeps only the generic process-control substrate it used. |
 | GPU kernel IR | Experimental, macOS/Metal only. Kernel-only IR with TIRx-style freeze and `.metallib` finalization; evidence is claim-leveled (`GPU_LEVEL_0`..`GPU_LEVEL_6`). Toolchain/device absence reports `SKIPPED_WITH_REASON`, never success. |
 | Distributed | Metadata-only first slice (`pcc.dist`): single process, CPU-only, no sockets. Every network mode reports `SKIPPED_WITH_REASON`. |
@@ -219,55 +381,22 @@ For a pinned offline/reproducibility gate, the repository also retains
 The authoritative machine-readable state is
 [`tests/bootstrap_gate_baseline.json`](tests/bootstrap_gate_baseline.json)
 (bootstrap) and [`tests/fallback_baseline.json`](tests/fallback_baseline.json)
-(no-libpython). The active goal and task board live in
-[`docs/goal/goal-prompt.md`](docs/goal/goal-prompt.md) and
-[`docs/current-goal-state.md`](docs/current-goal-state.md).
+(no-libpython). Active work is tracked as
+[GitHub issues](https://github.com/allstoalls/pcc/issues); what has already
+been measured and disproved is in
+[`docs/knowledge/denied-experiments.md`](docs/knowledge/denied-experiments.md).
 
 ## Architecture
 
-The CPU compiler/runtime path and the bounded accelerator path are separate.
-Dashed arrows below mean an optional compatibility boundary or a validation
-oracle, not a production dependency.
+The complete overview fits the page width by default. Click the diagram to
+open the scalable image. The CPU frontends share an IR/backend layer; the
+accelerator lane remains a separate, bounded path. The dashed link is the
+explicitly enabled libpython compatibility bridge.
 
-```mermaid
-flowchart TB
-    C_SRC["C sources"] --> ENTRY
-    PY_SRC["Typed Python sources"] --> ENTRY
-    GPU_SRC["@gpu.kernel source"] --> ENTRY
-    ENTRY["CLI / Python API<br/>pcc.cli_core · pcc.api"] --> COLLECT["Project collection and build orchestration<br/>pcc.project"]
+[![pcc architecture: C and typed Python frontends, shared backends, native runtime, self-host chain and bounded Metal path](docs/architecture/pcc-overview.svg)](docs/architecture/pcc-overview.svg)
 
-    subgraph CPU["CPU compiler and runtime path"]
-        COLLECT --> C_FE["C frontend — mature<br/>preprocess · parse · semantic lowering"]
-        COLLECT --> PY_FE["Typed-Python frontend — experimental<br/>parse · infer · native lowering"]
-        C_FE --> IR["Native LLVM IR and pass pipeline"]
-        PY_FE --> IR
-
-        IR --> LLVM["LLVM / LLVM-CAPI backends<br/>LLVM is the public default"]
-        IR --> SELF["LLVM-free self backend — experimental<br/>AArch64 Darwin · x86_64 Linux subsets"]
-        LLVM -. "validation oracle only" .-> SELF
-
-        LLVM --> EMIT["Native emission"]
-        SELF --> EMIT
-        EMIT --> C_OUT["C outputs<br/>MCJIT · LLVM IR · object · assembly · executable"]
-        EMIT --> PY_LINK["Python native link"]
-
-        GC["Five selectable GC backends<br/>refcount · incremental · concurrent<br/>generational · relocating"] --> RUNTIME["Native Python runtime<br/>freestanding pcc-Python migration in progress"]
-        ABI["Compiler-owned memory · atomic · syscall · host-ABI intrinsics"] --> RUNTIME
-        RUNTIME --> PY_LINK
-        PY_FE -. "only with --python-libpython=auto/on" .-> CPYTHON["Optional CPython compatibility bridge<br/>libpython"]
-        CPYTHON -.-> PY_LINK
-        PY_LINK --> PY_OUT["Python native executable<br/>strict mode: no libpython"]
-
-        PY_OUT -- "when compiling pcc itself" --> BOOT["Self-host contract<br/>pcc0/host → pcc1 → pcc2 → pcc3"]
-    end
-
-    subgraph GPU["Bounded accelerator path"]
-        COLLECT --> KIR["Kernel IR — experimental, kernel-only"]
-        KIR --> METAL["validate → TIRx-shaped freeze → Metal finalize"]
-        METAL --> GPU_OUT["Host executable + .metallib<br/>macOS/Metal · hardware-gated"]
-        ORACLES["TVM / TIRx / TileLang<br/>reference shapes only"] -. "oracle only" .-> KIR
-    end
-```
+See the [detailed pipeline and repository map](docs/architecture/01-overview.md)
+for the implementation behind each layer.
 
 | Layer | Main paths | Role |
 |---|---|---|
@@ -373,7 +502,7 @@ pcc-Python `_start`, raw `write`, and raw `exit_group`. Its gate observes no
 `PT_INTERP`, no `DT_NEEDED`, no undefined symbols, and no hand-written C,
 assembly, or libc runtime object. This does not yet prove the complete Python
 runtime, five-GC matrix, C frontend, or a pcc1 Linux cross-compile. See the
-[bounded evidence](docs/goal/evidence/2026-08-03-linux-zero-libc-python-start.md)
+[bounded evidence](https://github.com/allstoalls/pcc/blob/2574f5857e89ed177b1b704409d6f05d577c15da/docs/goal/evidence/2026-08-03-linux-zero-libc-python-start.md)
 and the [remaining runtime-closure investigation](docs/investigations/freestanding-runtime-final-no-c-closure.md).
 
 The final platform claims are intentionally different: the supported Linux
@@ -420,8 +549,8 @@ route contract and level definitions are in
 [docs/design/pcc-gpu-next-work.md](docs/design/pcc-gpu-next-work.md).
 
 ```bash
-env -u LC_ALL uv run pytest tests/kernel -q -n0        # IR/oracle/finalize/package (skips without toolchain)
-env -u LC_ALL uv run pytest tests/gpu_hardware -q -n0  # real Metal launch: Level 4/5/6 gates
+gtimeout 600s env -u LC_ALL uv run pytest tests/kernel -vv -x -n0        # IR/oracle/finalize/package
+gtimeout 600s env -u LC_ALL uv run pytest tests/gpu_hardware -vv -x -n0  # real Metal launch: Level 4/5/6 gates
 ```
 
 ### Native GUI (macOS, experimental)
@@ -453,11 +582,14 @@ scripts/bootstrap.sh --backend llvm
 scripts/bootstrap.sh --stage 1
 ```
 
-A stage-1 binary can launch the repository test suite against itself:
+A stage1 binary also provides a native pytest subset driver:
 
 ```bash
-./build/bootstrap/pcc1 --pytest tests -q -n0
+./build/bootstrap/pcc1 --pytest tests -q -x -n0
 ```
+
+This subset is a separate capability from the full host-driven pytest suites;
+it does not replace default/integration release qualification.
 
 The strict no-libpython path (verified as of 2026-05-01, Issue 1 closure)
 produces `pcc2`/`pcc3` with 0 `py_cpy_*` calls, no `libpython` in `otool -L`,
@@ -467,7 +599,8 @@ removal — frozen in
 enforced by `tests/python/test_bootstrap_gate_baseline.py`. The three-stage gate
 also runs per GC backend
 ([`tests/python/gc/test_pcc_bootstrap_full_gc{0..4}.py`](tests/python/gc/)); all
-five currently pass.
+five have historical passing receipts; rerun them for the exact compiler and
+runtime source being qualified.
 
 ## Garbage collection
 
@@ -485,7 +618,8 @@ Backend #0 is the default and rollback reference.
 | **#3** | generational young/old | OCaml | Selectable, production-facing on focused gates. Remaining: cross-domain/threaded object-graph proof, workload perf data. |
 | **#4** | colored relocating / GenZGC | ZGC (OpenJDK) | Selectable and gated through full self-host bootstrap. 2026-06 relocation overhaul (count-on-NEW accounting, remap phase, per-owner payload chains) made three-stage bootstrap and long-run workloads pass crash-free. Remaining: retention tuning, full young/old policy, fragmentation policy. |
 
-All five pass the full three-stage self-host bootstrap matrix. The runtime also
+The per-backend bootstrap matrix checks all five against the selected source.
+The runtime also
 ships a long-running measurement surface — pause count/sum/max + histogram, RSS
 and allocator heap bridges, and four steady-state workloads under
 [benchmarks/python/](benchmarks/python/) — because the north-star obligation is
@@ -500,13 +634,12 @@ concurrency (`Cown` + a `locked` context manager that acquires cowns in
 canonical order — deadlock-free by construction). A 4-pthread CPU-bound proof
 lands ~3.5× speedup on a macOS arm64 host.
 
-**Known semantic gaps vs CPython (backend #0):** the cycle collector runs but is
-not auto-paced (`gc.collect()` is the only trigger); `__del__` is dispatched but
-resurrection/warning policy is minimal; `weakref` exists but not all callback /
-`WeakValueDictionary` semantics; refcounts are atomic only under
-`PCC_WITH_THREADS=1`; unsynchronized shared-container mutation is not yet
-correct. The bootstrap closure does not exercise these, so they do not block
-`pcc1 → pcc2 → pcc3`; long-lived real-world programs may surface them.
+**Compatibility beyond bootstrap:** finalizers, resurrection, weakrefs,
+suspended coroutine frames, native handles and threaded object graphs have
+their own backend-specific gates under `tests/python/` and
+`tests/python/gc_production_contract/`. A compiler fixed point is not proof of
+all those application behaviors. Keep C-runtime and pcc-Python-runtime results,
+and single-threaded and `PCC_WITH_THREADS=1` results, separately labeled.
 
 ## Virtual threads, effects, and proof checks
 
@@ -514,17 +647,21 @@ An active track to make suspended continuations, scheduler queues, timer/IO
 waitsets, and GC roots explicit enough that every park/resume path can be checked
 against the runtime contract. Today: continuation and scheduler queues are
 GC-visible roots across all five backends, with an O(1) opaque-handle register
-API and a bounded per-queue entry freelist. The virtual-thread ready/waiter/timer/
-IO node pools, a timer heap/wheel, and a kqueue-backed IO waitset are not
-complete — no 1M-virtual-thread claim is credible yet.
+API and bounded ready/waiter/timer/IO node pools. A
+[2026-07-16 C-runtime gate](https://github.com/allstoalls/pcc/blob/2574f5857e89ed177b1b704409d6f05d577c15da/docs/goal/evidence/2026-07-16-vthread-1m-production-runtime.md)
+completed one million virtual-thread objects across GC0..4 on macOS arm64,
+including timers and 1,000 waiters on one pipe. That receipt does not prove a
+million sockets, the pcc-Python runtime's equality, or arbitrary application
+suspension. Current plain-`def` may-park call sites and external gateway
+execution remain under correctness investigation.
 
 A small executable category/effect/proof checker (`pcc/category.py`,
 `pcc/runtime_effects.py`) models runtime composition and classifies ABI calls
 (GC barriers, frame/continuation roots, park/resume, GPU boundaries) as effect
 events. It supports scoped proof-carrying claims but is not a dependent-type
 proof system and does not prove the compiler correct. Remaining work is tracked
-in [`docs/goal/task-board.yaml`](docs/goal/task-board.yaml) (`T-P0-VTHREAD-*`,
-`R-P1-*`).
+as [GitHub issues](https://github.com/allstoalls/pcc/issues) labelled
+`task-board` (the migrated `T-P0-VTHREAD-*` and `R-P1-*` rows).
 
 ## Testing
 
@@ -532,17 +669,26 @@ Use `uv run ...`; all examples use `env -u LC_ALL` (required for Codex locale
 handling, harmless elsewhere).
 
 ```bash
-env -u LC_ALL uv run pytest -q                          # normal lane
-env -u LC_ALL uv run pytest -m integration              # integration lane
-env -u LC_ALL uv run pytest tests/c/test_lua.py -q -n0
-env -u LC_ALL uv run pytest tests/integration/test_sqlite.py -q -n0
+gtimeout 120s env -u LC_ALL uv run pytest tests/c/test_lua.py -q -x -n0
+gtimeout 120s env -u LC_ALL uv run pytest tests/integration/test_sqlite.py -q -x -n0
 ```
 
 ```bash
-# Fast full run: regression tests live under tests/c and tests/python.
-env -u LC_ALL uv run pytest -n auto --dist=loadgroup tests/c tests/python --maxfail=1 --durations=20
-env -u LC_ALL uv run pytest -n0 tests/integration --maxfail=1 --durations=20
+# Final qualification only: first freeze sources, pass focused gates and
+# provision matching bootstrap artifacts. Use a measured timeout per shard.
+gtimeout 1200s env -u LC_ALL uv run pytest -vv -x --tb=short \
+  -p scripts.pytest_live_report --pcc-live-report build/default-report.jsonl
+gtimeout 1800s env -u LC_ALL uv run pytest -vv -x --tb=short -m integration \
+  -p scripts.pytest_live_report --pcc-live-report build/integration-report.jsonl
 ```
+
+The default worker configuration is six workers with `--dist=loadgroup`.
+Integration markers occur throughout `tests/`; testing only
+`tests/integration/` is not the complete integration suite. Use fresh report
+paths for each run. Reports retain failures as they arrive, but only a final
+successful pytest summary counts as a passed gate. Hardware/opt-in
+deselections must be listed in the qualification receipt. If a suite cannot
+fit its measured budget, shard it and account for every selected node.
 
 ## Benchmarks
 
@@ -611,17 +757,21 @@ LLVM/pass and diagnostic controls (`PCC_USE_LLVMLITE*`, `PCC_LIBLLVM_PATH`,
 
 ## Documentation
 
-Current work is governed by
-[`docs/goal/goal-prompt.md`](docs/goal/goal-prompt.md), selected from
-[`docs/goal/task-board.yaml`](docs/goal/task-board.yaml), and summarized in
-[`docs/current-goal-state.md`](docs/current-goal-state.md).
+Current work is tracked as
+[GitHub issues](https://github.com/allstoalls/pcc/issues). Read
+[`docs/knowledge/`](docs/knowledge/README.md) before changing the compiler: it
+holds the denied experiments, the confirmed root causes and the symptom routing
+distilled from [`docs/investigations/`](docs/investigations/INDEX.md). The
+retired goal protocol is archived under
+[`docs/archive/goal/`](docs/archive/goal/); see
+[`docs/goal/README.md`](docs/goal/README.md) for what moved where.
 
 | Topic | Path |
 |---|---|
 | Architecture background | [docs/system-architecture.md](docs/system-architecture.md) |
 | Python tutorial / how-to / limitations | [docs/python-tutorial.md](docs/python-tutorial.md), [docs/python-howto.md](docs/python-howto.md), [docs/python-limitations.md](docs/python-limitations.md) |
 | Python compat / NumPy plans | [docs/plans/python-compat-specialization-strategy.md](docs/plans/python-compat-specialization-strategy.md), [docs/plans/numpy_plan.md](docs/plans/numpy_plan.md) |
-| Freestanding runtime / libc ownership | [docs/investigations/freestanding-runtime-final-no-c-closure.md](docs/investigations/freestanding-runtime-final-no-c-closure.md), [Linux zero-libc tracer evidence](docs/goal/evidence/2026-08-03-linux-zero-libc-python-start.md) |
+| Freestanding runtime / libc ownership | [docs/investigations/freestanding-runtime-final-no-c-closure.md](docs/investigations/freestanding-runtime-final-no-c-closure.md), [Linux zero-libc tracer evidence](https://github.com/allstoalls/pcc/blob/2574f5857e89ed177b1b704409d6f05d577c15da/docs/goal/evidence/2026-08-03-linux-zero-libc-python-start.md) |
 | Declarative GUI and macOS canary | https://github.com/allstoalls/pcc-gui (`docs/gui-declarative-absorption.md` there) |
 | GPU route contract and Kernel IR | [docs/design/pcc-gpu-next-work.md](docs/design/pcc-gpu-next-work.md), [docs/design/pcc-kernel-ir.md](docs/design/pcc-kernel-ir.md) |
 | Investigation reports | [docs/investigations/](docs/investigations/) |
@@ -636,7 +786,8 @@ Requires Python 3.13+ and [uv](https://docs.astral.sh/uv/).
 
 ```bash
 uv sync
-env -u LC_ALL uv run pytest -q
+gtimeout 1200s env -u LC_ALL uv run pytest -vv -x --tb=short \
+  -p scripts.pytest_live_report --pcc-live-report build/development-report.jsonl
 ```
 
 Compiler changes should include a minimized regression test and, when relevant,

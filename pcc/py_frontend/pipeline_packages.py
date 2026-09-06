@@ -85,12 +85,67 @@ def resolve_pcc_native_extension_path(module_name: str) -> Optional[str]:
     return None
 
 
+PROJECT_ROOT_MARKERS = (
+    "pcc-package.json",
+    "pyproject.toml",
+    "setup.py",
+    ".git",
+)
+
+_PROJECT_ROOT_WALK_LIMIT = 24
+
+
+def project_root_search_dirs(start_dir: str) -> list[str]:
+    """Directories to search for a sibling package, nearest first.
+
+    ``pcc app.py`` resolves imports from the entry file's own directory.  A
+    project normally keeps its package at the repository root and its programs
+    in a subdirectory (``examples/probe/app.py`` importing ``mypkg``), so this
+    walks up from the entry directory and stops at the first directory holding
+    a project-root marker -- that directory is included, its parent is not.
+    Bounding the walk at the project root is what keeps an unrelated package
+    from ``$HOME`` out of a program's closure.  It needs no environment
+    variable; ``PCC_PACKAGE_SITE`` and the installed package site remain for
+    packages that live outside the project.
+    """
+    start_dir = str(start_dir or "").strip()
+    if not start_dir:
+        return []
+    current = os.path.abspath(start_dir)
+    out: list[str] = []
+    steps = 0
+    while steps < _PROJECT_ROOT_WALK_LIMIT:
+        steps += 1
+        out.append(current)
+        found_root = False
+        for marker in PROJECT_ROOT_MARKERS:
+            if os.path.exists(os.path.join(current, marker)):
+                found_root = True
+                break
+        if found_root:
+            return out
+        parent = os.path.dirname(current)
+        if not parent or parent == current:
+            return out
+        current = parent
+    return out
+
+
 def resolve_module_src_for_import(
     root_dir: str, dotted_name: str
 ) -> Optional[str]:
     target = resolve_module_src(root_dir, dotted_name)
     if target is not None:
         return target
+    # Nearest-first walk up to the project root: a program in a subdirectory
+    # imports its project's package without any configuration.
+    search_dirs = project_root_search_dirs(root_dir)
+    index = 1 if search_dirs else 0
+    while index < len(search_dirs):
+        target = resolve_module_src(search_dirs[index], dotted_name)
+        if target is not None:
+            return target
+        index += 1
     for site_root in package_site_roots():
         target = resolve_module_src(site_root, dotted_name)
         if target is not None:

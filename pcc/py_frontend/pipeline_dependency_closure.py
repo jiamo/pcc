@@ -776,10 +776,9 @@ def _is_pcc_owned_component_module(mod_name: str) -> bool:
 def _locate_pcc_owned_component_source(mod_name: str) -> Optional[str]:
     """Resolve an allow-listed first-party component from the pcc tree.
 
-    This is intentionally separate from stdlib discovery.  The allow-list is
-    empty today (the gateway and web framework live in their own repository
-    and resolve through the package site); arbitrary pcc compiler internals
-    are never admitted through this route.
+    This is intentionally separate from stdlib discovery. The allow-list names
+    runtime components shared with providers, such as the semantic target;
+    arbitrary pcc compiler internals are never admitted through this route.
     """
     if not _is_pcc_owned_component_module(mod_name):
         return None
@@ -1517,6 +1516,11 @@ def _expand_recursive_stdlib(
                 import_names.append(lazy_name)
         for import_name in import_names:
             top = import_name.split(".")[0]
+            if top == "pcc" and _is_pcc_owned_component_module(import_name):
+                component_source = _locate_pcc_owned_component_source(import_name)
+                if component_source is not None:
+                    admit_provider(import_name, component_source)
+                continue
             if (
                 import_name in seen
                 or import_name in failures
@@ -1575,19 +1579,28 @@ def _expand_required_native_builtin_providers(
             include_function_bodies=True,
         ):
             provider_name = import_name.split(".", 1)[0]
+            component = (
+                _locate_pcc_owned_component_source(import_name)
+                if provider_name == "pcc"
+                else None
+            )
+            if component is not None:
+                provider_name = import_name
             if provider_name in seen:
                 continue
-            provider = _locate_stdlib_module_source(provider_name)
-            if (
-                provider is None
-                or _native_stdlib_root_for_path(provider) is None
-            ):
-                continue
-            if (
-                provider_name in _NATIVE_BUILTIN_IMPORTS
-                and provider_name not in _REQUIRED_COMPILED_STDLIB_PROVIDERS
-            ):
-                continue
+            provider = component
+            if provider is None:
+                provider = _locate_stdlib_module_source(provider_name)
+                if (
+                    provider is None
+                    or _native_stdlib_root_for_path(provider) is None
+                ):
+                    continue
+                if (
+                    provider_name in _NATIVE_BUILTIN_IMPORTS
+                    and provider_name not in _REQUIRED_COMPILED_STDLIB_PROVIDERS
+                ):
+                    continue
             provider = str(os.path.abspath(provider))
             seen[provider_name] = provider
             ordered_srcs.append(provider)

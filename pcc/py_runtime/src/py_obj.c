@@ -622,6 +622,7 @@ void pcc_gc_store_ptr(PyObject *owner, PyObject **slot, PyObject *value) {
     if (backend == PCC_GC_KIND_REFCOUNT_CYCLE) {
         pcc_obj_runtime_log_event_code(2, 3, backend, 0, owner);
         PyObject *old = *slot;
+        if (old == value) return;
         py_incref(value);
         *slot = value;
         py_decref(old);
@@ -840,6 +841,7 @@ void pcc_gc_store_root(PyObject **slot, PyObject *value) {
     if (backend == PCC_GC_KIND_REFCOUNT_CYCLE) {
         pcc_obj_runtime_log_event_code(2, 3, backend, 0, NULL);
         PyObject *old = *slot;
+        if (old == value) return;
         /* Skip refcount calls for values that cannot be refcounted: a tagged
          * immediate and NULL both make py_incref/py_decref return at once, so
          * the calls are pure overhead.  Codegen emits ~47000 store_root sites

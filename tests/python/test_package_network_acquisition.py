@@ -158,6 +158,61 @@ def test_owned_acquisition_respects_target_python_metadata(tmp_path):
     assert result["target_python"] == "3.11"
 
 
+@pytest.mark.parametrize(
+    "configured, expected_version, expected_target",
+    [
+        (None, "1.3", "3.15"),
+        ("3.11", "1.2", "3.11"),
+    ],
+)
+def test_default_and_overridden_targets_select_requires_python_artifacts(
+    tmp_path, monkeypatch, configured, expected_version, expected_target
+):
+    from pcc import cli_bootstrap
+    from pcc.package.acquire import requires_python_allows
+
+    monkeypatch.delenv("PCC_PACKAGE_TARGET_PYTHON", raising=False)
+    if configured is not None:
+        monkeypatch.setenv("PCC_PACKAGE_TARGET_PYTHON", configured)
+    index = tmp_path / "index"
+    packages = index / "packages"
+    packages.mkdir(parents=True)
+    project = index / "simple/demo-pkg"
+    project.mkdir(parents=True)
+    links = []
+    for version, requires in (("1.2", ">=3.11,<3.15"), ("1.3", ">=3.15,<3.16")):
+        artifact = _write_wheel(
+            packages / ("demo_pkg-" + version + "-py3-none-any.whl")
+        )
+        digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
+        links.append(
+            '<a href="/packages/'
+            + artifact.name
+            + "#sha256="
+            + digest
+            + '" data-requires-python="'
+            + requires.replace("<", "&lt;").replace(">", "&gt;")
+            + '">artifact</a>\n'
+        )
+        expected = version == expected_version
+        assert requires_python_allows(requires, expected_target) is expected
+        assert (
+            cli_bootstrap._native_requires_python_allows(requires, expected_target)
+            is expected
+        )
+    (project / "index.html").write_text("".join(links), encoding="utf-8")
+    with _serve_directory(index) as base_url:
+        result = acquire_requirement(
+            "demo_pkg",
+            mode="owned",
+            cache_dir=tmp_path / "cache",
+            index_urls=[base_url + "/simple"],
+        )
+    assert result["ok"] is True, result
+    assert result["resolved_version"] == expected_version
+    assert result["target_python"] == expected_target
+
+
 def test_owned_acquisition_fails_closed_on_runtime_dependency_resolution(tmp_path):
     index = tmp_path / "index"
     packages = index / "packages"
@@ -244,7 +299,10 @@ def test_auto_owned_acquisition_delegates_supported_source_build_to_pcc(tmp_path
     assert result["build_isolation"] == "delegated-to-pcc-native-builder"
 
 
-def test_host_acquisition_is_labeled_and_publishes_immutable_artifact(tmp_path):
+def test_host_acquisition_is_labeled_and_publishes_immutable_artifact(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("PCC_PACKAGE_TARGET_PYTHON", raising=False)
     source = _write_wheel(tmp_path / "demo_pkg-1.2-py3-none-any.whl")
     fake_python = tmp_path / "fake-host-python"
     fake_python.write_text(
@@ -287,9 +345,9 @@ def test_host_acquisition_is_labeled_and_publishes_immutable_artifact(tmp_path):
     assert result["hash_verified"] is False
     assert result["sha256"] == digest
     assert result["artifact_origin"] == "host-pip"
-    assert result["target_python"] == "3.11"
+    assert result["target_python"] == "3.15"
     argv = argv_path.read_text(encoding="utf-8").splitlines()
-    assert argv[argv.index("--python-version") + 1] == "3.11"
+    assert argv[argv.index("--python-version") + 1] == "3.15"
     assert "--no-binary=:all:" in argv
     assert Path(str(result["artifact_path"])).parent.name == digest
 
@@ -580,6 +638,8 @@ def test_pcc1_owned_acquisition_uses_native_simple_api_and_hash(tmp_path):
         encoding="utf-8",
     )
     env = os.environ.copy()
+    # This case brackets the historical 3.11/3.12 selection boundary explicitly.
+    env["PCC_PACKAGE_TARGET_PYTHON"] = "3.11"
     env["PCC_HOST_PYTHON"] = "/definitely/not/available"
 
     with _serve_directory(index) as base_url:

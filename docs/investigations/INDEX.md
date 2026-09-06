@@ -48,6 +48,8 @@ Regenerate with `env -u LC_ALL uv run python scripts/regen_investigations_index.
   - resolved locally 2026-06-04
 - [self-backend-verifier-dense-dominator-sets-oom.md](self-backend-verifier-dense-dominator-sets-oom.md) — **self-backend verifier dense dominator sets OOM (50 GiB stage1 kill)**
   - `scripts/bootstrap.sh --stage 1` on HEAD `a2031b76` fails: the self-backend
+- [self-backend-windows-gnu-target-classification.md](self-backend-windows-gnu-target-classification.md) — **Windows-GNU is classified as a Linux self-backend target**
+  - active — focused host classifier/dispatch gates pass; fresh pcc1 qualification pending
 - [stage1-self-backend-ir-scaffold-segfault.md](stage1-self-backend-ir-scaffold-segfault.md) — **stage1 self-backend ir-scaffold segfault**
   - User-reported command sequence:
 
@@ -125,6 +127,16 @@ Regenerate with `env -u LC_ALL uv run python scripts/regen_investigations_index.
   - The user wants the no-libpython self-backend `pcc1` built in
 - [pcc1-profiling-sampling-parity.md](pcc1-profiling-sampling-parity.md) — **pcc1-native profiling.sampling parity with Python 3.15**
   - The user requires pcc1 to provide the Python 3.15 PEP 799
+- [pcc1-qualification-cache-and-project-selection.md](pcc1-qualification-cache-and-project-selection.md) — **pcc1 qualification misses effective cache and discovery selection**
+  - The earlier [effective-selection repair](pcc1-qualification-effective-pytest-selection.md)
+- [pcc1-qualification-child-environment-binding.md](pcc1-qualification-child-environment-binding.md) — **pcc1 qualification trusts the sampler parent environment**
+  - An `env PCC1_BINARY=/other/compiler ... pytest` child could override the selected
+- [pcc1-qualification-effective-pytest-selection.md](pcc1-qualification-effective-pytest-selection.md) — **pcc1 qualification accepts a filtered full-suite collection**
+  - Promotion qualification rejected a literal `-k` argument but admitted joined
+- [pcc1-qualification-real-pytest-checkout.md](pcc1-qualification-real-pytest-checkout.md) — **qualification source validation rejects a real pytest checkout**
+  - Qualification reused the bootstrap snapshot's exact-directory validator. That
+- [pcc1-rollback-damaged-active-toolchain.md](pcc1-rollback-damaged-active-toolchain.md) — **rollback rejects a broken promoted compiler**
+  - Rollback rehashed the active candidate before restoring its predecessor. A
 - [pcc1-runtime-abi-gc-global-type-registry-startup.md](pcc1-runtime-abi-gc-global-type-registry-startup.md) — **pcc1 startup fails after raw GC globals enter runtime ABI type registry**
   - A fresh self/no-libpython `pcc0 -> pcc1` build for the freestanding GC
 - [pcc1-self-host-generator-ctx-slot.md](pcc1-self-host-generator-ctx-slot.md) — **pcc1 self-host loses `_generator_ctx` after first assignment**
@@ -440,6 +452,10 @@ Regenerate with `env -u LC_ALL uv run python scripts/regen_investigations_index.
 
 ## python
 
+- [python-boxed-int-object-consumer-projection.md](python-boxed-int-object-consumer-projection.md) — **object consumers narrow the result of int(value)**
+  - Issue #194 reduces the array numeric work in #191 to a generic Python
+- [python-boxed-nan-value-comparison.md](python-boxed-nan-value-comparison.md) — **boxed NaN operators inherit container identity semantics**
+  - active — issue193; current-source failure reproduced, focused repair pending
 - [python-class-export-schema-test-mixin-init-drift.md](python-class-export-schema-test-mixin-init-drift.md) — **`test_pcc_cross_module_class_schema_matches_local_layout` drifted past `L1CodeGen.__init__` mixin refactor**
   - `tests/python/test_py_class_export_schema.py::test_pcc_cross_module_class_schema_matches_local_layout`
 - [python-class-init-phantom-symbol-link-fail.md](python-class-init-phantom-symbol-link-fail.md) — **Class(args) for a class without an explicit `__init__` synthesises a phantom user_<module>_<class>___init__ symbol → link error**
@@ -494,6 +510,8 @@ Regenerate with `env -u LC_ALL uv run python scripts/regen_investigations_index.
   - A generator whose body iterates `for <name> in range(...)` and `yield`s inside
 - [python-hasattr-static-false-on-builtin-modules.md](python-hasattr-static-false-on-builtin-modules.md) — **hasattr() on a native-builtin module statically folds to False for any attr not in pcc's hardcoded attr table**
   - resolved (the static-False fold is removed; runtime path handles it)
+- [python-int-float-lossy-comparison.md](python-int-float-lossy-comparison.md) — **Python mixed integer/float comparisons lose integer precision**
+  - active — issue193; current-source failure reproduced, exact comparison pending
 - [python-ir-passes-on-huge-memory-skip-2026-05-27.md](python-ir-passes-on-huge-memory-skip-2026-05-27.md) — **PCC_PYTHON_IR_PASSES=on should stay bounded on huge modules**
   - `PCC_PYTHON_IR_PASSES=off` is only a bounded bootstrap default. It does not
 - [python-ir-passes-self-compile-enum-and-parity-harness.md](python-ir-passes-self-compile-enum-and-parity-harness.md) — **`test_all_ir_pass_modules_emit_llvm_in_strict_frontend_mode` — `alias_analysis.py` Enum + `parity.py` harness deps**
@@ -502,6 +520,8 @@ Regenerate with `env -u LC_ALL uv run python scripts/regen_investigations_index.
   - `tests/test_python_module_imports_parity.py::test_module_attribute_write` is
 - [python-module-attrs-loses-extension-binding.md](python-module-attrs-loses-extension-binding.md) — **module attribute lookup loses an extension binding**
   - resolved locally (2026-07-21)
+- [python-nan-ordered-predicates.md](python-nan-ordered-predicates.md) — **Python NaN truth and inequality use ordered predicates**
+  - active — issue193; current-source failure reproduced, focused repair pending
 - [python-native-module-alias-module-global-attr-attribute-error.md](python-native-module-alias-module-global-attr-attribute-error.md) — **`mod_alias.module_global_attr` (e.g. `_mat.__all__`) failed with AttributeError because (a) Attr-RHS exports were dropped and (b) Attr lowering had no `module_global` branch**
   - `numpy/__init__.py:681 set(_mat.__all__)` failed at runtime with
 - [python-nested-if-import-from-skips-native-predeclare.md](python-nested-if-import-from-skips-native-predeclare.md) — **`from .sibling import name` nested inside top-level `if/try` skips native predeclare**
@@ -534,6 +554,8 @@ Regenerate with `env -u LC_ALL uv run python scripts/regen_investigations_index.
   - resolved 2026-05-31 — fix landed in `_append_source_import_from_spec`
 - [python-substrate-spike-test-sweep.md](python-substrate-spike-test-sweep.md) — **`test_runtime_substrate_spike.py` two stale-shape failures**
   - Two failures in `tests/python/test_runtime_substrate_spike.py`:
+- [python-target-provider-closure.md](python-target-provider-closure.md) — **shared Python target omitted from native provider closures**
+  - active — host/native execution passes; fresh pcc1/bootstrap validation pending
 - [python-user-iter-double-advance.md](python-user-iter-double-advance.md) — **User iterator __next__ advances state twice**
   - `tests/test_python_class_features_parity.py::test_class_user_iter` is still
 - [python-valhalla-value-model-actual-state.md](python-valhalla-value-model-actual-state.md) — **Python Valhalla value-model status overclaim**
@@ -580,6 +602,8 @@ Regenerate with `env -u LC_ALL uv run python scripts/regen_investigations_index.
   - resolved (fixes #26 `+`, #27 `-`/`*`, #28 comparison — all full-bootstrap-passed)
 - [bytearray-repr-and-methods-cluster-no-libpython.md](bytearray-repr-and-methods-cluster-no-libpython.md) — **bytearray repr + mutable methods unsupported (no-libpython cluster)**
   - active (scoped cluster; not started — bytearray repr is bounded, methods are several)
+- [bytes-membership-dispatch-missing.md](bytes-membership-dispatch-missing.md) — **generic bytes membership always reports no match**
+  - The native gateway dashboard produced a correct HTTP/1.1 200 response and
 - [c-frontend-freestanding-libc-link-route.md](c-frontend-freestanding-libc-link-route.md) — **C frontend has no shared pcc-Python libc link route**
   - `LIBC-P2-C-FRONTEND-FREESTANDING-LIBC` requires C programs compiled by pcc to
 - [c-large-aggregate-assignment-selectiondag-blowup.md](c-large-aggregate-assignment-selectiondag-blowup.md) — **large C aggregate assignment causes SelectionDAG blow-up**
@@ -660,6 +684,8 @@ Regenerate with `env -u LC_ALL uv run python scripts/regen_investigations_index.
   - Run:
 - [first-class-fn-key-via-inline-no-libpython.md](first-class-fn-key-via-inline-no-libpython.md) — **key= callables via inlining (no first-class functions, no-libpython)**
   - active — `sorted`/`min`/`max(key=<simple lambda>)` RESOLVED 2026-05-30 for
+- [first-install-runtime-copy-loses-port-abi.md](first-install-runtime-copy-loses-port-abi.md) — **first-install runtime copy loses static port ABI exports**
+  - The new source installer must work after a clean clone. Its first actual run
 - [five-gc-bootstrap-matrix-scheduling.md](five-gc-bootstrap-matrix-scheduling.md) — **Five-GC bootstrap matrix scheduling regression**
   - Resolved (2026-07-17). The bounded five-GC matrix completed inside its
 - [five-gc-matrix-timeout-contract-drift.md](five-gc-matrix-timeout-contract-drift.md) — **five-GC matrix timeout contract drift**
@@ -776,6 +802,8 @@ Regenerate with `env -u LC_ALL uv run python scripts/regen_investigations_index.
   - resolved for `PCC_GC_BACKEND=4` three-stage bootstrap
 - [generator-cpython-iteration-dominance.md](generator-cpython-iteration-dominance.md) — **generator bodies iterating CPython-backed iterables — LLVM dominance failure, then runtime SEGV**
   - active — No.1/No.2 (cpy slot spill + guard), No.4 (native protocol-for frame slot), and No.3-J1 (boxed iterator handle + precise cross-yi...
+- [generator-native-ast-reflection-misses-expression.md](generator-native-ast-reflection-misses-expression.md) — **native generator frame planning misses nested expressions**
+  - Host pcc compiles the gateway, while pcc1 reports a missing child continuation
 - [goal-data-model-b1-b2-0394-0402.md](goal-data-model-b1-b2-0394-0402.md) — **goal data-model B1/B2 slice 0394-0402**
   - This slice continues after the goal-order gate pack and advances the next
 - [goal-data-model-b3-classvar-0405-0412.md](goal-data-model-b3-classvar-0405-0412.md) — **goal data-model B3 class-level variables 0405-0412**
@@ -822,10 +850,20 @@ Regenerate with `env -u LC_ALL uv run python scripts/regen_investigations_index.
   - The first `projects/harness` product tracer bullet compiles and runs under
 - [harness-gui-current-source-pcc1-runtime-policy.md](harness-gui-current-source-pcc1-runtime-policy.md) — **Harness GUI needs a pcc1 that matches the current runtime import policy**
   - active — exact-current-source self-backend stage 1 exceeded the bounded cold-build gate
+- [host-source-install-project-helper-layout.md](host-source-install-project-helper-layout.md) — **host source installation wraps a project with top-level helpers**
+  - A real host install of the gateway reports success but does not place
 - [in-flight-32bfed70-relocation-rework-regressions.md](in-flight-32bfed70-relocation-rework-regressions.md) — **in-flight 32bfed70 relocation-rework regressions (pcc-Python port relocation + backend-#4 collect)**
   - confirmed-regressions / belongs-to-active-rework (filed 2026-06-18; not fixed —
+- [initial-pcc1-installer-receipt-binding.md](initial-pcc1-installer-receipt-binding.md) — **initial installer did not bind helper manifests to stage receipts**
+  - The initial installer compared copied source files against the current source
+- [initial-pcc1-installer-timeout-orphans.md](initial-pcc1-installer-timeout-orphans.md) — **initial installer timeouts lose output and can orphan helpers**
+  - The installer's canary/dependency checks captured output in memory and wrote
+- [installed-pcc1-helper-cwd-shadowing.md](installed-pcc1-helper-cwd-shadowing.md) — **installed pcc1 helper imports can use the caller checkout**
+  - The stable toolchain must consume its copied helper sources while compiling
 - [int-from-bytes-byteslike-no-libpython.md](int-from-bytes-byteslike-no-libpython.md) — **native `int.from_bytes` rejects bytearray and memoryview**
   - CPython accepts any bytes-like object in `int.from_bytes`, including `bytes`,
+- [isinstance-dynamic-classinfo-tuple.md](isinstance-dynamic-classinfo-tuple.md) — **dynamic isinstance classinfo tuples return false**
+  - The external gateway compiles under host pcc, but pcc1 rejects a string join
 - [layer1-host-helper-context-gap.md](layer1-host-helper-context-gap.md) — **Layer1 host helper extraction needs contextual host type**
   - `pcc/py_frontend/codegen/layer1.py` is still large. A natural next split is to
 - [libpy-runtime-pcc-archive-pure-c-chain-crashes.md](libpy-runtime-pcc-archive-pure-c-chain-crashes.md) — **libpy_runtime_pcc.a pure-C chain crashes (implicit decls + py_decref stack-free)**
@@ -858,6 +896,10 @@ Regenerate with `env -u LC_ALL uv run python scripts/regen_investigations_index.
   - When pcc1 self-host crashes with `nanov2_guard_corruption_detected` deep
 - [method-literal-aggregate-abi-equality.md](method-literal-aggregate-abi-equality.md) — **method ABI rejects distinct equal literal aggregates**
   - The native record-span experiment passes a `CompilerInt2` value into an
+- [multi-file-direct-link-tests-require-prebuilt-runtime.md](multi-file-direct-link-tests-require-prebuilt-runtime.md) — **direct-link tests require an unprepared mutable C runtime**
+  - Current compiler qualification in a clean, isolated checkout fails before the
+- [native-array-float64-precision.md](native-array-float64-precision.md) — **native array CLI silently quantizes float64 values**
+  - active — issue #191; source correction and native qualification pending
 - [native-binary-file-write-byteslike.md](native-binary-file-write-byteslike.md) — **native binary file write serializes bytes with `repr`**
   - pcc's native file object tracked whether `open(..., mode)` contained `b` and
 - [native-file-open-null-without-exception.md](native-file-open-null-without-exception.md) — **native file open returns NULL without an exception**
@@ -866,10 +908,16 @@ Regenerate with `env -u LC_ALL uv run python scripts/regen_investigations_index.
   - The new fragment label producer interns arbitrary text. Publication passes
 - [native-fragment-pco-label-publication-regression.md](native-fragment-pco-label-publication-regression.md) — **native fragment PCO label publication adds compute work**
   - The native pointer-reload fragment vertical must preserve Python semantics,
+- [native-ir-class-set-in-global-bridge.md](native-ir-class-set-in-global-bridge.md) — **IR class set in the integer global bridge fails under pcc1**
+  - The gateway facade re-exports PCC_TLS_REQUIRED_CAPABILITIES, computed by
 - [native-json-load-file-no-libpython.md](native-json-load-file-no-libpython.md) — **native `json.load(file)` falls into a no-libpython function stub**
   - pcc lowers `json.loads(str)` and `json.dumps(obj)` natively but does not lower
+- [native-package-hyphenated-source-identity.md](native-package-hyphenated-source-identity.md) — **native package installation truncates hyphenated project identities**
+  - The user requires pcc-gui, pcc-gateway and NumPy to install into one consistently
 - [native-provider-closure-scan-reparses-export-ast.md](native-provider-closure-scan-reparses-export-ast.md) — **Native provider closure scan reparses the export AST**
   - Resolved on 2026-07-29. This was a stacked regression from
+- [native-python-version-introspection-fallback.md](native-python-version-introspection-fallback.md) — **native sys and platform version queries use CPython fallback**
+  - active — focused native execution passes; fresh pcc1/bootstrap pending
 - [native-re-compiled-pattern-object.md](native-re-compiled-pattern-object.md) — **native re.compile pattern OBJECT (replace literal-alias rewriting; numpy `.cpy.attr.compile`~71)**
   - `B-P0-PKG` gating feature (a) from the 2026-05-28 NEXT pivot note in
 - [native-subprocess-called-process-error-returncode.md](native-subprocess-called-process-error-returncode.md) — **native subprocess failures lose CalledProcessError fields**
@@ -900,6 +948,12 @@ Regenerate with `env -u LC_ALL uv run python scripts/regen_investigations_index.
   - The host acquisition backend defaults to the first `python3` on PATH. Under
 - [package-manifest-schema-wheel-tag-source-of-truth.md](package-manifest-schema-wheel-tag-source-of-truth.md) — **host and pcc1 package manifests duplicate schema and wheel tags**
   - Host package metadata/install code and the no-libpython pcc1 CLI independently
+- [package-metadata-static-exports-missing.md](package-metadata-static-exports-missing.md) — **metadata helper import reintroduces standalone CLI bridges**
+  - The commit qualification fallback gate reports ten py_cpy calls in the
+- [package-requirements-scan-development-environments.md](package-requirements-scan-development-environments.md) — **package dependency discovery consumes development environments**
+  - A local gateway install plan reports unrelated build, black, mypy and tox
+- [package-source-data-inferred-as-c-extension.md](package-source-data-inferred-as-c-extension.md) — **optional package C source data is inferred as an extension**
+  - Installing the real pcc-gateway checkout tries to compile its optional
 - [pcc-bootstrap-stage2-type-infer-runtime-corruption.md](pcc-bootstrap-stage2-type-infer-runtime-corruption.md) — **Investigation Report: Bootstrap Stage2 Type Inference Runtime Corruption**
   - historical — fixes from this investigation have landed (Function.__init__
 - [pcc-compiler-design-reference-audit.md](pcc-compiler-design-reference-audit.md) — **compiler-design references for faster, exact, maintainable PCC**
@@ -970,6 +1024,8 @@ Regenerate with `env -u LC_ALL uv run python scripts/regen_investigations_index.
   - resolved (2026-08-15) — cold `pcc0 -> pcc1` self-backend build measured
 - [stage1-private-pycache-disabled-worker-startup.md](stage1-private-pycache-disabled-worker-startup.md) — **private Stage1 environment disables every worker bytecode cache**
   - The source-frozen Stage1 harness gives every CPython process an isolated
+- [stage1-receipt-metric-contract-rejected.md](stage1-receipt-metric-contract-rejected.md) — **Stage1 receipt validator rejects current producer metric labels**
+  - run_pcc_stage1_build emits metric_scopes and comparison_contract in its v1
 - [stage2-deferred-checkpoint-coordinator-memory-cap.md](stage2-deferred-checkpoint-coordinator-memory-cap.md) — **Stage2 coordinator exceeds memory cap at deferred checkpoint**
   - The first complete Stage2 qualification of the native fragment cohort fails
 - [str-print-format-no-repr-fallback-no-libpython.md](str-print-format-no-repr-fallback-no-libpython.md) — **str()/print()/format() of an instance does not fall back to __repr__ (no-libpython)**
@@ -1074,6 +1130,20 @@ Regenerate with `env -u LC_ALL uv run python scripts/regen_investigations_index.
   - resolved (2026-06-18)
 - [virtual-threads-runtime-prerequisites.md](virtual-threads-runtime-prerequisites.md) — **Loom-shaped virtual threads for pcc**
   - pcc currently has a synchronous no-suspension coroutine thunk and pthread-based
+- [vthread-asyncio-throughput-gap.md](vthread-asyncio-throughput-gap.md) — **virtual-thread handler throughput trails asyncio by 9.7x**
+  - The user rejects the gateway's zero-wait concurrency-100 baseline and requires
+- [vthread-concrete-nonparking-method-collision.md](vthread-concrete-nonparking-method-collision.md) — **unrelated parking methods reject a concrete nonparking call**
+  - The external gateway dashboard cannot compile: TaskScope.close parks, and the
+- [vthread-handler-context-across-park.md](vthread-handler-context-across-park.md) — **handled exception context survives only in an SSA value**
+  - After fixing return-root dominance, the external dashboard still fails the
+- [vthread-owned-local-return-double-release.md](vthread-owned-local-return-double-release.md) — **generator return consumes a local owner twice**
+  - Native dashboard dispatch returns an invalid Response, and the benchmark
+- [vthread-return-root-after-parking-finally.md](vthread-return-root-after-parking-finally.md) — **return root does not dominate a parking finally continuation**
+  - Compiling the external local HTTP gateway with the self backend fails SSA
+- [vthread-single-carrier-pending-timer-exit.md](vthread-single-carrier-pending-timer-exit.md) — **a single carrier exits with sleeping children pending**
+  - The dashboard compiled successfully but printed no success marker. A small
+- [vthread-threading-receiver-across-park.md](vthread-threading-receiver-across-park.md) — **native threading receiver temporary crosses a park in SSA**
+  - Adding explicit native Lock/Event field types repairs gateway acquire dispatch,
 - [wheel-pcc-runtime-archive-freshness.md](wheel-pcc-runtime-archive-freshness.md) — **wheel runtime archive loses target and freshness evidence**
   - After wheel-installed `pcc1` found the packaged runtime directory, application
 - [zero-division-silent-no-libpython-six-paths.md](zero-division-silent-no-libpython-six-paths.md) — **division/modulo by zero silently yields 0/inf/NULL instead of ZeroDivisionError (no-libpython, six lowering paths)**

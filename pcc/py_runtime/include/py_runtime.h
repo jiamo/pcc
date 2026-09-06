@@ -1045,8 +1045,10 @@ PyObject *py_obj_sorted(PyObject *x);
 /* int64_t returns for pcc-Python ABI parity (default-int lowering). */
 int64_t   py_obj_truthy(PyObject *o);                /* 0 or 1 */
 int64_t   py_obj_type_tag(PyObject *o);
-int64_t   py_obj_eq(PyObject *a, PyObject *b);
-int       py_obj_cmp_threeway(PyObject *a, PyObject *b);  /* -1 / 0 / 1 */
+int64_t   py_obj_eq(PyObject *a, PyObject *b);       /* identity-or-equality for containers */
+int64_t   py_obj_eq_value(PyObject *a, PyObject *b); /* direct Python value equality */
+#define PY_OBJ_CMP_UNORDERED 2
+int       py_obj_cmp_threeway(PyObject *a, PyObject *b);  /* -1 / 0 / 1 / unordered */
 PyObject *py_obj_min_max(PyObject *iterable, int64_t want_max);  /* min/max over iterable */
 int64_t   py_obj_lt(PyObject *a, PyObject *b);
 int64_t   py_obj_le(PyObject *a, PyObject *b);
@@ -1147,6 +1149,7 @@ PyObject *py_slice_new(PyObject *start, PyObject *stop, PyObject *step);
 int64_t   py_obj_is_slice(PyObject *o);
 
 /* ---- Native generator objects ------------------------------------------ */
+PyObject *py_gen_frame_new(int64_t slot_count); /* fixed-size, None-filled list frame */
 PyObject *py_gen_new(void *resume, PyObject *frame);
 void      py_gen_set_may_park(PyObject *gen);
 int64_t   py_gen_is_may_park(PyObject *gen);

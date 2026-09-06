@@ -35,6 +35,7 @@ from ..py_ast import (
 )
 from . import marshal
 from .errors import L1CodegenError
+from .hoist_analysis import _dataclass_field_names as _ast_field_names
 from .runtime_abi import declare_runtime_global
 from .vthread_effect_analysis import (
     vthread_delegate_frame_name,
@@ -159,7 +160,10 @@ def emit_generator_may_park_child(
             host.runtime["pcc_gc_store_root"],
             [initial_child_root_ptr, child],
         )
-        host.builder.call(host.runtime["pcc_gc_unpin"], [child])
+        host.builder.call(
+            host.runtime["pcc_gc_unpin"],
+            [host._value_available_at_insertion_point(child)],
+        )
         # The root store retained the replacement and released the slot's prior
         # owner. Consume the direct call's owned temporary so the hidden slot
         # is the single local owner.
@@ -170,7 +174,10 @@ def emit_generator_may_park_child(
     # across collector-visible cleanup calls.
     for value, managed, raw, owned in pinned_arg_provenance:
         if managed:
-            host.builder.call(host.runtime["pcc_gc_unpin"], [value])
+            host.builder.call(
+                host.runtime["pcc_gc_unpin"],
+                [host._value_available_at_insertion_point(value)],
+            )
             if owned:
                 host._gc_release(
                     value,
@@ -377,8 +384,13 @@ def generator_may_park_child_slot(host, expr: Call, callee_name: str):
     hidden_name = vthread_delegate_frame_name(expr, callee_name)
     frame_entry = ctx["frame_slots"].get(hidden_name)
     if frame_entry is None:
+        planned = sorted(
+            name for name in ctx["frame_slots"] if str(name).startswith("__pcc_vthread")
+        )
         raise L1CodegenError(
             "may_park call missing managed child frame slot: " + callee_name
+            + " (wanted " + hidden_name + "; planned delegation slots: "
+            + (", ".join(planned) if planned else "none") + ")"
         )
     child_slot = frame_entry[1]
     # This address is reused by sibling retry, cleanup and resume blocks.  A
@@ -411,10 +423,10 @@ def _dataclass_field_names(obj):
     if isinstance(obj, TupleExpr):
         return ("span", "ty", "elems")
     if isinstance(obj, Expr):
-        fields = getattr(obj, "__dataclass_fields__", None)
-        if fields is not None:
-            return fields.keys()
-        return ()
+        # Native dataclasses do not expose CPython's reflection dictionary.
+        # Use the shared AST schema so nested expressions retain their child
+        # continuation slots in both the host and self-hosted compiler.
+        return _ast_field_names(obj)
     if isinstance(obj, Assign):
         return ("span", "targets", "value", "annotation")
     if isinstance(obj, AugAssign):
@@ -447,9 +459,7 @@ def _dataclass_field_names(obj):
     if isinstance(obj, ClassDef):
         return ("span", "name", "bases", "keywords", "body", "decorators")
     if isinstance(obj, Stmt):
-        fields = getattr(obj, "__dataclass_fields__", None)
-        if fields is not None:
-            return fields.keys()
+        return _ast_field_names(obj)
     return ()
 
 
@@ -606,6 +616,10 @@ class GeneratorLoweringMixin:
     def _generator_finally_exception_name(self, stmt: Try) -> str:
         span = stmt.span
         return f"__pcc_finally_exception_{span.line}_{span.col}"
+
+    def _generator_handler_exception_name(self, stmt: Try, index: int) -> str:
+        span = stmt.span
+        return f"__pcc_handler_exception_{span.line}_{span.col}_{index}"
 
     def _collect_generator_target_names(
         self,
@@ -777,7 +791,10 @@ class GeneratorLoweringMixin:
                         names.append(hidden)
                 for item in s.body:
                     work.append(item)
-                for h in s.handlers:
+                for handler_index, h in enumerate(s.handlers):
+                    hidden = self._generator_handler_exception_name(s, handler_index)
+                    if hidden not in names:
+                        names.append(hidden)
                     if h.name:
                         if h.name not in names:
                             names.append(h.name)
@@ -824,6 +841,22 @@ class GeneratorLoweringMixin:
                     continue
                 if isinstance(node, FuncDef) or isinstance(node, ClassDef):
                     continue
+                if isinstance(node, Try):
+                    # Handler bodies are the one statement list the generic
+                    # dataclass descent below did not reach (ExceptHandler is
+                    # not a Stmt); a delegation call inside ``except`` needs
+                    # its frame slot like any other.
+                    for handler in getattr(node, "handlers", ()) or ():
+                        for handler_stmt in getattr(handler, "body", ()) or ():
+                            work.append(handler_stmt)
+                if (
+                    isinstance(node, Call)
+                    and isinstance(node.func, Attr)
+                    and node.func.name in ("acquire", "wait", "join")
+                ):
+                    hidden = vthread_delegate_frame_name(node, "pcc.threading.receiver")
+                    if hidden not in names:
+                        names.append(hidden)
                 primitive_key = vthread_proven_suspension_call_key(
                     self.ast_module,
                     fd,
@@ -1003,11 +1036,21 @@ class GeneratorLoweringMixin:
 
         self._emit_thread_safepoint()
 
-        frame = self.builder.call(
-            self.runtime["py_list_new"],
-            [ir.Constant(_I64, 0)],
-            name=self._fresh("gen.frame"),
-        )
+        bulk_frame_init = str(
+            os.environ.get("PCC_DISABLE_BULK_GENERATOR_FRAME_INIT", "1") or "1"
+        ).strip().lower() not in ("1", "true", "yes", "on")
+        if bulk_frame_init:
+            frame = self.builder.call(
+                self.runtime["py_gen_frame_new"],
+                [ir.Constant(_I64, len(frame_names))],
+                name=self._fresh("gen.frame"),
+            )
+        else:
+            frame = self.builder.call(
+                self.runtime["py_list_new"],
+                [ir.Constant(_I64, 0)],
+                name=self._fresh("gen.frame"),
+            )
         runtime_args = [a for a in fd.args if a.name != ""]
         arg_by_name = {
             ast_arg.name: (ir_arg, ast_arg)
@@ -1015,9 +1058,11 @@ class GeneratorLoweringMixin:
         }
         none_gv = declare_runtime_global(self.module, "py_None")
         none_obj = self.builder.load(none_gv, name=self._fresh("gen.none"))
-        for name in frame_names:
+        for frame_index, name in enumerate(frame_names):
             arg_entry = arg_by_name.get(name)
             if arg_entry is None:
+                if bulk_frame_init:
+                    continue
                 obj = none_obj
             else:
                 ir_arg, ast_arg = arg_entry
@@ -1028,7 +1073,13 @@ class GeneratorLoweringMixin:
                     ir_arg,
                     ast_arg.annotation or DynType(name="dyn"),
                 )
-            self.builder.call(self.runtime["py_list_append"], [frame, obj])
+            if bulk_frame_init:
+                self.builder.call(
+                    self.runtime["py_list_set"],
+                    [frame, ir.Constant(_I64, frame_index), obj],
+                )
+            else:
+                self.builder.call(self.runtime["py_list_append"], [frame, obj])
 
         resume_ptr = self.builder.bitcast(
             resume_fn,
@@ -1309,7 +1360,17 @@ class GeneratorLoweringMixin:
         # Normalize the expression to one owned reference, then transfer that
         # reference into the heap-frame slot.  The slot is saved by any park in
         # a pending finally block and is rewritten by relocating collectors.
-        value = self._retain_borrowed_return_value(value, stmt)
+        if (
+            isinstance(stmt.value, Name)
+            and stmt.value.ident in self._owned_local_names
+            and not self._value_is_owned_object(value)
+        ):
+            # Unlike an ordinary return, generator completion cleans every
+            # local (and finally may overwrite this name). Capture a separate
+            # owner instead of transferring the local's still-tracked owner.
+            value = self._gc_retain(value, name=self._fresh("gen.return.retain"))
+        else:
+            value = self._retain_borrowed_return_value(value, stmt)
         value_root_ptr = self._as_gc_ptr(
             value_slot,
             name=self._fresh("gen.return.root"),
@@ -1323,6 +1384,12 @@ class GeneratorLoweringMixin:
         self._emit_pending_finally_blocks()
         if self._builder_block_is_terminated():
             return
+        # A finally block may park and resume through a separate entry edge.
+        # The pre-finally cast no longer dominates that continuation.
+        value_root_ptr = self._as_gc_ptr(
+            value_slot,
+            name=self._fresh("gen.return.resume.root"),
+        )
         rooted_value = self.builder.call(
             self.runtime["pcc_gc_load_ptr"],
             [ir.Constant(_CSTR, None), value_root_ptr],

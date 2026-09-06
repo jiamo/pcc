@@ -32,7 +32,7 @@ def test_starred_unpack_from_sys_version_info_tuple(tmp_path):
     )
     run = subprocess.run([str(exe)], capture_output=True, text=True, timeout=20)
     assert run.returncode == 0, run.stderr
-    assert run.stdout.splitlines() == ["3", "13", "1"]
+    assert run.stdout.splitlines() == ["3", "15", "1"]
 
 
 def test_starred_unpack_from_dynamic_sequence(tmp_path):

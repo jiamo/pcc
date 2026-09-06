@@ -32,10 +32,12 @@ from .layer1_support import (
     _import_from_level_or_zero,
     _import_from_module_or_empty,
 )
+from .vthread_effect_analysis import vthread_delegate_frame_name
 
 
 _I64 = ir.IntType(64)
 _I1 = ir.IntType(1)
+_CSTR = ir.IntType(8).as_pointer()
 
 
 def _import_names(stmt: Import) -> tuple[tuple[str, str], ...]:
@@ -345,10 +347,18 @@ class NativeThreadingLoweringMixin:
         recv = self._emit_expr(attr.obj)
         recv_source = attr.obj
 
-        def _release_recv_if_owned() -> None:
-            self._gc_release_if_owned(recv, recv_source)
+        def _release_recv_if_owned(slot: Optional[ir.Value] = None) -> None:
+            if slot is not None:
+                self.builder.call(
+                    self.runtime["pcc_gc_store_root"],
+                    [self._as_gc_ptr(slot), ir.Constant(_CSTR, None)],
+                )
+            else:
+                self._gc_release_if_owned(recv, recv_source)
 
-        def _check_threading_rc(raw: ir.Value, hint: str) -> None:
+        def _check_threading_rc(
+            raw: ir.Value, hint: str, slot: Optional[ir.Value] = None
+        ) -> None:
             failed = self.builder.icmp_signed(
                 "!=",
                 raw,
@@ -363,7 +373,7 @@ class NativeThreadingLoweringMixin:
             )
             self.builder.cbranch(failed, fail_bb, ok_bb)
             self.builder.position_at_end(fail_bb)
-            _release_recv_if_owned()
+            _release_recv_if_owned(slot)
             exc = self.builder.call(
                 self.runtime["py_exc_new"],
                 [
@@ -451,6 +461,16 @@ class NativeThreadingLoweringMixin:
                 name=self._fresh(hint + ".vthread.rc"),
             )
             _check_negative_rc(raw, hint)
+            # Evaluate the receiver once and persist that exact primitive.
+            # Attribute receivers can be owned temporaries and cannot remain
+            # in SSA across a suspension, nor be re-read from a mutable field.
+            hidden = vthread_delegate_frame_name(expr, "pcc.threading.receiver")
+            recv_slot = self._generator_ctx_stack[-1]["frame_slots"][hidden][1]
+            self.builder.call(
+                self.runtime["pcc_gc_store_root"],
+                [self._as_gc_ptr(recv_slot), recv],
+            )
+            _release_recv_if_owned()
             parked = self.builder.icmp_signed(
                 "==",
                 raw,
@@ -467,18 +487,21 @@ class NativeThreadingLoweringMixin:
             self.builder.position_at_end(park_bb)
             self._emit_generator_yield_value(self._emit_none_literal())
             if reacquire_runtime_name is not None:
-                reacquire_recv = self._emit_expr(recv_source)
+                reacquire_recv = self.builder.call(
+                    self.runtime["pcc_gc_load_ptr"],
+                    [ir.Constant(_CSTR, None), self._as_gc_ptr(recv_slot)],
+                    name=self._fresh(hint + ".receiver"),
+                )
                 reacquire_rc = self.builder.call(
                     self.runtime[reacquire_runtime_name],
                     [reacquire_recv],
                     name=self._fresh(hint + ".reacquire.rc"),
                 )
-                _check_threading_rc(reacquire_rc, hint + ".reacquire")
-                self._gc_release_if_owned(reacquire_recv, recv_source)
+                _check_threading_rc(reacquire_rc, hint + ".reacquire", recv_slot)
             if not self._builder_block_is_terminated():
                 self.builder.branch(done_bb)
             self.builder.position_at_end(done_bb)
-            _release_recv_if_owned()
+            _release_recv_if_owned(recv_slot)
             return ir.Constant(_I1, 1)
 
         if kind in ("Lock", "RLock"):

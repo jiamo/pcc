@@ -160,6 +160,7 @@ PORT_ABI_NATIVE_EXPORTS = {
         "PY_FLAG_FINALIZED": {"kind": "constant", "value_kind": "int", "value": 4},
         "PY_FLAG_GC_PINNED": {"kind": "constant", "value_kind": "int", "value": 64},
         "PY_FLAG_GC_MALLOC_ALLOC": {"kind": "constant", "value_kind": "int", "value": 262144},
+        "PY_OBJ_CMP_UNORDERED": {"kind": "constant", "value_kind": "int", "value": 2},
         "PCC_VTHREAD_WAIT_CHANNEL_SEND": {"kind": "constant", "value_kind": "int", "value": 5},
         "PCC_VTHREAD_WAIT_CHANNEL_RECV": {"kind": "constant", "value_kind": "int", "value": 6},
         "PCC_VTHREAD_WAIT_CHANNEL_SELECT2": {"kind": "constant", "value_kind": "int", "value": 7},

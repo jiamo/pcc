@@ -1118,6 +1118,7 @@ class MethodCallExpressionLoweringMixin:
                             current_class.global_var,
                             name=self._fresh(".cls.recv"),
                         )
+                        self._note_global_backed_value(cls_ptr, current_class.global_var)
                     method_fn = method_info.methods[attr.name]
                     return self._emit_direct_method_call(
                         method_fn,
@@ -1182,6 +1183,7 @@ class MethodCallExpressionLoweringMixin:
                         method_info.global_var,
                         name=self._fresh(".cls.recv"),
                     )
+                    self._note_global_backed_value(cls_ptr, method_info.global_var)
                     method_fn = method_info.methods[attr.name]
                     try:
                         return self._emit_direct_method_call(
@@ -1219,6 +1221,7 @@ class MethodCallExpressionLoweringMixin:
                         method_info.global_var,
                         name=self._fresh(".cls.recv"),
                     )
+                    self._note_global_backed_value(cls_ptr, method_info.global_var)
                     method_fn = method_info.methods[attr.name]
                     return self._emit_direct_method_call(
                         method_fn,
@@ -1314,6 +1317,7 @@ class MethodCallExpressionLoweringMixin:
                             class_info.global_var,
                             name=self._fresh(".meta.cls.recv"),
                         )
+                        self._note_global_backed_value(call_receiver, class_info.global_var)
             if info is not None:
                 kind = info.method_kinds.get(attr.name, "instance")
                 if (
@@ -1344,6 +1348,7 @@ class MethodCallExpressionLoweringMixin:
                             class_info.global_var,
                             name=self._fresh(".cls.recv"),
                         )
+                        self._note_global_backed_value(cls_ptr, class_info.global_var)
                     method_fn = info.methods[attr.name]
                     return self._emit_direct_method_call(
                         method_fn,
@@ -1429,6 +1434,7 @@ class MethodCallExpressionLoweringMixin:
                                 info.global_var,
                                 name=self._fresh(".cls.recv"),
                             )
+                            self._note_global_backed_value(cls_ptr, info.global_var)
                             return self._emit_direct_method_call(
                                 method_fn,
                                 cls_ptr,
@@ -1675,6 +1681,7 @@ class MethodCallExpressionLoweringMixin:
                             candidate_info.global_var,
                             name=self._fresh(".cls.recv"),
                         )
+                        self._note_global_backed_value(obj_val, candidate_info.global_var)
                     method_fn = candidate_info.methods[attr.name]
                     return self._emit_direct_method_call(
                         method_fn,

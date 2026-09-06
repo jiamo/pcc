@@ -13,6 +13,15 @@ from functools import reduce
 from operator import mul
 from typing import Iterable
 
+from pcc.array_numeric import (
+    coerce_float,
+    wrap_integer,
+    float_binary,
+    float_unary,
+    float_sum,
+    number_compare,
+)
+
 
 _DTYPE_ITEMSIZE = {
     "bool": 1,
@@ -397,7 +406,7 @@ def _coerce_scalar(value: object, dtype: str) -> object:
     if dtype in _INTEGER_DTYPES:
         return _coerce_integer(value, dtype)
     if dtype in _FLOAT_DTYPES:
-        return float(value)
+        return coerce_float(value)
     return value
 
 
@@ -405,11 +414,7 @@ def _coerce_integer(value: object, dtype: str) -> int:
     raw = int(value)
     meta = _INTEGER_DTYPE_META[dtype]
     bits, signed = meta
-    modulo = 1 << bits
-    raw %= modulo
-    if signed and raw >= (1 << (bits - 1)):
-        raw -= modulo
-    return raw
+    return wrap_integer(raw, bits, signed)
 
 
 def _flatten_rectangular(value: object, shape: tuple[int, ...], dtype: str) -> list[object]:
@@ -1167,6 +1172,8 @@ def _result_dtype(op: str, left: str, right: str) -> str:
 
 
 def _apply_ufunc(op: str, left: object, right: object) -> object:
+    if isinstance(left, float) or isinstance(right, float):
+        return float_binary(op, coerce_float(left), coerce_float(right))
     if op == "add":
         return left + right  # type: ignore[operator]
     if op == "sub":
@@ -1193,6 +1200,8 @@ def _unary_result_dtype(op: str, dtype: str) -> str:
 
 
 def _apply_unary_op(op: str, value: object) -> object:
+    if isinstance(value, float) and op in {"neg", "abs"}:
+        return float_unary(op, value)
     if op == "neg":
         return -value  # type: ignore[operator]
     if op == "abs":
@@ -1439,19 +1448,7 @@ def array_matmul(left: ArrayCoreValue, right: ArrayCoreValue) -> ArrayCoreValue:
 
 
 def _apply_compare(op: str, left: object, right: object) -> bool:
-    if op == "eq":
-        return left == right
-    if op == "ne":
-        return left != right
-    if op == "lt":
-        return left < right  # type: ignore[operator]
-    if op == "le":
-        return left <= right  # type: ignore[operator]
-    if op == "gt":
-        return left > right  # type: ignore[operator]
-    if op == "ge":
-        return left >= right  # type: ignore[operator]
-    raise ValueError(f"unsupported array-core compare: {op}")
+    return number_compare(op, left, right)
 
 
 def array_compare(left: ArrayCoreValue, right: ArrayCoreValue, op: str) -> ArrayCoreValue:
@@ -2368,6 +2365,13 @@ def _normalize_axis(axis: int, ndim: int) -> int:
 
 def _reduce_values(items: Iterable[object], kind: str) -> object:
     values = list(items)
+    if (
+        kind in {"sum", "mean"}
+        and values
+        and all(isinstance(value, float) for value in values)
+    ):
+        total = float_sum(values)
+        return total / len(values) if kind == "mean" else total
     if kind == "sum":
         return sum(values)  # type: ignore[arg-type]
     if kind == "prod":

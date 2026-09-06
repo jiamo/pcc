@@ -106,6 +106,27 @@ STAGE_RESULT_FIELDS = frozenset(
     }
 )
 STAGE_RESULT_SCHEMA = "pcc.stage1-build-result.v1"
+STAGE_RESULT_METRIC_FIELDS = frozenset({"metric_scopes", "comparison_contract"})
+# These admitted v1 fields describe measurements, never compiler semantics.
+# Keep the producer contract exact; the focused test supplies the current
+# stage1 producer's constants so producer/consumer drift fails immediately.
+STAGE_RESULT_METRIC_SCOPES = {
+    "wall_s": "end_to_end_elapsed",
+    "user_s": "timed_command_plus_waited_children_cpu",
+    "system_s": "timed_command_plus_waited_children_cpu",
+    "cpu_s": "timed_command_plus_waited_children_cpu_sum",
+    "instructions": "coordinator_only_diagnostic",
+    "cycles": "coordinator_only_diagnostic",
+    "max_rss_bytes": "nonadditive_process_max_not_tree_sum",
+    "peak_footprint_bytes": "coordinator_only_not_tree_sum",
+}
+STAGE_RESULT_COMPARISON_CONTRACT = {
+    "primary_compute_metric": "cpu_s",
+    "wall_metric_role": "paired_end_to_end_observation",
+    "required_comparison": "adjacent_alternating_same_environment_pairs",
+    "single_wall_verdict_allowed": False,
+    "hardware_counters_allowed_for_stage_verdict": False,
+}
 SOURCE_MANIFEST_SCHEMA = "pcc.bootstrap-source-manifest.v1"
 PRIMARY_SOURCE = "pcc/llvm_capi/ir.py"
 BUILD_SOURCE_SUPPORT = (
@@ -1427,12 +1448,22 @@ def _load_build_receipt(
     if sha256_path(stage_result_path) != receipt["stage_result_sha256"]:
         raise CompileABError(f"{arm} stage result digest differs from build receipt")
     stage_result = _load_json_object(stage_result_path, arm + " stage result")
-    if set(stage_result) != STAGE_RESULT_FIELDS:
+    # Original v1 receipts predate measurement labels. Continue admitting that
+    # exact shape, or admit both current labels with their exact contract.
+    current_stage_fields = STAGE_RESULT_FIELDS | STAGE_RESULT_METRIC_FIELDS
+    if set(stage_result) not in (STAGE_RESULT_FIELDS, current_stage_fields):
         missing = sorted(STAGE_RESULT_FIELDS - set(stage_result))
         extra = sorted(set(stage_result) - STAGE_RESULT_FIELDS)
         raise CompileABError(
             f"{arm} stage result fields mismatch: missing={missing!r} extra={extra!r}"
         )
+    if set(stage_result) == current_stage_fields and (
+        _canonical_sha256(stage_result["metric_scopes"])
+        != _canonical_sha256(STAGE_RESULT_METRIC_SCOPES)
+        or _canonical_sha256(stage_result["comparison_contract"])
+        != _canonical_sha256(STAGE_RESULT_COMPARISON_CONTRACT)
+    ):
+        raise CompileABError(f"{arm} stage result metric contract is invalid")
     if stage_result.get("schema") != STAGE_RESULT_SCHEMA:
         raise CompileABError(f"{arm} stage result schema is invalid")
     artifacts = stage_result.get("artifacts")

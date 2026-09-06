@@ -21,7 +21,9 @@ from pathlib import Path
 from typing import Iterable
 
 from pcc.package_schema import (
+    distribution_filename_fields,
     pcc_native_wheel_tag as pcc_native_wheel_tag_for_platform,
+    validate_project_name,
     wheel_tag_fields,
 )
 
@@ -251,12 +253,21 @@ def _wheel_name(path: Path) -> str:
 
 
 def _sdist_name(path: Path) -> str:
-    name = path.name
-    for suffix in (".tar.gz", ".tar.bz2", ".tar.xz", ".zip", ".tgz"):
-        if name.endswith(suffix):
-            name = name[: -len(suffix)]
-            break
-    return name.split("-")[0] if "-" in name else name
+    return distribution_filename_fields(str(path))[0]
+
+
+def _local_project_name(root: Path) -> str:
+    config = root / "pyproject.toml"
+    if not config.is_file() or tomllib is None:
+        return root.name
+    project = tomllib.loads(config.read_text(encoding="utf-8")).get("project", {})
+    name = project.get("name")
+    if name is None:
+        return root.name
+    if not isinstance(name, str):
+        raise ValueError("PCC-PKG-PROJECT-NAME-INVALID")
+    validate_project_name(name)
+    return name
 
 
 def _source_kind(path: Path | None) -> str:
@@ -349,7 +360,7 @@ def inspect_artifact(
     names: tuple[str, ...] = ()
     generated_from_content: list[str] = []
     if raw_path is not None and raw_path.is_dir():
-        package_name = package_name or raw_path.name.split("-")[0]
+        package_name = package_name or _local_project_name(raw_path)
         file_paths = tuple(_iter_files(raw_path))
         names = tuple(str(p.relative_to(raw_path)) for p in file_paths)
         generated_from_content = [

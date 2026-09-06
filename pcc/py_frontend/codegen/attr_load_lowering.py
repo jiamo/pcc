@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from pcc.llvm_capi.compat import ir
+from pcc.python_target import PYTHON_TARGET_FULL_VERSION
 
 from ..py_ast import (
     Attr,
@@ -1350,6 +1351,10 @@ class AttrLoadLoweringMixin:
                     )
                 if builtin_module == "sys" and expr.name == "version_info":
                     return self._emit_sys_version_info_tuple()
+                if builtin_module == "sys" and expr.name == "version":
+                    return self._emit_str_literal(
+                        PYTHON_TARGET_FULL_VERSION + " (pcc self-host)"
+                    )
                 if builtin_module == "gc" and expr.name == "garbage":
                     return self._emit_gc_garbage()
                 if builtin_module == "gc" and expr.name == "callbacks":

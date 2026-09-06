@@ -4,9 +4,11 @@ import json
 import os
 import sys
 
+from .python_target import PYTHON_TARGET_VERSION
+
 PACKAGE_ENVIRONMENT_SCHEMA = "pcc.package-environment.v1"
 PCC_NATIVE_ABI_VERSION = "pcc-native-v1"
-DEFAULT_PYTHON_SEMANTIC_TARGET = "3.11"
+DEFAULT_PYTHON_SEMANTIC_TARGET = PYTHON_TARGET_VERSION
 DEFAULT_PACKAGE_ABI_MODE = "pcc-native"
 
 
@@ -84,15 +86,17 @@ def _compatibility_component(value):
 
 
 def _compatibility_tag(python_target, abi_version, target_triple, abi_mode):
-    python_component = "py" + str(python_target or "").replace(".", "")
-    return "-".join(
+    native_tag = "-".join(
         (
-            _compatibility_component(python_component),
             _compatibility_component(abi_version),
             _compatibility_component(target_triple),
             _compatibility_component(abi_mode),
         )
     )
+    if abi_mode == "pcc-native":
+        return native_tag
+    python_component = "py" + str(python_target or "").replace(".", "")
+    return _compatibility_component(python_component) + "-" + native_tag
 
 
 def _user_data_root(

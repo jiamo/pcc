@@ -10,6 +10,12 @@ from __future__ import annotations
 import sys as _native_sys
 
 from pcc.extern import c_int, extern
+from pcc.python_target import (
+    PYTHON_TARGET_FULL_VERSION,
+    PYTHON_TARGET_MAJOR,
+    PYTHON_TARGET_MINOR,
+    PYTHON_TARGET_MICRO,
+)
 
 # libc glue.
 exit_c: "extern" = extern("exit", (c_int,))  # noreturn; treat as void
@@ -56,11 +62,12 @@ class _Stream:
             _native_sys.stderr.flush()
 
 
-# pcc's self-host binary reports itself as CPython-3.13-compatible so
-# that user code probing ``sys.version_info.major`` works the same
-# way.
-version_info: _VersionInfo = _VersionInfo(3, 13, 0)
-version: str = "3.13.0 (pcc self-host)"
+# Runtime version introspection agrees with the compiler's version guards.
+# A package-selection override does not change the executing language target.
+version_info: _VersionInfo = _VersionInfo(
+    PYTHON_TARGET_MAJOR, PYTHON_TARGET_MINOR, PYTHON_TARGET_MICRO
+)
+version: str = PYTHON_TARGET_FULL_VERSION + " (pcc self-host)"
 implementation: _Implementation = _Implementation("pcc")
 stdout: _Stream = _Stream("stdout")
 stderr: _Stream = _Stream("stderr")

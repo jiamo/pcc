@@ -392,12 +392,25 @@ def _populate_static_native_exports_0(out):
             (_export_arg("path", ("str",)),),
         ),
     }
+    out["pcc.package_metadata_paths"] = {
+        "package_metadata_paths": _function_export(
+            ("list", ("str",)),
+            (("str",),),
+            (_export_arg("root", ("str",)),),
+        ),
+        "package_metadata_member_paths": _function_export(
+            ("list", ("str",)),
+            (("list", ("str",)),),
+            (_export_arg("names", ("list", ("str",))),),
+        ),
+    }
     # Package environment selection is shared by the host CLI, the compiled
     # bootstrap CLI, and frontend import discovery.  Standalone module probes
     # need the same signatures as the closed-world build; treating these
     # helpers as dynamic silently adds libpython calls to both cli_bootstrap
     # and pipeline.
     out["pcc.package_environment"] = {
+        "package_environment_fingerprint": _function_export(("str",), (), ()),
         "apply_locked_environment_resource_defaults": _function_export(
             ("list", ("str",)),
             (),
@@ -433,6 +446,13 @@ def _populate_static_native_exports_0(out):
                 _export_arg("environ", ("dyn",), has_default=True),
                 _export_arg("target_triple", ("dyn",), has_default=True),
             ),
+        ),
+    }
+    out["pcc.py_frontend.pipeline_paths"] = {
+        "resolve_module_src": _function_export(
+            ("dyn",),
+            (("str",), ("str",)),
+            (_export_arg("root_dir", ("str",)), _export_arg("dotted_name", ("str",))),
         ),
     }
     # The strict AArch64 self path is linked into pcc1 and called in-process;
@@ -1692,6 +1712,8 @@ _PCC_FRONTEND_STATIC_NATIVE_EXPORTS = _build_static_native_exports()
 _PCC_FRONTEND_STATIC_NATIVE_MODULES = frozenset(
     {
         "pcc.py_frontend.pipeline",
+        "pcc.py_frontend.pipeline_exports",
+        "pcc.py_frontend.pipeline_packages",
         "pcc.py_frontend.pipeline_frontend_parallel",
         "pcc.py_frontend.pipeline_frontend_workers",
         "pcc.py_frontend.compile_cache",
@@ -1722,6 +1744,7 @@ _PCC_FRONTEND_STATIC_NATIVE_MODULES = frozenset(
         "pcc.parse.py_parse",
         "pcc.py_frontend.export_meta",
         "pcc.package_schema",
+        "pcc.package_metadata_paths",
         "pcc.__main__",
         "pcc.cli_contract",
     }

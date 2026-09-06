@@ -1,5 +1,18 @@
 import sys
 
+from .array_numeric import (
+    binary_token,
+    cast_token,
+    compare_tokens,
+    float_token,
+    reduce_tokens,
+    token_float,
+    token_integer,
+    token_is_float,
+    token_truth,
+    unary_token,
+)
+
 
 def _write_text(text: str, *, err: bool = False, nl: bool = True) -> None:
     if nl:
@@ -182,32 +195,14 @@ def _native_array_integer_signed(dtype: str) -> bool:
 
 
 def _native_array_int_pow2(bits: int) -> int:
-    # Only called with bits < 64 (see _native_array_wrap_integer): 2**bits then
-    # fits in i64 and the loop is exact. (2**64 would overflow/truncate the i64
-    # ``-> int`` return in the multi-module self-backend build.)
+    # Dtype metadata handles the 64-bit limits as text. Remaining widths fit
+    # in i64; numeric wrapping itself belongs to array_numeric.wrap_integer.
     value = 1
     i = 0
     while i < bits:
         value *= 2
         i += 1
     return value
-
-
-def _native_array_wrap_integer(value: int, dtype: str) -> int:
-    bits = _native_array_integer_bits(dtype)
-    if bits >= 64:
-        # ``value`` is already an i64 here (the param is a native int), so it IS
-        # the 64-bit two's-complement wrap for int64/uint64 — no modulo needed.
-        # Computing 2**64 would overflow/truncate the i64 ``-> int`` return in
-        # the multi-module self-backend build (2**64 -> 0 -> ``value % 0``).
-        return value
-    modulo = _native_array_int_pow2(bits)
-    wrapped = value % modulo
-    if _native_array_integer_signed(dtype):
-        sign = _native_array_int_pow2(bits - 1)
-        if wrapped >= sign:
-            wrapped -= modulo
-    return wrapped
 
 
 def _native_array_dtype_range_json(dtype: str) -> str:
@@ -307,7 +302,9 @@ def _native_array_literal_dtype(text: str) -> str:
         ch = text[i]
         if ch == '"' or ch == "'":
             has_quote = True
-        if ch == ".":
+        if ch == "." or (
+            (ch == "e" or ch == "E") and i > 0 and "0" <= text[i - 1] <= "9"
+        ):
             has_float = True
         if "0" <= ch <= "9":
             has_int = True
@@ -439,6 +436,12 @@ def _native_array_token_json(token: str) -> str:
         return "true"
     if stripped == "False":
         return "false"
+    if stripped == "nan":
+        return "NaN"
+    if stripped == "inf":
+        return "Infinity"
+    if stripped == "-inf":
+        return "-Infinity"
     if stripped.startswith('"') or stripped.startswith("'"):
         inner = stripped[1:]
         if len(inner) > 0 and (inner.endswith('"') or inner.endswith("'")):
@@ -518,100 +521,26 @@ def _native_array_op_dtype(op: str, left_dtype: str, right_dtype: str) -> str:
     return "bool"
 
 
-def _native_array_token_to_scaled(token: str) -> int:
-    if token == "True":
-        return 1000000
-    if token == "False":
-        return 0
-    stripped = token.strip()
-    negative = False
-    if stripped.startswith("-"):
-        negative = True
-        stripped = stripped[1:]
-    whole = stripped
-    frac = ""
-    dot = _native_find_from(stripped, ".", 0)
-    if dot >= 0:
-        whole = stripped[:dot]
-        frac = stripped[dot + 1 :]
-    if whole == "":
-        whole_value = 0
-    else:
-        whole_value = int(whole)
-    value = whole_value * 1000000
-    scale = 100000
-    i = 0
-    while i < len(frac) and i < 6:
-        ch = frac[i]
-        if "0" <= ch <= "9":
-            value += int(ch) * scale
-        scale //= 10
-        i += 1
-    if negative:
-        return -value
-    return value
 
 
-def _native_array_scaled_to_token(value: int, dtype: str) -> str:
-    if dtype == "float32" or dtype == "float64":
-        negative = value < 0
-        if negative:
-            value = -value
-        whole = value // 1000000
-        frac = value % 1000000
-        text = str(whole) + "."
-        scale = 100000
-        while scale > 0:
-            digit = frac // scale
-            text += str(digit)
-            frac = frac - digit * scale
-            scale //= 10
-        while len(text) > 0 and text.endswith("0"):
-            text = text[:-1]
-        if text.endswith("."):
-            text += "0"
-        if negative:
-            text = "-" + text
-        return text
-    if dtype == "bool":
-        return "True" if value != 0 else "False"
-    if value < 0:
-        integer = -((-value) // 1000000)
-    else:
-        integer = value // 1000000
-    if _native_array_is_integer_dtype(dtype):
-        integer = _native_array_wrap_integer(integer, dtype)
-    return str(integer)
 
 
-def _native_array_token_is_scaled_number(token: str) -> bool:
-    stripped = token.strip()
-    if stripped == "":
-        return False
-    i = 0
-    if stripped[0] == "-" or stripped[0] == "+":
-        i = 1
-    if i >= len(stripped):
-        return False
-    saw_digit = False
-    saw_dot = False
-    while i < len(stripped):
-        ch = stripped[i]
-        if "0" <= ch <= "9":
-            saw_digit = True
-        elif ch == "." and not saw_dot:
-            saw_dot = True
+def _native_array_token_is_number(token: str) -> bool:
+    try:
+        if token_is_float(token):
+            token_float(token)
         else:
-            return False
-        i += 1
-    return saw_digit
+            token_integer(token)
+        return True
+    except ValueError:
+        return False
 
 
 def _native_array_arange_uses_float(arange_text: str) -> bool:
     parts = _native_array_split_commas(arange_text)
     i = 0
     while i < len(parts):
-        if _native_find_from(parts[i], ".", 0) >= 0:
+        if token_is_float(parts[i]):
             return True
         i += 1
     return False
@@ -621,30 +550,13 @@ def _native_array_cast_values(values, dtype: str):
     out = []
     i = 0
     while i < len(values):
-        if dtype == "object":
-            out.append(values[i])
-        else:
-            out.append(
-                _native_array_scaled_to_token(
-                    _native_array_token_to_scaled(values[i]), dtype
-                )
-            )
+        out.append(cast_token(values[i], dtype))
         i += 1
     return out
 
 
 def _native_array_apply_op(left: str, right: str, op: str, dtype: str) -> str:
-    lv = _native_array_token_to_scaled(left)
-    rv = _native_array_token_to_scaled(right)
-    if op == "add":
-        result = lv + rv
-    elif op == "sub":
-        result = lv - rv
-    elif op == "mul":
-        result = (lv * rv) // 1000000
-    else:
-        result = (lv * 1000000) // rv
-    return _native_array_scaled_to_token(result, dtype)
+    return binary_token(left, right, op, dtype)
 
 
 def _native_array_unary_op_name(op: str) -> str:
@@ -674,19 +586,7 @@ def _native_array_unary_op(shape, values, dtype: str, op: str, diagnostics):
     out = []
     i = 0
     while i < len(values):
-        scaled = _native_array_token_to_scaled(values[i])
-        if op_name == "neg":
-            result = -scaled
-        elif op_name == "abs":
-            if scaled < 0:
-                result = -scaled
-            else:
-                result = scaled
-        else:
-            result = 0
-            if scaled == 0:
-                result = 1000000
-        out.append(_native_array_scaled_to_token(result, out_dtype))
+        out.append(unary_token(values[i], op_name, out_dtype))
         i += 1
     return [shape, out, out_dtype]
 
@@ -704,8 +604,6 @@ def _native_array_clip(shape, values, dtype: str, clip_text: str, diagnostics):
     if dtype == "object":
         diagnostics.append("PCC-ARRAY-OBJECT-CLIP-UNSUPPORTED")
         return [shape, [], dtype]
-    lower = _native_array_token_to_scaled(lower_text)
-    upper = _native_array_token_to_scaled(upper_text)
     out_dtype = dtype
     if _native_array_is_float_token(lower_text) or _native_array_is_float_token(
         upper_text
@@ -714,12 +612,12 @@ def _native_array_clip(shape, values, dtype: str, clip_text: str, diagnostics):
     out = []
     i = 0
     while i < len(values):
-        current = _native_array_token_to_scaled(values[i])
-        if current < lower:
-            current = lower
-        if current > upper:
-            current = upper
-        out.append(_native_array_scaled_to_token(current, out_dtype))
+        current = values[i]
+        if compare_tokens(current, lower_text, "lt"):
+            current = lower_text
+        if compare_tokens(current, upper_text, "gt"):
+            current = upper_text
+        out.append(cast_token(current, out_dtype))
         i += 1
     return [shape, out, out_dtype]
 
@@ -1119,12 +1017,6 @@ def _native_array_matmul_dtype(left_dtype: str, right_dtype: str) -> str:
     return dtype
 
 
-def _native_array_matmul_token_sum(total: int, left: str, right: str) -> int:
-    return (
-        total
-        + (_native_array_token_to_scaled(left) * _native_array_token_to_scaled(right))
-        // 1000000
-    )
 
 
 def _native_array_matmul(
@@ -1170,28 +1062,24 @@ def _native_array_matmul(
         return [out_shape, [], dtype]
     out = []
     if left_rank == 1 and right_rank == 1:
-        total = 0
+        products = []
         i = 0
         while i < left_shape[0]:
-            total = _native_array_matmul_token_sum(
-                total, left_values[i], right_values[i]
-            )
+            products.append(binary_token(left_values[i], right_values[i], "mul", dtype))
             i += 1
-        out.append(_native_array_scaled_to_token(total, dtype))
+        out.append(reduce_tokens(products, "sum", dtype))
         return [[], out, dtype]
     if left_rank == 2 and right_rank == 1:
         rows = left_shape[0]
         inner = left_shape[1]
         r = 0
         while r < rows:
-            total = 0
+            products = []
             i = 0
             while i < inner:
-                total = _native_array_matmul_token_sum(
-                    total, left_values[r * inner + i], right_values[i]
-                )
+                products.append(binary_token(left_values[r * inner + i], right_values[i], "mul", dtype))
                 i += 1
-            out.append(_native_array_scaled_to_token(total, dtype))
+            out.append(reduce_tokens(products, "sum", dtype))
             r += 1
         return [out_shape, out, dtype]
     if left_rank == 1 and right_rank == 2:
@@ -1199,14 +1087,12 @@ def _native_array_matmul(
         cols = right_shape[1]
         c = 0
         while c < cols:
-            total = 0
+            products = []
             i = 0
             while i < inner:
-                total = _native_array_matmul_token_sum(
-                    total, left_values[i], right_values[i * cols + c]
-                )
+                products.append(binary_token(left_values[i], right_values[i * cols + c], "mul", dtype))
                 i += 1
-            out.append(_native_array_scaled_to_token(total, dtype))
+            out.append(reduce_tokens(products, "sum", dtype))
             c += 1
         return [out_shape, out, dtype]
     rows = left_shape[0]
@@ -1216,14 +1102,12 @@ def _native_array_matmul(
     while r < rows:
         c = 0
         while c < cols:
-            total = 0
+            products = []
             i = 0
             while i < inner:
-                total = _native_array_matmul_token_sum(
-                    total, left_values[r * inner + i], right_values[i * cols + c]
-                )
+                products.append(binary_token(left_values[r * inner + i], right_values[i * cols + c], "mul", dtype))
                 i += 1
-            out.append(_native_array_scaled_to_token(total, dtype))
+            out.append(reduce_tokens(products, "sum", dtype))
             c += 1
         r += 1
     return [out_shape, out, dtype]
@@ -1385,20 +1269,7 @@ def _native_array_compare_token(
         if op == "ne":
             return "True" if left != right else "False"
         return "False"
-    lv = _native_array_token_to_scaled(left)
-    rv = _native_array_token_to_scaled(right)
-    if op == "eq":
-        ok = lv == rv
-    elif op == "ne":
-        ok = lv != rv
-    elif op == "lt":
-        ok = lv < rv
-    elif op == "le":
-        ok = lv <= rv
-    elif op == "gt":
-        ok = lv > rv
-    else:
-        ok = lv >= rv
+    ok = compare_tokens(left, right, op)
     return "True" if ok else "False"
 
 
@@ -1917,9 +1788,8 @@ def _native_array_sort_values(values):
     i = 1
     while i < len(out):
         current = out[i]
-        current_scaled = _native_array_token_to_scaled(current)
         j = i - 1
-        while j >= 0 and _native_array_token_to_scaled(out[j]) > current_scaled:
+        while j >= 0 and compare_tokens(out[j], current, "gt"):
             out[j + 1] = out[j]
             j -= 1
         out[j + 1] = current
@@ -1936,11 +1806,10 @@ def _native_array_argsort_values(values):
     i = 1
     while i < len(indices):
         current_index = indices[i]
-        current_scaled = _native_array_token_to_scaled(values[current_index])
         j = i - 1
         while (
             j >= 0
-            and _native_array_token_to_scaled(values[indices[j]]) > current_scaled
+            and compare_tokens(values[indices[j]], values[current_index], "gt")
         ):
             indices[j + 1] = indices[j]
             j -= 1
@@ -2088,14 +1957,12 @@ def _native_array_searchsorted(
     out = []
     q = 0
     while q < len(query_values):
-        query_scaled = _native_array_token_to_scaled(query_values[q])
         pos = 0
         while pos < len(values):
-            current_scaled = _native_array_token_to_scaled(values[pos])
             if side == "left":
-                if current_scaled >= query_scaled:
+                if compare_tokens(values[pos], query_values[q], "ge"):
                     break
-            elif current_scaled > query_scaled:
+            elif compare_tokens(values[pos], query_values[q], "gt"):
                 break
             pos += 1
         out.append(str(pos))
@@ -2198,29 +2065,27 @@ def _native_array_arange(arange_text: str, dtype: str, diagnostics):
     else:
         diagnostics.append("PCC-ARRAY-ARANGE-PARSE-FAILED")
         return [[], [], dtype]
-    if (
-        not _native_array_token_is_scaled_number(start)
-        or not _native_array_token_is_scaled_number(stop)
-        or not _native_array_token_is_scaled_number(step)
-    ):
+    if not (_native_array_token_is_number(start) and _native_array_token_is_number(stop)
+            and _native_array_token_is_number(step)):
         diagnostics.append("PCC-ARRAY-ARANGE-PARSE-FAILED")
         return [[], [], dtype]
-    start_value = _native_array_token_to_scaled(start)
-    stop_value = _native_array_token_to_scaled(stop)
-    step_value = _native_array_token_to_scaled(step)
-    if step_value == 0:
+    if _native_array_arange_uses_float(arange_text):
+        start = float_token(token_float(start))
+        stop = float_token(token_float(stop))
+        step = float_token(token_float(step))
+    if not token_truth(step):
         diagnostics.append("PCC-ARRAY-ARANGE-PARSE-FAILED")
         return [[], [], dtype]
     values = []
-    current = start_value
-    if step_value > 0:
-        while current < stop_value:
-            values.append(_native_array_scaled_to_token(current, dtype))
-            current += step_value
-    else:
-        while current > stop_value:
-            values.append(_native_array_scaled_to_token(current, dtype))
-            current += step_value
+    current = start
+    comparison = "lt" if compare_tokens(step, "0", "gt") else "gt"
+    while compare_tokens(current, stop, comparison):
+        values.append(cast_token(current, dtype))
+        next_value = binary_token(current, step, "add", "object")
+        if compare_tokens(next_value, current, "eq"):
+            diagnostics.append("PCC-ARRAY-ARANGE-PARSE-FAILED")
+            return [[], [], dtype]
+        current = next_value
     return [[len(values)], values, dtype]
 
 
@@ -2248,9 +2113,9 @@ def _native_array_eye(eye_text: str, dtype: str, diagnostics):
         c = 0
         while c < cols:
             if c - r == diagonal:
-                values.append(_native_array_scaled_to_token(1000000, dtype))
+                values.append(cast_token("1", dtype))
             else:
-                values.append(_native_array_scaled_to_token(0, dtype))
+                values.append(cast_token("0", dtype))
             c += 1
         r += 1
     return [shape, values, dtype]
@@ -2259,12 +2124,8 @@ def _native_array_eye(eye_text: str, dtype: str, diagnostics):
 def _native_array_linspace(linspace_text: str, dtype: str, diagnostics):
     parts = _native_array_split_commas(linspace_text)
     if len(parts) == 2:
-        start = _native_array_token_to_scaled(parts[0])
-        stop = _native_array_token_to_scaled(parts[1])
         count = 50
     elif len(parts) == 3:
-        start = _native_array_token_to_scaled(parts[0])
-        stop = _native_array_token_to_scaled(parts[1])
         count = int(parts[2])
     else:
         diagnostics.append("PCC-ARRAY-LINSPACE-PARSE-FAILED")
@@ -2272,16 +2133,18 @@ def _native_array_linspace(linspace_text: str, dtype: str, diagnostics):
     if count < 0:
         diagnostics.append("PCC-ARRAY-LINSPACE-PARSE-FAILED")
         return [[], [], dtype]
+    start = token_float(parts[0])
+    stop = token_float(parts[1])
     values = []
     if count == 0:
         return [[0], values, dtype]
     if count == 1:
-        values.append(_native_array_scaled_to_token(start, dtype))
+        values.append(cast_token(float_token(start), dtype))
         return [[1], values, dtype]
-    step = (stop - start) // (count - 1)
+    step = (stop - start) / (count - 1)
     i = 0
     while i < count:
-        values.append(_native_array_scaled_to_token(start + step * i, dtype))
+        values.append(cast_token(float_token(start + step * i), dtype))
         i += 1
     return [[count], values, dtype]
 
@@ -2298,52 +2161,8 @@ def _native_array_axis_normalize(axis: int, ndim: int) -> int:
     return axis
 
 
-def _native_array_reduce_scaled(values, kind: str) -> int:
-    result = _native_array_token_to_scaled(values[0])
-    if kind == "sum":
-        result = 0
-        i = 0
-        while i < len(values):
-            result += _native_array_token_to_scaled(values[i])
-            i += 1
-        return result
-    if kind == "prod":
-        result = 1000000
-        i = 0
-        while i < len(values):
-            result = (result * _native_array_token_to_scaled(values[i])) // 1000000
-            i += 1
-        return result
-    if kind == "any":
-        i = 0
-        while i < len(values):
-            if _native_array_token_to_scaled(values[i]) != 0:
-                return 1000000
-            i += 1
-        return 0
-    if kind == "all":
-        i = 0
-        while i < len(values):
-            if _native_array_token_to_scaled(values[i]) == 0:
-                return 0
-            i += 1
-        return 1000000
-    if kind == "mean":
-        result = 0
-        i = 0
-        while i < len(values):
-            result += _native_array_token_to_scaled(values[i])
-            i += 1
-        return result // len(values)
-    i = 1
-    while i < len(values):
-        current = _native_array_token_to_scaled(values[i])
-        if kind == "min" and current < result:
-            result = current
-        if kind == "max" and current > result:
-            result = current
-        i += 1
-    return result
+def _native_array_reduce_token(values, kind: str, dtype: str) -> str:
+    return reduce_tokens(values, kind, dtype)
 
 
 def _native_array_reduce(
@@ -2376,23 +2195,23 @@ def _native_array_reduce(
         dtype = "int64"
     axis = _native_array_axis_value(axis_text)
     if axis == -999999:
-        result = _native_array_reduce_scaled(values, kind)
+        result = _native_array_reduce_token(values, kind, dtype)
         out_shape = []
         if keepdims:
             i = 0
             while i < len(shape):
                 out_shape.append(1)
                 i += 1
-        return [out_shape, [_native_array_scaled_to_token(result, dtype)], dtype]
+        return [out_shape, [result], dtype]
     normalized_axis = _native_array_axis_normalize(axis, len(shape))
     if normalized_axis < 0 or normalized_axis >= len(shape):
         diagnostics.append("PCC-ARRAY-AXIS-OUT-OF-BOUNDS")
         return [[], [], dtype]
     if len(shape) == 1:
-        result = _native_array_reduce_scaled(values, kind)
+        result = _native_array_reduce_token(values, kind, dtype)
         if keepdims:
-            return [[1], [_native_array_scaled_to_token(result, dtype)], dtype]
-        return [[], [_native_array_scaled_to_token(result, dtype)], dtype]
+            return [[1], [result], dtype]
+        return [[], [result], dtype]
     if len(shape) != 2:
         diagnostics.append("PCC-ARRAY-AXIS-REDUCE-RANK-UNSUPPORTED")
         return [[], [], dtype]
@@ -2408,9 +2227,7 @@ def _native_array_reduce(
                 slice_values.append(values[r * cols + c])
                 r += 1
             out.append(
-                _native_array_scaled_to_token(
-                    _native_array_reduce_scaled(slice_values, kind), dtype
-                )
+                _native_array_reduce_token(slice_values, kind, dtype)
             )
             c += 1
         if keepdims:
@@ -2424,9 +2241,7 @@ def _native_array_reduce(
             slice_values.append(values[r * cols + c])
             c += 1
         out.append(
-            _native_array_scaled_to_token(
-                _native_array_reduce_scaled(slice_values, kind), dtype
-            )
+            _native_array_reduce_token(slice_values, kind, dtype)
         )
         r += 1
     if keepdims:
@@ -2434,18 +2249,13 @@ def _native_array_reduce(
     return [[rows], out, dtype]
 
 
-def _native_array_arg_reduce_scaled(values, kind: str) -> int:
+def _native_array_arg_reduce_token(values, kind: str) -> int:
     best_index = 0
-    best_value = _native_array_token_to_scaled(values[0])
     i = 1
     while i < len(values):
-        current = _native_array_token_to_scaled(values[i])
-        if kind == "argmin" and current < best_value:
+        op = "lt" if kind == "argmin" else "gt"
+        if compare_tokens(values[i], values[best_index], op):
             best_index = i
-            best_value = current
-        if kind == "argmax" and current > best_value:
-            best_index = i
-            best_value = current
         i += 1
     return best_index
 
@@ -2464,7 +2274,7 @@ def _native_array_arg_reduce(
         return [[], [], "int64"]
     axis = _native_array_axis_value(axis_text)
     if axis == -999999:
-        result = _native_array_arg_reduce_scaled(values, kind)
+        result = _native_array_arg_reduce_token(values, kind)
         out_shape = []
         if keepdims:
             i = 0
@@ -2477,7 +2287,7 @@ def _native_array_arg_reduce(
         diagnostics.append("PCC-ARRAY-AXIS-OUT-OF-BOUNDS")
         return [[], [], "int64"]
     if len(shape) == 1:
-        result = _native_array_arg_reduce_scaled(values, kind)
+        result = _native_array_arg_reduce_token(values, kind)
         if keepdims:
             return [[1], [str(result)], "int64"]
         return [[], [str(result)], "int64"]
@@ -2495,7 +2305,7 @@ def _native_array_arg_reduce(
             while r < rows:
                 slice_values.append(values[r * cols + c])
                 r += 1
-            out.append(str(_native_array_arg_reduce_scaled(slice_values, kind)))
+            out.append(str(_native_array_arg_reduce_token(slice_values, kind)))
             c += 1
         if keepdims:
             return [[1, cols], out, "int64"]
@@ -2507,7 +2317,7 @@ def _native_array_arg_reduce(
         while c < cols:
             slice_values.append(values[r * cols + c])
             c += 1
-        out.append(str(_native_array_arg_reduce_scaled(slice_values, kind)))
+        out.append(str(_native_array_arg_reduce_token(slice_values, kind)))
         r += 1
     if keepdims:
         return [[rows, 1], out, "int64"]
@@ -2518,7 +2328,7 @@ def _native_array_count_nonzero_values(values) -> int:
     count = 0
     i = 0
     while i < len(values):
-        if _native_array_token_to_scaled(values[i]) != 0:
+        if token_truth(values[i]):
             count += 1
         i += 1
     return count
@@ -2587,14 +2397,14 @@ def _native_array_nonzero(shape, values, dtype: str, diagnostics):
         diagnostics.append("PCC-ARRAY-NONZERO-UNSUPPORTED")
         return [[len(shape), 0], [], "int64"]
     if len(shape) == 0:
-        if len(values) > 0 and _native_array_token_to_scaled(values[0]) != 0:
+        if len(values) > 0 and token_truth(values[0]):
             return [[1, 1], ["0"], "int64"]
         return [[1, 0], [], "int64"]
     if len(shape) == 1:
         out = []
         i = 0
         while i < len(values):
-            if _native_array_token_to_scaled(values[i]) != 0:
+            if token_truth(values[i]):
                 out.append(str(i))
             i += 1
         return [[1, len(out)], out, "int64"]
@@ -2607,7 +2417,7 @@ def _native_array_nonzero(shape, values, dtype: str, diagnostics):
         while r < rows:
             c = 0
             while c < cols:
-                if _native_array_token_to_scaled(values[r * cols + c]) != 0:
+                if token_truth(values[r * cols + c]):
                     row_indices.append(str(r))
                     col_indices.append(str(c))
                 c += 1
@@ -2631,14 +2441,14 @@ def _native_array_argwhere(shape, values, dtype: str, diagnostics):
         diagnostics.append("PCC-ARRAY-ARGWHERE-UNSUPPORTED")
         return [[0, len(shape)], [], "int64"]
     if len(shape) == 0:
-        if len(values) > 0 and _native_array_token_to_scaled(values[0]) != 0:
+        if len(values) > 0 and token_truth(values[0]):
             return [[1, 0], [], "int64"]
         return [[0, 0], [], "int64"]
     if len(shape) == 1:
         out = []
         i = 0
         while i < len(values):
-            if _native_array_token_to_scaled(values[i]) != 0:
+            if token_truth(values[i]):
                 out.append(str(i))
             i += 1
         return [[len(out), 1], out, "int64"]
@@ -2651,7 +2461,7 @@ def _native_array_argwhere(shape, values, dtype: str, diagnostics):
         while r < rows:
             c = 0
             while c < cols:
-                if _native_array_token_to_scaled(values[r * cols + c]) != 0:
+                if token_truth(values[r * cols + c]):
                     out.append(str(r))
                     out.append(str(c))
                     count += 1
@@ -2669,7 +2479,7 @@ def _native_array_flatnonzero(shape, values, dtype: str, diagnostics):
     out = []
     i = 0
     while i < len(values):
-        if _native_array_token_to_scaled(values[i]) != 0:
+        if token_truth(values[i]):
             out.append(str(i))
         i += 1
     return [[len(out)], out, "int64"]
@@ -2683,19 +2493,12 @@ def _native_array_cumulative_dtype(dtype: str) -> str:
 
 def _native_array_cumulative_values(values, kind: str, dtype: str):
     out = []
-    if kind == "cumsum":
-        total = 0
-        i = 0
-        while i < len(values):
-            total += _native_array_token_to_scaled(values[i])
-            out.append(_native_array_scaled_to_token(total, dtype))
-            i += 1
-        return out
-    total = 1000000
+    total = "0" if kind == "cumsum" else "1"
+    op = "add" if kind == "cumsum" else "mul"
     i = 0
     while i < len(values):
-        total = (total * _native_array_token_to_scaled(values[i])) // 1000000
-        out.append(_native_array_scaled_to_token(total, dtype))
+        total = binary_token(total, values[i], op, dtype)
+        out.append(total)
         i += 1
     return out
 
@@ -3104,20 +2907,8 @@ def _native_array_where(
 
 
 def _native_array_astype(shape, values, dtype: str, target_dtype: str, diagnostics):
-    dtype = _native_array_normalize_dtype(target_dtype)
-    out = []
-    i = 0
-    while i < len(values):
-        if dtype == "object":
-            out.append(values[i])
-        else:
-            out.append(
-                _native_array_scaled_to_token(
-                    _native_array_token_to_scaled(values[i]), dtype
-                )
-            )
-        i += 1
-    return [shape, out, dtype]
+    target = _native_array_normalize_dtype(target_dtype)
+    return [shape, _native_array_cast_values(values, target), target]
 
 
 def _native_array_diagnostics_json(codes) -> str:
@@ -3695,7 +3486,7 @@ def _native_array_core_json(
     return out
 
 
-def _run_native_package_array_core_from_pcc1(module_args) -> int:
+def _run_native_package_array_core_impl(module_args) -> int:
     shape_text = ""
     literal = ""
     dtype = "auto"
@@ -4838,3 +4629,20 @@ def _run_native_package_array_core_from_pcc1(module_args) -> int:
     )
     _write_text(report)
     return 2 if _native_find_from(report, '"ok": false', 0) >= 0 else 0
+
+
+def _run_native_package_array_core_from_pcc1(module_args) -> int:
+    try:
+        return _run_native_package_array_core_impl(module_args)
+    except ValueError as exc:
+        code = str(exc)
+        if not code.startswith("PCC-ARRAY-"):
+            code = "PCC-ARRAY-NUMERIC-PARSE-FAILED"
+        _write_text('{"ok": false, "diagnostics": [{"code": ' + _json_str(code) + '}]}')
+        return 2
+    except OverflowError:
+        _write_text('{"ok": false, "diagnostics": [{"code": "PCC-ARRAY-NUMERIC-OVERFLOW-UNSUPPORTED"}]}')
+        return 2
+    except ZeroDivisionError:
+        _write_text('{"ok": false, "diagnostics": [{"code": "PCC-ARRAY-UFUNC-FAILED"}]}')
+        return 2

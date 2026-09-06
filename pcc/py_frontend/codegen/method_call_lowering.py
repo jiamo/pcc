@@ -228,7 +228,10 @@ def _method_emit_ast_args(
 def _method_release_arg_provenance(host, provenance) -> None:
     for value, managed, raw, owned in provenance:
         if managed:
-            host.builder.call(host.runtime["pcc_gc_unpin"], [value])
+            host.builder.call(
+                host.runtime["pcc_gc_unpin"],
+                [host._value_available_at_insertion_point(value)],
+            )
             if owned:
                 host._gc_release(
                     value,

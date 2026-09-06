@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import os
+import sys
+
 from typing import Optional
 
 from pcc.llvm_capi.compat import ir
@@ -1721,6 +1724,15 @@ class NativeVirtualThreadLoweringMixin:
         rejected = getattr(self, "_vthread_rejected_park_boundaries", {})
         reject_reason = rejected.get(target.ident)
         if reject_reason is not None:
+            if os.environ.get("PCC_DEBUG_VTHREAD_REJECTS", "").strip() not in ("", "0"):
+                # The spawn error names only the last link of a rejection
+                # chain; dump every rejected boundary so the first cause
+                # (usually an unresolved callee of a may_park wrapper) is
+                # visible without re-deriving the analysis by hand.
+                for rejected_name in sorted(rejected):
+                    sys.stderr.write(
+                        "[pcc.vthread.reject] " + rejected_name + ": " + str(rejected[rejected_name]) + "\n"
+                    )
             raise L1CodegenError(
                 "pcc.virtual_thread.spawn cannot prove a resumable parking "
                 "boundary for "

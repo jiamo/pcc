@@ -24,9 +24,19 @@ from ..py_ast import (
     Assign,
     Attr,
     AugAssign,
+    BoolType,
+    BytesType,
     Call,
     ClassDef,
     ClassType,
+    DictType,
+    FloatType,
+    IntType,
+    ListType,
+    NoneType,
+    SetType,
+    StrType,
+    TupleType,
     Delete,
     ExceptHandler,
     For,
@@ -947,7 +957,7 @@ def _resolve_local_method_key(
 def vthread_proven_method_call_key(
     expr: Call,
     current_class: Optional[str],
-    method_keys: set[str],
+    method_keys: Optional[set[str]],
     module: Module,
     fd: Optional[FuncDef] = None,
     *,
@@ -956,7 +966,7 @@ def vthread_proven_method_call_key(
     local_hints: Optional[dict[str, str]] = None,
     proof_cache: Optional[dict] = None,
 ) -> Optional[str]:
-    """Return a local method effect key only when the receiver is concrete."""
+    """Resolve a concrete local method, optionally restricted to effect keys."""
     if not isinstance(expr.func, Attr):
         return None
     if methods is None or bases is None:
@@ -992,7 +1002,7 @@ def vthread_proven_method_call_key(
         methods,
         bases,
     )
-    if key is None or key not in method_keys:
+    if key is None or (method_keys is not None and key not in method_keys):
         return None
     return key
 
@@ -1111,6 +1121,20 @@ def _local_method_call_keys(
             if key is not None and key not in keys:
                 keys.append(key)
     return keys
+
+
+_BUILTIN_VALUE_RECEIVER_TYPES = (
+    StrType,
+    BytesType,
+    ListType,
+    SetType,
+    DictType,
+    TupleType,
+    IntType,
+    FloatType,
+    BoolType,
+    NoneType,
+)
 
 
 _VTHREAD_EFFECT_SUMMARY_SCHEMA = "pcc.vthread.effect-summary.v1"
@@ -1740,6 +1764,11 @@ def _unresolved_method_effect_reason(
         attr_name = call.func.name
         if attr_name not in effect_method_names:
             continue
+        if isinstance(getattr(call.func.obj, "ty", None), _BUILTIN_VALUE_RECEIVER_TYPES):
+            # ``", ".join(...)``, ``payload.read(...)`` on a str/bytes/list/
+            # dict/tuple/set/int/float/bool/None receiver is a builtin method,
+            # never an open-world user method that could park.
+            continue
         if (
             isinstance(call.func.obj, Name)
             and effective_vthread_modules.get(call.func.obj.ident)
@@ -1754,7 +1783,7 @@ def _unresolved_method_effect_reason(
             vthread_proven_method_call_key(
                 call,
                 current_class,
-                may_park_method_keys,
+                None,
                 module,
                 fd,
                 methods=methods,
@@ -1766,7 +1795,7 @@ def _unresolved_method_effect_reason(
         ):
             continue
         if (
-            vthread_proven_export_method_call_key(
+            _vthread_proven_export_method_call_target(
                 call,
                 native_exports,
                 module,
@@ -1775,7 +1804,12 @@ def _unresolved_method_effect_reason(
             is not None
         ):
             continue
-        return "unresolved user-method may park: ." + attr_name
+        receiver_ty = getattr(call.func.obj, "ty", None)
+        return (
+            "unresolved user-method may park: ." + attr_name
+            + " (receiver type " + repr(getattr(receiver_ty, "name", None))
+            + ", module " + repr(getattr(receiver_ty, "module", None)) + ")"
+        )
     return ""
 
 
@@ -2377,6 +2411,7 @@ def classify_vthread_park_boundaries(
                     rejected[key] = (
                         "calls unresolved may_park method wrapper: "
                         + callee_key
+                        + ": " + rejected[callee_key]
                     )
                     changed = True
                     break
@@ -2392,7 +2427,10 @@ def classify_vthread_park_boundaries(
                 continue
             for callee in callees:
                 if callee in rejected:
-                    rejected[caller] = "calls unresolved may_park wrapper: " + callee
+                    rejected[caller] = (
+                        "calls unresolved may_park wrapper: " + callee
+                        + ": " + rejected[callee]
+                    )
                     changed = True
                     break
             if caller in rejected:
@@ -2416,6 +2454,7 @@ def classify_vthread_park_boundaries(
                     rejected[caller] = (
                         "calls unresolved may_park method wrapper: "
                         + callee_key
+                        + ": " + rejected[callee_key]
                     )
                     changed = True
                     break

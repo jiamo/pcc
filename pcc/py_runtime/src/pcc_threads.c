@@ -2726,6 +2726,10 @@ static int64_t pcc_vthread_io_result_bits(
 int64_t py_virtual_thread_poll_io(int64_t timeout_ms) {
     if (pcc_vthread_scheduler_init() != 0) return -1;
     if (pcc_mutex_lock(pcc_vthread_lock) != 0) return -1;
+    if (timeout_ms == 0 && pcc_vthread_io_wait_count_value == 0) {
+        (void)pcc_mutex_unlock(pcc_vthread_lock);
+        return 0;
+    }
     if (pcc_vthread_io_waitset_ensure_locked() != 0) {
         (void)pcc_mutex_unlock(pcc_vthread_lock);
         return -1;

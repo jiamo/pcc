@@ -3564,25 +3564,15 @@ class MultiFileBootstrapShimTests(unittest.TestCase):
             "warn",
             "warnx",
         }
+        # The GUI framework moved to https://github.com/allstoalls/pcc-gui,
+        # so its CoreGraphics/Metal window symbols are no longer part of the
+        # core runtime's dynamic-symbol inventory.
         dynamic_symbol_abis = {
-            "CGBitmapContextCreate": "fixed",
-            "CGContextFillRect": "fixed",
-            "CGContextRelease": "fixed",
-            "CGContextSetFillColorWithColor": "fixed",
-            "CGContextSetRGBFillColor": "fixed",
-            "CGContextStrokeLineSegments": "fixed",
             "curl_easy_cleanup": "fixed",
             "curl_easy_init": "fixed",
             "curl_easy_perform": "fixed",
             "curl_easy_setopt": "variadic",
-            "pcc_gui_metal_run_loop_pump": "fixed",
-            "pcc_gui_metal_window_close": "fixed",
-            "pcc_gui_metal_window_create": "fixed",
-            "pcc_gui_metal_window_is_closed": "fixed",
-            "pcc_gui_metal_window_render": "fixed",
-            "pcc_gui_metal_window_show": "fixed",
             "pcc_metal_buffer_runtime_release": "fixed",
-            "uncompress": "fixed",
         }
         expected_variable_symbols = {
             ("freestanding_metal_runtime.py", "dynamic_library_symbol", "symbol"),

@@ -303,7 +303,10 @@ def _for_prepare_owned_object_target(host, target_ident: str, target_ty: Type):
             [host._as_gc_ptr(alloca), initial_obj],
         )
         host.builder.store(ir.Constant(_I1, 1), owned_flag)
-        host.builder.call(host.runtime["pcc_gc_unpin"], [initial_obj])
+        host.builder.call(
+            host.runtime["pcc_gc_unpin"],
+            [host._value_available_at_insertion_point(initial_obj)],
+        )
         # ``pcc_gc_store_root`` retains the value for the slot.  The boxed
         # scalar / promoted borrowed binding supplied ``initial_obj`` as an
         # owned temporary, so transfer that original reference after the

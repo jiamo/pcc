@@ -1973,20 +1973,20 @@ class NativeModuleAliasMixin:
                         )
                         source_gv.linkage = "external"
                     local_gv, local_ty = self._module_globals[local_name]
-                    if not self._ir_type_matches(
-                        local_gv.value_type,
-                        source_gv.value_type,
-                    ):
-                        raise NotImplementedError(
-                            "cross-module global representation mismatch for "
-                            + src_module
-                            + "."
-                            + attr_name
-                        )
                     imported_value = self.builder.load(
                         source_gv,
                         name=self._fresh("native.import.global." + local_name),
                     )
+                    if not self._ir_type_matches(
+                        local_gv.value_type,
+                        source_gv.value_type,
+                    ):
+                        imported_value = self._bridge_cross_module_int_global(
+                            imported_value,
+                            local_gv.value_type,
+                            src_module,
+                            attr_name,
+                        )
                     self._store_module_global_root_value(
                         local_gv,
                         imported_value,
@@ -2065,10 +2065,21 @@ class NativeModuleAliasMixin:
             gv.linkage = "external"
         else:
             gv = existing
-        return self.builder.load(
+        loaded = self.builder.load(
             gv,
             name=self._fresh(f"modvar.{attr_name}"),
         )
+        if isinstance(value_ty, IntType):
+            # The consumer may keep ints in the other representation than the
+            # exporting module (raw i64 versus boxed object); bridge on load.
+            consumer_ir_ty = (
+                _CSTR if self._should_box_python_ints() else self._storage_ir_type(value_ty)
+            )
+            if not self._ir_type_matches(consumer_ir_ty, gv.value_type):
+                loaded = self._bridge_cross_module_int_global(
+                    loaded, consumer_ir_ty, module_name, attr_name
+                )
+        return loaded
 
     def _declare_native_module_extern_global(
         self,
@@ -2096,12 +2107,63 @@ class NativeModuleAliasMixin:
             gv = existing
         local_gv, _local_ty = self._ensure_module_global_name(local_name, value_ty)
         if not self._ir_type_matches(local_gv.value_type, ir_ty):
-            raise NotImplementedError(
-                "cross-module global representation mismatch for "
-                + owning_module
-                + "."
-                + attr_name
+            # Declaration time has no builder.  An int stored by the exporter
+            # in the other representation (raw i64 versus boxed object) is
+            # bridged at every load in _emit_native_module_global_attr_load;
+            # anything else is a genuine mismatch and fails closed here.
+            int_shaped = isinstance(
+                local_gv.value_type, (ir.IntType, ir.PointerType)
+            ) and isinstance(ir_ty, (ir.IntType, ir.PointerType))
+            if not (isinstance(value_ty, IntType) and int_shaped):
+                raise NotImplementedError(
+                    "cross-module global representation mismatch for "
+                    + owning_module
+                    + "."
+                    + attr_name
+                )
+
+
+    def _bridge_cross_module_int_global(
+        self,
+        value: ir.Value,
+        local_ir_ty: ir.Type,
+        owning_module: str,
+        attr_name: str,
+    ) -> ir.Value:
+        """Convert a sibling module's int global between its raw ``i64`` and
+        boxed-object representations.
+
+        Modules decide their int representation independently (the raw-int
+        scaffold follows ``pcc.*`` naming or a ``pcc.unsafe``/``pcc.extern``
+        import), so an application package can import ``CONST = 7`` from a
+        sibling that stores it as ``i64`` into a module that stores ints as
+        objects, or the reverse.  Both directions are exact for the int lane;
+        anything else is a genuine mismatch and fails closed.
+        """
+        value_ty = getattr(value, "type", None)
+        if isinstance(value_ty, ir.IntType) and isinstance(local_ir_ty, ir.PointerType):
+            if value_ty.width != 64:
+                value = self.builder.sext(value, _I64, name=self._fresh("native.import.sext"))
+            return self.builder.call(
+                self.runtime["py_int_from_i64"],
+                [value],
+                name=self._fresh("native.import.box." + attr_name),
             )
+        if isinstance(value_ty, ir.PointerType) and isinstance(local_ir_ty, ir.IntType):
+            unboxed = self.builder.call(
+                self.runtime["py_int_value_i64"],
+                [value],
+                name=self._fresh("native.import.unbox." + attr_name),
+            )
+            if local_ir_ty.width != 64:
+                unboxed = self.builder.trunc(unboxed, local_ir_ty, name=self._fresh("native.import.trunc"))
+            return unboxed
+        raise NotImplementedError(
+            "cross-module global representation mismatch for "
+            + owning_module
+            + "."
+            + attr_name
+        )
 
     def _register_native_module_alias(
         self,

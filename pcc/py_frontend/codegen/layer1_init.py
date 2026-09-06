@@ -216,6 +216,9 @@ class Layer1InitMixin:
         # construction site (single source, multi-module, frontend workers)
         # agrees with type inference without pipeline plumbing.
         self._runtime_port_module: bool = _module_declares_runtime_port(module)
+        # id(value) -> (module-level source global, value): lets cleanup sites
+        # re-derive a global-backed value that their block does not dominate.
+        self._global_backed_values: dict = {}
         self._sibling_module_inits: tuple[str, ...] = ()
         self._native_module_exports: Optional[dict] = _default_native_module_exports(
             module.name

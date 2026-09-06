@@ -103,6 +103,9 @@ def build_closed_world_context(
     from .py_ast import StrLit as _StrLit
     from .py_ast import Subscript as _Subscript
     from .py_ast import TupleExpr as _TupleExpr
+    from .pipeline_exports import (
+        _export_signed_int_literal_or_none,
+    )
 
     def known_module_int_expr(expr, known_names) -> bool:
         if _closed_world_is_node(expr, (_IntLit, _BoolLit)):
@@ -457,6 +460,18 @@ def build_closed_world_context(
                         "export_name": target_name,
                         "value_kind": "bool",
                         "value": bool(literal_value),
+                    }
+                elif _export_signed_int_literal_or_none(value) is not None:
+                    # ``FLOOR = -7`` is a UnaryOp over a literal, not an
+                    # IntLit; without this it became an untyped module global
+                    # whose raw i64 storage the importer read as a tagged
+                    # object pointer.
+                    exports[target_name] = {
+                        "kind": "constant",
+                        "owning_module": mod_name,
+                        "export_name": target_name,
+                        "value_kind": "int",
+                        "value": _export_signed_int_literal_or_none(value),
                     }
                 elif _closed_world_is_node(value, _NoneLit):
                     exports[target_name] = {

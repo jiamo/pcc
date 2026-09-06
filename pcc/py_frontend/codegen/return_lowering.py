@@ -310,6 +310,12 @@ class ReturnLoweringMixin:
             stmt.value.ident
         ):
             value = self._emit_expr_with_native_callable_values(stmt.value)
+        elif (
+            isinstance(ret_ty, ir.PointerType)
+            and self._is_object(self.current_func_def.return_ty)
+            and isinstance(stmt.value.ty, IntType)
+        ):
+            value = self._emit_expr_as_pcc_object(stmt.value)
         else:
             value = self._emit_expr(stmt.value)
         self._return_log("value coerce")

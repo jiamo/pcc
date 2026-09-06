@@ -327,6 +327,36 @@ def test_locked_sync_is_transactional_and_unchanged_repeat_skips_installer(tmp_p
     assert not (Path(env["VIRTUAL_ENV"]) / "lib" / "python3.13").exists()
 
 
+def test_locked_sync_reselects_python_markers_in_same_native_environment(tmp_path):
+    project = _graph_project(tmp_path)
+    lock_path = project / "uv.lock"
+    lock_text = lock_path.read_text(encoding="utf-8")
+    old_marker = "sys_platform == 'win32'"
+    assert lock_text.count(old_marker) == 1
+    lock_path.write_text(lock_text.replace(old_marker, "python_version >= '3.16'"))
+    env = {**_environment(tmp_path), "PCC_PACKAGE_TARGET_PYTHON": "3.15"}
+    pcc1 = tmp_path / "pcc1"
+    _fake_pcc1(pcc1, tmp_path / "pcc1-count")
+
+    first = sync_uv_lock(lock_path, project_root=project, pcc1=str(pcc1), environ=env)
+    later_env = {**env, "PCC_PACKAGE_TARGET_PYTHON": "3.16"}
+    second = sync_uv_lock(
+        lock_path, project_root=project, pcc1=str(pcc1), environ=later_env
+    )
+    assert first["environment_root"] == second["environment_root"]
+    assert "dep-win" not in {package["name"] for package in first["packages"]}
+    assert second["changed"] is True, second
+    assert "dep-win" in {package["name"] for package in second["packages"]}
+    assert second["lock_provenance"]["target_python"] == "3.16"
+    assert (
+        Path(second["environment_root"]) / "site-packages/dep_win/__init__.py"
+    ).is_file()
+    repeated = sync_uv_lock(
+        lock_path, project_root=project, pcc1=str(pcc1), environ=later_env
+    )
+    assert repeated["changed"] is False
+
+
 def test_failed_locked_sync_preserves_previous_environment(tmp_path):
     project = _graph_project(tmp_path)
     env = _environment(tmp_path)

@@ -238,6 +238,58 @@ def _export_func_uses_unboxed_typed_int_abi(fd) -> bool:
     return True
 
 
+def _export_signed_literal_type_or_none(expr):
+    """Type ``-7`` / ``+3.5`` the way ``7`` / ``3.5`` are typed.
+
+    The parser lifts a signed literal as ``UnaryOp`` over the literal, so
+    without this a module-level ``FLOOR = -7`` was exported as an untyped
+    module global while ``LIMIT = 64`` became a constant.  A raw-int provider
+    then stored ``i64`` into a slot the importer declared ``PyObject*`` and
+    read the bits back as a tagged small int: ``-7`` arrived as ``-4``.
+    """
+    from .py_ast import BoolLit as _BoolLit
+    from .py_ast import FloatLit as _FloatLit
+    from .py_ast import FloatType as _FloatType
+    from .py_ast import IntLit as _IntLit
+    from .py_ast import IntType as _IntType
+    from .py_ast import UnaryOp as _UnaryOp
+
+    if not _closed_world_is_node(expr, _UnaryOp):
+        return None
+    if _py_ast_field_value(expr, "op", "") not in ("-", "+"):
+        return None
+    operand = _py_ast_field_value(expr, "operand", None)
+    if _closed_world_is_node(operand, (_IntLit, _BoolLit)):
+        return _IntType("int")
+    if _closed_world_is_node(operand, _FloatLit):
+        return _FloatType("float")
+    return None
+
+
+def _export_signed_int_literal_or_none(expr):
+    """Return the value of a signed integer literal, else ``None``."""
+    from .py_ast import BoolLit as _BoolLit
+    from .py_ast import IntLit as _IntLit
+    from .py_ast import UnaryOp as _UnaryOp
+
+    if _closed_world_is_node(expr, _IntLit):
+        raw = _export_literal_value_or_none(expr)
+        return None if raw is None else int(raw)
+    if not _closed_world_is_node(expr, _UnaryOp):
+        return None
+    op = _py_ast_field_value(expr, "op", "")
+    if op not in ("-", "+"):
+        return None
+    operand = _py_ast_field_value(expr, "operand", None)
+    if not _closed_world_is_node(operand, (_IntLit, _BoolLit)):
+        return None
+    raw = _export_literal_value_or_none(operand)
+    if raw is None:
+        return None
+    value = int(raw)
+    return -value if op == "-" else value
+
+
 def _export_static_literal_type(expr):
     """Return a shallow static type for top-level literal containers.
 
@@ -280,6 +332,9 @@ def _export_static_literal_type(expr):
         return _FloatType("float")
     if _closed_world_is_node(expr, _NoneLit):
         return _NoneType("None")
+    signed_literal_ty = _export_signed_literal_type_or_none(expr)
+    if signed_literal_ty is not None:
+        return signed_literal_ty
     if _closed_world_is_node(expr, _BinOp):
         lhs_ty = _export_static_literal_type(
             _py_ast_field_value(expr, "lhs", None)

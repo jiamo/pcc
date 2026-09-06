@@ -31,6 +31,9 @@ import urllib.parse
 import urllib.request
 import zipfile
 
+from pcc.package_environment import DEFAULT_PYTHON_SEMANTIC_TARGET
+from pcc.package_schema import distribution_filename_fields
+
 from .install import (
     _ARTIFACT_SUFFIXES,
     _artifact_compatibility_reason_from_name,
@@ -41,7 +44,7 @@ from .install import (
 )
 
 DEFAULT_INDEX_URL = "https://pypi.org/simple"
-DEFAULT_TARGET_PYTHON = "3.11"
+DEFAULT_TARGET_PYTHON = DEFAULT_PYTHON_SEMANTIC_TARGET
 ACQUIRE_MODES = ("auto", "host", "owned", "offline")
 _REQUIREMENT_RE = re.compile(
     r"^(?P<name>[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?)"
@@ -170,13 +173,7 @@ def selected_acquire_mode(requested: str) -> str:
 
 
 def _artifact_version(filename: str) -> str:
-    name = filename
-    for suffix in _ARTIFACT_SUFFIXES:
-        if name.endswith(suffix):
-            name = name[: -len(suffix)]
-            break
-    parts = name.split("-")
-    return parts[1] if len(parts) >= 2 else "0"
+    return distribution_filename_fields(filename)[1]
 
 
 def _matching_artifacts(

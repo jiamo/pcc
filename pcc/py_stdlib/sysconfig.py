@@ -17,6 +17,8 @@ import os
 import platform as _platform
 import sys
 
+from pcc.python_target import PYTHON_TARGET_VERSION_PARTS
+
 
 _SCHEME_KEYS = (
     "stdlib",
@@ -147,12 +149,7 @@ def _is_pcc_runtime():
 
 def _version_parts():
     if _is_pcc_runtime():
-        configured = os.getenv("PCC_PACKAGE_TARGET_PYTHON", "")
-        if configured:
-            parts = configured.split(".")
-            if len(parts) >= 2:
-                micro = parts[2] if len(parts) >= 3 else "0"
-                return parts[0], parts[1], micro
+        return PYTHON_TARGET_VERSION_PARTS
     return (
         str(sys.version_info.major),
         str(sys.version_info.minor),

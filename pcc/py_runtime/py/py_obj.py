@@ -573,6 +573,10 @@ def pcc_gc_store_ptr(owner, slot, value) -> None:
         if load_i32(global_addr("pcc_runtime_log_fast_state"), 0) != 0:
             pcc_runtime_log_event_code(2, 3, backend, 0, owner)
         old = load_ptr(slot, 0)
+        # This retaining store already owns the same reference. GC0 has no
+        # tracing/relocation barrier to perform for an unchanged edge.
+        if ptr_eq(old, value) != 0:
+            return
         py_incref(value)
         store_ptr(slot, 0, value)
         py_decref(old)
@@ -699,6 +703,8 @@ def pcc_gc_store_root(slot, value) -> None:
         if load_i32(global_addr("pcc_runtime_log_fast_state"), 0) != 0:
             pcc_runtime_log_event_code(2, 3, backend, 0, null())
         old = load_ptr(slot, 0)
+        if ptr_eq(old, value) != 0:
+            return
         # Skip the refcount calls for values that cannot be refcounted.  A
         # tagged immediate and NULL both make py_incref/py_decref return
         # immediately, so the calls are pure overhead -- and codegen emits

@@ -270,7 +270,7 @@ class CoercionLoweringMixin:
             return self.builder.icmp_signed("!=", v, zero, name=self._fresh("truthy_i"))
         if isinstance(ty, FloatType):
             zero = ir.Constant(_DOUBLE, 0.0)
-            return self.builder.fcmp_ordered(
+            return self.builder.fcmp_unordered(
                 "!=", v, zero, name=self._fresh("truthy_f")
             )
         if self._is_object(ty) or isinstance(ty, DynType):

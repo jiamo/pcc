@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from pcc.py_frontend import compile_cache, pipeline
 
 
@@ -26,9 +28,14 @@ def _plan(tmp_path, monkeypatch, *, compiler_text="compiler"):
     return plan, compiler, entry, helper
 
 
+@pytest.mark.parametrize("codegen_name,codegen_value", [
+    ("PCC_PYTHON_TYPED_INT_ABI", "boxed"),
+    ("PCC_DISABLE_BULK_GENERATOR_FRAME_INIT", "1"),
+])
 def test_frontend_ir_cache_key_is_gc_invariant_but_codegen_sensitive(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, codegen_name, codegen_value
 ):
+    monkeypatch.delenv(codegen_name, raising=False)
     monkeypatch.setenv("PCC_GC_BACKEND", "0")
     first, compiler, entry, helper = _plan(tmp_path, monkeypatch)
 
@@ -46,7 +53,7 @@ def test_frontend_ir_cache_key_is_gc_invariant_but_codegen_sensitive(
     assert second is not None
     assert second["key"] == first["key"]
 
-    monkeypatch.setenv("PCC_PYTHON_TYPED_INT_ABI", "boxed")
+    monkeypatch.setenv(codegen_name, codegen_value)
     third = compile_cache.plan_python_frontend_ir_cache(
         [str(entry), str(helper)],
         ["entry", "helper"],

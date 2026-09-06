@@ -56,6 +56,7 @@ def _write_demo_project(root: Path) -> Path:
     )
     (root / "meson.build").write_text("project('demo_pkg', 'c')\n", encoding="utf-8")
     (root / "pyproject.toml").write_text(
+        "[project]\nname = 'demo_pkg'\nversion = '0.1'\n"
         "[build-system]\n"
         "requires = ['meson-python', 'cython']\n"
         "build-backend = 'mesonpy'\n",
@@ -186,6 +187,9 @@ def test_source_install_prefers_distribution_package_and_scans_build_overlay(
 ):
     project = tmp_path / "demo_pkg-0.1"
     (project / "demo_pkg").mkdir(parents=True)
+    (project / "pyproject.toml").write_text(
+        '[project]\nname="demo-pkg"\nversion="0.1"\n', encoding="utf-8"
+    )
     (project / "demo_pkg" / "__init__.py").write_text("VALUE = 1\n", encoding="utf-8")
     (project / "benchmarks").mkdir()
     (project / "benchmarks" / "__init__.py").write_text("\n", encoding="utf-8")

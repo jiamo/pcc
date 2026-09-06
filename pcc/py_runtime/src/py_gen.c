@@ -6,6 +6,7 @@
  */
 
 #include "py_internal.h"
+#include <stdlib.h>
 
 
 static PyObject *gen_require_result(
@@ -19,6 +20,33 @@ static PyObject *gen_require_result(
     return result;
 }
 
+
+PyObject *py_gen_frame_new(int64_t slot_count) {
+    if (slot_count < 0 || slot_count > 134217728) {
+        return gen_require_result(NULL, "py_gen_frame_new", "invalid generator frame size");
+    }
+    PyListObject *frame = (PyListObject *)pcc_gc_alloc(sizeof(PyListObject), PY_TYPE_LIST, 0);
+    if (frame == NULL) {
+        return gen_require_result(NULL, "pcc_gc_alloc", "generator frame allocation failed");
+    }
+    int64_t capacity = slot_count < 4 ? 4 : slot_count;
+    frame->length = 0;
+    frame->capacity = capacity;
+    frame->items = NULL;
+    frame->items = (PyObject **)malloc((size_t)capacity * sizeof(PyObject *));
+    if (frame->items == NULL) {
+        py_decref((PyObject *)frame);
+        return gen_require_result(NULL, "malloc", "generator frame slots allocation failed");
+    }
+    for (int64_t index = 0; index < slot_count; index++) frame->items[index] = py_None;
+    frame->length = slot_count;
+    (void)pcc_gc_backend4_zpage_register_owner_payload_span(
+        (PyObject *)frame, frame->items, capacity * (int64_t)sizeof(PyObject *)
+    );
+    py_gc_track((PyObject *)frame);
+    pcc_gc_publish_initialized((PyObject *)frame);
+    return (PyObject *)frame;
+}
 
 PyObject *py_gen_new(void *resume, PyObject *frame) {
     if (resume == NULL || frame == NULL) {

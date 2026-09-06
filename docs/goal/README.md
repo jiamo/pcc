@@ -1,39 +1,24 @@
-# Agent Goal State Workflow
+# docs/goal — retired 2026-09-06
 
-This directory owns the repository's single goal execution system.
+The structured task board (`task-board.yaml`, 490 rows) and its evidence
+directory (`evidence/`, 924 files) were removed on 2026-09-06. They served a
+single-file execution queue plus a per-slice evidence log; the queue is now
+GitHub issues and the durable knowledge is distilled under `docs/knowledge/`.
 
-The workflow is agent-neutral. Codex, Claude, or another coding agent should be
-able to follow the same protocol, task board, evidence format, and shell
-commands.
+- **Unfinished work** — the 241 rows that were not `DONE_STRONG` became issues
+  with `priority:*`, `status:*` and `task-board` labels, split across the three
+  repositories. The mapping is
+  [`docs/task-board-migration-2026-09-06.md`](../task-board-migration-2026-09-06.md).
+- **The last board and all evidence files** remain in git history at commit
+  `2574f585`; nothing was rewritten.
+- **The protocol documents** moved to
+  [`docs/archive/goal/`](../archive/goal/): `goal-prompt-through-2026-09-06.md`
+  and `current-goal-state-through-2026-09-06.md`.
+- **What replaced them** — `docs/knowledge/` (generated decision pages plus
+  handoffs), `docs/investigations/` (unchanged, the evidence those pages
+  summarise), and issues for the queue. See the "Working agreement" section of
+  [`AGENTS.md`](../../AGENTS.md).
 
-The startup-state migration is complete:
-
-- `docs/goal/goal-prompt.md` is the single stable execution protocol.
-- The former root compatibility entrypoint has been removed; active routing
-  names the canonical protocol directly.
-- `docs/current-goal-state.md` is generated from the task board and checked
-  truth manifest; do not append work logs to it.
-- `docs/goal/task-board.yaml` is the machine-readable task board for migrated
-  rows.
-- `docs/goal/head-truth-manifest.json` is the checked machine truth record.
-- `docs/goal/evidence/` holds one small evidence file per completed slice.
-- `docs/goal/goal-prompt.md` applies to Codex `/goal`, Claude loops, and direct
-  human-launched agent runs.
-
-Use:
-
-```bash
-gtimeout 30s env -u LC_ALL uv run python scripts/goal_state.py next
-gtimeout 30s env -u LC_ALL uv run python scripts/goal_state.py validate
-gtimeout 30s env -u LC_ALL uv run python scripts/goal_state.py render
-gtimeout 30s env -u LC_ALL uv run python scripts/goal_state.py render-startup \
-  --check docs/current-goal-state.md
-```
-
-Do not promote a task to `DONE_STRONG` from this file alone. The evidence file
-and current gates must prove the exact claim.
-
-For multi-agent loops, keep one agent as the owner of task selection,
-validation, and task-board updates. Worker agents may edit their assigned files
-and propose evidence, but the owner should run the gates and write the final
-task-board status.
+What stays in this directory: `head-truth-manifest.json` and
+`m1-package-canary.json`, which are consumed by `scripts/head_truth_gate.py`
+and `scripts/head_truth_manifest.py` and are unrelated to the board.

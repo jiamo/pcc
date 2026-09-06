@@ -88,8 +88,8 @@ class CompareMembershipLoweringMixin:
         order and valueclass/CPython boundary policy stay outside this owner.
         """
         runtime_name = {
-            "==": "py_obj_eq",
-            "!=": "py_obj_eq",
+            "==": "py_obj_eq_value",
+            "!=": "py_obj_eq_value",
             "<": "py_obj_lt",
             "<=": "py_obj_le",
             ">": "py_obj_gt",
@@ -262,7 +262,7 @@ class CompareMembershipLoweringMixin:
             lhs_obj = self._emit_expr_as_pcc_object(expr.lhs)
             rhs_obj = self._emit_expr_as_pcc_object(expr.rhs)
             eq = self.builder.call(
-                self.runtime["py_obj_eq"],
+                self.runtime["py_obj_eq_value"],
                 [lhs_obj, rhs_obj],
                 name=self._fresh("value.mixed.eq"),
             )
@@ -467,7 +467,7 @@ class CompareMembershipLoweringMixin:
                         rhs_ty,
                     )
                     eq = self.builder.call(
-                        self.runtime["py_obj_eq"],
+                        self.runtime["py_obj_eq_value"],
                         [lhs_obj, rhs_obj],
                         name=self._fresh("obj.scalar.eq"),
                     )
@@ -486,6 +486,10 @@ class CompareMembershipLoweringMixin:
                 if isinstance(lhs_ty, FloatType) or isinstance(rhs_ty, FloatType):
                     lf = self._to_double(lhs, lhs_ty)
                     rf = self._to_double(rhs, rhs_ty)
+                    if expr.op == "!=":
+                        return self.builder.fcmp_unordered(
+                            "!=", lf, rf, name=self._fresh("dyn.scalar.fcmp")
+                        )
                     return self.builder.fcmp_ordered(
                         expr.op,
                         lf,
@@ -548,7 +552,7 @@ class CompareMembershipLoweringMixin:
                     rhs_ty,
                 )
             eq = self.builder.call(
-                self.runtime["py_obj_eq"],
+                self.runtime["py_obj_eq_value"],
                 [lhs, rhs],
                 name=self._fresh("obj.str.eq"),
             )
@@ -578,6 +582,8 @@ class CompareMembershipLoweringMixin:
         if isinstance(lhs_ty, FloatType) or isinstance(rhs_ty, FloatType):
             lf = self._to_double(lhs, lhs_ty)
             rf = self._to_double(rhs, rhs_ty)
+            if expr.op == "!=":
+                return self.builder.fcmp_unordered("!=", lf, rf, name=self._fresh("fcmp"))
             return self.builder.fcmp_ordered(expr.op, lf, rf, name=self._fresh("fcmp"))
         if (isinstance(lhs_ty, DynType) or isinstance(rhs_ty, DynType)) and expr.op in (
             "<",
@@ -816,7 +822,7 @@ class CompareMembershipLoweringMixin:
                 "value.eq.r.obj",
             )
             eq = self.builder.call(
-                self.runtime["py_obj_eq"],
+                self.runtime["py_obj_eq_value"],
                 [lhs_obj, rhs_obj],
                 name=self._fresh("value.eq.obj"),
             )
@@ -895,7 +901,7 @@ class CompareMembershipLoweringMixin:
             )
         if isinstance(lhs_field.type, ir.PointerType):
             obj_eq = self.builder.call(
-                self.runtime["py_obj_eq"],
+                self.runtime["py_obj_eq_value"],
                 [lhs_field, rhs_field],
                 name=self._fresh("value.eq.obj"),
             )

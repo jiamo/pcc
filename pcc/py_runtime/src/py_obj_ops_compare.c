@@ -100,7 +100,11 @@ static PyObject *cmp_set_key(PySetObject *s, SetEntry *e) {
 }
 
 int py_obj_cmp_threeway(PyObject *a, PyObject *b) {
-    if (a == b) return 0;
+    if (a == b) {
+        if (a != NULL && py_type_of(a) == PY_TYPE_FLOAT
+            && isnan(((PyFloatObject *)a)->value)) return PY_OBJ_CMP_UNORDERED;
+        return 0;
+    }
     if (a == NULL) return (b == NULL) ? 0 : -1;
     if (b == NULL) return 1;
 
@@ -127,6 +131,7 @@ int py_obj_cmp_threeway(PyObject *a, PyObject *b) {
         double bv = (tb == PY_TYPE_FLOAT)
             ? ((PyFloatObject *)b)->value
             : (double)int_or_bool_as_i64(b);
+        if (isnan(av) || isnan(bv)) return PY_OBJ_CMP_UNORDERED;
         if (av < bv) return -1;
         if (av > bv) return 1;
         return 0;
@@ -162,9 +167,11 @@ int py_obj_cmp_threeway(PyObject *a, PyObject *b) {
         PyTupleObject *tb_o = (PyTupleObject *)b;
         int64_t n = ta_o->len < tb_o->len ? ta_o->len : tb_o->len;
         for (int64_t i = 0; i < n; i++) {
+            PyObject *ea = cmp_tuple_item(a, ta_o, i);
+            PyObject *eb = cmp_tuple_item(b, tb_o, i);
+            if (ea == eb) continue;
             int r = py_obj_cmp_threeway(
-                cmp_tuple_item(a, ta_o, i),
-                cmp_tuple_item(b, tb_o, i)
+                ea, eb
             );
             if (r != 0) return r;
         }
@@ -178,9 +185,11 @@ int py_obj_cmp_threeway(PyObject *a, PyObject *b) {
         PyListObject *lb = (PyListObject *)b;
         int64_t n = la->length < lb->length ? la->length : lb->length;
         for (int64_t i = 0; i < n; i++) {
+            PyObject *ea = cmp_list_item(a, la, i);
+            PyObject *eb = cmp_list_item(b, lb, i);
+            if (ea == eb) continue;
             int r = py_obj_cmp_threeway(
-                cmp_list_item(a, la, i),
-                cmp_list_item(b, lb, i)
+                ea, eb
             );
             if (r != 0) return r;
         }
@@ -253,11 +262,20 @@ PyObject *py_obj_abs(PyObject *o) {
 }
 
 int64_t py_obj_eq(PyObject *a, PyObject *b) {
+    /* Container membership/equality and RichCompareBool require reflexivity. */
     if (a == b) return 1;
-    if (a == NULL || b == NULL) return 0;
+    return py_obj_eq_value(a, b);
+}
+
+int64_t py_obj_eq_value(PyObject *a, PyObject *b) {
+    if (a == NULL || b == NULL) return a == b;
 
     int32_t ta = py_type_of(a);
     int32_t tb = py_type_of(b);
+    /* Floats may be NaNs, and user __eq__ can be non-reflexive. Builtin
+     * containers keep their own identity semantics, including cyclic values. */
+    if (a == b && ta != PY_TYPE_FLOAT && ta != PY_TYPE_INSTANCE
+        && ta < PY_TYPE_USER_CLASS_START) return 1;
 
     /* numpy / C-extension scalar ==: drive its tp_richcompare (Py_EQ=2), same
      * as py_obj_lt/le/gt/ge. Without this a[i] == 3 fell through to the default
@@ -399,7 +417,7 @@ int64_t py_obj_eq(PyObject *a, PyObject *b) {
         if (dispatched >= 0) return dispatched;
     }
 
-    return 0;
+    return a == b;
 }
 
 static int64_t py_valuebox_hash(PyValueBoxObject *box) {
@@ -591,7 +609,7 @@ int64_t py_obj_lt(PyObject *a, PyObject *b) {
     if (both_sets(a, b)) {
         return py_set_issubset(a, b) && py_set_len(a) < py_set_len(b);
     }
-    return py_obj_cmp_threeway(a, b) < 0;
+    return py_obj_cmp_threeway(a, b) == -1;
 }
 int64_t py_obj_le(PyObject *a, PyObject *b) {
     if (
@@ -601,7 +619,8 @@ int64_t py_obj_le(PyObject *a, PyObject *b) {
         return pcc_capi_cext_richcompare_bool(a, b, 1) > 0 ? 1 : 0;
     }
     if (both_sets(a, b)) return py_set_issubset(a, b);
-    return py_obj_cmp_threeway(a, b) <= 0;
+    int comparison = py_obj_cmp_threeway(a, b);
+    return comparison == -1 || comparison == 0;
 }
 int64_t py_obj_gt(PyObject *a, PyObject *b) {
     if (
@@ -613,7 +632,7 @@ int64_t py_obj_gt(PyObject *a, PyObject *b) {
     if (both_sets(a, b)) {
         return py_set_issuperset(a, b) && py_set_len(a) > py_set_len(b);
     }
-    return py_obj_cmp_threeway(a, b) > 0;
+    return py_obj_cmp_threeway(a, b) == 1;
 }
 int64_t py_obj_ge(PyObject *a, PyObject *b) {
     if (
@@ -623,7 +642,8 @@ int64_t py_obj_ge(PyObject *a, PyObject *b) {
         return pcc_capi_cext_richcompare_bool(a, b, 5) > 0 ? 1 : 0;
     }
     if (both_sets(a, b)) return py_set_issuperset(a, b);
-    return py_obj_cmp_threeway(a, b) >= 0;
+    int comparison = py_obj_cmp_threeway(a, b);
+    return comparison == 1 || comparison == 0;
 }
 
 PyObject *py_obj_sorted(PyObject *x) {
@@ -826,7 +846,8 @@ PyObject *py_obj_sorted(PyObject *x) {
             int64_t j = i;
             while (j > 0) {
                 PyObject *prev = py_list_get(out, j - 1);
-                if (py_obj_cmp_threeway(prev, cur) <= 0) break;
+                int sort_order = py_obj_cmp_threeway(prev, cur);
+                if (sort_order == PY_OBJ_CMP_UNORDERED || sort_order <= 0) break;
                 py_list_set(out, j, prev);
                 j--;
             }
@@ -862,6 +883,9 @@ int64_t py_obj_contains(PyObject *container, PyObject *item) {
             return c ? 1 : 0;
         }
         case PY_TYPE_STR:   return py_str_contains(container, item);
+        case PY_TYPE_BYTES:
+        case PY_TYPE_BYTEARRAY:
+            return py_bytes_find(container, item) >= 0;
         default:
             if (tag == PY_TYPE_INSTANCE || tag >= PY_TYPE_USER_CLASS_START) {
                 int64_t handled = 0;

@@ -251,6 +251,11 @@ class UnaryCallLoweringMixin:
         style (CPython ceval.c) is portable, debuggable, and keeps
         libc++abi out of the runtime link.
         """
+        # An operand computed before a park boundary may have been defined in
+        # a block that does not dominate this one (may_park splits a function
+        # at every park).  Global-backed operands are re-derived here; every
+        # other value passes through unchanged.
+        args_ir = [self._value_available_at_insertion_point(a) for a in args_ir]
         result = self.builder.call(fn, args_ir, name=call_name)
         root_slot = None
         root_ptr = None

@@ -16,11 +16,15 @@ from .package_schema import (
     PCC_CAPI_HEADERS,
     campaign_profile,
     capability_profile,
+    distribution_filename_fields,
+    literal_project_metadata_fields,
+    source_build_policy,
     pcc_native_extension_suffix,
     pcc_native_wheel_tag,
     wheel_tag_fields,
 )
 from .package_environment import (
+    DEFAULT_PYTHON_SEMANTIC_TARGET,
     apply_locked_environment_resource_defaults,
     default_package_cache as _pcc_default_package_cache,
     default_package_site as _pcc_default_package_site,
@@ -28,6 +32,7 @@ from .package_environment import (
     environment_info_text,
     package_site_roots,
 )
+from .package_metadata_paths import package_metadata_paths
 
 from .py_frontend.pipeline import compile_python as _compile_python
 from .py_frontend.pipeline import (
@@ -6741,7 +6746,9 @@ def _run_native_pip_shim_from_pcc1(module_args) -> int:
     acquire_mode = "auto"
     build_mode = "owned"
     force = False
-    target_python = os.environ.get("PCC_PACKAGE_TARGET_PYTHON") or "3.11"
+    target_python = (
+        os.environ.get("PCC_PACKAGE_TARGET_PYTHON") or DEFAULT_PYTHON_SEMANTIC_TARGET
+    )
     packages = []
     i = 1
     while i < len(raw):
@@ -7122,15 +7129,34 @@ def _run_native_pip_shim_from_pcc1(module_args) -> int:
 
 
 def _native_package_basename(spec: str) -> str:
-    base = os.path.basename(spec)
-    if base == "":
-        base = spec
-    for suffix in (".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".zip", ".whl"):
-        if base.endswith(suffix):
-            base = base[: -len(suffix)]
-    if "-" in base:
-        base = base.split("-")[0]
-    return base or "package"
+    if os.path.isdir(spec):
+        metadata = _native_local_project_metadata(spec)
+        if metadata[0]:
+            return metadata[0]
+        return os.path.basename(os.path.normpath(spec)) or "package"
+    return distribution_filename_fields(spec)[0]
+
+
+def _native_local_project_metadata(root: str):
+    path = os.path.join(root, "pyproject.toml")
+    if not os.path.isfile(path):
+        return ["", ""]
+    with open(path, "r", encoding="utf-8") as stream:
+        text = stream.read()
+    return literal_project_metadata_fields(text)
+
+
+def _native_source_build_policy(root: str) -> str:
+    path = os.path.join(root, "pyproject.toml")
+    if not os.path.isfile(path):
+        return "unrecognized"
+    if os.path.isfile(os.path.join(root, "hatch.toml")):
+        return "requires_build_hook"
+    if os.path.isfile(os.path.join(root, "hatch_build.py")):
+        return "requires_build_hook"
+    with open(path, "r", encoding="utf-8") as stream:
+        text = stream.read()
+    return source_build_policy(text)
 
 
 def _native_normalized_package_name(name: str) -> str:
@@ -7138,26 +7164,13 @@ def _native_normalized_package_name(name: str) -> str:
 
 
 def _native_artifact_project_name(path: str) -> str:
-    base = os.path.basename(path)
-    for suffix in (".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".zip", ".whl"):
-        if base.endswith(suffix):
-            base = base[: -len(suffix)]
-    if "-" in base:
-        base = base.split("-")[0]
-    return _native_normalized_package_name(base)
+    return _native_normalized_package_name(_native_package_basename(path))
 
 
 def _native_artifact_version_text(path: str) -> str:
-    base = os.path.basename(path)
-    for suffix in (".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".zip", ".whl"):
-        if base.endswith(suffix):
-            base = base[: -len(suffix)]
-    parts = base.split("-")
-    if path.endswith(".whl") and len(parts) >= 5:
-        return parts[1]
-    if len(parts) >= 2:
-        return parts[1]
-    return "0"
+    if os.path.isdir(path):
+        return _native_local_project_metadata(path)[1] or "0"
+    return distribution_filename_fields(path)[1]
 
 
 def _native_version_numbers(path: str):
@@ -8190,27 +8203,11 @@ def _native_requires_from_metadata_file(path: str):
 
 def _native_requires_from_tree(root: str):
     deps = []
-    stack = [root]
-    while len(stack) > 0:
-        current = stack.pop()
-        try:
-            names = sorted(os.listdir(current))
-        except Exception:
-            names = []
-        i = 0
-        while i < len(names):
-            name = names[i]
-            path = current + "/" + name
-            if os.path.isdir(path):
-                stack.append(path)
-            elif name == "METADATA" or name == "PKG-INFO":
-                file_deps = _native_requires_from_metadata_file(path)
-                j = 0
-                while j < len(file_deps):
-                    if file_deps[j] not in deps:
-                        deps.append(file_deps[j])
-                    j += 1
-            i += 1
+    for path in package_metadata_paths(root):
+        file_deps = _native_requires_from_metadata_file(path)
+        for dependency in file_deps:
+            if dependency not in deps:
+                deps.append(dependency)
     return deps
 
 
@@ -9525,6 +9522,16 @@ def _native_owned_meson_build_json(name: str, source: str) -> str:
     return out
 
 
+def _native_unsupported_source_build_json(build_mode: str, reason: str, diagnostic: str) -> str:
+    return (
+        '{"actions": [], "build_mode_requested": ' + _json_str(build_mode)
+        + ', "build_ownership": "unresolved", "diagnostics": ['
+        + _json_str(diagnostic) + '], "host_assisted": false, '
+        '"host_free_build_claim": false, "host_python": null, "ok": false, '
+        '"reason": ' + _json_str(reason) + ', "skipped": false}'
+    )
+
+
 def _native_build_install_source_json(
     name: str, source, abi: str, build_mode: str = "owned"
 ) -> str:
@@ -9548,6 +9555,18 @@ def _native_build_install_source_json(
             '"reason": "not_source_tree", "skipped": true}'
         )
     has_meson_build = os.path.isfile(os.path.join(source, "meson.build"))
+    source_policy = "unrecognized"
+    if not has_meson_build:
+        try:
+            source_policy = _native_source_build_policy(source)
+        except ValueError:
+            return _native_unsupported_source_build_json(
+                build_mode, "unsupported_build_metadata", "PCC-PKG-PROJECT-METADATA-UNSUPPORTED"
+            )
+        if source_policy == "requires_build_hook":
+            return _native_unsupported_source_build_json(
+                build_mode, "declared_build_hook_requires_owner", "PCC-PKG-BUILD-HOOK-UNSUPPORTED"
+            )
     if build_mode == "owned" and has_meson_build:
         # A source-tree report is not an ownership authority.  Re-enter the
         # compiler/tool/source-bound receipt path; it may reuse its verified
@@ -9580,6 +9599,15 @@ def _native_build_install_source_json(
         return _native_host_eager_meson_build_json(name, source)
     if has_meson_build:
         return _native_ensure_meson_build_outputs_json(source, build_mode)
+    if source_policy == "declarative_python_source":
+        return (
+            '{"actions": [], "build_backend": "hatchling.build", '
+            '"build_mode_requested": ' + _json_str(build_mode)
+            + ', "build_ownership": "not-required", '
+            '"host_assisted": false, "host_free_build_claim": true, '
+            '"host_python": null, "ok": true, '
+            '"reason": "declarative_python_source", "skipped": true}'
+        )
     c_files = _native_collect_suffix_files(source, [".c"], True)
     if len(c_files) == 0:
         return (

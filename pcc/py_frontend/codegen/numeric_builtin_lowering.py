@@ -44,22 +44,16 @@ def _is_class_type_for_numeric_builtin(ty) -> bool:
 
 class NumericBuiltinLoweringMixin:
     def emit_int_builtin_as_object(self, expr) -> Optional[ir.Value]:
-        """``int(<str>[, base])`` as an OBJECT, skipping the i64 round trip.
+        """Produce int's object projection before any lossy scalar conversion.
 
         The ordinary lowering parses to an object and then unboxes it to satisfy
         this builtin's i64 contract, which truncates anything above 2**63-1 to
         0.  Callers that want the object projection ask for it here instead, so
         no re-box has to recover a value that was already destroyed.
 
-        Only the statically-str-typed argument is handled, which is the shape
-        the parser uses (`int(e.text, 0)` in `py_lift._e_Num`).  The Dyn form
-        phis four unboxed branches and needs its own object projection; that is
-        deliberately still absent rather than approximated here.
-
-        The result is a NEW owned reference straight from the runtime, which is
-        exactly what an object-wanting caller expects -- no retain, no
-        ownership-transfer bookkeeping, so none of the leak/early-free failure
-        modes that an unbox-then-recover scheme ran into.
+        String and dynamic conversions return NEW runtime references, recorded
+        in the ownership ledger. An already-integer argument keeps its own
+        projection and ownership; callers must not treat that borrow as new.
         """
         if len(expr.args) not in (1, 2):
             return None
@@ -110,6 +104,7 @@ class NumericBuiltinLoweringMixin:
             name=self._fresh("int.obj.parse"),
         )
         self._emit_post_call_err_check(getattr(expr, "span", None))
+        self._note_owned_dynamic_call_value(boxed)
         return boxed
 
     def _emit_int_dyn_as_object(self, expr, arg) -> Optional[ir.Value]:

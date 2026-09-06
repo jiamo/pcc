@@ -7,17 +7,15 @@ This file is for humans and AI agents working in this repository.
 Startup route for active goal work and direct human task intake:
 
 1. Read this file first for repository rules and safety constraints.
-2. Read `docs/goal/goal-prompt.md` for the single goal contract and work
-   protocol.
-3. Read `docs/current-goal-state.md` for the current audit state and the
-   investigation/doc routing that should be read next.
-4. Inspect `docs/goal/task-board.yaml` through `scripts/goal_state.py resume` before
-   choosing active goal work. This structured task board is the source for
-   migrated rows and new actionable tasks; `DONE_WEAK` is still unfinished.
-   This applies to directly launched agents too, not only Codex `/goal` or
-   Claude loop sessions. If the startup prompt or current conversation contains
-   a new actionable task, normalize it into `docs/goal/task-board.yaml` and
-   validate the board before selecting active work.
+2. Read `docs/knowledge/denied-experiments.md` before proposing any fix. Every
+   line there is a change somebody already wrote, measured and disproved.
+3. Read `docs/knowledge/README.md` for the rest of the distilled knowledge
+   (confirmed root causes, symptom routing, dated handoffs).
+4. Take work from GitHub issues in the repository you are changing
+   (`allstoalls/pcc`, `allstoalls/pcc-gui`, `allstoalls/pcc-gateway`); use
+   `gh issue list` and `gh issue view`. There is no task-board file: it retired
+   on 2026-09-06 and its unfinished rows became issues (see
+   `docs/goal/README.md` and `docs/task-board-migration-2026-09-06.md`).
 5. Use `docs/investigations/INDEX.md` to find relevant prior investigations
    before opening or continuing a non-trivial bug. Then **read the matching
    file end to end, including every `[DENIED]` verdict and every "did not
@@ -33,109 +31,64 @@ Startup route for active goal work and direct human task intake:
    These two were split out of this file to stay under the context budget;
    the split lowered their resident-in-context cost, **not** their authority.
 
-## Goal Task Board
+## Working agreement
 
-`docs/goal/task-board.yaml` is the structured execution queue for migrated and
-new actionable goal tasks. Use it even when the agent was launched directly
-instead of through a `/goal` or loop command. `docs/goal/goal-prompt.md` is the
-only protocol and claim-hygiene authority; task rows themselves should be
-agent-neutral and should not mention Codex, Claude, or any specific runner.
+There is no single-file task queue and no goal-mode protocol. Work is tracked
+as GitHub issues; durable knowledge is tracked as documents. The task board
+(`docs/goal/task-board.yaml`, 490 rows) and its per-slice evidence directory
+(`docs/goal/evidence/`, 924 files) were removed on 2026-09-06 because they had
+become a running log that every session had to re-read. Their content lives on:
+the 241 unfinished rows are issues (labels `priority:*`, `status:*`,
+`task-board`), the last board and every evidence file remain in git history at
+commit `2574f585`, and the protocol documents are in `docs/archive/goal/`.
 
-For active goal work:
+### Where each kind of information belongs
 
-```bash
-gtimeout 30s env -u LC_ALL uv run python scripts/goal_state.py resume
-```
+| Kind | Home |
+|---|---|
+| Work to do, and its state | GitHub issues in the repository being changed |
+| What was already tried and disproved | `docs/knowledge/denied-experiments.md` (generated) |
+| Established failure mechanisms | `docs/knowledge/confirmed-root-causes.md` (generated) |
+| Which investigation covers a symptom | `docs/knowledge/symptom-routing.md` (generated) |
+| How a verdict was reached, in order | `docs/investigations/<slug>.md` |
+| Uncommitted state and blockers at a handoff | `docs/knowledge/<date>-session-handoff.md` |
+| Authoritative bootstrap/fallback state | `tests/bootstrap_gate_baseline.json`, `tests/fallback_baseline.json` |
 
-### Ordinary-session continuation
-
-`继续任务板`, `continue the task board`, `continue active goal`, and equivalent
-ordinary requests mean: run the repository `resume` command above and follow
-its selected task. They are continuation commands, not new-task intake, and
-they do not activate or require a product-specific persistent Goal mode.
-
-When `resume` reports `CONTINUE`, finish the selected row or its next finite
-slice, add the required evidence, update and validate the task board, then run
-`resume` again immediately. Do not voluntarily end the session while `resume`
-reports `CONTINUE`; continue across task boundaries. Stop only when it reports
-`COMPLETE`, the human explicitly says stop/cancel/switch, or `BLOCKED`/
-`MILESTONE_COMPLETE` identifies a real authority transition that cannot be
-resolved from repository state. This loop is runner-neutral and applies to
-ordinary sessions with no Goal mode, loops, or persistent-agent facility.
-
-Before sending any final response while task-board work is active, run:
+Regenerate the three generated pages after editing any investigation; a test
+(`tests/test_knowledge_pages_are_current.py`) fails when they are stale:
 
 ```bash
-gtimeout 30s env -u LC_ALL uv run python scripts/goal_state.py finish-check
+env -u LC_ALL uv run python scripts/distill_investigations.py
 ```
 
-Exit 4 / `finalization: DENIED` is a hard stop on finalization: send only a
-commentary checkpoint and continue the selected task. Runners must treat this
-command as a pre-final gate, not as advisory text. Only `BLOCKED`,
-`MILESTONE_COMPLETE`, or board-wide `COMPLETE` returns an allowed receipt.
+### Taking and finishing work
 
-### Task-board mutations
+- **Pick up an issue** rather than inventing scope. `gh issue list --label
+  priority:P0`, then `gh issue view <n>`. A migrated issue carries the old
+  row's open boundary, exit criteria and required gates verbatim; those are
+  still the definition of done.
+- **New actionable work becomes an issue** as soon as it is described, so it is
+  visible to the next session: `gh issue create --title ... --body ...`. Do not
+  leave it only in chat or in a document.
+- **Report honestly.** An issue is closed when its listed gates prove its full
+  claim. If part of the work is done, say which part and leave it open. The old
+  board's `DONE_WEAK` state exists to be avoided, not reproduced.
+- **Write the durable half.** When a slice teaches something that would cost
+  another session a rebuild cycle to rediscover, put it in the investigation for
+  that symptom (a `## Update` block, including any `[DENIED]` verdict) so the
+  generated pages pick it up. Do not create a new per-slice evidence file tree.
+- **A handoff is a document, not a chat message.** Before a long pause, write
+  `docs/knowledge/<date>-session-handoff.md`: uncommitted state, blockers with
+  their minimal reproducer, and decisions a reader cannot infer from the diff.
 
-No CRUD command is required. Agents make narrow structured edits to
-`docs/goal/task-board.yaml`, run `goal_state.py validate`, then run
-`goal_state.py resume`. The supported operations are:
+### Continuation requests
 
-- **Add a task:** create one agent-neutral row with a unique id, requested
-  `P0`, `P1`, or `P2` priority, status, track, title, claim/open boundaries,
-  milestone, dependencies, rank, exit criteria, and required gates. Normal
-  additions use the ordinary queue. If work starts now, use `IN_PROGRESS`;
-  otherwise use the honest TODO/design status.
-- **Add an immediate task:** only an explicit human request for immediate
-  execution authorizes `dispatch: IMMEDIATE`. It outranks normal ready rows
-  regardless of rank or priority, but never bypasses dependencies: `resume`
-  selects a dependency-ready prerequisite first or reports a real blocker.
-  Keep the interrupted parent row intact; after the immediate row completes,
-  rerun `resume` to return to the authoritative unfinished queue.
-- **Update a task:** patch only the exact requested row, preserve unrelated
-  fields and linked evidence, keep status/claim language honest, validate, and
-  confirm the resulting selection with `resume`.
-- **Remove a task:** destructive removal requires an explicit exact task id.
-  Inspect reverse dependencies first. If any row depends on it, stop unless
-  the human also authorizes the exact dependency rewrite or replacement. Write
-  a small removal receipt under `docs/goal/evidence/`, remove only that YAML
-  row, retain linked evidence/investigations/docs unless they are separately
-  named for deletion, then validate and resume.
-
-Priority is not an urgency synonym: `dispatch: IMMEDIATE` is the explicit
-interrupt mechanism. For normal rows, established `rank`, then priority, then
-id ordering remains authoritative.
-
-Add new actionable work as a task row in `docs/goal/task-board.yaml`, with a
-priority, status, track, title, open boundary, and required gate commands. Add
-one small evidence file under `docs/goal/evidence/` for each completed slice,
-then update that task row's `latest_evidence`, `status`, and
-`open_boundary`. Promote to `DONE_STRONG` only when the listed gates prove the
-full claim and the open boundary is empty.
-
-New-task ingestion rule: when a human asks to "add a P0/P1 task", "package this
-into the task board", or describes a new actionable goal, put it in
-`docs/goal/task-board.yaml` immediately instead of leaving it only in chat,
-`docs/goal/goal-prompt.md`, or `docs/current-goal-state.md`. Once the row exists,
-every directly launched agent, Claude loop, or Codex `/goal` run must see it
-through `scripts/goal_state.py resume`; no extra `/goal` prompt or loop-specific
-bootstrap is required for the task to become eligible. Use
-`docs/goal/goal-prompt.md` only for protocol and long-form guardrails, not as
-the place where new executable tasks live. This is an `AGENTS.md` startup rule, so
-the user should not need to copy `docs/goal/goal-prompt.md` into each new agent
-session just to make newly added tasks visible.
-
-Direct human-task intake is part of startup state, not a separate loop mode. If
-the current conversation or startup prompt contains a new actionable task,
-normalize it into `docs/goal/task-board.yaml` first, run
-`gtimeout 30s env -u LC_ALL uv run python scripts/goal_state.py resume`, and then let the
-normal priority order choose it. Do not wait for a `/goal` command, cron loop,
-or agent-specific bootstrap before recording the task.
-
-If the human gives the task as ordinary prose, first normalize it into a
-task-board row with an agent-neutral id, priority, status, track, title,
-claim boundary, open boundary, and required gates. Example intent such as "add
-a P0 task: fix GPU TVM/TIRx host/device split" is already sufficient input; do
-not wait for a separate `/goal` command before recording it.
+`继续`, `continue`, `continue the work` and equivalents mean: look at the open
+issues for the repository you are in, continue the one already in progress
+(or the highest-priority ready one), and keep going across issue boundaries.
+Stop when the work is done, when a human says stop, or when you are blocked on
+something only a human can decide. There is no `resume`/`finish-check` command
+to run and no exit-code gate on finalization.
 
 ## Project Intent (north star — read before changing direction)
 
@@ -143,7 +96,7 @@ not wait for a separate `/goal` command before recording it.
 > work aligned: when a change would trade away one of the obligations below for
 > a local win — a faster benchmark, a greener gate, a smaller diff, a passing
 > bootstrap by rewrite — **stop and surface the tradeoff instead of taking it
-> silently.** This section is the *why*; `docs/goal/goal-prompt.md` is the *how*
+> silently.** This section is the *why*; `docs/archive/goal/goal-prompt-through-2026-09-06.md` is the *how*
 > (tracks, gates, claim hygiene, prohibitions). If you find yourself weakening
 > Python semantics, mislabeling a mode, or special-casing a package to make
 > progress, you are off the north star — re-read this section.
@@ -186,7 +139,7 @@ pcc2      -> pcc3     stable pcc2/pcc3 == a self-hosted fixed point
 ```
 
 **Seven obligations.** Each is operationalized by a track + gates in
-`docs/goal/goal-prompt.md`; the one-line form here is the guardrail, and the
+`docs/archive/goal/goal-prompt-through-2026-09-06.md`; the one-line form here is the guardrail, and the
 parenthetical is where it is actually enforced:
 
 ```text
@@ -194,7 +147,7 @@ parenthetical is where it is actually enforced:
      host pcc != pcc1   |   cpython-compat != pcc-native
      libpython != no-libpython   |   LLVM-backed != self-backed
      stage1 != pcc1->pcc2->pcc3 fixed point
-   (`docs/goal/goal-prompt.md` §0.10 claim hygiene, §9.2 mode boundaries)
+   (`docs/archive/goal/goal-prompt-through-2026-09-06.md` §0.10 claim hygiene, §9.2 mode boundaries)
 
 2. Performance must be proven. C-like claims require IR-shape evidence + runtime
    benchmark + a slow path that preserves Python semantics when assumptions fail.
@@ -294,7 +247,7 @@ C/libc sources        REMOVE from the production dependency after differential
 This is stronger than no-libpython: the final Linux zero-libc claim requires no
 production C/libc runtime dependency either. Darwin may still enter the OS
 through named libSystem ABI calls and must not be labeled zero-libc. The
-**5-GC Production Equality Rule** (`docs/goal/goal-prompt.md`, G-track) still
+**5-GC Production Equality Rule** (`docs/archive/goal/goal-prompt-through-2026-09-06.md`, G-track) still
 requires every backend to consume ONE slot-based trace/update contract
 (`py_obj_visit_slots` / `py_obj_update_slot` / root + frame + native-handle
 registration). During migration the C oracle and pcc-Python implementation must
@@ -516,7 +469,7 @@ completion.
   adapter has an exact regression test, and the task evidence names it.  Low
   Amdahl share, construction-only lifetime, or inconvenient implementation
   size does not turn an unfinished hot representation into completed work.
-  `DONE_WEAK` and a non-empty `open_boundary` are unfinished states.
+  A partially satisfied issue stays open, with the remainder written down.
 
 - **Match optimization scale to the goal gap.** Before selecting a performance
   candidate, record the end-to-end gap, the candidate owner's measured share,
@@ -570,12 +523,12 @@ completion.
   read enough of it to verify identity/status.  Intended output paths and
   interrupted commands are not artifacts.
 
-- **Completion requires a fresh contradiction audit.** Immediately before a
-  task is marked complete, rerun its inventory/resume command and enumerate
-  every remaining family, fallback, compatibility adapter, skipped gate, and
-  open boundary.  Any item that contradicts the title or exit criteria keeps
-  the row active.  While `goal_state.py resume` reports `CONTINUE`, neither a
-  milestone summary nor a successful finite slice authorizes stopping.
+- **Completion requires a fresh contradiction audit.** Immediately before
+  closing an issue, rerun its inventory command and enumerate every remaining
+  family, fallback, compatibility adapter, skipped gate, and open boundary.
+  Any item that contradicts the issue title or its exit criteria keeps the
+  issue open.  A milestone summary or one successful finite slice does not
+  authorize stopping while listed work remains.
 
 - **Native-data-plane growth is fail-closed.** Every new top-level class in
   `pcc/backend/self_backend*.py` must be classified by
@@ -634,7 +587,7 @@ interrupting subtask, not a replacement.
 | `pcc/extern/`, `pcc/unsafe/` | Python→C extern decls; compiler-recognized intrinsics |
 | `utils/fake_libc_include/` | Fake libc headers (host ABI / decl mismatches surface here) |
 | `tests/` | Unit, parity, integration regression coverage |
-| `tests/py_corpus/phase*/` | End-to-end Python corpus retained from the earlier phase taxonomy. These tests still run; the phase framework is no longer the active task board. See current priorities in `docs/current-goal-state.md`. |
+| `tests/py_corpus/phase*/` | End-to-end Python corpus retained from the earlier phase taxonomy. These tests still run; the phase framework is no longer the active task board. See current priorities in the repository's GitHub issues. |
 | `tests/python/test_self_host_oracle_diff.py` | Core Python semantic oracle / pcc1-pcc2 parity ratchet |
 | `tests/python/gc/test_pcc_bootstrap_full_gc{0..4}.py` | Full stage1→stage2→stage3 self-backend bootstrap gate, one file per GC backend (shared helpers live in `tests/python/test_pcc_bootstrap_full.py`) |
 | `tests/bootstrap_gate_baseline.json` | **Authoritative bootstrap state** (Issue 1 closure evidence) |
@@ -643,10 +596,11 @@ interrupting subtask, not a replacement.
 | `scripts/pcc_multi.py` | Experimental multi-file Python entry |
 | `projects/lua-5.5.0/` | Real-program stress target |
 | `docs/refs_docs/gc-research/` | Reference impls for the 5 GC backends (Lua, Go, OCaml, ZGC, CPython) |
-| `docs/goal/goal-prompt.md` | Single active goal contract and work protocol |
-| `docs/current-goal-state.md` | Current goal audit, selected task state, and investigation routing |
+| `docs/knowledge/` | Distilled decision pages (denied experiments, confirmed causes, symptom routing) and dated handoffs |
+| `docs/archive/goal/` | The retired goal protocol and its last state snapshot |
 | `docs/design/pcc-gpu-next-work.md` | Durable GPU / TVM-TIRx / Metal / GPU-GC / distributed / ds4 route contract, reference pins, and GPU claim levels |
 | `docs/investigations/INDEX.md` | Index of investigation docs; keep it current when investigation docs change |
+| `scripts/distill_investigations.py` | Regenerate the `docs/knowledge/` decision pages from the investigations |
 
 
 ## Dev Tools — check here before writing a probe
@@ -685,6 +639,8 @@ paths.
 
 | Tool | Use it for |
 |---|---|
+| `scripts/install_pcc1_toolchain.py` | Bootstrap the initial stable `~/.local/bin/pcc1` from a matching successful Stage1/Stage2 receipt, copied source/runtime and an isolated host-helper environment. Runs an installed native canary before creating the entry; refuses to replace an existing command. This is baseline installation, not release qualification. |
+| `scripts/pytest_live_report.py` | Opt-in pytest plugin (`-p scripts.pytest_live_report --pcc-live-report PATH`) that writes incremental JSONL node reports and failure tracebacks, including xdist controller reports, before the final summary. Refuses to overwrite prior evidence. |
 | `scripts/pcc_profile.py <pid> [secs]` | Sample a live pcc/pcc1 and rank **self** time by function. Reads the symbol table from the sampled process's own executable, derives the slide from the image `sample` reports, and counts only frames in that image. `--binary` is a *check*: a mismatch is an error, not an override. Follows the pid down to the busiest leaf, so passing a `gtimeout`/`sh` wrapper's pid still profiles the compiler. |
 | `scripts/pcc_flamegraph.py <mode>` | Flame graph with **caller** attribution, self-contained SVG + folded stacks. `cpu`/`heap`/`peak <pid>` profile a native pcc1/pcc2 out-of-process (`sample`, `malloc_history`; heap/peak need the target launched with `MallocStackLogging=1`). Native modes normally follow the busiest child; use `--exact-pid` to retain an explicitly selected coordinator, with the same executable-identity checks. `host --argv <pcc cmdline>` profiles host CPython by injecting a `sitecustomize.py` sampler, so the coordinator **and every worker** self-profile with the build's parallelism untouched; add `--memory` for `tracemalloc` bytes-by-traceback. Blocked frames are excluded on both sides so the two graphs share one estimator and can actually be compared. |
 | `scripts/pcc_tachyon_aggregate.py <dir>` | Aggregate CPython 3.15 `profiling.sampling` flamegraph HTML across coordinator and worker processes. Reports cross-process self samples by Python file/line/function, frame opcode counts, per-process sample quality, and an optional JSON receipt. Use after a Tachyon `--subprocesses --mode=cpu --opcodes --flamegraph` Stage1 run. |
@@ -714,7 +670,7 @@ paths.
 | `scripts/check_layer1_ownership.py` | Enforce that `layer1.py` stays a facade. |
 | `scripts/regen_investigations_index.py` | Mandatory after editing `docs/investigations/*.md`. |
 | `scripts/pcc_per_op_cost_table.py --out-dir DIR` | Per-operation cost table, pcc-compiled runtime vs CPython: one operation per counted loop, `/usr/bin/time -lp` instructions and wall at N and 2N, `(2N-N)/N` cancels startup, outputs must match. The compass for the per-op runtime gap behind Stage2/Stage1; add a benchmark to `BENCHMARKS` rather than writing a one-off probe. |
-| `scripts/goal_state.py next` / `validate` | The task board. |
+| `scripts/distill_investigations.py` | Regenerate `docs/knowledge/` from `docs/investigations/`; `--check` fails when stale. |
 
 **Profiling rules these tools encode — the failures they came from:**
 
@@ -788,7 +744,7 @@ alone.
 | Flag | Default | Meaning |
 |---|---|---|
 | `--python-libpython` | `off` | `off`: hard error if codegen would need a CPython fallback. `auto`: link `libpython` only when fallback was needed. `on`: always allow/link the fallback surface. |
-| `--ir-scaffold` | `on` | `on`: closed-world lowering used by the strict self-host work. `off`: older lowering escape hatch. `auto`: legacy mixed mode. |
+| `--ir-scaffold` | `on` | Only affects compiling pcc's own IR-builder code (scaffolding `pcc.llvm_capi.compat` out of the link, the matching libpython decision, native `ir.*` lowering). `auto` resolves to `on`; `off` is an older escape hatch. An application never needs it. |
 | `--backend` | `llvm` | `llvm`, `llvm_capi`, or `self`. Strict self-host requires `--backend self`. |
 
 Strict no-libpython self-host invocation:
@@ -863,8 +819,8 @@ gtimeout 120s env -u LC_ALL uv run pytest tests/python/test_bootstrap_gate_basel
 The active multi-stage plan is to compile pcc's runtime in pcc-Python and
 shrink the libpython surface, while the current active goal prioritizes the
 package/import path when it blocks real `pip install` / `import` scenarios.
-Use `docs/goal/goal-prompt.md` for the goal contract and
-`docs/current-goal-state.md` for the current selected task, evidence, and
+Use `docs/archive/goal/goal-prompt-through-2026-09-06.md` for the goal contract and
+the repository's GitHub issues for the current selected task, evidence, and
 investigation routing. Older plans such as
 `docs/plans/python-runtime-no-c-plan.md` are background, not the active task
 board.
@@ -887,7 +843,7 @@ values 0..4). The current default decision is recorded in
 `docs/investigations/gc-backend-selection-matrix.md`: backend #0 remains the
 default and rollback reference.
 
-Detailed backend status lives in `docs/current-goal-state.md` and routed GC investigations. Startup needs only the invariants below.
+Detailed backend status lives in the repository's GitHub issues and routed GC investigations. Startup needs only the invariants below.
 
 
 Rules when working on GC code:
@@ -969,8 +925,8 @@ rule names the cheap check that would have caught it.
   changes into one expensive run rather than paying it per change.
 
 - **Look up the historical number before calling a current one normal.** The
-  repo records its own baselines (`docs/goal/task-board.yaml` baseline_metric,
-  `docs/investigations/*.md`, `docs/issues/performance-gaps.md`). A stage2 at
+  repo records its own baselines (`docs/investigations/*.md`,
+  `docs/issues/performance-gaps.md`, migrated issue bodies). A stage2 at
   90 minutes and a cold stage1 at 589 s were both treated as "how slow it is"
   until a search found 434 s and 311 s recorded days earlier — they were
   regressions, and knowing that changes where you look.
@@ -1324,12 +1280,12 @@ shape that only looks similar.
 - Native extension ABI compatibility and no-libpython behavior are separate
   claims. Keep `pcc-native` rejection, `cpython-compat` acceptance, and
   `PCC_HOST_PYTHON=/bin/false` evidence distinct.
-- See the full claim-hygiene table in `docs/goal/goal-prompt.md` §0.10 for related
+- See the full claim-hygiene table in `docs/archive/goal/goal-prompt-through-2026-09-06.md` §0.10 for related
   distinctions such as host pcc vs pcc1, libpython mode vs no-libpython, fake
   package vs real package, and stage1 vs pcc1→pcc2→pcc3.
 - Current package priority and known blockers live in
-  `docs/current-goal-state.md`; the active protocol lives in
-  `docs/goal/goal-prompt.md`.
+  the repository's GitHub issues; the active protocol lives in
+  `docs/archive/goal/goal-prompt-through-2026-09-06.md`.
 
 
 ## Platform Gotchas (macOS)

@@ -75,11 +75,21 @@ class ExceptionLoweringMixin:
         if not active_stack:
             return None
         entry = active_stack[-1]
-        if not isinstance(entry, tuple) or len(entry) != 2:
+        if not isinstance(entry, tuple) or len(entry) not in (2, 3):
             return None
-        owner, active = entry
+        owner, active = entry[0], entry[1]
         if owner is not self.current_function:
             return None
+        if len(entry) == 3:
+            # A parked handler resumes through a fresh function entry. Read
+            # its original exception from the saved, collector-visible slot.
+            return self.builder.call(
+                self.runtime["pcc_gc_load_ptr"],
+                [ir.Constant(_CSTR, None), self._as_gc_ptr(
+                    entry[2], name=self._fresh("handler.exception.root")
+                )],
+                name=self._fresh("handler.exception.active"),
+            )
         return active
 
     def _push_try_err_block(self, err_bb):
@@ -142,19 +152,30 @@ class ExceptionLoweringMixin:
             self._restore_try_err_block(saved_err_block)
 
         if not self._builder_block_is_terminated():
+            # Re-derive the slot pointer here: in a may_park state machine
+            # the finally body may have resumed into blocks the try-entry
+            # cast does not dominate.
+            restore_root_ptr = self._as_gc_ptr(
+                frame_entry[1],
+                name=self._fresh("finally.exception.root"),
+            )
             saved_exc = self.builder.call(
                 self.runtime["pcc_gc_load_ptr"],
-                [ir.Constant(_CSTR, None), root_ptr],
+                [ir.Constant(_CSTR, None), restore_root_ptr],
                 name=self._fresh("finally.exception.restore"),
             )
             self.builder.call(self.runtime["py_raise"], [saved_exc])
             self.builder.call(
                 self.runtime["pcc_gc_store_root"],
-                [root_ptr, ir.Constant(_CSTR, None)],
+                [restore_root_ptr, ir.Constant(_CSTR, None)],
             )
             self.builder.branch(outer_err_block)
 
         self.builder.position_at_end(cleanup_error_bb)
+        cleanup_root_ptr = self._as_gc_ptr(
+            frame_entry[1],
+            name=self._fresh("finally.exception.root"),
+        )
         cleanup_exc = self.builder.call(
             self.runtime["py_current_exception"],
             [],
@@ -162,7 +183,7 @@ class ExceptionLoweringMixin:
         )
         saved_exc = self.builder.call(
             self.runtime["pcc_gc_load_ptr"],
-            [ir.Constant(_CSTR, None), root_ptr],
+            [ir.Constant(_CSTR, None), cleanup_root_ptr],
             name=self._fresh("finally.original.exception"),
         )
         cleanup_nonnull = self.builder.icmp_unsigned(
@@ -204,7 +225,7 @@ class ExceptionLoweringMixin:
         self.builder.position_at_end(release_bb)
         self.builder.call(
             self.runtime["pcc_gc_store_root"],
-            [root_ptr, ir.Constant(_CSTR, None)],
+            [cleanup_root_ptr, ir.Constant(_CSTR, None)],
         )
         self.builder.branch(outer_err_block)
         return True
@@ -616,13 +637,35 @@ class ExceptionLoweringMixin:
             retain_handler_exc = h.name is not None or body_has_raise(
                 h.body, bare_only=False
             )
+            handler_slot = None
             if retain_handler_exc:
-                handler_exc = self._gc_retain(handler_exc)
+                if self._generator_ctx_stack:
+                    ctx = self._generator_ctx_stack[-1]
+                    hidden = self._generator_handler_exception_name(stmt, i)
+                    handler_slot = ctx["frame_slots"][hidden][1]
+                    self.builder.call(
+                        self.runtime["pcc_gc_store_root"],
+                        [self._as_gc_ptr(handler_slot), handler_exc],
+                    )
+                else:
+                    handler_exc = self._gc_retain(handler_exc)
             self.builder.call(self.runtime["py_clear_exception"], [])
+            binding_slot = None
             if h.name is not None:
-                slot = self._alloca_in_entry(_CSTR, name=f"{h.name}.addr")
-                self.builder.store(handler_exc, slot)
+                if handler_slot is not None:
+                    # Use the planned frame slot, not a fresh stack local
+                    # that the generator save/restore loop cannot see.
+                    slot = self._generator_ctx_stack[-1]["frame_slots"][h.name][1]
+                    handler_exc = self.builder.load(handler_slot)
+                    self.builder.call(
+                        self.runtime["pcc_gc_store_root"],
+                        [self._as_gc_ptr(slot), handler_exc],
+                    )
+                else:
+                    slot = self._alloca_in_entry(_CSTR, name=f"{h.name}.addr")
+                    self.builder.store(handler_exc, slot)
                 self.env[h.name] = (slot, _CSTR, DynType(name="dyn"))
+                binding_slot = slot
                 # Mark `e` as an except-binding so a later `saved = e` GC-roots
                 # `saved` (the surviving reference once the handler's retain is
                 # released at handler end). Otherwise the borrowed-copy local is
@@ -633,7 +676,10 @@ class ExceptionLoweringMixin:
                     binding_names.add(h.name)
             active_excs = list(self._active_handler_excs)
             if retain_handler_exc:
-                active_excs.append((self.current_function, handler_exc))
+                if handler_slot is not None:
+                    active_excs.append((self.current_function, handler_exc, handler_slot))
+                else:
+                    active_excs.append((self.current_function, handler_exc))
                 self._active_handler_excs = active_excs
             if stmt.finally_body:
                 finally_stack = list(getattr(self, "_finally_stack", ()))
@@ -657,8 +703,22 @@ class ExceptionLoweringMixin:
                 if stmt.finally_body:
                     self._emit_stmts(stmt.finally_body)
                 if not self._builder_block_is_terminated():
-                    if retain_handler_exc:
-                        self._gc_release(handler_exc)
+                    if handler_slot is not None:
+                        self.builder.call(
+                            self.runtime["pcc_gc_store_root"],
+                            [self._as_gc_ptr(handler_slot), ir.Constant(_CSTR, None)],
+                        )
+                    elif retain_handler_exc:
+                        release_value = handler_exc
+                        if binding_slot is not None:
+                            # A may_park handler body may resume into a block
+                            # the retain does not dominate; the binding slot
+                            # is the frame-visible home of the same reference.
+                            release_value = self.builder.load(
+                                binding_slot,
+                                name=self._fresh(f"{h.name}.release"),
+                            )
+                        self._gc_release(release_value)
                     self.builder.branch(done_bb)
 
             if next_test_bb is not None:

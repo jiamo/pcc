@@ -25,6 +25,7 @@ __pcc_runtime_port__ = True
 
 from pcc.extern import extern, c_abi_export, c_ptr, c_int32, c_int64, c_void, c_double
 from pcc.py_runtime.py.py_abi_constants import (
+    PY_OBJ_CMP_UNORDERED,
     C_POINTER_SIZE,
     DICTENTRY_KEY_OFFSET,
     DICTENTRY_SIZE,
@@ -102,6 +103,7 @@ py_set_issuperset    = extern("py_set_issuperset",    (c_ptr, c_ptr),           
 py_set_len           = extern("py_set_len",           (c_ptr,),                    c_int64)
 py_str_eq            = extern("py_str_eq",            (c_ptr, c_ptr),              c_int32)
 py_str_contains      = extern("py_str_contains",      (c_ptr, c_ptr),              c_int32)
+py_bytes_find        = extern("py_bytes_find",        (c_ptr, c_ptr),              c_int64)
 py_str_len           = extern("py_str_len",           (c_ptr,),                    c_int64)
 
 py_list_new          = extern("py_list_new",          (c_int64,),                  c_ptr)
@@ -405,6 +407,10 @@ def _fnv1a(p, n: int) -> int:
 
 def _cmp_threeway(a, b) -> int:
     if ptr_eq(a, b) != 0:
+        if ptr_is_null(a) == 0 and _type_of(a) == PY_TYPE_FLOAT:
+            same_float: float = py_float_to_f64(a)
+            if same_float != same_float:
+                return PY_OBJ_CMP_UNORDERED
         return 0
     if ptr_is_null(a) != 0:
         if ptr_is_null(b) != 0:
@@ -444,6 +450,8 @@ def _cmp_threeway(a, b) -> int:
     if a_num != 0 and b_num != 0:
         fa: float = py_float_to_f64(a)
         fb: float = py_float_to_f64(b)
+        if fa != fa or fb != fb:
+            return PY_OBJ_CMP_UNORDERED
         if fa < fb:
             return -1
         if fa > fb:
@@ -512,7 +520,9 @@ def _cmp_threeway(a, b) -> int:
             while i < n:
                 ea = py_tuple_get(a, i)
                 eb = py_tuple_get(b, i)
-                r: int = _cmp_threeway(ea, eb)
+                r: int = 0
+                if ptr_eq(ea, eb) == 0:
+                    r = _cmp_threeway(ea, eb)
                 if r != 0:
                     return r
                 i = i + 1
@@ -533,7 +543,9 @@ def _cmp_threeway(a, b) -> int:
             while i < n:
                 ea = py_list_get(a, i)
                 eb = py_list_get(b, i)
-                r: int = _cmp_threeway(ea, eb)
+                r: int = 0
+                if ptr_eq(ea, eb) == 0:
+                    r = _cmp_threeway(ea, eb)
                 py_decref(ea)
                 py_decref(eb)
                 if r != 0:
@@ -591,15 +603,26 @@ def py_obj_abs(o):
 
 @c_abi_export("py_obj_eq")
 def py_obj_eq(a, b) -> int:
+    # Container identity-or-equality is distinct from a direct value operator.
     if ptr_eq(a, b) != 0:
         return 1
+    return py_obj_eq_value(a, b)
+
+
+@c_abi_export("py_obj_eq_value")
+def py_obj_eq_value(a, b) -> int:
     if ptr_is_null(a) != 0:
+        if ptr_is_null(b) != 0:
+            return 1
         return 0
     if ptr_is_null(b) != 0:
         return 0
 
     ta: int = _type_of(a)
     tb: int = _type_of(b)
+    if ptr_eq(a, b) != 0:
+        if ta != PY_TYPE_FLOAT and ta != PY_TYPE_INSTANCE and ta < PY_TYPE_USER_CLASS_START:
+            return 1
 
     # numpy / C-extension scalar ==: drive its tp_richcompare (Py_EQ=2), same as
     # py_obj_lt/le/gt/ge already do. Without this a[i] == 3 fell through to the
@@ -654,11 +677,9 @@ def py_obj_eq(a, b) -> int:
     if a_num != 0 and b_num != 0:
         fa: float = py_float_to_f64(a)
         fb: float = py_float_to_f64(b)
-        if fa < fb:
-            return 0
-        if fa > fb:
-            return 0
-        return 1
+        if fa == fb:
+            return 1
+        return 0
 
     if _is_bytes_like_tag(ta) != 0:
         if _is_bytes_like_tag(tb) != 0:
@@ -797,7 +818,7 @@ def py_obj_eq(a, b) -> int:
         if dispatched >= 0:
             return dispatched
 
-    return 0
+    return ptr_eq(a, b)
 
 
 # ---- Hash -----------------------------------------------------------
@@ -947,7 +968,7 @@ def py_obj_lt(a, b) -> int:
         if py_set_issubset(a, b) != 0 and py_set_len(a) < py_set_len(b):
             return 1
         return 0
-    if _cmp_threeway(a, b) < 0:
+    if _cmp_threeway(a, b) == -1:
         return 1
     return 0
 
@@ -963,7 +984,8 @@ def py_obj_le(a, b) -> int:
         return 0
     if _both_sets(a, b) != 0:
         return py_set_issubset(a, b)
-    if _cmp_threeway(a, b) <= 0:
+    comparison: int = _cmp_threeway(a, b)
+    if comparison == -1 or comparison == 0:
         return 1
     return 0
 
@@ -981,7 +1003,7 @@ def py_obj_gt(a, b) -> int:
         if py_set_issuperset(a, b) != 0 and py_set_len(a) > py_set_len(b):
             return 1
         return 0
-    if _cmp_threeway(a, b) > 0:
+    if _cmp_threeway(a, b) == 1:
         return 1
     return 0
 
@@ -997,7 +1019,8 @@ def py_obj_ge(a, b) -> int:
         return 0
     if _both_sets(a, b) != 0:
         return py_set_issuperset(a, b)
-    if _cmp_threeway(a, b) >= 0:
+    comparison: int = _cmp_threeway(a, b)
+    if comparison == 1 or comparison == 0:
         return 1
     return 0
 
@@ -1361,7 +1384,8 @@ def py_obj_sorted(x):
             done: int = 0
             while k > 0 and done == 0:
                 prev = py_list_get(out, k - 1)
-                if _cmp_threeway(prev, cur) <= 0:
+                sort_order: int = _cmp_threeway(prev, cur)
+                if sort_order == PY_OBJ_CMP_UNORDERED or sort_order <= 0:
                     py_decref(prev)
                     done = 1
                 else:
@@ -1413,6 +1437,8 @@ def py_obj_contains(container, item) -> int:
         if py_str_contains(container, item) != 0:
             return 1
         return 0
+    if tag == PY_TYPE_BYTES or tag == PY_TYPE_BYTEARRAY:
+        return 1 if py_bytes_find(container, item) >= 0 else 0
     if tag == PY_TYPE_INSTANCE or tag >= PY_TYPE_USER_CLASS_START:
         return py_user_contains_dispatch(container, item, null())
     return 0

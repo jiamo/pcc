@@ -79,6 +79,7 @@ py_obj_setitem = extern("py_obj_setitem", (c_ptr, c_ptr, c_ptr), c_int64)
 py_obj_delitem = extern("py_obj_delitem", (c_ptr, c_ptr), c_int64)
 py_obj_iter = extern("py_obj_iter", (c_ptr,), c_ptr)
 py_obj_eq = extern("py_obj_eq", (c_ptr, c_ptr), c_int64)
+py_obj_eq_value = extern("py_obj_eq_value", (c_ptr, c_ptr), c_int64)
 py_obj_lt = extern("py_obj_lt", (c_ptr, c_ptr), c_int64)
 py_obj_le = extern("py_obj_le", (c_ptr, c_ptr), c_int64)
 py_obj_gt = extern("py_obj_gt", (c_ptr, c_ptr), c_int64)
@@ -272,6 +273,15 @@ def PyObject_RichCompareBool(left, right, opid: int) -> int:
 
 @c_abi_typed_export("PyObject_RichCompare", "ptr", ("ptr", "ptr", "i32"))
 def PyObject_RichCompare(left, right, opid: int):
+    if opid == 2 or opid == 3:
+        equal: int = py_obj_eq_value(left, right)
+        if py_err_occurred() != 0:
+            return null()
+        if opid == 3:
+            if equal != 0:
+                return PyBool_FromLong(0)
+            return PyBool_FromLong(1)
+        return PyBool_FromLong(equal)
     result: int = PyObject_RichCompareBool(left, right, opid)
     if result < 0:
         return null()

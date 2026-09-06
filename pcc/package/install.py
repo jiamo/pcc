@@ -8,6 +8,7 @@ directory and writes a manifest that future import/build steps can consume.
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 import hashlib
 import json
 import os
@@ -27,10 +28,13 @@ from pcc.package_schema import (
     PACKAGE_MANIFEST_SCHEMA,
     PACKAGE_MANIFEST_SCHEMA_VERSION,
     capability_profile,
+    distribution_filename_fields,
+    source_build_policy,
     wheel_tag_fields,
     wheel_tags,
 )
 from pcc.package_environment import default_package_cache, default_package_site
+from pcc.package_metadata_paths import package_metadata_member_paths, package_metadata_paths
 
 from .inspect import inspect_package
 from .linkage import linkage_report
@@ -63,26 +67,11 @@ def _normalized_package_name(name: str) -> str:
 
 
 def _artifact_project_name(path: Path) -> str:
-    name = path.name
-    for suffix in (".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".zip", ".whl"):
-        if name.endswith(suffix):
-            name = name[: -len(suffix)]
-            break
-    return name.split("-")[0] if "-" in name else name
+    return distribution_filename_fields(str(path))[0]
 
 
 def _artifact_version_text(path: Path) -> str:
-    name = path.name
-    for suffix in (".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".zip", ".whl"):
-        if name.endswith(suffix):
-            name = name[: -len(suffix)]
-            break
-    parts = name.split("-")
-    if path.name.endswith(".whl") and len(parts) >= 5:
-        return parts[1]
-    if len(parts) >= 2:
-        return parts[1]
-    return "0"
+    return distribution_filename_fields(str(path))[1]
 
 
 def _wheel_tags_from_name(name: str) -> tuple[str | None, str | None, str | None]:
@@ -215,96 +204,47 @@ def _metadata_requires_dist_text(text: str) -> tuple[str, ...]:
     return tuple(deps)
 
 
-def artifact_requires_dist_diagnostics(path: str | Path) -> tuple[str, ...]:
-    source = Path(path).expanduser().resolve()
-    diagnostics: list[str] = []
+def _artifact_metadata_texts(source: Path) -> list[str]:
+    """Read only metadata selected by the common artifact-location policy."""
+    texts: list[str] = []
     if source.is_dir():
-        metadata_files = list(source.rglob("METADATA")) + list(source.rglob("PKG-INFO"))
-        for metadata in metadata_files:
+        for name in package_metadata_paths(str(source)):
             try:
-                diagnostics.extend(
-                    _requires_dist_diagnostics_text(
-                        metadata.read_text(encoding="utf-8")
-                    )
-                )
+                texts.append(Path(name).read_text(encoding="utf-8"))
             except OSError:
                 continue
-        return tuple(dict.fromkeys(diagnostics))
+        return texts
     lower = source.name.lower()
     try:
-        if lower.endswith(".whl") or lower.endswith(".zip"):
-            with zipfile.ZipFile(source) as zf:
-                for name in zf.namelist():
-                    if name.endswith(".dist-info/METADATA") or name.endswith(
-                        "PKG-INFO"
-                    ):
-                        diagnostics.extend(
-                            _requires_dist_diagnostics_text(
-                                zf.read(name).decode("utf-8", errors="replace")
-                            )
-                        )
+        if lower.endswith((".whl", ".zip")):
+            with zipfile.ZipFile(source) as archive:
+                for name in package_metadata_member_paths(archive.namelist()):
+                    texts.append(archive.read(name).decode("utf-8", errors="replace"))
         elif lower.endswith((".tar.gz", ".tar.bz2", ".tar.xz", ".tgz")):
-            with tarfile.open(source) as tf:
-                for member in tf.getmembers():
-                    if member.isfile() and (
-                        member.name.endswith(".dist-info/METADATA")
-                        or member.name.endswith("PKG-INFO")
-                    ):
-                        extracted = tf.extractfile(member)
+            with tarfile.open(source) as archive:
+                members = archive.getmembers()
+                selected = set(package_metadata_member_paths([member.name for member in members]))
+                for member in members:
+                    if member.isfile() and member.name in selected:
+                        extracted = archive.extractfile(member)
                         if extracted is not None:
-                            diagnostics.extend(
-                                _requires_dist_diagnostics_text(
-                                    extracted.read().decode("utf-8", errors="replace")
-                                )
-                            )
+                            texts.append(extracted.read().decode("utf-8", errors="replace"))
     except (OSError, tarfile.TarError, zipfile.BadZipFile):
-        return ()
+        return []
+    return texts
+
+
+def artifact_requires_dist_diagnostics(path: str | Path) -> tuple[str, ...]:
+    diagnostics: list[str] = []
+    for text in _artifact_metadata_texts(Path(path).expanduser().resolve()):
+        diagnostics.extend(_requires_dist_diagnostics_text(text))
     return tuple(dict.fromkeys(diagnostics))
 
 
 def artifact_requires_dist(path: str | Path) -> tuple[str, ...]:
-    source = Path(path).expanduser().resolve()
-    if source.is_dir():
-        metadata_files = list(source.rglob("METADATA")) + list(source.rglob("PKG-INFO"))
-        deps: list[str] = []
-        for metadata in metadata_files:
-            try:
-                deps.extend(
-                    _metadata_requires_dist_text(metadata.read_text(encoding="utf-8"))
-                )
-            except OSError:
-                continue
-        return tuple(dict.fromkeys(deps))
-    lower = source.name.lower()
     deps: list[str] = []
-    try:
-        if lower.endswith(".whl") or lower.endswith(".zip"):
-            with zipfile.ZipFile(source) as zf:
-                for name in zf.namelist():
-                    if name.endswith(".dist-info/METADATA") or name.endswith(
-                        "PKG-INFO"
-                    ):
-                        deps.extend(
-                            _metadata_requires_dist_text(
-                                zf.read(name).decode("utf-8", errors="replace")
-                            )
-                        )
-        elif lower.endswith((".tar.gz", ".tar.bz2", ".tar.xz", ".tgz")):
-            with tarfile.open(source) as tf:
-                for member in tf.getmembers():
-                    if member.isfile() and (
-                        member.name.endswith(".dist-info/METADATA")
-                        or member.name.endswith("PKG-INFO")
-                    ):
-                        extracted = tf.extractfile(member)
-                        if extracted is not None:
-                            deps.extend(
-                                _metadata_requires_dist_text(
-                                    extracted.read().decode("utf-8", errors="replace")
-                                )
-                            )
-    except (OSError, tarfile.TarError, zipfile.BadZipFile):
-        return ()
+    for text in _artifact_metadata_texts(Path(path).expanduser().resolve()):
+        deps.extend(_metadata_requires_dist_text(text))
     return tuple(dict.fromkeys(deps))
 
 
@@ -565,7 +505,10 @@ def _iter_importable_roots(source: Path) -> Iterable[Path]:
     for base in bases:
         if not base.is_dir():
             continue
-        if (base / "__init__.py").is_file() or _has_direct_importable_payload(base):
+        source_project = (base / "pyproject.toml").is_file() or (base / "setup.py").is_file()
+        if (base / "__init__.py").is_file() or (
+            _has_direct_importable_payload(base) and not source_project
+        ):
             resolved = base.resolve()
             if resolved not in seen:
                 seen.add(resolved)
@@ -1198,8 +1141,52 @@ def install_package(
             satisfied["resolved_from"] = resolved_from or "unresolved"
             return satisfied
 
+    with _prepared_source_tree(source, build_source=build_source) as install_source:
+        return _install_prepared_package(
+            spec=spec, source=source, install_source=install_source,
+            metadata=metadata, site=site, cache=cache, abi=abi,
+            build_source=build_source, build_mode=build_mode,
+            resolved_from=resolved_from, artifact_sha256=artifact_sha256,
+        )
+
+
+@contextmanager
+def _prepared_source_tree(source: Path, *, build_source: bool):
+    """Keep an sdist's extracted build tree alive until payload publication.
+
+    Wheels already contain built payloads. Source archives use the same build
+    policy and output checks as source directories; extracting directly into
+    site-packages would bypass those checks.
+    """
+    archive = source.name.lower().endswith(_ARTIFACT_SUFFIXES[1:])
+    if not build_source or source.is_dir() or not archive:
+        yield source
+        return
+    with tempfile.TemporaryDirectory(prefix="pcc_pkg_build_") as tmp:
+        root = Path(tmp)
+        if source.name.lower().endswith(".zip"):
+            with zipfile.ZipFile(source) as zf:
+                zf.extractall(root)
+        else:
+            with tarfile.open(source) as tf:
+                tf.extractall(root, filter="data")
+        markers = ("pyproject.toml", "setup.py", "setup.cfg", "meson.build", "PKG-INFO")
+        if not any((root / marker).is_file() for marker in markers):
+            candidates = [
+                child for child in root.iterdir()
+                if child.is_dir() and any((child / marker).is_file() for marker in markers)
+            ]
+            if len(candidates) == 1:
+                root = candidates[0]
+        yield root
+
+
+def _install_prepared_package(
+    *, spec, source, install_source, metadata, site, cache, abi,
+    build_source, build_mode, resolved_from, artifact_sha256,
+) -> dict[str, object]:
     inspection = inspect_package(
-        metadata.name, str(source) if source.is_dir() else None
+        metadata.name, str(install_source) if install_source.is_dir() else None
     )
     build_report: dict[str, object] = {
         "ok": True,
@@ -1212,16 +1199,54 @@ def install_package(
         "host_python": None,
         "host_free_build_claim": False,
     }
-    if build_source and source.is_dir():
+    source_policy = "unrecognized"
+    if build_source and install_source.is_dir():
+        project_config = install_source / "pyproject.toml"
+        if project_config.is_file() and not (install_source / "meson.build").exists():
+            try:
+                source_policy = source_build_policy(project_config.read_text())
+                if (install_source / "hatch.toml").exists() or (install_source / "hatch_build.py").exists():
+                    source_policy = "requires_build_hook"
+            except ValueError:
+                source_policy = "unsupported_build_metadata"
+    if source_policy in ("requires_build_hook", "unsupported_build_metadata"):
+        build_report = {
+            "ok": False,
+            "skipped": False,
+            "actions": [],
+            "reason": ("declared_build_hook_requires_owner" if source_policy == "requires_build_hook"
+                       else "unsupported_build_metadata"),
+            "diagnostics": [("PCC-PKG-BUILD-HOOK-UNSUPPORTED" if source_policy == "requires_build_hook"
+                             else "PCC-PKG-PROJECT-METADATA-UNSUPPORTED")],
+            "build_mode_requested": build_mode,
+            "build_ownership": "unresolved",
+            "host_assisted": False,
+            "host_python": None,
+            "host_free_build_claim": False,
+        }
+    elif build_source and source_policy == "declarative_python_source":
+        build_report = {
+            "ok": True,
+            "skipped": True,
+            "reason": "declarative_python_source",
+            "actions": [],
+            "build_backend": "hatchling.build",
+            "build_mode_requested": build_mode,
+            "build_ownership": "not-required",
+            "host_assisted": False,
+            "host_python": None,
+            "host_free_build_claim": True,
+        }
+    elif build_source and install_source.is_dir():
         persisted_report = _existing_payload_build_report(
-            source, build_mode=build_mode
+            install_source, build_mode=build_mode
         )
         if persisted_report is not None:
             build_report = persisted_report
         else:
             build_report = _ensure_meson_build_outputs(
-                source,
-                metadata.pyproject_requires,
+                install_source,
+                inspect_artifact(metadata.name, install_source).pyproject_requires,
                 build_mode=build_mode,
             )
     if not bool(build_report.get("ok", True)):
@@ -1246,7 +1271,7 @@ def install_package(
             "build_report": build_report,
             "diagnostics": list(build_report.get("diagnostics", [])),
         }
-    install_root, installed_payloads = _copy_or_extract(source, site, metadata.name)
+    install_root, installed_payloads = _copy_or_extract(install_source, site, metadata.name)
 
     cache_record = cache / metadata.name
     scan_roots = installed_payloads if installed_payloads else [str(install_root)]

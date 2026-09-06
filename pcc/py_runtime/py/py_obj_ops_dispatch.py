@@ -622,7 +622,8 @@ def py_obj_truthy(o) -> int:
             return 1
         return 0
     if tag == PY_TYPE_FLOAT:  # PY_TYPE_FLOAT — read i64 bits at offset 16
-        if load_i64(o, 16) != 0:
+        # Only the two signed-zero encodings have zero magnitude bits.
+        if (load_i64(o, 16) & 0x7fffffffffffffff) != 0:
             return 1
         return 0
     if tag == PY_TYPE_LIST:  # PY_TYPE_LIST — length@16
@@ -2517,6 +2518,17 @@ def py_obj_isinstance(o, cls) -> int:
     if ptr_is_null(cls) != 0:
         return 0
     if is_tagged_int(cls) != 0:
+        return 0
+    if load_i32(cls, 8) == PY_TYPE_TUPLE:
+        count: int = py_tuple_len(cls)
+        index: int = 0
+        while index < count:
+            candidate = py_tuple_get(cls, index)
+            matched: int = py_obj_isinstance(o, candidate)
+            py_decref(candidate)
+            if matched != 0:
+                return matched
+            index += 1
         return 0
     if load_i32(cls, 8) != PY_TYPE_CLASS:  # PY_TYPE_CLASS
         return 0

@@ -660,6 +660,7 @@ def _sync_key(projection: dict[str, object], environment: dict[str, object]) -> 
         "lock_sha256": projection["lock_sha256"],
         "groups": projection["groups"],
         "extras": projection["extras"],
+        "python_semantic_target": environment["python_semantic_target"],
         "compatibility_tag": environment["compatibility_tag"],
         "package_abi_mode": environment["package_abi_mode"],
     }

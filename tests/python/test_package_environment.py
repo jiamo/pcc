@@ -5,8 +5,13 @@ import os
 from pathlib import Path
 import subprocess
 
+import pytest
+
 from pcc import cli_bootstrap, cli_core
+from pcc.package.acquire import target_python_version
 from pcc.package.install import install_package
+from pcc.package.pip_shim import pip_dry_run_plan
+from pcc.package.uv_lock_sync import _marker_environment
 from pcc.package_environment import (
     apply_locked_environment_resource_defaults,
     default_package_cache,
@@ -217,6 +222,72 @@ def test_runtime_policy_does_not_change_environment_identity(tmp_path):
     assert changed["package_sites"] == baseline["package_sites"]
 
 
+@pytest.mark.parametrize("virtual_env", [False, True])
+def test_native_environment_path_is_stable_across_python_selection_versions(
+    tmp_path, virtual_env
+):
+    env = {"HOME": str(tmp_path / "home")}
+    if virtual_env:
+        env["VIRTUAL_ENV"] = str(tmp_path / ".venv")
+    baseline = resolve_package_environment(env, target_triple="aarch64-apple-darwin")
+    changed = resolve_package_environment(
+        {**env, "PCC_PACKAGE_TARGET_PYTHON": "3.16"},
+        target_triple="aarch64-apple-darwin",
+    )
+    assert baseline["python_semantic_target"] == "3.15"
+    assert changed["python_semantic_target"] == "3.16"
+    assert baseline["compatibility_tag"] == changed["compatibility_tag"]
+    assert not baseline["compatibility_tag"].startswith("py")
+    assert baseline["root"] == changed["root"]
+    assert baseline["selected_site_packages"] == changed["selected_site_packages"]
+
+
+def test_native_environment_path_still_isolates_abi_and_target_platform(tmp_path):
+    env = {"HOME": str(tmp_path / "home")}
+    baseline = resolve_package_environment(env, target_triple="aarch64-apple-darwin")
+    changed_abi = resolve_package_environment(
+        {**env, "PCC_NATIVE_ABI_VERSION": "pcc-native-v2"},
+        target_triple="aarch64-apple-darwin",
+    )
+    changed_platform = resolve_package_environment(
+        env, target_triple="x86_64-unknown-linux-gnu"
+    )
+    assert len({baseline["root"], changed_abi["root"], changed_platform["root"]}) == 3
+
+
+@pytest.mark.parametrize("abi_mode", ["cpython-compat", "libpython"])
+def test_cpython_environment_identity_retains_python_abi_version(tmp_path, abi_mode):
+    env = {"HOME": str(tmp_path / "home"), "PCC_PACKAGE_ABI_MODE": abi_mode}
+    baseline = resolve_package_environment(env, target_triple="aarch64-apple-darwin")
+    changed = resolve_package_environment(
+        {**env, "PCC_PACKAGE_TARGET_PYTHON": "3.16"},
+        target_triple="aarch64-apple-darwin",
+    )
+    assert baseline["compatibility_tag"].startswith("py315-")
+    assert changed["compatibility_tag"].startswith("py316-")
+    assert baseline["root"] != changed["root"]
+
+
+def test_legacy_versioned_environment_is_preserved_and_explicitly_selectable(tmp_path):
+    home = tmp_path / "home"
+    legacy = (
+        home
+        / ".local/share/pcc/environments/py311-pcc_native_v1-aarch64_apple_darwin-pcc_native"
+    )
+    payload = legacy / "site-packages/old_module.py"
+    payload.parent.mkdir(parents=True)
+    payload.write_text("VALUE = 42\n")
+    env = {"HOME": str(home)}
+    default = resolve_package_environment(env, target_triple="aarch64-apple-darwin")
+    assert default["root"] != str(legacy)
+    selected = resolve_package_environment(
+        {**env, "PCC_ENVIRONMENT": str(legacy)}, target_triple="aarch64-apple-darwin"
+    )
+    assert selected["root"] == str(legacy)
+    assert selected["selected_site_packages"] == str(payload.parent)
+    assert payload.read_text() == "VALUE = 42\n"
+
+
 def test_host_and_bootstrap_env_info_report_same_selection(
     tmp_path, monkeypatch, capsys
 ):
@@ -233,6 +304,43 @@ def test_host_and_bootstrap_env_info_report_same_selection(
     assert compiled == host
     assert host["selection_reason"] == "virtual-env"
     assert host["root"].startswith(str(tmp_path / ".venv" / ".pcc"))
+
+
+@pytest.mark.parametrize("configured, expected", [(None, "3.15"), ("3.11", "3.11")])
+def test_package_target_agrees_across_environment_acquisition_and_lock_markers(
+    tmp_path, monkeypatch, capsys, configured, expected
+):
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    monkeypatch.setenv("VIRTUAL_ENV", str(tmp_path / ".venv"))
+    for name in ("PCC_PACKAGE_SITE", "PCC_ENVIRONMENT", "PCC_PACKAGE_TARGET_PYTHON"):
+        monkeypatch.delenv(name, raising=False)
+    if configured is not None:
+        monkeypatch.setenv("PCC_PACKAGE_TARGET_PYTHON", configured)
+
+    assert cli_core.cli_main(["env", "info", "--json"]) == 0
+    host = json.loads(capsys.readouterr().out)
+    assert cli_bootstrap.bootstrap_cli_main(["env", "info", "--json"]) == 0
+    native = json.loads(capsys.readouterr().out)
+    assert host == native
+    assert host["python_semantic_target"] == expected
+    assert host["compatibility_tag"].startswith("pcc_native_v1-")
+    assert target_python_version() == expected
+    args = [
+        "install",
+        "target-probe",
+        "--dry-run",
+        "--acquire=offline",
+        "--cache-dir",
+        str(tmp_path / "cache"),
+    ]
+    assert pip_dry_run_plan(args)["target_python"] == expected
+    assert cli_bootstrap._run_native_pip_shim_from_pcc1(args) == 0
+    assert json.loads(capsys.readouterr().out)["target_python"] == expected
+    marker_env = _marker_environment(
+        host["python_semantic_target"], host["target_triple"]
+    )
+    assert marker_env["python_version"] == expected
+    assert marker_env["python_full_version"] == expected + ".0"
 
 
 def test_bootstrap_compile_activates_locked_resource_defaults_before_frontend(

@@ -7216,3 +7216,21 @@ exactly, keeping `pcc_gc_pointer_is_managed` for the extension/C-API boundary
 where foreign pointers legitimately enter. Adjacent probe micro-slices
 (radix cache, power-of-two shift) are not selected: two consecutive
 sub-threshold candidates already stand and the guardrail requires the owner.
+
+
+## Update 2026-09-06 (evening): raw-pointer static typing landed; probe removal DENIED
+
+Phase A (raw addresses typed `int` in application modules, `c_obj`/`c_rawptr`
+extern markers, `__pcc_runtime_port__` pointer-lane directive) landed with
+green focused/GC0..4/fallback gates; Stage1 v85 CPU 751.5 s vs 747.6 s (flat).
+
+Phase B (skip `pcc_gc_pointer_is_managed` in incref/decref and class checks on
+GC0..2) is **[DENIED]**: pcc1 crashed in Stage2 (`pcc_allocator_take_small_object`
+on a corrupted free list). A C-runtime diagnostic pcc1 with `PCC_DEBUG_RUNTIME=1`
+counted, per tiny compile, 213 refcount operations on non-managed pointers:
+22 on the `py_set_dummy` tombstone (1-byte static) via `pcc_gc_store_ptr`, and
+about 190 `pcc_gc_release` calls from the compiler's own ownership-cleanup code
+on libmalloc addresses with `malloc_size == 0` (stale releases the probe
+absorbs). The probe therefore masks real over-releases in pcc1's compiled code;
+removing it requires immortal-header sentinels and fixing those releases first.
+Both mirrors keep the probe. Handoff: `docs/knowledge/2026-09-06-session-handoff.md`.

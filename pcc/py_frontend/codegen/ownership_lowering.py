@@ -152,7 +152,39 @@ class OwnershipLoweringMixin:
     def _gc_unpin(self, obj: ir.Value) -> None:
         if self._value_is_never_gc_object(obj):
             return
-        self.builder.call(self.runtime["pcc_gc_unpin"], [obj])
+        self.builder.call(
+            self.runtime["pcc_gc_unpin"],
+            [self._value_available_at_insertion_point(obj)],
+        )
+
+    def _note_global_backed_value(self, value: ir.Value, source) -> None:
+        """Record that ``value`` was loaded from module-level ``source``.
+
+        The entry keeps a reference to ``value`` itself so the ``id`` key can
+        never be reused by a freed object (the recorded id-keyed cache hazard).
+        """
+        table = getattr(self, "_global_backed_values", None)
+        if table is None:
+            table = {}
+            self._global_backed_values = table
+        table[id(value)] = (source, value)
+
+    def _value_available_at_insertion_point(self, value: ir.Value) -> ir.Value:
+        """Return ``value``, re-deriving it here when it may not dominate.
+
+        A cleanup site can be reached from a resume block that the defining
+        block does not dominate (may_park state machines split a function at
+        every park).  For a value loaded from a module-level global -- a class
+        object receiver, for instance -- the load is pure and the global is
+        stable for the image lifetime, so re-emitting it here is exact.
+        """
+        table = getattr(self, "_global_backed_values", None)
+        if not table:
+            return value
+        entry = table.get(id(value))
+        if entry is None or entry[1] is not value:
+            return value
+        return self.builder.load(entry[0], name=self._fresh("gc.reload"))
 
     def _gc_release(self, obj: ir.Value, label: Optional[str] = None) -> None:
         if self._value_is_never_gc_object(obj):
@@ -1270,7 +1302,10 @@ class OwnershipLoweringMixin:
                     alloca,
                     name=self._fresh("gc.root.cleanup.unpin"),
                 )
-                self.builder.call(self.runtime["pcc_gc_unpin"], [pinned])
+                self.builder.call(
+                    self.runtime["pcc_gc_unpin"],
+                    [self._value_available_at_insertion_point(pinned)],
+                )
                 self.builder.call(
                     self.runtime["pcc_gc_store_root"],
                     [
