@@ -81,6 +81,7 @@ except BaseException as exc:
 # object-emitter policy intentionally remain outside this pre-pass key.
 _CODEGEN_ENV_NAMES = (
     "PCC_DISABLE_BULK_GENERATOR_FRAME_INIT",
+    "PCC_GENERATOR_FIRST_ENTRY_INIT",
     "PCC_DEBUG_CODEGEN_PHASES",
     "PCC_DEBUG_RELEASES",
     "PCC_DEBUG_RUNTIME",

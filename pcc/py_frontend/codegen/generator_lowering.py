@@ -1189,14 +1189,35 @@ class GeneratorLoweringMixin:
 
         self._emit_thread_safepoint()
 
+        first_entry_init = str(
+            os.environ.get("PCC_GENERATOR_FIRST_ENTRY_INIT", "0") or "0"
+        ).strip().lower() in ("1", "true", "yes", "on")
+        argument_names = {arg.name for arg in fd.args if arg.name != ""}
+        if len(frame_names) == len(argument_names):
+            # No placeholders means there is no first-entry work to elide.
+            first_entry_init = False
+        entry_state = None
+        if first_entry_init:
+            entry_state = self.builder.call(
+                self.runtime["py_gen_state"],
+                [fn.args[0]],
+                name=self._fresh("gen.entry.state"),
+            )
+
         frame_slots: dict[str, tuple[int, ir.Value]] = {}
         for idx, local_name in enumerate(frame_names):
             slot = self._alloca_in_entry(_CSTR, name=f"{local_name}.addr")
-            item = self.builder.call(
-                self.runtime["py_list_get"],
-                [fn.args[1], ir.Constant(_I64, idx)],
-                name=self._fresh(f"gen.frame.{local_name}"),
-            )
+            if first_entry_init and local_name not in argument_names:
+                # The private factory filled these slots with immortal None.
+                # Keep the same owned locals and roots without a retaining
+                # list read before the function has executed its first line.
+                item = self._emit_none_literal()
+            else:
+                item = self.builder.call(
+                    self.runtime["py_list_get"],
+                    [fn.args[1], ir.Constant(_I64, idx)],
+                    name=self._fresh(f"gen.frame.{local_name}"),
+                )
             self.builder.store(item, slot)
             self.env[local_name] = (slot, _CSTR, DynType(name="dyn"))
             frame_slots[local_name] = (idx, slot)
@@ -1208,13 +1229,33 @@ class GeneratorLoweringMixin:
 
         dispatch_bb = fn.append_basic_block(name="gen.dispatch")
         start_bb = fn.append_basic_block(name="gen.start")
+        if first_entry_init:
+            restore_bb = fn.append_basic_block(name="gen.restore.locals")
+            is_first = self.builder.icmp_signed(
+                "==", entry_state, ir.Constant(_I64, 0),
+                name=self._fresh("gen.first.entry"),
+            )
+            self.builder.cbranch(is_first, dispatch_bb, restore_bb)
+            self.builder.position_at_end(restore_bb)
+            for local_name, (idx, slot) in frame_slots.items():
+                if local_name in argument_names:
+                    continue
+                item = self.builder.call(
+                    self.runtime["py_list_get"],
+                    [fn.args[1], ir.Constant(_I64, idx)],
+                    name=self._fresh(f"gen.frame.{local_name}"),
+                )
+                # This root still contains only its initial immortal None.
+                self.builder.store(item, slot)
         self.builder.branch(dispatch_bb)
         self.builder.position_at_end(dispatch_bb)
-        state = self.builder.call(
-            self.runtime["py_gen_state"],
-            [fn.args[0]],
-            name=self._fresh("gen.state"),
-        )
+        state = entry_state
+        if state is None:
+            state = self.builder.call(
+                self.runtime["py_gen_state"],
+                [fn.args[0]],
+                name=self._fresh("gen.state"),
+            )
         switch_inst = self.builder.switch(state, start_bb)
         self.builder.position_at_end(start_bb)
         self._generator_ctx_stack.append(

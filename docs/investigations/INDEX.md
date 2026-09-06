@@ -898,6 +898,8 @@ Regenerate with `env -u LC_ALL uv run python scripts/regen_investigations_index.
   - When pcc1 self-host crashes with `nanov2_guard_corruption_detected` deep
 - [method-literal-aggregate-abi-equality.md](method-literal-aggregate-abi-equality.md) — **method ABI rejects distinct equal literal aggregates**
   - The native record-span experiment passes a `CompilerInt2` value into an
+- [minmax-dynamic-float-integer-fold.md](minmax-dynamic-float-integer-fold.md) — **iterable min/max silently converts dynamic floats to integers**
+  - The gateway performance summary reports latency_min_ms=latency_max_ms=0 for
 - [multi-file-direct-link-tests-require-prebuilt-runtime.md](multi-file-direct-link-tests-require-prebuilt-runtime.md) — **direct-link tests require an unprepared mutable C runtime**
   - Current compiler qualification in a clean, isolated checkout fails before the
 - [native-array-float64-precision.md](native-array-float64-precision.md) — **native array CLI silently quantizes float64 values**

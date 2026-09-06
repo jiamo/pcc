@@ -7,7 +7,7 @@ Each line is a mechanism that was established by an experiment, not a
 plausible explanation. Use it to recognise a repeat of a known failure
 instead of re-diagnosing it.
 
-1541 confirmations across 448 investigations.
+1544 confirmations across 449 investigations.
 
 ## [Investigation: direct AArch64 instruction capture order and lifetime](../investigations/aarch64-direct-instruction-capture-order.md)
 
@@ -1442,6 +1442,10 @@ instead of re-diagnosing it.
 - Test [CONFIRMED] — The native compile test failed in 1.37s before executing an output. A smaller
 - for identities, exact receipts and timings. No.1 is CONFIRMED at the full
 
+## [Investigation: iterable min/max silently converts dynamic floats to integers](../investigations/minmax-dynamic-float-integer-fold.md)
+
+- Test [CONFIRMED] — The application control printed 1000 requests, elapsed_ms=1048.63 and min/max
+
 ## [Investigation: direct-link tests require an unprepared mutable C runtime](../investigations/multi-file-direct-link-tests-require-prebuilt-runtime.md)
 
 - Test [CONFIRMED] — The first failure in `build/correctness-20260906-a/focused-02.stdout.log` is that
@@ -2855,8 +2859,10 @@ instead of re-diagnosing it.
 - Test [CONFIRMED] — The full three-arm baseline completed 90 runs. Both compiler entries passed the
 - No.1 bypass zero-timeout IO polling when no fd waiters exist [CONFIRMED]
 - No.2 elide repeated retaining stores of the same reference under GC0 [CONFIRMED]
+- No.4 skip placeholder frame reads on first generator entry [CONFIRMED for host application; pcc1 pending]
 - CONFIRMED — The interposed-kevent test failed with 101 calls before the patch, then passed
 - CONFIRMED — Both runtime variants passed the ownership and empty-IO regressions (four
+- CONFIRMED — bounded host-compiled application gain — After the user stopped other CPU-intensive programs, a fresh normal-output
 
 ## [Investigation: unrelated parking methods reject a concrete nonparking call](../investigations/vthread-concrete-nonparking-method-collision.md)
 

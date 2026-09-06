@@ -46,6 +46,7 @@ waiting samples as CPU time or reuse its timeout as a proven scheduler defect.
 - No.1 bypass zero-timeout IO polling when no fd waiters exist [CONFIRMED]
 - No.2 elide repeated retaining stores of the same reference under GC0 [CONFIRMED]
 - No.3 initialize fixed-size generator frames in one operation [DENIED as a speed claim]
+- No.4 skip placeholder frame reads on first generator entry [CONFIRMED for host application; pcc1 pending]
 
 ## No.1 bypass zero-timeout IO polling when no fd waiters exist
 ### Code Change
@@ -174,3 +175,57 @@ entirely). The placeholder-read subset is not yet separately timed; this
 bounded experiment must have an application A/B verdict and is not presented
 as sufficient to close the 1.92x gap. No generator-local borrowing or GC
 barrier removal is authorized by this hypothesis.
+
+## No.4 skip placeholder frame reads on first generator entry
+### Code Change
+With diagnostic PCC_GENERATOR_FIRST_ENTRY_INIT=1, the resume prologue loads
+arguments normally and initializes nonargument local roots to immortal None.
+One state-zero branch skips restoring those placeholders. Subsequent entries
+load every saved local as before. Owned flags, root registration, frame saves
+and cleanup are unchanged. The flag is included in frontend cache identity;
+it remains off by default until the application A/B is accepted.
+
+### pending
+The prerequisite protocol test first exposed an existing missing finally on
+handler close, reduced and corrected separately in
+generator-handler-close-skips-finally.md. The first-entry optimization is now
+being checked with that regression under GC0–4 before a frozen-source A/B.
+
+### Validation update
+The new protocol regression passed with the optimization off/on under GC0–4
+(2 pytest cases / 10 executions, 15.62 s). The emitted-IR cost gate reduces
+first-entry py_list_get calls from three frame slots to the one actual
+argument. The existing 12 vthread gateway cases completed successfully with
+the flag on. A combined extended run hit its watchdog in Clang linking;
+faulthandler located pipeline_native_link.link_with_clang rather than Python
+execution. The complete nine-case generator protocol suite then passed with
+the application target's self backend (58.00 s). No placeholders means no
+first-entry optimization branch is emitted.
+
+The first A/B attempt was invalid before any requests: the copied source root
+lacked the AGENTS.md marker required by _repo_root_for_link. A new source-bound
+run uses a complete 1,066-file snapshot, one fixed e05708b... application
+runtime in both arms, seven rotating repeats, 20,000 zero-wait requests/run,
+summary output and a CPython asyncio witness. No speed verdict yet.
+
+### CONFIRMED — bounded host-compiled application gain
+After the user stopped other CPU-intensive programs, a fresh normal-output
+comparison completed all 42 runs / 441,000 requests. Seven rotating repeats
+used one frozen compiler and one runtime archive. Zero-wait C100 median QPS
+rose from 37,943.8 (37,556.3–38,440.7) to 39,368.2 (38,333.4–39,885.4), +3.8%.
+The asyncio witness measured 86,549.5 QPS. At 100 ms, control/candidate/asyncio
+were 966.2 / 966.4 / 973.8 QPS. Gateway report:
+benchmarks/results/2026-09-07-first-entry-idle-ab.json.
+
+The earlier summary-output run is incomplete because native min/max over the
+dynamic float latency array returned zero; the actual raw latencies remained
+correct. This is reduced separately in minmax-dynamic-float-integer-fold.md.
+Whole-process CPU/instructions in normal-output mode include expensive final
+latency-array formatting and must not be called request-only CPU.
+
+Retain the measured first-entry optimization behind its diagnostic flag until
+fresh pcc1 application qualification. It does not close the ~2.2x same-run
+asyncio gap. Three adjacent candidates now have gains below 5%; per the
+convergence rule, stop selecting neighboring reference-count helpers. The
+next performance proposal must address the generated resumable-call owner
+(frame construction/completion and lifetime) as a whole, with caller evidence.

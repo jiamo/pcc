@@ -10,7 +10,7 @@ work. **Read this page before proposing a fix**; if your idea is here,
 either cite new evidence that overturns the verdict or do not make the
 change. The linked investigation holds the measurement.
 
-620 verdicts across 127 investigations.
+621 verdicts across 128 investigations.
 
 ## [Investigation: backend-0 finalizer re-enters the tracked-object table lock](../investigations/backend0-finalizer-table-lock-reentrancy.md)
 
@@ -364,6 +364,10 @@ change. The linked investigation holds the measurement.
 ## [Investigation: NumPy L4 import under pcc1/self/no-libpython](../investigations/m2-numpy-l4-import.md)
 
 - dynamic names and zero CPython fallback calls. The first complete build denied
+
+## [Investigation: iterable min/max silently converts dynamic floats to integers](../investigations/minmax-dynamic-float-integer-fold.md)
+
+- Do not repeat the denied attempts to change runtime custom-__lt__ dispatch in
 
 ## [Investigation: native file open returns NULL without an exception](../investigations/native-file-open-null-without-exception.md)
 

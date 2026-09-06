@@ -2,6 +2,7 @@
 
 import os
 from pathlib import Path
+import re
 import subprocess
 
 import pytest
@@ -57,3 +58,31 @@ print(events)
                              capture_output=True, timeout=20)
         assert ran.returncode == 0, f"GC{backend}: " + ran.stdout + ran.stderr
         assert ran.stdout.strip().splitlines() == [str(backend), *expected], f"GC{backend}: " + ran.stdout
+
+
+def test_first_entry_reads_arguments_without_reading_placeholder_slots(tmp_path, monkeypatch):
+    from pcc.py_frontend.pipeline import compile_python
+
+    source = tmp_path / "entry_shape.py"
+    source.write_text('''def worker(seed):
+    first = seed
+    second = seed
+    yield first
+    yield second
+g = worker(5)
+print(next(g))
+''')
+    counts = []
+    for enabled in ("0", "1"):
+        monkeypatch.setenv("PCC_GENERATOR_FIRST_ENTRY_INIT", enabled)
+        output = tmp_path / ("entry_" + enabled + ".ll")
+        compile_python(str(source), str(output), emit_llvm_only=True,
+                       libpython_mode="off", ir_scaffold_mode="on", backend="self")
+        ir = output.read_text()
+        resume = re.search(r"define[^\n]*worker__gen_resume[^\n]*\{\n(.*?)\n\}", ir, re.S)
+        assert resume, "the test must emit the actual generator resume body"
+        entry = resume.group(1).split("\ngen.dispatch:", 1)[0]
+        counts.append(len(re.findall(r"call[^\n]*@py_list_get\(", entry)))
+        if enabled == "1":
+            assert "gen.restore.locals:" in resume.group(1)
+    assert counts == [3, 1], "only the argument needs a retaining read on first entry"
