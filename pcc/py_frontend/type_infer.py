@@ -1990,8 +1990,17 @@ def _infer_expr(ctx: _InferCtx, scope: _Scope, expr: Expr) -> Expr:
                         acc = ctx.resolve_type_refs(a0_ty.elems[0])
                         for e in a0_ty.elems[1:]:
                             acc = common_type(acc, ctx.resolve_type_refs(e))
+                    elif isinstance(a0_ty, DynType):
+                        acc = DynType(name="dyn")
+                    elif isinstance(a0_ty, StrType):
+                        acc = TYPE_STR
                     else:
                         acc = IntType(name="int")
+                    # min/max return the selected element object. A float
+                    # projection would rebox it and lose identity (and may
+                    # coerce a selected int from a mixed numeric iterable).
+                    if isinstance(acc, (FloatType, BoolType)):
+                        acc = DynType(name="dyn")
                 else:
                     acc = ctx.resolve_type_refs(new_args[0].ty)
                     for a in new_args[1:]:

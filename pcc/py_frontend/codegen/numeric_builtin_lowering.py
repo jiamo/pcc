@@ -1080,15 +1080,15 @@ class NumericBuiltinLoweringMixin:
         )
     def _min_max_needs_object_compare(self, ty) -> bool:
         """True if min()/max() over ``ty`` must compare elements as objects
-        (py_obj_cmp_threeway) rather than the int-accumulator fast path: a str
-        (iterates chars) or a list of str. Conservative — int/dyn-element
-        containers keep the int fold."""
-        if isinstance(ty, StrType):
+        rather than assuming that every element can use an integer lane.
+        Unknown elements must retain their runtime type and selected identity.
+        Static custom-__lt__ and key folds are resolved before this route."""
+        if isinstance(ty, (StrType, DynType)):
             return True
-        if isinstance(ty, ListType) and isinstance(
-            getattr(ty, "elem", None), StrType
-        ):
-            return True
+        if isinstance(ty, ListType):
+            return not isinstance(getattr(ty, "elem", None), IntType)
+        if isinstance(ty, TupleType):
+            return not ty.elems or any(not isinstance(elem, IntType) for elem in ty.elems)
         return False
 
     def _min_max_obj_lt_class(self, arg):
