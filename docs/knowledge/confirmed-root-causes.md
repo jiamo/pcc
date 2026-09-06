@@ -7,7 +7,7 @@ Each line is a mechanism that was established by an experiment, not a
 plausible explanation. Use it to recognise a repeat of a known failure
 instead of re-diagnosing it.
 
-1540 confirmations across 447 investigations.
+1541 confirmations across 448 investigations.
 
 ## [Investigation: direct AArch64 instruction capture order and lifetime](../investigations/aarch64-direct-instruction-capture-order.md)
 
@@ -1255,6 +1255,10 @@ instead of re-diagnosing it.
 - No.4 Second dominance site: gc-root reload (`pcc_gc_load_ptr` of `call.ret.root`) in native protocol-for inside generators (fortran.py's `for line in pushbackiter:`) [CONFIRMED]
 - CONFIRMED — Observed (2026-06-10): minimal repro (user-class iterator + `for x in
 - CONFIRMED — Observed (2026-06-10): minimal repro verifier failures 4 -> 0;
+
+## [Investigation: closing a generator suspended in except skips finally](../investigations/generator-handler-close-skips-finally.md)
+
+- Test [CONFIRMED] — Control failed twice under GC0 (6.85 s / 5.60 s). No compiler optimization had
 
 ## [Investigation: native generator frame planning misses nested expressions](../investigations/generator-native-ast-reflection-misses-expression.md)
 

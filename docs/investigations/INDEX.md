@@ -802,6 +802,8 @@ Regenerate with `env -u LC_ALL uv run python scripts/regen_investigations_index.
   - resolved for `PCC_GC_BACKEND=4` three-stage bootstrap
 - [generator-cpython-iteration-dominance.md](generator-cpython-iteration-dominance.md) — **generator bodies iterating CPython-backed iterables — LLVM dominance failure, then runtime SEGV**
   - active — No.1/No.2 (cpy slot spill + guard), No.4 (native protocol-for frame slot), and No.3-J1 (boxed iterator handle + precise cross-yi...
+- [generator-handler-close-skips-finally.md](generator-handler-close-skips-finally.md) — **closing a generator suspended in except skips finally**
+  - The application-performance investigation (pcc #188) needs a regression for
 - [generator-native-ast-reflection-misses-expression.md](generator-native-ast-reflection-misses-expression.md) — **native generator frame planning misses nested expressions**
   - Host pcc compiles the gateway, while pcc1 reports a missing child continuation
 - [goal-data-model-b1-b2-0394-0402.md](goal-data-model-b1-b2-0394-0402.md) — **goal data-model B1/B2 slice 0394-0402**

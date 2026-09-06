@@ -45,7 +45,7 @@ waiting samples as CPU time or reuse its timeout as a proven scheduler defect.
 ## Proposals
 - No.1 bypass zero-timeout IO polling when no fd waiters exist [CONFIRMED]
 - No.2 elide repeated retaining stores of the same reference under GC0 [CONFIRMED]
-- No.3 initialize fixed-size generator frames in one operation [pending]
+- No.3 initialize fixed-size generator frames in one operation [DENIED as a speed claim]
 
 ## No.1 bypass zero-timeout IO polling when no fd waiters exist
 ### Code Change
@@ -124,3 +124,53 @@ exist. The initial C implementation needed the standard malloc declaration;
 that build failure is not performance evidence. Runtime validation is in
 progress. This targets the frame-construction caller rather than disabling
 pointer safety checks; no speed claim is made before the A/B completes.
+
+## Update 2026-09-07: current application baseline and bulk-frame verdict
+
+The optimized application three-way run is published in pcc-gateway commit
+61cc568. Both host pcc and pcc1 rebuilt the workload with the same fixed v5
+compiler source and optimized runtime archive (SHA-256 514ed8bf2d4b...). All
+90 runs / 241,650 requests passed. Zero-wait C100 medians are 22,092.9 /
+22,241.0 / 42,647.1 QPS; the current same-run pcc1 gap is 1.92x. System load
+varied and is retained in the report. These are application execution timings,
+not compiler Stage1/Stage2 speed measurements.
+
+### No.3 DENIED as a speed claim
+The fixed-size frame helper passed C and pcc-Python runtime checks under all
+five collectors; generator regression/protocol checks also passed. Its first
+A/B was noisy and did not establish a gain. A later frozen-source diagnostic
+with 20,000 requests/run and a same-run asyncio witness reduced process
+instructions/request from 353,997 to 340,787 (3.7%), but user CPU/request stayed
+43 microseconds and QPS ranges overlapped. Keep the helper and regression
+coverage, with compiler activation disabled by default. Do not repeat this as
+an accepted throughput optimization.
+
+### Application profile and the core million-task benchmark
+The newly captured optimized pcc1 application's native on-CPU profile has
+2,488 samples; 2,249 pass through py_gen_next (90.4%). Request resume is on
+610 paths (24.5%), batch resume on 210 (8.4%). GC/ownership leaves dominate;
+granule object-start checks alone account for 412 samples (16.6%). This is the
+compiled gateway workload, not a profile of the compiler building itself.
+Gateway artifact: benchmarks/build/profile-optimized-pcc1-20260907.
+
+The earlier core 1M gate's 1,493,625 tasks/s result is a different boundary:
+tests/benchmarks/vthread/vthread_real_runtime.c creates py_virtual_thread_new
+with py_None, then times poll_ready and manually calls complete. Its `resume`
+metric is ready-queue removal, not execution of a generated Python frame. It
+uses the C runtime, while the gateway benchmark uses the pcc-Python runtime.
+The result proves scheduler capacity, not the complete Python handler cost.
+
+### Next bounded hypothesis: first-entry frame restoration
+Generator factories initialize every nonargument frame slot to immortal None,
+but the generated resume function calls py_list_get on every slot even on its
+first entry. That does list checks and retaining reads for placeholders. Test
+initializing only those local stack slots directly to None when state is zero,
+while restoring arguments and all slots after a suspension as before. Keep
+the same owned local flags, GC roots, save path and cleanup semantics.
+
+The measured architectural owner is generated resumable application calls,
+including the request resume's 24.5% share (ceiling 1.32x even if removed
+entirely). The placeholder-read subset is not yet separately timed; this
+bounded experiment must have an application A/B verdict and is not presented
+as sufficient to close the 1.92x gap. No generator-local borrowing or GC
+barrier removal is authorized by this hypothesis.

@@ -10,7 +10,7 @@ work. **Read this page before proposing a fix**; if your idea is here,
 either cite new evidence that overturns the verdict or do not make the
 change. The linked investigation holds the measurement.
 
-618 verdicts across 126 investigations.
+620 verdicts across 127 investigations.
 
 ## [Investigation: backend-0 finalizer re-enters the tracked-object table lock](../investigations/backend0-finalizer-table-lock-reentrancy.md)
 
@@ -993,6 +993,11 @@ change. The linked investigation holds the measurement.
 
 - No.2 Permit coercion between unrelated same-layout classes [DENIED].
 - DENIED — The source names are aliases of one class; the descriptor must preserve that
+
+## [Investigation: virtual-thread handler throughput trails asyncio by 9.7x](../investigations/vthread-asyncio-throughput-gap.md)
+
+- No.3 initialize fixed-size generator frames in one operation [DENIED as a speed claim]
+- No.3 DENIED as a speed claim — The fixed-size frame helper passed C and pcc-Python runtime checks under all
 
 ## [Investigation: a single carrier exits with sleeping children pending](../investigations/vthread-single-carrier-pending-timer-exit.md)
 
