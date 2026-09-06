@@ -415,6 +415,25 @@ class ExceptionLoweringMixin:
         self.builder.position_at_end(cont_bb)
 
     def _emit_try(self, stmt: Try) -> None:
+        if stmt.handlers and stmt.finally_body:
+            # A finally owns every exit from the try/except, including a
+            # throw/close injected while a generator is paused in a handler.
+            # Preserve spans used by the preplanned generator frame slots.
+            handled = Try(
+                span=stmt.span,
+                body=stmt.body,
+                handlers=stmt.handlers,
+                else_body=stmt.else_body,
+                finally_body=(),
+            )
+            self._emit_try(Try(
+                span=stmt.span,
+                body=(handled,),
+                handlers=(),
+                else_body=(),
+                finally_body=stmt.finally_body,
+            ))
+            return
         if self._maybe_emit_optional_missing_import_try(stmt):
             return
         debug_codegen = bool(os.environ.get("PCC_DEBUG_CODEGEN_PHASES"))

@@ -40,3 +40,14 @@ their normal exits and explicit returns have finally coverage, but exceptional
 resume edges bypass it. After the targeted regression, run existing generator,
 vthread failure/cancellation and exception-cleanup checks before performance
 work resumes.
+
+## Update: focused correction verified
+The normalization now passes both first-entry control settings across GC0–4
+(2 pytest cases / 10 collector executions, 10.02 s). Existing generator and
+vthread gateway regressions pass (21 cases, 57.59 s), as do the existing
+unmatched-handler and finally-on-break/continue checks (2 cases, 5.56 s).
+The pcc-Python application archive is e05708b0918788d4076c5f91-pcc-py.
+
+This is a host-compiler application correctness checkpoint. Fresh pcc1 and
+full self-host qualification are still required before closing this issue's
+compiler boundary; no throughput improvement is claimed for the correction.
